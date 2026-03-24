@@ -267,6 +267,7 @@ impl ReaderApp {
 
         if self.pg.page + 1 < self.pg.total_pages {
             self.pg.page += 1;
+            self.recent_dirty = true;
             self.state = State::NeedPage;
             return true;
         }
@@ -276,6 +277,7 @@ impl ReaderApp {
             && (self.epub.chapter as usize + 1) < self.epub.spine.len()
         {
             self.epub.chapter += 1;
+            self.recent_dirty = true;
             self.goto_last_page = false;
             self.state = State::NeedIndex;
             return true;
@@ -291,12 +293,14 @@ impl ReaderApp {
 
         if self.pg.page > 0 {
             self.pg.page -= 1;
+            self.recent_dirty = true;
             self.state = State::NeedPage;
             return true;
         }
 
         if self.is_epub && self.epub.chapter > 0 {
             self.epub.chapter -= 1;
+            self.recent_dirty = true;
             self.goto_last_page = true;
             self.state = State::NeedIndex;
             return true;

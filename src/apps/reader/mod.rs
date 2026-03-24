@@ -347,6 +347,7 @@ pub struct ReaderApp {
     pub(super) is_epub: bool,
     pub(super) goto_last_page: bool,
     pub(super) restore_offset: Option<u32>,
+    pub(super) recent_dirty: bool,
 
     pub(super) page_img: Option<DecodedImage>,
     pub(super) fullscreen_img: bool,
@@ -398,6 +399,7 @@ impl ReaderApp {
             is_epub: false,
             goto_last_page: false,
             restore_offset: None,
+            recent_dirty: false,
 
             page_img: None,
             fullscreen_img: false,
@@ -766,6 +768,46 @@ impl ReaderApp {
         let size = self.file_size as u64;
         ((pos * 100) / size).min(100) as u8
     }
+
+    // write extended RECENT file: filename\0title\0author\0progress
+    fn write_recent(&mut self, k: &mut KernelHandle<'_>) {
+        let mut buf = [0u8; 196];
+        let mut pos = 0usize;
+
+        // filename
+        let fl = self.filename_len.min(32);
+        buf[pos..pos + fl].copy_from_slice(&self.filename[..fl]);
+        pos += fl;
+        buf[pos] = 0;
+        pos += 1;
+
+        // title
+        let tl = (self.title_len as usize).min(64);
+        buf[pos..pos + tl].copy_from_slice(&self.title[..tl]);
+        pos += tl;
+        buf[pos] = 0;
+        pos += 1;
+
+        // author
+        let al = if self.is_epub {
+            (self.epub.meta.author_len as usize).min(64)
+        } else {
+            0
+        };
+        if al > 0 {
+            buf[pos..pos + al].copy_from_slice(&self.epub.meta.author[..al]);
+        }
+        pos += al;
+        buf[pos] = 0;
+        pos += 1;
+
+        // progress percentage as a single byte
+        buf[pos] = self.progress_pct();
+        pos += 1;
+
+        let _ = k.write_app_data(RECENT_FILE, &buf[..pos]);
+        self.recent_dirty = false;
+    }
 }
 
 // read_full: read exactly buf.len() bytes from name at offset
@@ -934,7 +976,7 @@ impl App<AppId> for ReaderApp {
                 State::NeedBookmark => {
                     self.bookmark_load(k.bookmark_cache());
 
-                    let _ = k.write_app_data(RECENT_FILE, &self.filename[..self.filename_len]);
+                    self.write_recent(k);
 
                     if self.is_epub {
                         self.epub.zip.clear();
@@ -973,6 +1015,8 @@ impl App<AppId> for ReaderApp {
                         if spine_len > 0 && self.epub.chapter as usize >= spine_len {
                             self.epub.chapter = (spine_len - 1) as u16;
                         }
+                        // rewrite RECENT now that title/author are known
+                        self.write_recent(k);
                         self.state = State::NeedToc;
                         ctx.set_loading(LOADING_REGION, "Loading", 40);
                     }
@@ -1152,6 +1196,11 @@ impl App<AppId> for ReaderApp {
                 _ => {}
             }
             break;
+        }
+
+        // flush recent progress to SD if dirty
+        if self.recent_dirty && self.state == State::Ready {
+            self.write_recent(k);
         }
 
         // background caching; runs whenever the page content is
