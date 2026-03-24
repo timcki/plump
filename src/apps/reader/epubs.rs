@@ -219,10 +219,11 @@ impl EpubState {
         let entry_idx = self.spine.items[ch] as usize;
         let entry = *self.zip.entry(entry_idx);
 
-        // if this is the first chapter, create the file with a
-        // placeholder header + empty chapter table so appends start
-        // at the correct data offset
-        if self.cache_chapter == 0 && ch == 0 {
+        // if this is the first chapter being cached, create the file
+        // with a placeholder header + empty chapter table so appends
+        // start at the correct data offset.  ch may not be 0 when a
+        // bookmark restores the reader to a later chapter.
+        if !self.chapters_cached && k.cache_file_size(cf_str).is_err() {
             let spine_len = self.spine.len();
             let mut init_buf = [0u8; cache::HEADER_SIZE];
             // write a minimal header (will be overwritten by finish_cache)
