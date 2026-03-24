@@ -5,6 +5,7 @@ use core::fmt::Write as _;
 use crate::apps::{App, AppContext, AppId, RECENT_FILE, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
+use crate::drivers::battery;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::kernel::KernelHandle;
@@ -13,6 +14,14 @@ use crate::ui::{
     Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, HEADER_W, LARGE_MARGIN,
     Region, SECTION_GAP, TITLE_Y_OFFSET,
 };
+
+// status bar at top
+const STATUS_Y: u16 = CONTENT_TOP + 4;
+const STATUS_H: u16 = 20;
+const STATUS_PAD: u16 = 12;
+const STATUS_TITLE_REGION: Region = Region::new(STATUS_PAD, STATUS_Y, 160, STATUS_H);
+const STATUS_BAT_REGION: Region =
+    Region::new(SCREEN_W - STATUS_PAD - 80, STATUS_Y, 80, STATUS_H);
 
 const ITEM_W: u16 = 280;
 const ITEM_H: u16 = 52;
@@ -33,8 +42,8 @@ const BM_STATUS_X: u16 = SCREEN_W - LARGE_MARGIN - BM_STATUS_W;
 
 const CONTENT_REGION: Region = Region::new(0, CONTENT_TOP, SCREEN_W, SCREEN_H - CONTENT_TOP);
 
-fn compute_item_regions(heading_line_h: u16) -> [Region; MAX_ITEMS] {
-    let item_y = CONTENT_TOP + 8 + heading_line_h + TITLE_ITEM_GAP;
+fn compute_item_regions(_heading_line_h: u16) -> [Region; MAX_ITEMS] {
+    let item_y = STATUS_Y + STATUS_H + TITLE_ITEM_GAP;
     [
         Region::new(ITEM_X, item_y, ITEM_W, ITEM_H),
         Region::new(ITEM_X, item_y + ITEM_STRIDE, ITEM_W, ITEM_H),
@@ -72,6 +81,8 @@ pub struct HomeApp {
     bm_selected: usize,
     bm_scroll: usize,
     needs_load_bookmarks: bool,
+
+    bat_pct: u8,
 }
 
 impl Default for HomeApp {
@@ -97,6 +108,7 @@ impl HomeApp {
             bm_selected: 0,
             bm_scroll: 0,
             needs_load_bookmarks: false,
+            bat_pct: 0,
         }
     }
 
@@ -272,17 +284,19 @@ impl HomeApp {
 }
 
 impl App<AppId> for HomeApp {
-    fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
+    fn on_enter(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
         ctx.clear_message();
         self.state = HomeState::Menu;
         self.selected = 0;
+        self.bat_pct = battery::battery_percentage(k.battery_mv());
         ctx.mark_dirty(CONTENT_REGION);
     }
 
-    fn on_resume(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
+    fn on_resume(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
         self.state = HomeState::Menu;
         self.selected = 0;
         self.needs_load_recent = true;
+        self.bat_pct = battery::battery_percentage(k.battery_mv());
         ctx.mark_dirty(CONTENT_REGION);
     }
 
@@ -476,17 +490,18 @@ impl HomeApp {
 
 impl HomeApp {
     fn draw_menu(&self, strip: &mut StripBuffer) {
-        let title_region = Region::new(
-            ITEM_X,
-            CONTENT_TOP + 8,
-            ITEM_W,
-            self.ui_fonts.heading.line_height,
-        );
-        BitmapLabel::new(title_region, "pulp-os", self.ui_fonts.heading)
-            .alignment(Alignment::Center)
+        // status bar: "pulp-os" left, battery right
+        BitmapLabel::new(STATUS_TITLE_REGION, "pulp-os", self.ui_fonts.body)
+            .alignment(Alignment::CenterLeft)
             .draw(strip)
             .unwrap();
 
+        let mut bat_buf = BitmapDynLabel::<8>::new(STATUS_BAT_REGION, self.ui_fonts.body)
+            .alignment(Alignment::CenterRight);
+        let _ = write!(bat_buf, "{}%", self.bat_pct);
+        bat_buf.draw(strip).unwrap();
+
+        // menu items
         for i in 0..self.item_count {
             let label = self.item_label(i);
             BitmapLabel::new(self.item_regions[i], label, self.ui_fonts.body)
