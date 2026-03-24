@@ -83,6 +83,17 @@ pub fn reading_theme(idx: u8) -> &'static ReadingTheme {
     &READING_THEMES[i]
 }
 
+// text alignment for the reader (0 = Left, 1 = Justify)
+pub const NUM_TEXT_ALIGNMENTS: u8 = 2;
+pub const DEFAULT_TEXT_ALIGNMENT: u8 = 0;
+
+pub const TEXT_ALIGNMENT_NAMES: &[&str] = &["Left", "Justify"];
+
+pub fn text_alignment_name(idx: u8) -> &'static str {
+    let i = (idx as usize).min(TEXT_ALIGNMENT_NAMES.len() - 1);
+    TEXT_ALIGNMENT_NAMES[i]
+}
+
 #[derive(Clone, Copy)]
 pub struct SystemSettings {
     // power settings
@@ -104,7 +115,8 @@ pub struct SystemSettings {
     pub text_aa: bool,      // antialiased text via grayscale LUT (slower page turns)
 
     // reader settings
-    pub reader_status: bool, // show book title + page info bar at bottom of reader
+    pub reader_status: bool,    // show book title + page info bar at bottom of reader
+    pub text_alignment: u8,     // 0 = Left, 1 = Justify (index into TEXT_ALIGNMENT_NAMES)
 }
 
 impl Default for SystemSettings {
@@ -125,6 +137,7 @@ impl SystemSettings {
             sunlight_fix: false,
             text_aa: false,
             reader_status: true,
+            text_alignment: DEFAULT_TEXT_ALIGNMENT,
         }
     }
 
@@ -140,6 +153,7 @@ impl SystemSettings {
         self.book_font_size_idx = self.book_font_size_idx.min(max_font);
         self.ui_font_size_idx = self.ui_font_size_idx.min(max_font);
         self.reading_theme = self.reading_theme.min(NUM_READING_THEMES - 1);
+        self.text_alignment = self.text_alignment.min(NUM_TEXT_ALIGNMENTS - 1);
     }
 
     // reasonable default - override via sanitize_with_max_font
@@ -256,6 +270,11 @@ fn apply_setting(key: &[u8], val: &[u8], s: &mut SystemSettings, w: &mut WifiCon
         b"reader_status" => {
             s.reader_status = val == b"1" || val == b"true";
         }
+        b"text_alignment" => {
+            if let Some(v) = parse_u16(val) {
+                s.text_alignment = v as u8;
+            }
+        }
         b"wifi_ssid" => w.set_ssid(val),
         b"wifi_pass" => w.set_pass(val),
         _ => {}
@@ -345,6 +364,8 @@ pub fn write_settings_txt(s: &SystemSettings, w: &WifiConfig, buf: &mut [u8]) ->
 
     wr.put(b"\n# reader settings\n");
     wr.kv_num(b"reader_status", if s.reader_status { 1 } else { 0 });
+    wr.put(b"# text alignment (0=Left, 1=Justify)\n");
+    wr.kv_num(b"text_alignment", s.text_alignment as u16);
 
     wr.put(b"\n# control settings\n");
     wr.kv_num(b"swap_buttons", if s.swap_buttons { 1 } else { 0 });

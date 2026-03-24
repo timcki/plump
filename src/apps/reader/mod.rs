@@ -174,6 +174,22 @@ impl LineSpan {
     pub(super) const FLAG_HEADING: u8 = 1 << 2;
     pub(super) const FLAG_IMAGE: u8 = 1 << 3;
 
+    // Line-ending kind, stored in bits 4-5:
+    //   00 = BufferEnd (last line, end of page buffer or chapter)
+    //   01 = HardBreak (line ended at \n)
+    //   10 = SoftWrap  (line ended by word-wrap overflow)
+    //   11 = reserved
+    pub(super) const END_SHIFT: u8 = 4;
+    pub(super) const END_MASK: u8 = 0b11 << Self::END_SHIFT;
+    pub(super) const END_BUFFER: u8 = 0 << Self::END_SHIFT;
+    pub(super) const END_HARD: u8 = 1 << Self::END_SHIFT;
+    pub(super) const END_SOFT: u8 = 2 << Self::END_SHIFT;
+
+    #[inline]
+    pub(super) fn is_soft_wrap(&self) -> bool {
+        (self.flags & Self::END_MASK) == Self::END_SOFT
+    }
+
     #[inline]
     pub(super) fn is_image(&self) -> bool {
         self.flags & Self::FLAG_IMAGE != 0
@@ -196,8 +212,9 @@ impl LineSpan {
         }
     }
 
-    pub(super) fn pack_flags(bold: bool, italic: bool, heading: bool) -> u8 {
-        (bold as u8) | ((italic as u8) << 1) | ((heading as u8) << 2)
+    /// Pack style + line-ending flags. `end` is one of END_BUFFER, END_HARD, END_SOFT.
+    pub(super) fn pack_flags(bold: bool, italic: bool, heading: bool, end: u8) -> u8 {
+        (bold as u8) | ((italic as u8) << 1) | ((heading as u8) << 2) | end
     }
 }
 
@@ -365,6 +382,7 @@ pub struct ReaderApp {
     pub(super) text_area_h: u16, // height of text area (SCREEN_H - text_y - bottom_pad)
     pub(super) reading_theme_idx: u8,
     pub(super) show_chrome: bool,
+    pub(super) text_alignment: u8, // 0 = Left, 1 = Justify
 
     // pre-scanned image heights for the current page buffer;
     // populated before wrapping so the pager can reserve the exact
@@ -423,6 +441,7 @@ impl ReaderApp {
             text_area_h: TEXT_AREA_H,
             reading_theme_idx: 0,
             show_chrome: true,
+            text_alignment: 0,
 
             img_heights: [0u16; MAX_IMAGES_PER_PAGE],
             img_height_count: 0,
@@ -454,6 +473,10 @@ impl ReaderApp {
         self.reading_theme_idx = idx;
         self.apply_theme_layout();
         self.apply_font_metrics();
+    }
+
+    pub fn set_text_alignment(&mut self, alignment: u8) {
+        self.text_alignment = alignment;
     }
 
     pub fn set_show_chrome(&mut self, show: bool) {
@@ -1808,6 +1831,37 @@ impl App<AppId> for ReaderApp {
 
                     let line = &self.pg.buf[start..end];
                     let mut cx = self.text_margin as i32 + x_indent;
+
+                    // justification: distribute extra space across inter-word gaps.
+                    // only applies to soft-wrapped non-heading text lines when
+                    // the user has selected Justify alignment.
+                    let justify = self.text_alignment == 1
+                        && span.is_soft_wrap()
+                        && (span.flags & LineSpan::FLAG_HEADING) == 0;
+                    let (extra_per_gap, remainder) = if justify {
+                        let m = paging::measure_line(&self.pg.buf, span, fs);
+                        let avail = self.text_w.saturating_sub(INDENT_PX * span.indent as u32);
+                        let spare = avail.saturating_sub(m.width);
+                        // skip if: no gaps, tiny spare (< 3px — invisible),
+                        // or spare > 40% of line width (line too short to justify)
+                        if m.gaps >= 2 && spare >= 3 && spare * 5 < avail * 2 {
+                            let per = spare / m.gaps as u32;
+                            // cap per-gap extra to 3× natural space width to
+                            // avoid rivers when a line has very few gaps
+                            let space_w = fs.advance(' ', span.style()) as u32;
+                            let max_per = space_w.saturating_mul(3);
+                            if per <= max_per {
+                                (per as i32, (spare % m.gaps as u32) as i32)
+                            } else {
+                                (0i32, 0i32)
+                            }
+                        } else {
+                            (0i32, 0i32)
+                        }
+                    } else {
+                        (0i32, 0i32)
+                    };
+                    let mut gap_idx: i32 = 0;
                     let mut sty = span.style();
                     let mut j = 0usize;
                     while j < line.len() {
@@ -1826,6 +1880,15 @@ impl App<AppId> for ReaderApp {
                         if b >= 0xC0 {
                             let (ch, seq_len) = decode_utf8_char(line, j);
                             cx += fs.draw_char(strip, ch, sty, cx, baseline) as i32;
+                            // justify: add extra space after NBSP is
+                            // intentionally skipped (NBSP is not stretchable)
+                            if ch == ' ' && extra_per_gap > 0 {
+                                cx += extra_per_gap;
+                                if gap_idx < remainder {
+                                    cx += 1;
+                                }
+                                gap_idx += 1;
+                            }
                             j += seq_len;
                             continue;
                         }
@@ -1840,6 +1903,14 @@ impl App<AppId> for ReaderApp {
                             continue; // control char
                         }
                         cx += fs.draw_char(strip, b as char, sty, cx, baseline) as i32;
+                        // justify: distribute extra pixels at ASCII space gaps
+                        if b == b' ' && extra_per_gap > 0 {
+                            cx += extra_per_gap;
+                            if gap_idx < remainder {
+                                cx += 1;
+                            }
+                            gap_idx += 1;
+                        }
                         j += 1;
                     }
                 }

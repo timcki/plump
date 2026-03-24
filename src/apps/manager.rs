@@ -539,6 +539,7 @@ impl AppManager {
         let book_idx = ss.book_font_size_idx;
         let theme_idx = ss.reading_theme;
         let reader_status = ss.reader_status;
+        let text_alignment = ss.text_alignment;
 
         self.home.set_ui_font_size(ui_idx);
         self.files.set_ui_font_size(ui_idx);
@@ -547,6 +548,7 @@ impl AppManager {
         self.reader.set_book_font_size(book_idx);
         self.reader.set_reading_theme(theme_idx);
         self.reader.set_show_chrome(reader_status);
+        self.reader.set_text_alignment(text_alignment);
 
         let chrome = fonts::chrome_font();
         self.reader.set_chrome_font(chrome);

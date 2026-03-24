@@ -6,7 +6,7 @@ use smol_epub::html_strip::{
 };
 
 use crate::fonts;
-use crate::fonts::bitmap::FIRST_CHAR;
+use crate::fonts::bitmap::{self, FIRST_CHAR};
 use crate::kernel::KernelHandle;
 
 use super::{
@@ -364,6 +364,148 @@ impl ReaderApp {
     }
 }
 
+// ── Phase 3: line analysis helpers for justification ─────────────────
+
+/// Result of measuring a single line span for justification.
+pub(super) struct LineMeasure {
+    /// Rendered width in pixels (excluding trailing whitespace).
+    pub width: u32,
+    /// Number of stretchable inter-word gaps (ASCII spaces only; NBSP excluded).
+    pub gaps: u16,
+}
+
+/// Measure one text line's natural rendered width and count stretchable gaps.
+///
+/// Stretchable gaps are ASCII spaces (0x20) only — NBSP (U+00A0) is rendered
+/// but not stretched, and style markers are zero-width. Trailing spaces at
+/// the end of a soft-wrapped line are excluded from width measurement.
+pub(super) fn measure_line(
+    buf: &[u8],
+    span: &super::LineSpan,
+    fonts: &fonts::FontSet,
+) -> LineMeasure {
+    let start = span.start as usize;
+    let end = start + span.len as usize;
+    let line = &buf[start..end];
+    let sty_initial = span.style();
+
+    let mut width: u32 = 0;
+    let mut gaps: u16 = 0;
+    let mut sty = sty_initial;
+    let mut last_space_width: u32 = 0; // width contribution of the last trailing space run
+    let mut in_trailing_space = false;
+
+    let mut j = 0usize;
+    while j < line.len() {
+        let b = line[j];
+
+        // style markers: zero width, update style
+        if b == MARKER && j + 1 < line.len() {
+            sty = match line[j + 1] {
+                BOLD_ON => fonts::Style::Bold,
+                ITALIC_ON => fonts::Style::Italic,
+                HEADING_ON => fonts::Style::Heading,
+                BOLD_OFF | ITALIC_OFF | HEADING_OFF => fonts::Style::Regular,
+                _ => sty,
+            };
+            j += 2;
+            continue;
+        }
+
+        // UTF-8 multi-byte
+        if b >= 0xC0 {
+            let (ch, seq_len) = decode_utf8_char(line, j);
+
+            // soft hyphen: zero-width
+            if ch == '\u{00AD}' {
+                j += seq_len;
+                continue;
+            }
+
+            // NBSP: rendered as space width but NOT a stretchable gap
+            if ch == '\u{00A0}' {
+                let adv = fonts.advance(' ', sty) as u32;
+                width += adv;
+                in_trailing_space = false; // NBSP is not a trailing space
+                j += seq_len;
+                continue;
+            }
+
+            // regular space (multi-byte won't normally be space, but be safe)
+            if ch == ' ' {
+                let adv = fonts.advance(' ', sty) as u32;
+                width += adv;
+                gaps += 1;
+                if !in_trailing_space {
+                    in_trailing_space = true;
+                    last_space_width = adv;
+                } else {
+                    last_space_width += adv;
+                }
+                j += seq_len;
+                continue;
+            }
+
+            let adv = fonts.advance(ch, sty) as u32;
+            width += adv;
+            in_trailing_space = false;
+            j += seq_len;
+            continue;
+        }
+
+        // stray continuation byte
+        if b >= 0x80 {
+            j += 1;
+            continue;
+        }
+
+        // control chars (except space)
+        if b < bitmap::FIRST_CHAR && b != b' ' {
+            j += 1;
+            continue;
+        }
+
+        // ASCII space
+        if b == b' ' {
+            let adv = fonts.advance(' ', sty) as u32;
+            width += adv;
+            gaps += 1;
+            if !in_trailing_space {
+                in_trailing_space = true;
+                last_space_width = adv;
+            } else {
+                last_space_width += adv;
+            }
+            j += 1;
+            continue;
+        }
+
+        // printable ASCII
+        let adv = fonts.advance(b as char, sty) as u32;
+        width += adv;
+        in_trailing_space = false;
+        j += 1;
+    }
+
+    // strip trailing spaces from width measurement (soft-wrapped lines
+    // often include the trailing space before the break point)
+    if in_trailing_space {
+        width = width.saturating_sub(last_space_width);
+        // trailing spaces don't count as stretchable gaps
+        // (they're invisible at the end of the line)
+        // Count how many trailing spaces we had and subtract from gaps
+        // Simple approach: we tracked last_space_width which is the sum
+        // of the trailing run. Divide by single space advance to get count.
+        let space_adv = fonts.advance(' ', sty_initial) as u32;
+        if space_adv > 0 {
+            let trailing_count = (last_space_width / space_adv) as u16;
+            gaps = gaps.saturating_sub(trailing_count);
+        }
+    }
+
+    LineMeasure { width, gaps }
+}
+
 // UTF-8 decoding is provided by pulp_kernel::util::decode_utf8_char
 // (re-exported via super::decode_utf8_char)
 
@@ -419,13 +561,13 @@ pub(super) fn wrap_proportional(
     }
 
     macro_rules! emit {
-        ($start:expr, $end:expr) => {
+        ($start:expr, $end:expr, $end_kind:expr) => {
             if line_count < max_l {
                 let e = trim_trailing_cr(buf, $start, $end);
                 lines[line_count] = LineSpan {
                     start: ($start) as u16,
                     len: (e - ($start)) as u16,
-                    flags: LineSpan::pack_flags(bold, italic, heading),
+                    flags: LineSpan::pack_flags(bold, italic, heading, $end_kind),
                     indent,
                 };
                 line_count += 1;
@@ -443,7 +585,7 @@ pub(super) fn wrap_proportional(
                 let path_start = i + 3;
                 if path_start + path_len <= n && path_len > 0 {
                     if line_start < i {
-                        emit!(line_start, i);
+                        emit!(line_start, i, LineSpan::END_HARD);
                         if line_count >= max_l {
                             return (i, line_count);
                         }
@@ -522,7 +664,7 @@ pub(super) fn wrap_proportional(
         }
 
         if b == b'\n' {
-            emit!(line_start, i);
+            emit!(line_start, i, LineSpan::END_HARD);
             line_start = i + 1;
             cursor_x = 0;
             last_space = line_start;
@@ -554,7 +696,7 @@ pub(super) fn wrap_proportional(
                 last_space = i + seq_len;
                 cursor_at_space = cursor_x;
                 if cursor_x > max_w {
-                    emit!(line_start, i);
+                    emit!(line_start, i, LineSpan::END_SOFT);
                     line_start = i + seq_len;
                     cursor_x = 0;
                     last_space = line_start;
@@ -572,11 +714,11 @@ pub(super) fn wrap_proportional(
             cursor_x += adv;
             if cursor_x > max_w {
                 if last_space > line_start {
-                    emit!(line_start, last_space);
+                    emit!(line_start, last_space, LineSpan::END_SOFT);
                     cursor_x -= cursor_at_space;
                     line_start = last_space;
                 } else {
-                    emit!(line_start, i);
+                    emit!(line_start, i, LineSpan::END_SOFT);
                     line_start = i;
                     cursor_x = adv;
                 }
@@ -606,7 +748,7 @@ pub(super) fn wrap_proportional(
             last_space = i + 1;
             cursor_at_space = cursor_x;
             if cursor_x > max_w {
-                emit!(line_start, i);
+                emit!(line_start, i, LineSpan::END_SOFT);
                 line_start = i + 1;
                 cursor_x = 0;
                 last_space = line_start;
@@ -647,11 +789,11 @@ pub(super) fn wrap_proportional(
             if cursor_x > max_w {
                 // overflow: break at last space or at word start
                 if last_space > line_start {
-                    emit!(line_start, last_space);
+                    emit!(line_start, last_space, LineSpan::END_SOFT);
                     cursor_x -= cursor_at_space;
                     line_start = last_space;
                 } else {
-                    emit!(line_start, word_start);
+                    emit!(line_start, word_start, LineSpan::END_SOFT);
                     line_start = word_start;
                     // recompute cursor_x from line_start..i
                     cursor_x = 0;
@@ -681,7 +823,7 @@ pub(super) fn wrap_proportional(
             lines[line_count] = LineSpan {
                 start: line_start as u16,
                 len: (e - line_start) as u16,
-                flags: LineSpan::pack_flags(bold, italic, heading),
+                flags: LineSpan::pack_flags(bold, italic, heading, LineSpan::END_BUFFER),
                 indent,
             };
             line_count += 1;

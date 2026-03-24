@@ -21,8 +21,8 @@ use crate::fonts::max_size_idx;
 use crate::kernel::KernelHandle;
 use crate::kernel::config::{
     self, GHOST_CLEAR_STEP, MAX_GHOST_CLEAR, MAX_SLEEP_TIMEOUT, MIN_GHOST_CLEAR,
-    NUM_READING_THEMES, SLEEP_TIMEOUT_STEP, SystemSettings, WifiConfig, parse_settings_txt,
-    reading_theme, write_settings_txt,
+    NUM_READING_THEMES, NUM_TEXT_ALIGNMENTS, SLEEP_TIMEOUT_STEP, SystemSettings, WifiConfig,
+    parse_settings_txt, reading_theme, text_alignment_name, write_settings_txt,
 };
 use crate::ui::{
     Alignment, BUTTON_BAR_H, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, LARGE_MARGIN, Region,
@@ -40,7 +40,7 @@ const COL_GAP: u16 = 8;
 const VALUE_X: u16 = LABEL_X + LABEL_W + COL_GAP;
 const VALUE_W: u16 = FULL_CONTENT_W - LABEL_W - COL_GAP;
 
-const NUM_ITEMS: usize = 9;
+const NUM_ITEMS: usize = 10;
 const HEADING_ITEMS_GAP: u16 = SECTION_GAP;
 
 impl Default for SettingsApp {
@@ -160,6 +160,7 @@ impl SettingsApp {
             6 => "Sunlight Fix",
             7 => "Text AA",
             8 => "Reader Status",
+            9 => "Text Align",
             _ => "",
         }
     }
@@ -235,6 +236,9 @@ impl SettingsApp {
                     }
                 );
             }
+            9 => {
+                let _ = write!(buf, "{}", text_alignment_name(self.settings.text_alignment));
+            }
             _ => {}
         }
     }
@@ -284,6 +288,11 @@ impl SettingsApp {
             8 => {
                 self.settings.reader_status = !self.settings.reader_status;
             }
+            9 => {
+                if self.settings.text_alignment < NUM_TEXT_ALIGNMENTS - 1 {
+                    self.settings.text_alignment += 1;
+                }
+            }
             _ => return,
         }
         self.save_needed = true;
@@ -330,6 +339,11 @@ impl SettingsApp {
             }
             8 => {
                 self.settings.reader_status = !self.settings.reader_status;
+            }
+            9 => {
+                if self.settings.text_alignment > 0 {
+                    self.settings.text_alignment -= 1;
+                }
             }
             _ => return,
         }
