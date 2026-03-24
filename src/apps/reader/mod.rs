@@ -1365,8 +1365,12 @@ impl App<AppId> for ReaderApp {
         }
     }
 
+    // NOTE: sync_quick_menu() calls this on every close, even when nothing
+    // changed. the early-return guard here avoids a spurious re-index. if
+    // more cycle values are added to the quick menu, the changed-value
+    // check should move into sync_quick_menu() itself.
     fn on_quick_cycle_update(&mut self, id: u8, value: u8, _ctx: &mut AppContext) {
-        if id == QA_FONT_SIZE {
+        if id == QA_FONT_SIZE && value != self.book_font_size_idx {
             self.book_font_size_idx = value;
             self.apply_font_metrics();
             if self.state == State::Ready {
