@@ -552,7 +552,10 @@ impl HomeApp {
     fn draw_menu(&self, strip: &mut StripBuffer) {
         use embedded_graphics::pixelcolor::BinaryColor;
         use embedded_graphics::prelude::*;
-        use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
+        use embedded_graphics::primitives::{PrimitiveStyle, Rectangle, RoundedRectangle};
+
+        const R_CARD: Size = Size::new(8, 8);
+        const R_BTN: Size = Size::new(4, 4);
 
         // status bar: "pulp-os" left, battery right
         BitmapLabel::new(STATUS_TITLE_REGION, "pulp-os", self.ui_fonts.body)
@@ -575,18 +578,18 @@ impl HomeApp {
             };
 
             // card background + border
-            CARD_REGION
-                .to_rect()
+            let card_rect = Rectangle::new(
+                Point::new(CARD_X as i32, CARD_Y as i32),
+                Size::new(CARD_W as u32, CARD_H as u32),
+            );
+            RoundedRectangle::with_equal_corners(card_rect, R_CARD)
                 .into_styled(PrimitiveStyle::with_fill(bg))
                 .draw(strip)
                 .unwrap();
-            Rectangle::new(
-                Point::new(CARD_X as i32, CARD_Y as i32),
-                Size::new(CARD_W as u32, CARD_H as u32),
-            )
-            .into_styled(PrimitiveStyle::with_stroke(fg, 2))
-            .draw(strip)
-            .unwrap();
+            RoundedRectangle::with_equal_corners(card_rect, R_CARD)
+                .into_styled(PrimitiveStyle::with_stroke(fg, 2))
+                .draw(strip)
+                .unwrap();
 
             let inner_x = CARD_X + CARD_PAD;
             let inner_w = CARD_W - 2 * CARD_PAD;
@@ -617,18 +620,22 @@ impl HomeApp {
                 let bar_w = inner_w as u32;
                 let filled = (bar_w * self.recent_progress as u32) / 100;
 
-                Rectangle::new(
+                let bar_rect = Rectangle::new(
                     Point::new(inner_x as i32, bar_y as i32),
                     Size::new(bar_w, CARD_PROGRESS_H as u32),
-                )
-                .into_styled(PrimitiveStyle::with_stroke(fg, 1))
-                .draw(strip)
-                .unwrap();
+                );
+                RoundedRectangle::with_equal_corners(bar_rect, Size::new(3, 3))
+                    .into_styled(PrimitiveStyle::with_stroke(fg, 1))
+                    .draw(strip)
+                    .unwrap();
 
                 if filled > 0 {
-                    Rectangle::new(
-                        Point::new(inner_x as i32, bar_y as i32),
-                        Size::new(filled, CARD_PROGRESS_H as u32),
+                    RoundedRectangle::with_equal_corners(
+                        Rectangle::new(
+                            Point::new(inner_x as i32, bar_y as i32),
+                            Size::new(filled, CARD_PROGRESS_H as u32),
+                        ),
+                        Size::new(3, 3),
                     )
                     .into_styled(PrimitiveStyle::with_fill(fg))
                     .draw(strip)
@@ -657,11 +664,25 @@ impl HomeApp {
         // menu items (1..4)
         for i in 1..self.item_count {
             let label = self.item_label(i);
-            BitmapLabel::new(self.item_regions[i - 1], label, self.ui_fonts.body)
-                .alignment(Alignment::Center)
-                .inverted(i == self.selected)
+            let region = self.item_regions[i - 1];
+            let selected = i == self.selected;
+            let (bg, fg) = if selected {
+                (BinaryColor::On, BinaryColor::Off)
+            } else {
+                (BinaryColor::Off, BinaryColor::On)
+            };
+
+            let rect = Rectangle::new(
+                Point::new(region.x as i32, region.y as i32),
+                Size::new(region.w as u32, region.h as u32),
+            );
+            RoundedRectangle::with_equal_corners(rect, R_BTN)
+                .into_styled(PrimitiveStyle::with_fill(bg))
                 .draw(strip)
                 .unwrap();
+            self.ui_fonts.body.draw_aligned(
+                strip, region, label, Alignment::Center, fg,
+            );
         }
     }
 
