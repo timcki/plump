@@ -374,8 +374,6 @@ impl super::Kernel {
             }
 
             if matches!(redraw, Redraw::Full | Redraw::Partial(_)) {
-                self.epd.power_off_async().await;
-
                 self.log_stats();
 
                 {

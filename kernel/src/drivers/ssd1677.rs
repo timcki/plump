@@ -283,7 +283,7 @@ where
         self.send_data(&[0x80]);
 
         self.send_command(cmd::BOOSTER_SOFT_START);
-        self.send_data(&[0xAE, 0xC7, 0xC3, 0xC0, 0x80]);
+        self.send_data(&[0xAE, 0xC7, 0xC3, 0xC0, 0x40]);
 
         self.send_command(cmd::DRIVER_OUTPUT_CONTROL);
         self.send_data(&[((HEIGHT - 1) & 0xFF) as u8, ((HEIGHT - 1) >> 8) as u8, 0x02]);
@@ -568,18 +568,38 @@ where
         }
     }
 
+    /// Start a full GC refresh.
+    ///
+    /// Builds the CTRL2 byte dynamically:
+    ///   - skips CLOCK_ON + ANALOG_ON when power is already on (avoids
+    ///     booster re-start transient that causes extra visible flashes)
+    ///   - adds ANALOG_OFF + CLOCK_OFF in sunlight mode to prevent
+    ///     UV-induced fading between refreshes
     pub fn start_full_update(&mut self) {
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x40, 0x00]);
 
+        // core: TEMP_LOAD + LUT_LOAD + DISPLAY_START
+        let mut ctrl2: u8 = 0x34;
+
+        if !self.power_is_on {
+            ctrl2 |= 0xC0; // CLOCK_ON + ANALOG_ON
+        }
+
+        if self.sunlight_mode {
+            ctrl2 |= 0x03; // ANALOG_OFF + CLOCK_OFF after refresh
+        }
+
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
-        self.send_data(&[0xF7]);
+        self.send_data(&[ctrl2]);
 
         self.send_command(cmd::MASTER_ACTIVATION);
+
+        // power state after waveform completes
+        self.power_is_on = !self.sunlight_mode;
     }
 
     pub fn finish_full_update(&mut self) {
-        self.power_is_on = false;
         self.initial_refresh = false;
     }
 
@@ -725,7 +745,6 @@ where
     {
         self.write_full_frame_async(strip, delay, draw).await;
         self.update_full_async().await;
-        self.initial_refresh = false;
     }
 
     pub async fn power_off_async(&mut self) {
@@ -792,16 +811,9 @@ where
     }
 
     async fn update_full_async(&mut self) {
-        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
-        self.send_data(&[0x40, 0x00]);
-
-        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
-        self.send_data(&[0xF7]);
-
-        self.send_command(cmd::MASTER_ACTIVATION);
+        self.start_full_update();
         self.wait_busy_async().await;
-
-        self.power_is_on = false;
+        self.finish_full_update();
     }
 }
 
