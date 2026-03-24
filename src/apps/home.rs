@@ -37,7 +37,7 @@ const ITEM_H: u16 = 52;
 const ITEM_GAP: u16 = 14;
 const ITEM_STRIDE: u16 = ITEM_H + ITEM_GAP;
 const ITEM_X: u16 = (SCREEN_W - ITEM_W) / 2;
-const MAX_ITEMS: usize = 5;
+const MAX_ITEMS: usize = 6;
 
 // bookmark list layout (matches Files app)
 const BM_ROW_H: u16 = 52;
@@ -58,6 +58,7 @@ fn compute_item_regions() -> [Region; MAX_ITEMS] {
         Region::new(ITEM_X, item_y + ITEM_STRIDE * 2, ITEM_W, ITEM_H),
         Region::new(ITEM_X, item_y + ITEM_STRIDE * 3, ITEM_W, ITEM_H),
         Region::new(ITEM_X, item_y + ITEM_STRIDE * 4, ITEM_W, ITEM_H),
+        Region::new(ITEM_X, item_y + ITEM_STRIDE * 5, ITEM_W, ITEM_H),
     ]
 }
 
@@ -87,6 +88,9 @@ pub struct HomeApp {
     recent_author: [u8; 64],
     recent_author_len: u8,
     recent_progress: u8,
+    recent_stats_pages: u32,
+    recent_stats_time: u32,
+    recent_cover: Option<crate::kernel::work_queue::DecodedImage>,
     needs_load_recent: bool,
 
     bm_entries: [BmListEntry; bookmarks::SLOTS],
@@ -120,6 +124,9 @@ impl HomeApp {
             recent_author: [0u8; 64],
             recent_author_len: 0,
             recent_progress: 0,
+            recent_stats_pages: 0,
+            recent_stats_time: 0,
+            recent_cover: None,
             needs_load_recent: false,
             bm_entries: [BmListEntry::EMPTY; bookmarks::SLOTS],
             bm_count: 0,
@@ -190,6 +197,31 @@ impl HomeApp {
             Ok((_, n)) if n > 0 => self.parse_recent(&buf[..n]),
             _ => self.recent_book_len = 0,
         }
+        // load reading stats and cover thumb for the recent book
+        if self.recent_book_len > 0 {
+            let fname = core::str::from_utf8(&self.recent_book[..self.recent_book_len])
+                .unwrap_or("");
+            if let Some((pages, time, _sessions)) =
+                crate::apps::stats::load_book_stats(k, fname)
+            {
+                self.recent_stats_pages = pages;
+                self.recent_stats_time = time;
+            } else {
+                self.recent_stats_pages = 0;
+                self.recent_stats_time = 0;
+            }
+            // try to load cached cover thumbnail
+            let dir_buf = crate::apps::cover_cache::cache_dir_for_filename(
+                &self.recent_book[..self.recent_book_len],
+            );
+            let dir = smol_epub::cache::dir_name_str(&dir_buf);
+            self.recent_cover = crate::apps::cover_cache::load_cover_thumb(k, dir);
+            if self.recent_cover.is_some() {
+                log::info!("home: loaded cover thumbnail for recent book");
+            }
+        } else {
+            self.recent_cover = None;
+        }
         self.rebuild_item_count();
         self.needs_load_recent = false;
     }
@@ -236,8 +268,8 @@ impl HomeApp {
     }
 
     fn rebuild_item_count(&mut self) {
-        // card (item 0) is always present; items 1..4 are menu buttons
-        self.item_count = 5;
+        // card (item 0) is always present; items 1..5 are menu buttons
+        self.item_count = 6;
         if self.selected >= self.item_count {
             self.selected = 0;
         }
@@ -274,7 +306,8 @@ impl HomeApp {
             0 => "", // card, not drawn as button
             1 => "Files",
             2 => "Bookmarks",
-            3 => "Settings",
+            3 => "Stats",
+            4 => "Settings",
             _ => "Upload",
         }
     }
@@ -284,7 +317,8 @@ impl HomeApp {
             0 => MenuAction::Continue,
             1 => MenuAction::Push(AppId::Files),
             2 => MenuAction::OpenBookmarks,
-            3 => MenuAction::Push(AppId::Settings),
+            3 => MenuAction::Push(AppId::Stats),
+            4 => MenuAction::Push(AppId::Settings),
             _ => MenuAction::Push(AppId::Upload),
         }
     }
@@ -373,6 +407,28 @@ impl App<AppId> for HomeApp {
             match k.read_app_data_start(RECENT_FILE, &mut buf) {
                 Ok((_, n)) if n > 0 => self.parse_recent(&buf[..n]),
                 _ => self.recent_book_len = 0,
+            }
+            // load reading stats for the recent book
+            if self.recent_book_len > 0 {
+                let fname = core::str::from_utf8(&self.recent_book[..self.recent_book_len])
+                    .unwrap_or("");
+                if let Some((pages, time, _sessions)) =
+                    crate::apps::stats::load_book_stats(k, fname)
+                {
+                    self.recent_stats_pages = pages;
+                    self.recent_stats_time = time;
+                } else {
+                    self.recent_stats_pages = 0;
+                    self.recent_stats_time = 0;
+                }
+                // load cached cover thumbnail
+                let dir_buf = crate::apps::cover_cache::cache_dir_for_filename(
+                    &self.recent_book[..self.recent_book_len],
+                );
+                let dir = smol_epub::cache::dir_name_str(&dir_buf);
+                self.recent_cover = crate::apps::cover_cache::load_cover_thumb(k, dir);
+            } else {
+                self.recent_cover = None;
             }
             self.rebuild_item_count();
             self.needs_load_recent = false;
@@ -597,31 +653,56 @@ impl HomeApp {
             let heading_h = self.ui_fonts.heading.line_height;
 
             if self.has_recent() {
+                // layout: if we have a cover thumbnail, show it on the
+                // left with text/stats on the right; otherwise use the
+                // full-width centered text layout.
+                const COVER_GAP: u16 = 16;
+                let (text_x, text_w, text_align) = if let Some(ref img) = self.recent_cover {
+                    let img_x = inner_x as i32;
+                    let img_y = CARD_Y as i32 + CARD_PAD as i32
+                        + ((CARD_H - 2 * CARD_PAD) as i32 - img.height as i32) / 2;
+                    strip.blit_1bpp(
+                        &img.data,
+                        0,
+                        img.width as usize,
+                        img.height as usize,
+                        img.stride,
+                        img_x,
+                        img_y.max(CARD_Y as i32 + CARD_PAD as i32),
+                        !selected, // invert when card is selected
+                    );
+                    let tx = inner_x + img.width + COVER_GAP;
+                    let tw = (CARD_X + CARD_W - CARD_PAD).saturating_sub(tx);
+                    (tx, tw, Alignment::TopLeft)
+                } else {
+                    (inner_x, inner_w, Alignment::Center)
+                };
+
                 // title
                 let title_y = CARD_Y + CARD_PAD + 20;
-                let title_region = Region::new(inner_x, title_y, inner_w, heading_h);
+                let title_region = Region::new(text_x, title_y, text_w, heading_h);
                 self.ui_fonts.heading.draw_aligned(
                     strip, title_region, self.recent_display_title(),
-                    Alignment::Center, fg,
+                    text_align, fg,
                 );
 
                 // author
                 let author = self.recent_author_str();
                 if !author.is_empty() {
                     let author_y = title_y + heading_h + 8;
-                    let author_region = Region::new(inner_x, author_y, inner_w, line_h);
+                    let author_region = Region::new(text_x, author_y, text_w, line_h);
                     self.ui_fonts.body.draw_aligned(
-                        strip, author_region, author, Alignment::Center, fg,
+                        strip, author_region, author, text_align, fg,
                     );
                 }
 
                 // progress bar
                 let bar_y = CARD_Y + CARD_H - CARD_PAD - CARD_PROGRESS_H - line_h - 8;
-                let bar_w = inner_w as u32;
+                let bar_w = text_w as u32;
                 let filled = (bar_w * self.recent_progress as u32) / 100;
 
                 let bar_rect = Rectangle::new(
-                    Point::new(inner_x as i32, bar_y as i32),
+                    Point::new(text_x as i32, bar_y as i32),
                     Size::new(bar_w, CARD_PROGRESS_H as u32),
                 );
                 RoundedRectangle::with_equal_corners(bar_rect, Size::new(3, 3))
@@ -632,7 +713,7 @@ impl HomeApp {
                 if filled > 0 {
                     RoundedRectangle::with_equal_corners(
                         Rectangle::new(
-                            Point::new(inner_x as i32, bar_y as i32),
+                            Point::new(text_x as i32, bar_y as i32),
                             Size::new(filled, CARD_PROGRESS_H as u32),
                         ),
                         Size::new(3, 3),
@@ -642,13 +723,26 @@ impl HomeApp {
                     .unwrap();
                 }
 
-                // progress text
+                // stats text: "342 pages · 5h 23m" or "X% read" if no stats
                 let pct_y = bar_y + CARD_PROGRESS_H + 4;
-                let pct_region = Region::new(inner_x, pct_y, inner_w, line_h);
-                let mut pct_buf = BitmapDynLabel::<12>::new(pct_region, self.ui_fonts.body)
-                    .alignment(Alignment::Center)
+                let pct_region = Region::new(text_x, pct_y, text_w, line_h);
+                let mut pct_buf = BitmapDynLabel::<28>::new(pct_region, self.ui_fonts.body)
+                    .alignment(text_align)
                     .inverted(selected);
-                let _ = write!(pct_buf, "{}% read", self.recent_progress);
+                if self.recent_stats_pages > 0 || self.recent_stats_time > 0 {
+                    let _ = write!(pct_buf, "{} pages", self.recent_stats_pages);
+                    if self.recent_stats_time > 0 {
+                        let hours = self.recent_stats_time / 3600;
+                        let mins = (self.recent_stats_time % 3600) / 60;
+                        if hours > 0 {
+                            let _ = write!(pct_buf, " \u{b7} {}h {}m", hours, mins);
+                        } else {
+                            let _ = write!(pct_buf, " \u{b7} {}m", mins);
+                        }
+                    }
+                } else {
+                    let _ = write!(pct_buf, "{}% read", self.recent_progress);
+                }
                 pct_buf.draw(strip).unwrap();
             } else {
                 // empty state

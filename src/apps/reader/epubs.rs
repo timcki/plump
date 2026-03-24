@@ -414,6 +414,89 @@ impl ReaderApp {
         Ok(())
     }
 
+    /// Generate a cover thumbnail for the home screen if the EPUB has
+    /// cover metadata and no cached thumbnail exists yet.
+    ///
+    /// Called once after OPF parse succeeds.  Uses the streaming SD
+    /// decode path so it works for arbitrarily large cover images
+    /// without buffering the entire file in RAM.
+    pub(super) fn generate_cover_thumb(&mut self, k: &mut KernelHandle<'_>) {
+        use crate::apps::cover_cache;
+        use smol_epub::epub::CoverMediaType;
+
+        if !self.epub.meta.has_cover() {
+            return;
+        }
+
+        let dir = self.epub.cache_dir_str();
+        if cover_cache::has_cover_thumb(k, dir) {
+            log::info!("epub: cover thumb already cached");
+            return;
+        }
+
+        // ensure the per-book cache directory exists (cover generation
+        // runs before NeedCache which normally creates it)
+        if k.ensure_app_subdir(dir).is_err() {
+            log::warn!("epub: failed to create cache dir for cover thumb");
+            return;
+        }
+
+        let cover_idx = self.epub.meta.cover_zip_index as usize;
+        if cover_idx >= self.epub.zip.count() {
+            log::warn!("epub: cover zip index {} out of range", cover_idx);
+            return;
+        }
+
+        let is_jpeg = match self.epub.meta.cover_media_type {
+            CoverMediaType::Jpeg => true,
+            CoverMediaType::Png => false,
+            CoverMediaType::Unknown => {
+                // fall back to extension sniffing
+                let name = self.epub.zip.entry_name(cover_idx);
+                if super::images::is_image_ext_jpeg(name) {
+                    true
+                } else if super::images::is_image_ext_png(name) {
+                    false
+                } else {
+                    log::warn!("epub: cover has unknown media type, skipping");
+                    return;
+                }
+            }
+        };
+
+        let entry = *self.epub.zip.entry(cover_idx);
+        let (nb, nl) = self.name_copy();
+        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+
+        let result = super::images::decode_image_streaming(
+            k,
+            epub_name,
+            &entry,
+            is_jpeg,
+            cover_cache::COVER_THUMB_MAX_W,
+            cover_cache::COVER_THUMB_MAX_H,
+        );
+
+        match result {
+            Ok(img) => {
+                log::info!(
+                    "epub: decoded cover thumb {}x{} ({} bytes)",
+                    img.width,
+                    img.height,
+                    img.data.len(),
+                );
+                if let Err(e) = cover_cache::save_cover_thumb(k, dir, &img) {
+                    log::warn!("epub: cover thumb save failed: {}", e);
+                } else {
+                    log::info!("epub: cover thumb cached");
+                }
+            }
+            Err(e) => {
+                log::warn!("epub: cover thumb decode failed: {}", e);
+            }
+        }
+    }
+
     pub(super) fn epub_index_chapter(&mut self) {
         self.reset_paging();
         // force reload; ch_cache may hold a different chapter's data

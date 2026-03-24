@@ -2,10 +2,12 @@
 //
 // AppId is defined here (the distro side) the kernel attempts to be generic
 
+pub mod cover_cache;
 pub mod files;
 pub mod home;
 pub mod manager;
 pub mod reader;
+pub mod stats;
 pub mod widgets;
 
 pub mod settings;
@@ -19,6 +21,7 @@ pub enum AppId {
     Files,
     Reader,
     Settings,
+    Stats,
     // upload bypasses the App trait; AppManager::needs_special_mode
     // returns true for this variant and run_special_mode handles it
     Upload,

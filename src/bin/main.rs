@@ -19,6 +19,7 @@ use pulp_os::apps::home::HomeApp;
 use pulp_os::apps::manager::AppManager;
 use pulp_os::apps::reader::ReaderApp;
 use pulp_os::apps::settings::SettingsApp;
+use pulp_os::apps::stats::StatsApp;
 use pulp_os::apps::widgets::{ButtonFeedback, QuickMenu};
 use pulp_os::board::action::ButtonMapper;
 use pulp_os::board::{Board, speed_up_spi};
@@ -53,6 +54,7 @@ static BM_CACHE: ConstStaticCell<BookmarkCache> = ConstStaticCell::new(BookmarkC
 static HOME: StaticCell<HomeApp> = StaticCell::new();
 static FILES: StaticCell<FilesApp> = StaticCell::new();
 static SETTINGS: StaticCell<SettingsApp> = StaticCell::new();
+static STATS: StaticCell<StatsApp> = StaticCell::new();
 
 #[esp_rtos::main]
 async fn main(spawner: embassy_executor::Spawner) -> ! {
@@ -137,6 +139,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         FILES.init(FilesApp::new()),
         READER.take(),
         SETTINGS.init(SettingsApp::new()),
+        STATS.init(StatsApp::new()),
         QUICK_MENU.take(),
         BUMPS.take(),
         ButtonMapper::new(),

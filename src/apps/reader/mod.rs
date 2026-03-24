@@ -378,6 +378,13 @@ pub struct ReaderApp {
     pub(super) chrome_font: Option<&'static BitmapFont>,
     pub(super) qa_buf: [QuickAction; QA_MAX],
     pub(super) qa_count: u8,
+
+    // reading statistics (accumulated per book, flushed to SD)
+    pub(super) stats_pages: u32,
+    pub(super) stats_time_secs: u32,
+    pub(super) stats_sessions: u16,
+    pub(super) stats_last_uptime: u32, // uptime_secs at last page turn / enter
+    pub(super) stats_dirty: bool,
 }
 
 impl ReaderApp {
@@ -427,6 +434,12 @@ impl ReaderApp {
 
             qa_buf: [QuickAction::trigger(0, "", ""); QA_MAX],
             qa_count: 0,
+
+            stats_pages: 0,
+            stats_time_secs: 0,
+            stats_sessions: 0,
+            stats_last_uptime: 0,
+            stats_dirty: false,
         }
     }
 
@@ -512,6 +525,67 @@ impl ReaderApp {
         };
 
         ctx.set_loading(LOADING_REGION, lbuf.as_str(), pct);
+    }
+
+    // ── reading statistics ──────────────────────────────────────────
+
+    // call on each page turn to accumulate time and increment page count
+    fn stats_record_page_turn(&mut self) {
+        let now = crate::kernel::uptime_secs();
+        let delta = now.saturating_sub(self.stats_last_uptime);
+        // ignore deltas > 10 min (user was idle / fell asleep)
+        if delta < 600 {
+            self.stats_time_secs = self.stats_time_secs.saturating_add(delta);
+        }
+        self.stats_last_uptime = now;
+        self.stats_pages = self.stats_pages.saturating_add(1);
+        self.stats_dirty = true;
+    }
+
+    // load stats from SD for the current book
+    fn stats_load(&mut self, k: &mut KernelHandle<'_>) {
+        if let Some((pages, time, sessions)) =
+            crate::apps::stats::load_book_stats(k, self.name())
+        {
+            self.stats_pages = pages;
+            self.stats_time_secs = time;
+            self.stats_sessions = sessions;
+        } else {
+            self.stats_pages = 0;
+            self.stats_time_secs = 0;
+            self.stats_sessions = 0;
+        }
+        // new session
+        self.stats_sessions = self.stats_sessions.saturating_add(1);
+        self.stats_dirty = true;
+    }
+
+    // flush stats to SD
+    fn stats_flush(&mut self, k: &mut KernelHandle<'_>) {
+        if !self.stats_dirty || self.filename_len == 0 {
+            return;
+        }
+        // accumulate any unrecorded time
+        let now = crate::kernel::uptime_secs();
+        let delta = now.saturating_sub(self.stats_last_uptime);
+        if delta < 600 {
+            self.stats_time_secs = self.stats_time_secs.saturating_add(delta);
+        }
+        self.stats_last_uptime = now;
+
+        crate::apps::stats::save_book_stats(
+            k,
+            self.name(),
+            self.stats_pages,
+            self.stats_time_secs,
+            self.stats_sessions,
+        );
+        self.stats_dirty = false;
+    }
+
+    // public accessors for home screen display
+    pub fn reading_stats(&self) -> (u32, u32) {
+        (self.stats_pages, self.stats_time_secs)
     }
 
     // transition to error state with consistent handling
@@ -910,6 +984,10 @@ impl App<AppId> for ReaderApp {
 
         self.apply_font_metrics();
 
+        // load existing stats for this book
+        self.stats_last_uptime = crate::kernel::uptime_secs();
+        self.stats_dirty = false;
+
         self.state = State::NeedBookmark;
 
         log::info!("reader: opening {}", self.name());
@@ -975,6 +1053,7 @@ impl App<AppId> for ReaderApp {
             match self.state {
                 State::NeedBookmark => {
                     self.bookmark_load(k.bookmark_cache());
+                    self.stats_load(k);
 
                     self.write_recent(k);
 
@@ -1017,6 +1096,9 @@ impl App<AppId> for ReaderApp {
                         }
                         // rewrite RECENT now that title/author are known
                         self.write_recent(k);
+                        // generate home-screen cover thumbnail (no-op if
+                        // already cached or no cover metadata)
+                        self.generate_cover_thumb(k);
                         self.state = State::NeedToc;
                         ctx.set_loading(LOADING_REGION, "Loading", 40);
                     }
@@ -1198,9 +1280,12 @@ impl App<AppId> for ReaderApp {
             break;
         }
 
-        // flush recent progress to SD if dirty
+        // flush recent progress and reading stats to SD if dirty
         if self.recent_dirty && self.state == State::Ready {
             self.write_recent(k);
+        }
+        if self.stats_dirty && self.state == State::Ready {
+            self.stats_flush(k);
         }
 
         // background caching; runs whenever the page content is

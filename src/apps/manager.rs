@@ -8,6 +8,7 @@ use crate::apps::files::FilesApp;
 use crate::apps::home::HomeApp;
 use crate::apps::reader::ReaderApp;
 use crate::apps::settings::SettingsApp;
+use crate::apps::stats::StatsApp;
 use crate::apps::{App, AppContext, AppId, Launcher, PendingSetting, Redraw, Transition};
 use esp_hal::delay::Delay;
 
@@ -45,6 +46,10 @@ macro_rules! with_app {
                 let $app = &mut *$mgr.settings;
                 $body
             }
+            AppId::Stats => {
+                let $app = &mut *$mgr.stats;
+                $body
+            }
             AppId::Upload => {
                 unreachable!("Upload mode is handled outside the app dispatch loop");
             }
@@ -72,6 +77,10 @@ macro_rules! with_app_ref {
                 let $app = &*$mgr.settings;
                 $body
             }
+            AppId::Stats => {
+                let $app = &*$mgr.stats;
+                $body
+            }
             AppId::Upload => {
                 unreachable!("Upload mode is handled outside the app dispatch loop");
             }
@@ -91,6 +100,7 @@ pub struct AppManager {
     pub files: &'static mut FilesApp,
     pub reader: &'static mut ReaderApp,
     pub settings: &'static mut SettingsApp,
+    pub stats: &'static mut StatsApp,
 
     pub quick_menu: &'static mut QuickMenu,
     pub bumps: &'static mut ButtonFeedback,
@@ -106,6 +116,7 @@ impl AppManager {
         files: &'static mut FilesApp,
         reader: &'static mut ReaderApp,
         settings: &'static mut SettingsApp,
+        stats: &'static mut StatsApp,
         quick_menu: &'static mut QuickMenu,
         bumps: &'static mut ButtonFeedback,
         mapper: ButtonMapper,
@@ -116,6 +127,7 @@ impl AppManager {
             files,
             reader,
             settings,
+            stats,
             quick_menu,
             bumps,
             mapper,
@@ -257,6 +269,7 @@ impl AppManager {
                 1 => AppId::Files,
                 2 => AppId::Reader,
                 3 => AppId::Settings,
+                4 => AppId::Stats,
                 _ => AppId::Home,
             },
         );
@@ -530,6 +543,7 @@ impl AppManager {
         self.home.set_ui_font_size(ui_idx);
         self.files.set_ui_font_size(ui_idx);
         self.settings.set_ui_font_size(ui_idx);
+        self.stats.set_ui_font_size(ui_idx);
         self.reader.set_book_font_size(book_idx);
         self.reader.set_reading_theme(theme_idx);
         self.reader.set_show_chrome(reader_status);
