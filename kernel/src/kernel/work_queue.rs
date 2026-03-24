@@ -96,9 +96,13 @@ pub fn status() -> BgStatus {
     critical_section::with(|cs| STATUS.borrow(cs).get())
 }
 
+/// Returns `true` only when the worker is not active AND there is no
+/// pending work in the input channel.  This avoids a race where the
+/// main task submits work but the executor hasn't scheduled the worker
+/// yet — `status()` still shows IDLE but the item is queued.
 #[inline]
 pub fn is_idle() -> bool {
-    !status().is_active()
+    !status().is_active() && WORK_IN.is_empty()
 }
 
 fn set_status(s: BgStatus) {
