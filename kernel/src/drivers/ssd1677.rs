@@ -72,6 +72,7 @@ pub struct DisplayDriver<SPI, DC, RST, BUSY> {
     power_is_on: bool,
     init_done: bool,
     initial_refresh: bool,
+    sunlight_mode: bool,
 }
 
 impl<SPI, DC, RST, BUSY, E> DisplayDriver<SPI, DC, RST, BUSY>
@@ -91,6 +92,7 @@ where
             power_is_on: false,
             init_done: false,
             initial_refresh: true,
+            sunlight_mode: false,
         }
     }
 
@@ -463,11 +465,14 @@ where
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x00, 0x00]);
 
+        // 0xFC: clock on, analog on, temp load, LUT load, mode, display
+        // 0xFF: same + analog off + clock off after refresh (sunlight fix)
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
-        self.send_data(&[0xFC]);
+        let ctrl2 = if self.sunlight_mode { 0xFF } else { 0xFC };
+        self.send_data(&[ctrl2]);
 
         self.send_command(cmd::MASTER_ACTIVATION);
-        self.power_is_on = true;
+        self.power_is_on = !self.sunlight_mode;
     }
 
     #[inline]
@@ -493,6 +498,12 @@ where
 
     pub fn needs_initial_refresh(&self) -> bool {
         self.initial_refresh
+    }
+
+    /// Power off analog drivers after each partial refresh to prevent
+    /// sunlight-induced fading on white-bezel X4 models.
+    pub fn set_sunlight_mode(&mut self, enabled: bool) {
+        self.sunlight_mode = enabled;
     }
 
     pub fn write_full_frame<F>(&mut self, strip: &mut StripBuffer, delay: &mut Delay, draw: &F)

@@ -1,12 +1,13 @@
 // settings app UI; configuration types live in kernel::config
 //
-// settings items (6 total, all fit on one screen at default font):
+// settings items (7 total):
 //   0: Sleep After    – power management
 //   1: Ghost Clear    – e-paper refresh interval
 //   2: Book Font      – reading font size
 //   3: UI Font        – chrome font size
 //   4: Reading Theme  – Compact / Default / Relaxed / Spacious
 //   5: Swap Buttons   – swap Back/OK with Left/Right for left-handed use
+//   6: Sunlight Fix   – power off analog after partial refresh (prevents fading)
 
 use core::fmt::Write as _;
 
@@ -38,7 +39,7 @@ const COL_GAP: u16 = 8;
 const VALUE_X: u16 = LABEL_X + LABEL_W + COL_GAP;
 const VALUE_W: u16 = FULL_CONTENT_W - LABEL_W - COL_GAP;
 
-const NUM_ITEMS: usize = 6;
+const NUM_ITEMS: usize = 7;
 const HEADING_ITEMS_GAP: u16 = SECTION_GAP;
 
 impl Default for SettingsApp {
@@ -155,6 +156,7 @@ impl SettingsApp {
             3 => "UI Font",
             4 => "Theme",
             5 => "Swap Buttons",
+            6 => "Sunlight Fix",
             _ => "",
         }
     }
@@ -201,6 +203,17 @@ impl SettingsApp {
                     }
                 );
             }
+            6 => {
+                let _ = write!(
+                    buf,
+                    "{}",
+                    if self.settings.sunlight_fix {
+                        "On"
+                    } else {
+                        "Off"
+                    }
+                );
+            }
             _ => {}
         }
     }
@@ -241,6 +254,9 @@ impl SettingsApp {
             5 => {
                 self.settings.swap_buttons = !self.settings.swap_buttons;
             }
+            6 => {
+                self.settings.sunlight_fix = !self.settings.sunlight_fix;
+            }
             _ => return,
         }
         self.save_needed = true;
@@ -278,6 +294,9 @@ impl SettingsApp {
             }
             5 => {
                 self.settings.swap_buttons = !self.settings.swap_buttons;
+            }
+            6 => {
+                self.settings.sunlight_fix = !self.settings.sunlight_fix;
             }
             _ => return,
         }

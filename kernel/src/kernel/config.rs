@@ -98,6 +98,9 @@ pub struct SystemSettings {
 
     // control settings
     pub swap_buttons: bool, // swap Back/Select with Left/Right physical buttons
+
+    // display settings
+    pub sunlight_fix: bool, // power off analog after each partial refresh (prevents sunlight fading)
 }
 
 impl Default for SystemSettings {
@@ -115,6 +118,7 @@ impl SystemSettings {
             ui_font_size_idx: DEFAULT_FONT_SIZE_IDX,
             reading_theme: DEFAULT_READING_THEME,
             swap_buttons: false,
+            sunlight_fix: false,
         }
     }
 
@@ -237,6 +241,9 @@ fn apply_setting(key: &[u8], val: &[u8], s: &mut SystemSettings, w: &mut WifiCon
         b"swap_buttons" => {
             s.swap_buttons = val == b"1" || val == b"true";
         }
+        b"sunlight_fix" => {
+            s.sunlight_fix = val == b"1" || val == b"true";
+        }
         b"wifi_ssid" => w.set_ssid(val),
         b"wifi_pass" => w.set_pass(val),
         _ => {}
@@ -319,6 +326,9 @@ pub fn write_settings_txt(s: &SystemSettings, w: &WifiConfig, buf: &mut [u8]) ->
 
     wr.put(b"\n# reading settings (0=Compact, 1=Default, 2=Relaxed, 3=Spacious)\n");
     wr.kv_num(b"reading_theme", s.reading_theme as u16);
+
+    wr.put(b"\n# display settings\n");
+    wr.kv_num(b"sunlight_fix", if s.sunlight_fix { 1 } else { 0 });
 
     wr.put(b"\n# control settings\n");
     wr.kv_num(b"swap_buttons", if s.swap_buttons { 1 } else { 0 });

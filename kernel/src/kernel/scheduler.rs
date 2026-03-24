@@ -77,6 +77,7 @@ impl super::Kernel {
         }
 
         tasks::set_idle_timeout(app_mgr.system_settings().sleep_timeout);
+        self.epd.set_sunlight_mode(app_mgr.system_settings().sunlight_fix);
         self.log_stats();
 
         // try to restore session from RTC memory
@@ -256,6 +257,7 @@ impl super::Kernel {
             self.log_stats();
             if app_mgr.settings_loaded() {
                 tasks::set_idle_timeout(app_mgr.system_settings().sleep_timeout);
+                self.epd.set_sunlight_mode(app_mgr.system_settings().sunlight_fix);
             }
         }
     }
