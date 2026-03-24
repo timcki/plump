@@ -56,7 +56,7 @@ fn linker_be_nice() {
 }
 
 // build-time font rasterisation: scan assets/fonts/ for TTFs, classify
-// by weight/style, rasterise to 1-bit bitmaps, emit font_data.rs.
+// by weight/style, rasterise to 2-bit (4-level) bitmaps, emit font_data.rs.
 //
 // five size tiers: XSmall / Small / Medium / Large / XLarge
 // two glyph sets per font:
@@ -89,8 +89,6 @@ const HEADING_PX: [(f32, &str); 5] = [
     (46.0, "XLARGE"),
 ];
 
-// fontdue coverage threshold; values >= this become black
-const THRESHOLD: u8 = 100;
 
 // ASCII range (direct-indexed)
 const FIRST_CHAR: u8 = 0x20;
@@ -478,17 +476,30 @@ fn rasterize_char(font: &fontdue::Font, ch: char, px: f32) -> RasterGlyph {
     let (metrics, coverage) = font.rasterize(ch, px);
     let w = metrics.width;
     let h = metrics.height;
-    let row_bytes = w.div_ceil(8);
+    let row_bytes = w.div_ceil(4); // 4 pixels per byte at 2bpp
 
-    // pack coverage to 1-bit MSB-first
+    // pack coverage to 2-bit MSB-first (4 pixels per byte)
+    // pixel 0 in bits 7:6, pixel 1 in bits 5:4, pixel 2 in bits 3:2, pixel 3 in bits 1:0
+    // coverage quantization: <64 → 0 (white), <128 → 1 (light gray),
+    //                        <192 → 2 (dark gray), >=192 → 3 (black)
     let mut bits = Vec::with_capacity(row_bytes * h);
     for y in 0..h {
         for bx in 0..row_bytes {
             let mut byte = 0u8;
-            for bit in 0..8usize {
-                let x = bx * 8 + bit;
-                if x < w && coverage[y * w + x] >= THRESHOLD {
-                    byte |= 1 << (7 - bit);
+            for px_idx in 0..4usize {
+                let x = bx * 4 + px_idx;
+                if x < w {
+                    let c = coverage[y * w + x];
+                    let val: u8 = if c < 64 {
+                        0
+                    } else if c < 128 {
+                        1
+                    } else if c < 192 {
+                        2
+                    } else {
+                        3
+                    };
+                    byte |= val << (6 - px_idx * 2);
                 }
             }
             bits.push(byte);

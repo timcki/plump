@@ -13,6 +13,21 @@ use embedded_graphics_core::{
 use super::ssd1677::{HEIGHT, Rotation, WIDTH};
 use crate::ui::Region;
 
+/// Controls how 2bpp font coverage values map to 1-bit strip pixels.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum GrayMode {
+    /// Normal BW: any non-zero coverage → black pixel (bit cleared).
+    /// Buffer starts 0xFF (white).
+    #[default]
+    Bw,
+    /// LSB plane (→ BW RAM): coverage values 2 and 3 set bit.
+    /// Buffer starts 0x00.
+    GrayLsb,
+    /// MSB plane (→ RED RAM): coverage values 1 and 2 set bit.
+    /// Buffer starts 0x00.
+    GrayMsb,
+}
+
 pub const STRIP_ROWS: u16 = 40;
 pub const PHYS_BYTES_PER_ROW: usize = (WIDTH as usize) / 8;
 
@@ -22,6 +37,7 @@ pub const STRIP_COUNT: u16 = HEIGHT / STRIP_ROWS;
 pub struct StripBuffer {
     buf: [u8; STRIP_BUF_SIZE],
     rotation: Rotation,
+    gray_mode: GrayMode,
     win_x: u16,
     win_y: u16,
     win_w: u16,
@@ -34,12 +50,21 @@ impl StripBuffer {
         Self {
             buf: [0xFF; STRIP_BUF_SIZE],
             rotation: Rotation::Deg270,
+            gray_mode: GrayMode::Bw,
             win_x: 0,
             win_y: 0,
             win_w: WIDTH,
             win_h: STRIP_ROWS,
             row_bytes: (WIDTH / 8),
         }
+    }
+
+    pub fn gray_mode(&self) -> GrayMode {
+        self.gray_mode
+    }
+
+    pub fn set_gray_mode(&mut self, mode: GrayMode) {
+        self.gray_mode = mode;
     }
 
     pub fn begin_strip(&mut self, rotation: Rotation, strip_idx: u16) {
@@ -50,7 +75,12 @@ impl StripBuffer {
         self.win_h = STRIP_ROWS;
         self.row_bytes = PHYS_BYTES_PER_ROW as u16;
 
-        self.buf[..STRIP_BUF_SIZE].fill(0xFF);
+        let fill = if self.gray_mode == GrayMode::Bw {
+            0xFF
+        } else {
+            0x00
+        };
+        self.buf[..STRIP_BUF_SIZE].fill(fill);
     }
 
     pub fn begin_window(&mut self, rotation: Rotation, x: u16, y: u16, w: u16, mut h: u16) {
@@ -80,7 +110,12 @@ impl StripBuffer {
         self.win_h = h;
         self.row_bytes = rb as u16;
 
-        self.buf[..total].fill(0xFF);
+        let fill = if self.gray_mode == GrayMode::Bw {
+            0xFF
+        } else {
+            0x00
+        };
+        self.buf[..total].fill(fill);
     }
 
     pub fn data(&self) -> &[u8] {
@@ -286,6 +321,186 @@ impl StripBuffer {
                 if bitmaps[row + x / 8] & (1 << (7 - (x & 7))) != 0 {
                     let (px, py) = self.to_physical(lx as u16, ly as u16);
                     self.set_pixel_physical(px, py, black);
+                }
+            }
+        }
+    }
+
+    /// Blit a 2bpp glyph bitmap to the strip buffer.
+    ///
+    /// Pixel values: 0=white, 1=light gray, 2=dark gray, 3=black.
+    /// `black` controls polarity in Bw mode (true=black text, false=white text).
+    /// In gray modes, `black` is ignored — gray planes always set bits.
+    ///
+    /// Behaviour depends on `self.gray_mode`:
+    ///   Bw:      any non-zero → set/clear bit per `black` (buffer starts 0xFF)
+    ///   GrayLsb: val >= 2     → set bit   (buffer starts 0x00)
+    ///   GrayMsb: val 1 or 2   → set bit   (buffer starts 0x00)
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_2bpp(
+        &mut self,
+        bitmaps: &[u8],
+        offset: usize,
+        w: usize,
+        h: usize,
+        stride: usize,
+        gx: i32,
+        gy: i32,
+        black: bool,
+    ) {
+        if w == 0 || h == 0 || offset + stride * h > bitmaps.len() {
+            return;
+        }
+        match self.rotation {
+            Rotation::Deg270 => self.blit_2bpp_270(bitmaps, offset, w, h, stride, gx, gy, black),
+            _ => self.blit_2bpp_generic(bitmaps, offset, w, h, stride, gx, gy, black),
+        }
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn blit_2bpp_270(
+        &mut self,
+        bitmaps: &[u8],
+        offset: usize,
+        w: usize,
+        h: usize,
+        stride: usize,
+        gx: i32,
+        gy: i32,
+        black: bool,
+    ) {
+        // 270° rotation: logical (lx, ly) → physical (ly, HEIGHT-1-lx)
+        // x-outer loop for cache-friendly destination writes (same as blit_1bpp_270)
+
+        let wx = self.win_x as i32;
+        let wy = self.win_y as i32;
+        let wx2 = wx + self.win_w as i32;
+        let wy2 = wy + self.win_h as i32;
+        let rb = self.row_bytes as usize;
+
+        // clip glyph rows (y axis) against physical-x window
+        let y0 = (wx - gy).clamp(0, h as i32) as usize;
+        let y1 = (wx2 - gy).clamp(0, h as i32) as usize;
+        if y0 >= y1 {
+            return;
+        }
+
+        // clip glyph cols (x axis) against physical-y window
+        let x0 = (HEIGHT as i32 - gx - wy2).clamp(0, w as i32) as usize;
+        let x1 = (HEIGHT as i32 - gx - wy).clamp(0, w as i32) as usize;
+        if x0 >= x1 {
+            return;
+        }
+
+        let base_buf_y_i = HEIGHT as i32 - 1 - gx - wy;
+        debug_assert!(base_buf_y_i >= 0, "blit_2bpp_270: base_buf_y underflow");
+        debug_assert!(gy + y0 as i32 >= wx, "blit_2bpp_270: buf_x underflow");
+        let base_buf_y = base_buf_y_i as usize;
+
+        let data = &bitmaps[offset..];
+        let gray_mode = self.gray_mode;
+
+        // x-outer, y-inner (same traversal order as blit_1bpp_270)
+        for x in x0..x1 {
+            let src_byte_col = x / 4;
+            let src_shift = 6 - (x & 3) * 2;
+            let dst_row_base = (base_buf_y - x) * rb;
+
+            match gray_mode {
+                GrayMode::Bw => {
+                    if black {
+                        // any non-zero → clear bit (black pixel)
+                        for y in y0..y1 {
+                            let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
+                            if val != 0 {
+                                let buf_x = (gy + y as i32 - wx) as usize;
+                                let byte_col = buf_x / 8;
+                                let inv_mask = !(1u8 << (7 - (buf_x & 7)));
+                                self.buf[dst_row_base + byte_col] &= inv_mask;
+                            }
+                        }
+                    } else {
+                        // any non-zero → set bit (white pixel, for inverted text)
+                        for y in y0..y1 {
+                            let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
+                            if val != 0 {
+                                let buf_x = (gy + y as i32 - wx) as usize;
+                                let byte_col = buf_x / 8;
+                                let mask = 1u8 << (7 - (buf_x & 7));
+                                self.buf[dst_row_base + byte_col] |= mask;
+                            }
+                        }
+                    }
+                }
+                GrayMode::GrayLsb => {
+                    // val >= 2 (dark gray + black) → set bit
+                    for y in y0..y1 {
+                        let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
+                        if val >= 2 {
+                            let buf_x = (gy + y as i32 - wx) as usize;
+                            let byte_col = buf_x / 8;
+                            let mask = 1u8 << (7 - (buf_x & 7));
+                            self.buf[dst_row_base + byte_col] |= mask;
+                        }
+                    }
+                }
+                GrayMode::GrayMsb => {
+                    // val 1 or 2 (light gray + dark gray) → set bit
+                    // val 3 (black) and val 0 (white) are NOT set
+                    for y in y0..y1 {
+                        let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
+                        if val == 1 || val == 2 {
+                            let buf_x = (gy + y as i32 - wx) as usize;
+                            let byte_col = buf_x / 8;
+                            let mask = 1u8 << (7 - (buf_x & 7));
+                            self.buf[dst_row_base + byte_col] |= mask;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn blit_2bpp_generic(
+        &mut self,
+        bitmaps: &[u8],
+        offset: usize,
+        w: usize,
+        h: usize,
+        stride: usize,
+        gx: i32,
+        gy: i32,
+        black: bool,
+    ) {
+        let (lw, lh) = match self.rotation {
+            Rotation::Deg0 | Rotation::Deg180 => (WIDTH as i32, HEIGHT as i32),
+            Rotation::Deg90 | Rotation::Deg270 => (HEIGHT as i32, WIDTH as i32),
+        };
+
+        for y in 0..h {
+            let ly = gy + y as i32;
+            if ly < 0 || ly >= lh {
+                continue;
+            }
+            let row = offset + y * stride;
+            for x in 0..w {
+                let lx = gx + x as i32;
+                if lx < 0 || lx >= lw {
+                    continue;
+                }
+                let val = (bitmaps[row + x / 4] >> (6 - (x & 3) * 2)) & 0x03;
+                let should_draw = match self.gray_mode {
+                    GrayMode::Bw => val != 0,
+                    GrayMode::GrayLsb => val >= 2,
+                    GrayMode::GrayMsb => val == 1 || val == 2,
+                };
+                if should_draw {
+                    let (px, py) = self.to_physical(lx as u16, ly as u16);
+                    // Bw: respect black param. Gray: always set bit.
+                    let set_black = black && self.gray_mode == GrayMode::Bw;
+                    self.set_pixel_physical(px, py, set_black);
                 }
             }
         }

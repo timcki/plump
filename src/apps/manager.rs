@@ -640,6 +640,10 @@ impl AppLayer for AppManager {
         AppManager::ghost_clear_every(self)
     }
 
+    fn wants_grayscale(&self) -> bool {
+        self.launcher.active() == AppId::Reader && !self.quick_menu.open
+    }
+
     fn wifi_config(&self) -> &WifiConfig {
         self.settings.wifi_config()
     }

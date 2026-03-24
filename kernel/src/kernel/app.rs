@@ -466,6 +466,7 @@ pub trait AppLayer {
     fn system_settings(&self) -> &SystemSettings;
     fn settings_loaded(&self) -> bool;
     fn ghost_clear_every(&self) -> u32;
+    fn wants_grayscale(&self) -> bool;
     fn wifi_config(&self) -> &WifiConfig;
 
     // boot-time init: load settings, populate caches, enter first app

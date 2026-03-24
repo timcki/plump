@@ -14,7 +14,7 @@ use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
 use esp_hal::delay::Delay;
 
-use super::strip::{STRIP_COUNT, StripBuffer};
+use super::strip::{GrayMode, STRIP_COUNT, StripBuffer};
 
 pub const WIDTH: u16 = 800;
 pub const HEIGHT: u16 = 480;
@@ -35,6 +35,8 @@ pub enum Rotation {
 #[allow(dead_code)]
 mod cmd {
     pub const DRIVER_OUTPUT_CONTROL: u8 = 0x01;
+    pub const GATE_VOLTAGE: u8 = 0x03;
+    pub const SOURCE_VOLTAGE: u8 = 0x04;
     pub const BOOSTER_SOFT_START: u8 = 0x0C;
     pub const DEEP_SLEEP: u8 = 0x10;
     pub const DATA_ENTRY_MODE: u8 = 0x11;
@@ -46,12 +48,49 @@ mod cmd {
     pub const DISPLAY_UPDATE_CONTROL_2: u8 = 0x22;
     pub const WRITE_RAM_BW: u8 = 0x24;
     pub const WRITE_RAM_RED: u8 = 0x26;
+    pub const WRITE_VCOM: u8 = 0x2C;
+    pub const WRITE_LUT: u8 = 0x32;
     pub const BORDER_WAVEFORM: u8 = 0x3C;
     pub const SET_RAM_X_RANGE: u8 = 0x44;
     pub const SET_RAM_Y_RANGE: u8 = 0x45;
     pub const SET_RAM_X_COUNTER: u8 = 0x4E;
     pub const SET_RAM_Y_COUNTER: u8 = 0x4F;
 }
+
+/// Custom waveform LUT for 4-level grayscale rendering.
+///
+/// The SSD1677 combines BW RAM (LSB) and RED RAM (MSB) into a 2-bit index
+/// per pixel. This LUT defines a waveform for each of the 4 states:
+///   {0,0} = no change (white/black pixels stay as-is from BW refresh)
+///   {0,1} = light gray
+///   {1,0} = medium gray
+///   {1,1} = dark gray
+///
+/// Waveform data from CrossPoint Reader (open-source, tuned for X4 display).
+#[rustfmt::skip]
+static LUT_GRAYSCALE: [u8; 112] = [
+    // VS[0..4] waveform entries (5 × 10 bytes = 50 bytes)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 00 no change
+    0x54, 0x54, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 01 light gray
+    0xAA, 0xA0, 0xA8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 10 medium gray
+    0xA2, 0x22, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 11 dark gray
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // VCOM
+    // TP/RP timing groups (10 × 5 bytes = 50 bytes)
+    0x01, 0x01, 0x01, 0x01, 0x00,  // G0
+    0x01, 0x01, 0x01, 0x01, 0x00,  // G1
+    0x01, 0x01, 0x01, 0x01, 0x00,  // G2
+    0x00, 0x00, 0x00, 0x00, 0x00,  // G3
+    0x00, 0x00, 0x00, 0x00, 0x00,  // G4
+    0x00, 0x00, 0x00, 0x00, 0x00,  // G5
+    0x00, 0x00, 0x00, 0x00, 0x00,  // G6
+    0x00, 0x00, 0x00, 0x00, 0x00,  // G7
+    0x00, 0x00, 0x00, 0x00, 0x00,  // G8
+    0x00, 0x00, 0x00, 0x00, 0x00,  // G9
+    // Frame rate (5 bytes)
+    0x8F, 0x8F, 0x8F, 0x8F, 0x8F,
+    // Voltages: VGH, VSH1, VSH2, VSL, VCOM (5 bytes) + reserved (2)
+    0x17, 0x41, 0xA8, 0x32, 0x30, 0x00, 0x00,
+];
 
 #[derive(Clone, Copy, Debug)]
 pub struct RenderState {
@@ -544,6 +583,42 @@ where
         self.initial_refresh = false;
     }
 
+    /// Load a custom LUT waveform into the SSD1677.
+    /// Data layout: 105 bytes (waveform + timing + frame rate),
+    /// then 5 bytes of voltages (VGH, VSH1, VSH2, VSL, VCOM).
+    fn load_custom_lut(&mut self, lut: &[u8]) {
+        // First 105 bytes: VS entries + TP/RP groups + frame rate
+        self.send_command(cmd::WRITE_LUT);
+        self.send_data(&lut[..105]);
+
+        // Voltage registers
+        self.send_command(cmd::GATE_VOLTAGE);
+        self.send_data(&lut[105..106]);
+
+        self.send_command(cmd::SOURCE_VOLTAGE);
+        self.send_data(&lut[106..109]);
+
+        self.send_command(cmd::WRITE_VCOM);
+        self.send_data(&lut[109..110]);
+    }
+
+    /// Start a grayscale refresh using the custom LUT.
+    /// Call after LSB plane → BW RAM and MSB plane → RED RAM are written.
+    fn start_grayscale_refresh(&mut self, rs: &RenderState) {
+        self.load_custom_lut(&LUT_GRAYSCALE);
+        self.set_partial_ram_area(rs.px, rs.py, rs.pw, rs.ph);
+
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
+        self.send_data(&[0x00, 0x00]);
+
+        // 0xCF: clock on, analog on, display using custom LUT, power off after
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
+        self.send_data(&[0xCF]);
+
+        self.send_command(cmd::MASTER_ACTIVATION);
+        self.power_is_on = false; // 0xCF powers off after refresh
+    }
+
     // mode 1: image retained, ~3 uA; requires hw reset to wake
     pub fn enter_deep_sleep(&mut self) {
         if self.power_is_on {
@@ -661,6 +736,59 @@ where
             self.wait_busy_async().await;
             self.power_is_on = false;
         }
+    }
+
+    /// Perform a grayscale antialiasing pass.
+    ///
+    /// Renders content twice (LSB + MSB planes) via strip streaming,
+    /// then loads the custom grayscale LUT and triggers a single refresh.
+    /// The draw closure is called in GrayLsb and GrayMsb modes —
+    /// the StripBuffer's gray_mode controls which pixels are drawn.
+    ///
+    /// After this, BW and RED RAM contain gray plane data (not BW content),
+    /// so the caller should mark red_stale = true.
+    pub async fn grayscale_pass<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        rs: &RenderState,
+        draw: &F,
+    ) where
+        F: Fn(&mut StripBuffer),
+    {
+        // LSB pass → BW RAM
+        strip.set_gray_mode(GrayMode::GrayLsb);
+        self.write_region_strips(
+            strip,
+            rs.px,
+            rs.py,
+            rs.pw,
+            rs.ph,
+            cmd::WRITE_RAM_BW,
+            draw,
+            rs.left_mask,
+            rs.right_mask,
+        );
+
+        // MSB pass → RED RAM
+        strip.set_gray_mode(GrayMode::GrayMsb);
+        self.write_region_strips(
+            strip,
+            rs.px,
+            rs.py,
+            rs.pw,
+            rs.ph,
+            cmd::WRITE_RAM_RED,
+            draw,
+            rs.left_mask,
+            rs.right_mask,
+        );
+
+        // Restore BW mode
+        strip.set_gray_mode(GrayMode::Bw);
+
+        // Trigger grayscale refresh and wait
+        self.start_grayscale_refresh(rs);
+        self.wait_busy_async().await;
     }
 
     async fn update_full_async(&mut self) {

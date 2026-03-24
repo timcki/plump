@@ -335,6 +335,26 @@ impl super::Kernel {
                             }
                             self.partial_refreshes += 1;
                             self.epd.power_off_async().await;
+
+                            // grayscale antialiasing pass: re-render into
+                            // LSB + MSB planes and refresh with gray LUT.
+                            // only for reader pages (not quick menu, settings, etc.)
+                            if app_mgr.system_settings().text_aa
+                                && app_mgr.wants_grayscale()
+                                && !app_mgr.has_redraw()
+                            {
+                                let draw = |s: &mut StripBuffer| app_mgr.draw(s);
+                                self.epd
+                                    .grayscale_pass(self.strip, &rs, &draw)
+                                    .await;
+
+                                // restore BW content to both RAM planes so
+                                // subsequent DU refreshes compute correct
+                                // pixel deltas (physical display keeps gray)
+                                let draw = |s: &mut StripBuffer| app_mgr.draw(s);
+                                self.epd.partial_phase3_sync(self.strip, &rs, &draw);
+                                // red_stale stays false — both planes are in sync
+                            }
                         }
 
                         if let Some(transition) = deferred {

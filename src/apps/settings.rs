@@ -1,6 +1,6 @@
 // settings app UI; configuration types live in kernel::config
 //
-// settings items (7 total):
+// settings items (8 total):
 //   0: Sleep After    – power management
 //   1: Ghost Clear    – e-paper refresh interval
 //   2: Book Font      – reading font size
@@ -8,6 +8,7 @@
 //   4: Reading Theme  – Compact / Default / Relaxed / Spacious
 //   5: Swap Buttons   – swap Back/OK with Left/Right for left-handed use
 //   6: Sunlight Fix   – power off analog after partial refresh (prevents fading)
+//   7: Text AA        – antialiased text via 4-level grayscale LUT
 
 use core::fmt::Write as _;
 
@@ -39,7 +40,7 @@ const COL_GAP: u16 = 8;
 const VALUE_X: u16 = LABEL_X + LABEL_W + COL_GAP;
 const VALUE_W: u16 = FULL_CONTENT_W - LABEL_W - COL_GAP;
 
-const NUM_ITEMS: usize = 7;
+const NUM_ITEMS: usize = 8;
 const HEADING_ITEMS_GAP: u16 = SECTION_GAP;
 
 impl Default for SettingsApp {
@@ -157,6 +158,7 @@ impl SettingsApp {
             4 => "Theme",
             5 => "Swap Buttons",
             6 => "Sunlight Fix",
+            7 => "Text AA",
             _ => "",
         }
     }
@@ -214,6 +216,13 @@ impl SettingsApp {
                     }
                 );
             }
+            7 => {
+                let _ = write!(
+                    buf,
+                    "{}",
+                    if self.settings.text_aa { "On" } else { "Off" }
+                );
+            }
             _ => {}
         }
     }
@@ -257,6 +266,9 @@ impl SettingsApp {
             6 => {
                 self.settings.sunlight_fix = !self.settings.sunlight_fix;
             }
+            7 => {
+                self.settings.text_aa = !self.settings.text_aa;
+            }
             _ => return,
         }
         self.save_needed = true;
@@ -297,6 +309,9 @@ impl SettingsApp {
             }
             6 => {
                 self.settings.sunlight_fix = !self.settings.sunlight_fix;
+            }
+            7 => {
+                self.settings.text_aa = !self.settings.text_aa;
             }
             _ => return,
         }

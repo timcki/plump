@@ -1,4 +1,4 @@
-// pre-rasterised 1-bit bitmap font types
+// pre-rasterised 2-bit (4-level) bitmap font types
 // data in flash via &'static refs from build.rs, packed MSB-first, row-major
 //
 // two glyph tables per font:
@@ -42,18 +42,18 @@ pub struct BitmapGlyph {
     pub bitmap_offset: u16, // byte offset into bitmap array
 }
 
-// pre-rasterised 1-bit bitmap font stored in flash
+// pre-rasterised 2-bit (4-level) bitmap font stored in flash
 //
 // ascii glyphs are direct-indexed for 0x20-0x7E
 // extended unicode glyphs are sorted by codepoint, binary-searched
 // generated at build time by build.rs; zero heap, zero parsing
 pub struct BitmapFont {
     pub glyphs: &'static [BitmapGlyph; GLYPH_COUNT], // ascii, indexed by (ch - FIRST_CHAR)
-    pub bitmaps: &'static [u8],                      // packed 1-bit data for ascii
+    pub bitmaps: &'static [u8],                      // packed 2-bit data for ascii
 
     pub ext_codepoints: &'static [u32], // sorted extended unicode codepoints
     pub ext_glyphs: &'static [BitmapGlyph], // parallel to ext_codepoints
-    pub ext_bitmaps: &'static [u8],     // packed 1-bit data for extended
+    pub ext_bitmaps: &'static [u8],     // packed 2-bit data for extended
 
     pub line_height: u16, // ascent + descent + leading
     pub ascent: u16,      // baseline to top of tallest glyph
@@ -232,9 +232,9 @@ fn blit_glyph(
     let gy = baseline + g.offset_y as i32;
     let w = g.width as usize;
     let h = g.height as usize;
-    let stride = w.div_ceil(8);
+    let stride = w.div_ceil(4); // 2bpp: 4 pixels per byte
 
-    strip.blit_1bpp(
+    strip.blit_2bpp(
         bitmaps,
         g.bitmap_offset as usize,
         w,
