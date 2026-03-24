@@ -29,7 +29,7 @@ use crate::kernel::QuickAction;
 use crate::kernel::bookmarks;
 use crate::kernel::work_queue;
 use crate::kernel::work_queue::DecodedImage;
-use crate::ui::{Alignment, CONTENT_TOP, HEADER_W, Region, StackFmt, TITLE_Y_OFFSET};
+use crate::ui::{Alignment, BUTTON_BAR_H, CONTENT_TOP, HEADER_W, Region, StackFmt, TITLE_Y_OFFSET};
 use smol_epub::cache;
 use smol_epub::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
 use smol_epub::html_strip::{
@@ -68,7 +68,7 @@ pub(super) const NO_PREFETCH: usize = usize::MAX;
 
 pub(super) const TEXT_W: u32 = (SCREEN_W - 2 * MARGIN) as u32;
 
-pub(super) const TEXT_AREA_H: u16 = SCREEN_H - TEXT_Y - 4;
+pub(super) const TEXT_AREA_H: u16 = SCREEN_H - TEXT_Y - BUTTON_BAR_H;
 
 pub(super) const EOCD_TAIL: usize = 512;
 
@@ -439,7 +439,7 @@ impl ReaderApp {
         self.text_margin = theme.margin_h;
         self.text_y = TEXT_Y + theme.margin_v;
         self.text_w = (SCREEN_W - 2 * self.text_margin) as u32;
-        self.text_area_h = SCREEN_H.saturating_sub(self.text_y + 4);
+        self.text_area_h = SCREEN_H.saturating_sub(self.text_y + BUTTON_BAR_H);
     }
 
     pub fn set_chrome_font(&mut self, font: &'static BitmapFont) {
