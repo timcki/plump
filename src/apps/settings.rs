@@ -40,7 +40,7 @@ const COL_GAP: u16 = 8;
 const VALUE_X: u16 = LABEL_X + LABEL_W + COL_GAP;
 const VALUE_W: u16 = FULL_CONTENT_W - LABEL_W - COL_GAP;
 
-const NUM_ITEMS: usize = 8;
+const NUM_ITEMS: usize = 9;
 const HEADING_ITEMS_GAP: u16 = SECTION_GAP;
 
 impl Default for SettingsApp {
@@ -159,6 +159,7 @@ impl SettingsApp {
             5 => "Swap Buttons",
             6 => "Sunlight Fix",
             7 => "Text AA",
+            8 => "Reader Status",
             _ => "",
         }
     }
@@ -223,6 +224,17 @@ impl SettingsApp {
                     if self.settings.text_aa { "On" } else { "Off" }
                 );
             }
+            8 => {
+                let _ = write!(
+                    buf,
+                    "{}",
+                    if self.settings.reader_status {
+                        "Show"
+                    } else {
+                        "Hide"
+                    }
+                );
+            }
             _ => {}
         }
     }
@@ -269,6 +281,9 @@ impl SettingsApp {
             7 => {
                 self.settings.text_aa = !self.settings.text_aa;
             }
+            8 => {
+                self.settings.reader_status = !self.settings.reader_status;
+            }
             _ => return,
         }
         self.save_needed = true;
@@ -312,6 +327,9 @@ impl SettingsApp {
             }
             7 => {
                 self.settings.text_aa = !self.settings.text_aa;
+            }
+            8 => {
+                self.settings.reader_status = !self.settings.reader_status;
             }
             _ => return,
         }

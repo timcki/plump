@@ -514,7 +514,10 @@ impl AppManager {
             self.quick_menu.draw(strip);
         }
 
-        self.bumps.draw(strip);
+        let hide = with_app_ref!(active, self, |app| app.hide_button_bar());
+        if !hide {
+            self.bumps.draw(strip);
+        }
     }
 
     pub fn propagate_fonts(&mut self) {
@@ -522,12 +525,14 @@ impl AppManager {
         let ui_idx = ss.ui_font_size_idx;
         let book_idx = ss.book_font_size_idx;
         let theme_idx = ss.reading_theme;
+        let reader_status = ss.reader_status;
 
         self.home.set_ui_font_size(ui_idx);
         self.files.set_ui_font_size(ui_idx);
         self.settings.set_ui_font_size(ui_idx);
         self.reader.set_book_font_size(book_idx);
         self.reader.set_reading_theme(theme_idx);
+        self.reader.set_show_chrome(reader_status);
 
         let chrome = fonts::chrome_font();
         self.reader.set_chrome_font(chrome);

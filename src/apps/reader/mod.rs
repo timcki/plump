@@ -29,7 +29,7 @@ use crate::kernel::QuickAction;
 use crate::kernel::bookmarks;
 use crate::kernel::work_queue;
 use crate::kernel::work_queue::DecodedImage;
-use crate::ui::{Alignment, BUTTON_BAR_H, CONTENT_TOP, HEADER_W, Region, StackFmt, TITLE_Y_OFFSET};
+use crate::ui::{Alignment, HEADER_W, Region, StackFmt};
 use smol_epub::cache;
 use smol_epub::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
 use smol_epub::html_strip::{
@@ -37,14 +37,19 @@ use smol_epub::html_strip::{
 };
 use smol_epub::zip::{self, ZipIndex};
 
-// chrome margin: used for header, status, progress bar, loading indicator.
+// chrome margin: used for bottom info bar, loading indicator.
 // this never changes; only the text content area responds to the reading theme.
 pub(super) const MARGIN: u16 = 8;
 
-pub(super) const HEADER_Y: u16 = CONTENT_TOP + TITLE_Y_OFFSET - 2; // slightly tighter
-pub(super) const HEADER_H: u16 = 16;
+// screen edge padding (display clips pixels at very edge)
+pub(super) const SCREEN_PAD: u16 = 4;
 
-pub(super) const TEXT_Y: u16 = HEADER_Y + HEADER_H + 2;
+// bottom chrome: book title + page/chapter info
+pub(super) const CHROME_H: u16 = 18;
+pub(super) const CHROME_PAD: u16 = 2;
+pub(super) const CHROME_Y: u16 = SCREEN_H - CHROME_H - SCREEN_PAD;
+
+pub(super) const TEXT_Y: u16 = SCREEN_PAD + 4;
 
 pub(super) const LINE_H: u16 = 20;
 
@@ -56,19 +61,19 @@ pub(super) const PAGE_BUF: usize = 8192;
 
 pub(super) const MAX_PAGES: usize = 512;
 
-pub(super) const HEADER_REGION: Region = Region::new(MARGIN, HEADER_Y, HEADER_W, HEADER_H);
+pub(super) const HEADER_REGION: Region = Region::new(MARGIN, CHROME_Y, HEADER_W, CHROME_H);
 
 const STATUS_X: u16 = MARGIN + HEADER_W + 8;
 const STATUS_W: u16 = SCREEN_W - STATUS_X - MARGIN;
-pub(super) const STATUS_REGION: Region = Region::new(STATUS_X, HEADER_Y, STATUS_W, HEADER_H);
+pub(super) const STATUS_REGION: Region = Region::new(STATUS_X, CHROME_Y, STATUS_W, CHROME_H);
 
-pub(super) const PAGE_REGION: Region = Region::new(0, HEADER_Y, SCREEN_W, SCREEN_H - HEADER_Y);
+pub(super) const PAGE_REGION: Region = Region::new(0, 0, SCREEN_W, SCREEN_H);
 
 pub(super) const NO_PREFETCH: usize = usize::MAX;
 
 pub(super) const TEXT_W: u32 = (SCREEN_W - 2 * MARGIN) as u32;
 
-pub(super) const TEXT_AREA_H: u16 = SCREEN_H - TEXT_Y - BUTTON_BAR_H;
+pub(super) const TEXT_AREA_H: u16 = CHROME_Y - CHROME_PAD - TEXT_Y;
 
 pub(super) const EOCD_TAIL: usize = 512;
 
@@ -358,6 +363,7 @@ pub struct ReaderApp {
     pub(super) text_w: u32,      // text content width (SCREEN_W - 2 * text_margin)
     pub(super) text_area_h: u16, // height of text area (SCREEN_H - text_y - bottom_pad)
     pub(super) reading_theme_idx: u8,
+    pub(super) show_chrome: bool,
 
     // pre-scanned image heights for the current page buffer;
     // populated before wrapping so the pager can reserve the exact
@@ -407,6 +413,7 @@ impl ReaderApp {
             text_w: TEXT_W,
             text_area_h: TEXT_AREA_H,
             reading_theme_idx: 0,
+            show_chrome: true,
 
             img_heights: [0u16; MAX_IMAGES_PER_PAGE],
             img_height_count: 0,
@@ -434,12 +441,25 @@ impl ReaderApp {
         self.apply_font_metrics();
     }
 
+    pub fn set_show_chrome(&mut self, show: bool) {
+        if self.show_chrome != show {
+            self.show_chrome = show;
+            self.apply_theme_layout();
+            self.apply_font_metrics();
+        }
+    }
+
     fn apply_theme_layout(&mut self) {
         let theme = crate::kernel::config::reading_theme(self.reading_theme_idx);
         self.text_margin = theme.margin_h;
         self.text_y = TEXT_Y + theme.margin_v;
         self.text_w = (SCREEN_W - 2 * self.text_margin) as u32;
-        self.text_area_h = SCREEN_H.saturating_sub(self.text_y + BUTTON_BAR_H);
+        let bottom = if self.show_chrome {
+            CHROME_Y - CHROME_PAD
+        } else {
+            SCREEN_H - SCREEN_PAD
+        };
+        self.text_area_h = bottom.saturating_sub(self.text_y);
     }
 
     pub fn set_chrome_font(&mut self, font: &'static BitmapFont) {
@@ -1388,6 +1408,10 @@ impl App<AppId> for ReaderApp {
         Some(PendingSetting::BookFontSize(self.book_font_size_idx))
     }
 
+    fn hide_button_bar(&self) -> bool {
+        true
+    }
+
     fn save_state(&self, bm: &mut bookmarks::BookmarkCache) {
         self.save_position(bm);
     }
@@ -1403,78 +1427,80 @@ impl App<AppId> for ReaderApp {
     fn draw(&self, strip: &mut StripBuffer) {
         let cf = self.chrome_font;
 
-        draw_chrome_text(
-            strip,
-            HEADER_REGION,
-            self.display_name(),
-            Alignment::CenterLeft,
-            cf,
-        );
+        if self.show_chrome {
+            draw_chrome_text(
+                strip,
+                HEADER_REGION,
+                self.display_name(),
+                Alignment::CenterLeft,
+                cf,
+            );
 
-        if self.state == State::ShowToc {
-            draw_chrome_text(strip, STATUS_REGION, "Contents", Alignment::CenterRight, cf);
-        } else if self.is_epub && !self.epub.spine.is_empty() {
-            let mut sbuf = StackFmt::<40>::new();
-            if self.epub.spine.len() > 1 {
+            if self.state == State::ShowToc {
+                draw_chrome_text(strip, STATUS_REGION, "Contents", Alignment::CenterRight, cf);
+            } else if self.is_epub && !self.epub.spine.is_empty() {
+                let mut sbuf = StackFmt::<40>::new();
+                if self.epub.spine.len() > 1 {
+                    if self.pg.fully_indexed {
+                        let _ = write!(
+                            sbuf,
+                            "Ch{}/{} {}/{}",
+                            self.epub.chapter + 1,
+                            self.epub.spine.len(),
+                            self.pg.page + 1,
+                            self.pg.total_pages
+                        );
+                    } else {
+                        let _ = write!(
+                            sbuf,
+                            "Ch{}/{} p{}",
+                            self.epub.chapter + 1,
+                            self.epub.spine.len(),
+                            self.pg.page + 1
+                        );
+                    }
+                } else if self.pg.fully_indexed {
+                    let _ = write!(sbuf, "{}/{}", self.pg.page + 1, self.pg.total_pages);
+                } else {
+                    let _ = write!(sbuf, "p{}", self.pg.page + 1);
+                }
+                if self.epub.bg_cache != BgCacheState::Idle {
+                    let cached = self.cached_chapter_count();
+                    let total = self.epub.spine.len();
+                    if cached < total {
+                        let _ = write!(sbuf, " [{}/{}]", cached, total);
+                    } else if self.epub.img_found_count > 0 {
+                        let _ = write!(
+                            sbuf,
+                            " [img {}/{}]",
+                            self.epub.img_cached_count, self.epub.img_found_count,
+                        );
+                    } else {
+                        let _ = write!(sbuf, " [img]");
+                    }
+                }
+                draw_chrome_text(
+                    strip,
+                    STATUS_REGION,
+                    sbuf.as_str(),
+                    Alignment::CenterRight,
+                    cf,
+                );
+            } else if self.file_size > 0 {
+                let mut sbuf = StackFmt::<24>::new();
                 if self.pg.fully_indexed {
-                    let _ = write!(
-                        sbuf,
-                        "Ch{}/{} {}/{}",
-                        self.epub.chapter + 1,
-                        self.epub.spine.len(),
-                        self.pg.page + 1,
-                        self.pg.total_pages
-                    );
+                    let _ = write!(sbuf, "{}/{}", self.pg.page + 1, self.pg.total_pages);
                 } else {
-                    let _ = write!(
-                        sbuf,
-                        "Ch{}/{} p{}",
-                        self.epub.chapter + 1,
-                        self.epub.spine.len(),
-                        self.pg.page + 1
-                    );
+                    let _ = write!(sbuf, "p{}", self.pg.page + 1);
                 }
-            } else if self.pg.fully_indexed {
-                let _ = write!(sbuf, "{}/{}", self.pg.page + 1, self.pg.total_pages);
-            } else {
-                let _ = write!(sbuf, "p{}", self.pg.page + 1);
+                draw_chrome_text(
+                    strip,
+                    STATUS_REGION,
+                    sbuf.as_str(),
+                    Alignment::CenterRight,
+                    cf,
+                );
             }
-            if self.epub.bg_cache != BgCacheState::Idle {
-                let cached = self.cached_chapter_count();
-                let total = self.epub.spine.len();
-                if cached < total {
-                    let _ = write!(sbuf, " [{}/{}]", cached, total);
-                } else if self.epub.img_found_count > 0 {
-                    let _ = write!(
-                        sbuf,
-                        " [img {}/{}]",
-                        self.epub.img_cached_count, self.epub.img_found_count,
-                    );
-                } else {
-                    let _ = write!(sbuf, " [img]");
-                }
-            }
-            draw_chrome_text(
-                strip,
-                STATUS_REGION,
-                sbuf.as_str(),
-                Alignment::CenterRight,
-                cf,
-            );
-        } else if self.file_size > 0 {
-            let mut sbuf = StackFmt::<24>::new();
-            if self.pg.fully_indexed {
-                let _ = write!(sbuf, "{}/{}", self.pg.page + 1, self.pg.total_pages);
-            } else {
-                let _ = write!(sbuf, "p{}", self.pg.page + 1);
-            }
-            draw_chrome_text(
-                strip,
-                STATUS_REGION,
-                sbuf.as_str(),
-                Alignment::CenterRight,
-                cf,
-            );
         }
 
         if let Some(e) = self.error {

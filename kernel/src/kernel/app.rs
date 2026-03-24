@@ -308,6 +308,10 @@ pub trait App<Id> {
 
     fn save_state(&self, _bm: &mut BookmarkCache) {}
 
+    fn hide_button_bar(&self) -> bool {
+        false
+    }
+
     fn has_background_when_suspended(&self) -> bool {
         false
     }

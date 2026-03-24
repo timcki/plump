@@ -102,6 +102,9 @@ pub struct SystemSettings {
     // display settings
     pub sunlight_fix: bool, // power off analog after each partial refresh (prevents sunlight fading)
     pub text_aa: bool,      // antialiased text via grayscale LUT (slower page turns)
+
+    // reader settings
+    pub reader_status: bool, // show book title + page info bar at bottom of reader
 }
 
 impl Default for SystemSettings {
@@ -121,6 +124,7 @@ impl SystemSettings {
             swap_buttons: false,
             sunlight_fix: false,
             text_aa: false,
+            reader_status: true,
         }
     }
 
@@ -249,6 +253,9 @@ fn apply_setting(key: &[u8], val: &[u8], s: &mut SystemSettings, w: &mut WifiCon
         b"text_aa" => {
             s.text_aa = val == b"1" || val == b"true";
         }
+        b"reader_status" => {
+            s.reader_status = val == b"1" || val == b"true";
+        }
         b"wifi_ssid" => w.set_ssid(val),
         b"wifi_pass" => w.set_pass(val),
         _ => {}
@@ -335,6 +342,9 @@ pub fn write_settings_txt(s: &SystemSettings, w: &WifiConfig, buf: &mut [u8]) ->
     wr.put(b"\n# display settings\n");
     wr.kv_num(b"sunlight_fix", if s.sunlight_fix { 1 } else { 0 });
     wr.kv_num(b"text_aa", if s.text_aa { 1 } else { 0 });
+
+    wr.put(b"\n# reader settings\n");
+    wr.kv_num(b"reader_status", if s.reader_status { 1 } else { 0 });
 
     wr.put(b"\n# control settings\n");
     wr.kv_num(b"swap_buttons", if s.swap_buttons { 1 } else { 0 });
