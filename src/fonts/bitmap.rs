@@ -130,6 +130,34 @@ impl BitmapFont {
         Utf8Iter::new(text).map(|c| self.advance(c) as u16).sum()
     }
 
+    /// Find the byte offset at which `text` should be truncated so that
+    /// the rendered text plus a trailing "…" fits within `max_px` pixels.
+    ///
+    /// Returns `text.len()` if the full string already fits.  Otherwise
+    /// returns the byte offset of the last character boundary that fits
+    /// (the caller should append "…" after slicing).
+    pub fn truncate_len(&self, text: &str, max_px: u16) -> usize {
+        let ellipsis_w = self.advance('…') as u16;
+        let mut w: u16 = 0;
+        let mut last_fit = 0usize;
+        for (i, ch) in text.char_indices() {
+            let cw = self.advance(ch) as u16;
+            if w + cw > max_px {
+                // full string doesn't fit — return the last position
+                // where text + ellipsis still fits
+                return last_fit;
+            }
+            w += cw;
+            // after adding this char, would there still be room for
+            // the ellipsis if we had to cut after it?
+            if w + ellipsis_w <= max_px {
+                last_fit = i + ch.len_utf8();
+            }
+        }
+        // entire string fits
+        text.len()
+    }
+
     // draw a character at (cx, baseline) in black, return advance
     #[inline]
     pub fn draw_char(&self, strip: &mut StripBuffer, ch: char, cx: i32, baseline: i32) -> u8 {

@@ -643,7 +643,7 @@ impl HomeApp {
                 .draw(strip)
                 .unwrap();
             RoundedRectangle::with_equal_corners(card_rect, R_CARD)
-                .into_styled(PrimitiveStyle::with_stroke(fg, 2))
+                .into_styled(PrimitiveStyle::with_stroke(fg, 3))
                 .draw(strip)
                 .unwrap();
 
@@ -678,22 +678,47 @@ impl HomeApp {
                     (inner_x, inner_w, Alignment::Center)
                 };
 
-                // title
+                // title (truncate with ellipsis if too wide)
                 let title_y = CARD_Y + CARD_PAD + 20;
                 let title_region = Region::new(text_x, title_y, text_w, heading_h);
-                self.ui_fonts.heading.draw_aligned(
-                    strip, title_region, self.recent_display_title(),
-                    text_align, fg,
-                );
+                let title = self.recent_display_title();
+                let title_cut = self.ui_fonts.heading.truncate_len(title, text_w);
+                if title_cut >= title.len() {
+                    self.ui_fonts.heading.draw_aligned(
+                        strip, title_region, title, text_align, fg,
+                    );
+                } else {
+                    let mut tbuf = [0u8; 68]; // 64 + "…"
+                    let n = title_cut.min(64);
+                    tbuf[..n].copy_from_slice(&title.as_bytes()[..n]);
+                    // append UTF-8 for '…' (0xE2 0x80 0xA6)
+                    tbuf[n] = 0xE2; tbuf[n+1] = 0x80; tbuf[n+2] = 0xA6;
+                    let truncated = core::str::from_utf8(&tbuf[..n + 3]).unwrap_or(title);
+                    self.ui_fonts.heading.draw_aligned(
+                        strip, title_region, truncated, text_align, fg,
+                    );
+                }
 
-                // author
+                // author (truncate with ellipsis if too wide)
                 let author = self.recent_author_str();
                 if !author.is_empty() {
                     let author_y = title_y + heading_h + 8;
                     let author_region = Region::new(text_x, author_y, text_w, line_h);
-                    self.ui_fonts.body.draw_aligned(
-                        strip, author_region, author, text_align, fg,
-                    );
+                    let author_cut = self.ui_fonts.body.truncate_len(author, text_w);
+                    if author_cut >= author.len() {
+                        self.ui_fonts.body.draw_aligned(
+                            strip, author_region, author, text_align, fg,
+                        );
+                    } else {
+                        let mut abuf = [0u8; 68];
+                        let n = author_cut.min(64);
+                        abuf[..n].copy_from_slice(&author.as_bytes()[..n]);
+                        abuf[n] = 0xE2; abuf[n+1] = 0x80; abuf[n+2] = 0xA6;
+                        let truncated = core::str::from_utf8(&abuf[..n + 3]).unwrap_or(author);
+                        self.ui_fonts.body.draw_aligned(
+                            strip, author_region, truncated, text_align, fg,
+                        );
+                    }
                 }
 
                 // progress bar
