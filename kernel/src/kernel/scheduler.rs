@@ -64,6 +64,20 @@ impl super::Kernel {
 
         let boot_start = Instant::now();
 
+        // log reset reason for debugging RTC session persistence
+        {
+            use esp_hal::rtc_cntl::{SocResetReason, reset_reason};
+            use esp_hal::system::Cpu;
+            let reason = reset_reason(Cpu::ProCpu);
+            info!("boot: reset reason = {:?}", reason);
+            // on battery wake, brownout can produce SysBrownOut instead
+            // of CoreDeepSleep — we disable the detector before sleep to
+            // prevent this (see enter_sleep)
+            if matches!(reason, Some(SocResetReason::SysBrownOut)) {
+                info!("boot: WARNING brownout reset detected (RTC memory may be lost)");
+            }
+        }
+
         let t0 = Instant::now();
         self.bm_cache.ensure_loaded(&self.sd);
         let bm_ms = t0.elapsed().as_millis();
@@ -621,6 +635,26 @@ impl super::Kernel {
         // instant wake restoration without SD card I/O.
         let mut sleep_config = RtcSleepConfig::deep();
         sleep_config.set_rtc_fastmem_pd_en(false); // keep RTC FAST powered
+
+        // disable brownout detector before entering deep sleep.
+        //
+        // on battery power, the CPU wake-up causes a brief voltage sag that
+        // triggers the brownout detector. this produces a BROWNOUT reset
+        // instead of a DEEPSLEEP_RESET, and the bootloader then zeros all
+        // RTC memory (destroying our saved session). disabling the detector
+        // before sleep ensures the wake is classified correctly.
+        //
+        // the brownout detector is re-enabled by the ROM/bootloader on the
+        // next boot, so this only affects the wake transition window.
+        //
+        // RTC_CNTL_BROWN_OUT_REG is at 0x6000_80D4; bit 30 is BROWN_OUT_ENA.
+        // safety: we are about to halt the CPU; no concurrent access.
+        unsafe {
+            const RTC_CNTL_BROWN_OUT_REG: *mut u32 = 0x6000_80D4 as *mut u32;
+            let val = core::ptr::read_volatile(RTC_CNTL_BROWN_OUT_REG);
+            core::ptr::write_volatile(RTC_CNTL_BROWN_OUT_REG, val & !(1 << 30));
+        }
+        info!("sleep: brownout detector disabled for clean wake");
 
         info!("mcu: entering deep sleep (power button to wake, RTC FAST retained)");
         rtc.sleep(&sleep_config, &[&rtcio]);
