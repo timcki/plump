@@ -173,6 +173,18 @@ impl super::Kernel {
         }
 
         {
+            let active = app_mgr.active();
+            {
+                let ctx = app_mgr.ctx_mut();
+                info!(
+                    "boot: first frame active={:?} loading_active={} loading='{}' pct={}",
+                    active,
+                    ctx.loading_active(),
+                    ctx.loading_msg(),
+                    ctx.loading_pct()
+                );
+            }
+
             let t0 = Instant::now();
             let draw = |s: &mut StripBuffer| app_mgr.draw(s);
             self.epd
@@ -367,7 +379,21 @@ impl super::Kernel {
     // returns true if power-long-press arrived during the waveform and
     // the caller should enter sleep
     async fn render<A: AppLayer>(&mut self, app_mgr: &mut A, redraw: Redraw) -> bool {
+        use embassy_time::Instant;
+
         let mut sleep_requested = false;
+        let active = app_mgr.active();
+        {
+            let ctx = app_mgr.ctx_mut();
+            info!(
+                "render: begin active={:?} redraw={:?} loading_active={} loading='{}' pct={}",
+                active,
+                redraw,
+                ctx.loading_active(),
+                ctx.loading_msg(),
+                ctx.loading_pct()
+            );
+        }
 
         'render: {
             if let Redraw::Partial(r) = redraw {
@@ -376,6 +402,7 @@ impl super::Kernel {
                 if self.partial_refreshes < ghost_clear_every {
                     let r = r.align8();
 
+                    let t_write = Instant::now();
                     let rs = {
                         let draw = |s: &mut StripBuffer| app_mgr.draw(s);
                         if self.red_stale {
@@ -402,9 +429,24 @@ impl super::Kernel {
                     };
 
                     if let Some(rs) = rs {
+                        info!(
+                            "render: partial phase1 region={:?} red_stale={} ({}ms)",
+                            r,
+                            self.red_stale,
+                            t_write.elapsed().as_millis()
+                        );
+                        let t_wave = Instant::now();
                         self.epd.partial_start_du(&rs);
                         let (deferred, sleep) = self.busy_wait_with_background(app_mgr).await;
                         sleep_requested = sleep;
+                        info!(
+                            "render: partial waveform done region={:?} pending_redraw={} deferred={} sleep={} ({}ms)",
+                            r,
+                            app_mgr.has_redraw(),
+                            deferred.is_some(),
+                            sleep,
+                            t_wave.elapsed().as_millis()
+                        );
 
                         // skip phase 3 when content changed mid-DU or
                         // a deferred transition is queued (the screen
@@ -462,16 +504,29 @@ impl super::Kernel {
             if matches!(redraw, Redraw::Full | Redraw::Partial(_)) {
                 self.log_stats();
 
+                let t_write = Instant::now();
                 {
                     let draw = |s: &mut StripBuffer| app_mgr.draw(s);
                     self.epd
                         .write_full_frame(self.strip, &mut self.delay, &draw);
                 }
+                info!(
+                    "render: full frame written ({}ms)",
+                    t_write.elapsed().as_millis()
+                );
 
+                let t_wave = Instant::now();
                 self.epd.start_full_update();
 
                 let (deferred, sleep) = self.busy_wait_with_background(app_mgr).await;
                 sleep_requested = sleep;
+                info!(
+                    "render: full waveform done pending_redraw={} deferred={} sleep={} ({}ms)",
+                    app_mgr.has_redraw(),
+                    deferred.is_some(),
+                    sleep,
+                    t_wave.elapsed().as_millis()
+                );
 
                 self.epd.finish_full_update();
                 self.partial_refreshes = 0;
@@ -482,6 +537,13 @@ impl super::Kernel {
                 }
             }
         } // 'render
+
+        info!(
+            "render: end active={:?} pending_redraw={} sleep_requested={}",
+            app_mgr.active(),
+            app_mgr.has_redraw(),
+            sleep_requested
+        );
 
         sleep_requested
     }

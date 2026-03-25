@@ -1255,9 +1255,12 @@ impl App<AppId> for ReaderApp {
     }
 
     async fn background(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
+        use embassy_time::Instant;
+
         loop {
             match self.state {
                 State::NeedBookmark => {
+                    let t0 = Instant::now();
                     self.bookmark_load(k.bookmark_cache());
                     self.stats_load(k);
 
@@ -1273,93 +1276,164 @@ impl App<AppId> for ReaderApp {
                         self.state = State::NeedPage;
                         ctx.set_loading(LOADING_REGION, "Loading", 50);
                     }
+                    log::info!(
+                        "reader:bg NeedBookmark -> {:?} loading='{}' pct={} ({}ms)",
+                        self.state,
+                        ctx.loading_msg(),
+                        ctx.loading_pct(),
+                        t0.elapsed().as_millis()
+                    );
                     continue;
                 }
 
                 State::NeedInit => {
+                    let t0 = Instant::now();
                     let (nb, nl) = self.name_copy();
                     let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
                     match self.epub.init_zip(k, name, &mut self.pg.buf) {
                         Ok(()) => {
                             self.state = State::NeedOpf;
                             ctx.set_loading(LOADING_REGION, "Loading", 25);
+                            log::info!(
+                                "reader:bg NeedInit -> {:?} loading='{}' pct={} ({}ms)",
+                                self.state,
+                                ctx.loading_msg(),
+                                ctx.loading_pct(),
+                                t0.elapsed().as_millis()
+                            );
                         }
                         Err(e) => {
+                            log::info!(
+                                "reader:bg NeedInit failed after {}ms: {}",
+                                t0.elapsed().as_millis(),
+                                e
+                            );
                             log::info!("reader: epub init (zip) failed: {}", e);
                             self.enter_error(ctx, e);
                         }
                     }
                 }
 
-                State::NeedOpf => match self.epub_init_opf(k) {
-                    Ok(()) => {
-                        // clamp restored chapter to valid spine range
-                        let spine_len = self.epub.spine.len();
-                        if spine_len > 0 && self.epub.chapter as usize >= spine_len {
-                            self.epub.chapter = (spine_len - 1) as u16;
+                State::NeedOpf => {
+                    let t0 = Instant::now();
+                    match self.epub_init_opf(k) {
+                        Ok(()) => {
+                            // clamp restored chapter to valid spine range
+                            let spine_len = self.epub.spine.len();
+                            if spine_len > 0 && self.epub.chapter as usize >= spine_len {
+                                self.epub.chapter = (spine_len - 1) as u16;
+                            }
+                            // defer RECENT/title/TOC/cover work until after
+                            // the first page is visible.
+                            self.pending_recent_write = true;
+                            self.pending_title_save = self.title_len > 0;
+                            self.pending_cover_thumb = self.epub.meta.has_cover();
+                            self.state = State::NeedToc;
+                            ctx.set_loading(LOADING_REGION, "Loading", 40);
+                            log::info!(
+                                "reader:bg NeedOpf -> {:?} loading='{}' pct={} ({}ms)",
+                                self.state,
+                                ctx.loading_msg(),
+                                ctx.loading_pct(),
+                                t0.elapsed().as_millis()
+                            );
                         }
-                        // defer RECENT/title/TOC/cover work until after
-                        // the first page is visible.
-                        self.pending_recent_write = true;
-                        self.pending_title_save = self.title_len > 0;
-                        self.pending_cover_thumb = self.epub.meta.has_cover();
-                        self.state = State::NeedToc;
-                        ctx.set_loading(LOADING_REGION, "Loading", 40);
+                        Err(e) => {
+                            log::info!(
+                                "reader:bg NeedOpf failed after {}ms: {}",
+                                t0.elapsed().as_millis(),
+                                e
+                            );
+                            log::info!("reader: epub init (opf) failed: {}", e);
+                            self.enter_error(ctx, e);
+                        }
                     }
-                    Err(e) => {
-                        log::info!("reader: epub init (opf) failed: {}", e);
-                        self.enter_error(ctx, e);
-                    }
-                },
+                }
 
                 State::NeedToc => {
+                    let t0 = Instant::now();
                     self.pending_toc_parse = self.epub.toc_source.is_some();
                     self.state = State::NeedCache;
                     ctx.set_loading(LOADING_REGION, "Caching", 55);
+                    log::info!(
+                        "reader:bg NeedToc -> {:?} loading='{}' pct={} ({}ms)",
+                        self.state,
+                        ctx.loading_msg(),
+                        ctx.loading_pct(),
+                        t0.elapsed().as_millis()
+                    );
                 }
 
-                State::NeedCache => match self.epub.check_cache(k, &mut self.pg.buf) {
-                    Ok(true) => {
-                        self.state = State::NeedIndex;
-                        ctx.set_loading(LOADING_REGION, "Indexing", 75);
-                    }
-                    Ok(false) => {
-                        // cache the current chapter; async version yields
-                        // during deflate so the scheduler's select can
-                        // interrupt if the user presses back
-                        let ch = self.epub.chapter as usize;
-                        let (nb, nl) = self.name_copy();
-                        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
-                        match self.epub.cache_chapter_async(k, ch, epub_name).await {
-                            Ok(()) => {
-                                self.epub.chapters_cached = true;
-                                self.epub.cache_chapter = 0;
+                State::NeedCache => {
+                    let t0 = Instant::now();
+                    match self.epub.check_cache(k, &mut self.pg.buf) {
+                        Ok(true) => {
+                            self.state = State::NeedIndex;
+                            ctx.set_loading(LOADING_REGION, "Indexing", 75);
+                            log::info!(
+                                "reader:bg NeedCache(cache-hit) -> {:?} loading='{}' pct={} ({}ms)",
+                                self.state,
+                                ctx.loading_msg(),
+                                ctx.loading_pct(),
+                                t0.elapsed().as_millis()
+                            );
+                        }
+                        Ok(false) => {
+                            // cache the current chapter; async version yields
+                            // during deflate so the scheduler's select can
+                            // interrupt if the user presses back
+                            let ch = self.epub.chapter as usize;
+                            let (nb, nl) = self.name_copy();
+                            let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+                            match self.epub.cache_chapter_async(k, ch, epub_name).await {
+                                Ok(()) => {
+                                    self.epub.chapters_cached = true;
+                                    self.epub.cache_chapter = 0;
 
-                                // eagerly dispatch nearby images to
-                                // the worker so they decode while the
-                                // user reads the first page
-                                if self.try_dispatch_nearby_image(k) {
-                                    self.epub.bg_cache = BgCacheState::WaitNearbyImage;
-                                } else {
-                                    self.epub.bg_cache = BgCacheState::CacheChapter;
+                                    // eagerly dispatch nearby images to
+                                    // the worker so they decode while the
+                                    // user reads the first page
+                                    if self.try_dispatch_nearby_image(k) {
+                                        self.epub.bg_cache = BgCacheState::WaitNearbyImage;
+                                    } else {
+                                        self.epub.bg_cache = BgCacheState::CacheChapter;
+                                    }
+
+                                    self.state = State::NeedIndex;
+                                    ctx.set_loading(LOADING_REGION, "Indexing", 75);
+                                    log::info!(
+                                        "reader:bg NeedCache(cache-build) -> {:?} loading='{}' pct={} ({}ms)",
+                                        self.state,
+                                        ctx.loading_msg(),
+                                        ctx.loading_pct(),
+                                        t0.elapsed().as_millis()
+                                    );
                                 }
-
-                                self.state = State::NeedIndex;
-                                ctx.set_loading(LOADING_REGION, "Indexing", 75);
-                            }
-                            Err(e) => {
-                                log::info!("reader: cache ch{} failed: {}", ch, e);
-                                self.enter_error(ctx, e);
+                                Err(e) => {
+                                    log::info!(
+                                        "reader:bg NeedCache(cache-build) failed after {}ms: {}",
+                                        t0.elapsed().as_millis(),
+                                        e
+                                    );
+                                    log::info!("reader: cache ch{} failed: {}", ch, e);
+                                    self.enter_error(ctx, e);
+                                }
                             }
                         }
+                        Err(e) => {
+                            log::info!(
+                                "reader:bg NeedCache failed after {}ms: {}",
+                                t0.elapsed().as_millis(),
+                                e
+                            );
+                            log::info!("reader: cache check failed: {}", e);
+                            self.enter_error(ctx, e);
+                        }
                     }
-                    Err(e) => {
-                        log::info!("reader: cache check failed: {}", e);
-                        self.enter_error(ctx, e);
-                    }
-                },
+                }
 
                 State::NeedIndex => {
+                    let t0 = Instant::now();
                     // ensure the target chapter is cached before
                     // indexing (it may not be if background caching
                     // hasn't reached it yet)
@@ -1373,6 +1447,11 @@ impl App<AppId> for ReaderApp {
                         let (nb, nl) = self.name_copy();
                         let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
                         if let Err(e) = self.epub.cache_chapter_async(k, ch, epub_name).await {
+                            log::info!(
+                                "reader:bg NeedIndex cache prerequisite failed after {}ms: {}",
+                                t0.elapsed().as_millis(),
+                                e
+                            );
                             self.enter_error(ctx, e);
                             break;
                         }
@@ -1395,21 +1474,47 @@ impl App<AppId> for ReaderApp {
                                 self.arm_deferred_open_work();
                                 ctx.clear_loading();
                                 ctx.mark_dirty(PAGE_REGION);
+                                log::info!(
+                                    "reader:bg NeedIndex(last-page) -> {:?} loading_active={} ({}ms)",
+                                    self.state,
+                                    ctx.loading_active(),
+                                    t0.elapsed().as_millis()
+                                );
                             }
-                            Err(e) => self.enter_error(ctx, e),
+                            Err(e) => {
+                                log::info!(
+                                    "reader:bg NeedIndex(last-page) failed after {}ms: {}",
+                                    t0.elapsed().as_millis(),
+                                    e
+                                );
+                                self.enter_error(ctx, e)
+                            }
                         }
                     } else {
                         self.state = State::NeedPage;
                         ctx.set_loading(LOADING_REGION, "Loading page", 90);
+                        log::info!(
+                            "reader:bg NeedIndex -> {:?} loading='{}' pct={} ({}ms)",
+                            self.state,
+                            ctx.loading_msg(),
+                            ctx.loading_pct(),
+                            t0.elapsed().as_millis()
+                        );
                     }
                 }
 
                 State::NeedPage => {
+                    let t0 = Instant::now();
                     let page_hint = self.restore_page_hint.take();
                     if let Some(target_off) = self.restore_offset.take() {
                         if self.pg.fully_indexed && self.pg.total_pages > 0 {
                             self.pg.page = self.locate_page_for_offset(target_off, page_hint);
                             if let Err(e) = self.load_and_prefetch(k) {
+                                log::info!(
+                                    "reader:bg NeedPage(restore-indexed) failed after {}ms: {}",
+                                    t0.elapsed().as_millis(),
+                                    e
+                                );
                                 self.enter_error(ctx, e);
                             }
                         } else {
@@ -1418,6 +1523,11 @@ impl App<AppId> for ReaderApp {
                                 match self.load_and_prefetch(k) {
                                     Ok(()) => {}
                                     Err(e) => {
+                                        log::info!(
+                                            "reader:bg NeedPage(restore-scan) failed after {}ms: {}",
+                                            t0.elapsed().as_millis(),
+                                            e
+                                        );
                                         self.enter_error(ctx, e);
                                         break;
                                     }
@@ -1437,6 +1547,13 @@ impl App<AppId> for ReaderApp {
                             self.arm_deferred_open_work();
                             ctx.clear_loading();
                             ctx.mark_dirty(PAGE_REGION);
+                            log::info!(
+                                "reader:bg NeedPage(restore) -> {:?} page={} loading_active={} ({}ms)",
+                                self.state,
+                                self.pg.page,
+                                ctx.loading_active(),
+                                t0.elapsed().as_millis()
+                            );
                         }
                     } else {
                         match self.load_and_prefetch(k) {
@@ -1446,8 +1563,20 @@ impl App<AppId> for ReaderApp {
                                 self.arm_deferred_open_work();
                                 ctx.clear_loading();
                                 ctx.mark_dirty(PAGE_REGION);
+                                log::info!(
+                                    "reader:bg NeedPage(open) -> {:?} page={} loading_active={} ({}ms)",
+                                    self.state,
+                                    self.pg.page,
+                                    ctx.loading_active(),
+                                    t0.elapsed().as_millis()
+                                );
                             }
                             Err(e) => {
+                                log::info!(
+                                    "reader:bg NeedPage(open) failed after {}ms: {}",
+                                    t0.elapsed().as_millis(),
+                                    e
+                                );
                                 log::info!("reader: load failed: {}", e);
                                 self.enter_error(ctx, e);
                             }

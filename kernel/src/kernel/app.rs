@@ -229,10 +229,19 @@ impl AppContext {
     // app header in the content area.
     // auto-marks the region dirty so the next render shows it.
     pub fn set_loading(&mut self, region: Region, msg: &str, pct: u8) {
+        let pct = pct.min(100);
+        log::info!(
+            "ui: set_loading msg='{}' pct={} region={:?} redraw_before={:?}",
+            msg,
+            pct,
+            region,
+            self.redraw
+        );
+
         let n = msg.len().min(LOADING_BUF_SIZE);
         self.loading_buf[..n].copy_from_slice(&msg.as_bytes()[..n]);
         self.loading_len = n as u8;
-        self.loading_pct = pct.min(100);
+        self.loading_pct = pct;
         self.loading_region = region;
 
         self.loading_active = true;
@@ -244,6 +253,11 @@ impl AppContext {
     pub fn clear_loading(&mut self) {
         if self.loading_active {
             let region = self.loading_region;
+            log::info!(
+                "ui: clear_loading region={:?} redraw_before={:?}",
+                region,
+                self.redraw
+            );
             self.loading_active = false;
             self.loading_len = 0;
             self.loading_pct = 0;
