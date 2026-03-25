@@ -693,17 +693,63 @@ impl super::Kernel {
         }
         info!("sleep: bookmark flush ({}ms)", t0.elapsed().as_millis());
 
+        // load sleep wallpaper from SD before putting the card to sleep
+        let t0 = Instant::now();
+        let sleep_img = super::sleep_image::load_sleep_image(&self.sd);
+        if sleep_img.is_some() {
+            info!("sleep: wallpaper loaded ({}ms)", t0.elapsed().as_millis());
+        } else {
+            info!("sleep: no wallpaper found ({}ms)", t0.elapsed().as_millis());
+        }
+
         let t0 = Instant::now();
         self.sd_card_sleep();
         info!("sleep: SD card sleep ({}ms)", t0.elapsed().as_millis());
 
         let t0 = Instant::now();
-        self.epd
-            .full_refresh_async(self.strip, &mut self.delay, &|s: &mut StripBuffer| {
-                let style = MonoTextStyle::new(&FONT_9X18, BinaryColor::On);
-                let _ = Text::new("(sleep)", Point::new(210, 400), style).draw(s);
-            })
-            .await;
+        if let Some(ref img) = sleep_img {
+            // render 4-level grayscale wallpaper via dual-plane grayscale pass
+            use crate::drivers::ssd1677::{HEIGHT, RenderState, WIDTH};
+
+            let rs = RenderState {
+                px: 0,
+                py: 0,
+                pw: WIDTH,
+                ph: HEIGHT,
+                left_mask: 0,
+                right_mask: 0,
+            };
+
+            let draw = |s: &mut StripBuffer| {
+                s.blit_2bpp(
+                    &img.data,
+                    0,
+                    img.width as usize,
+                    img.height as usize,
+                    img.stride as usize,
+                    0,
+                    0,
+                    true,
+                );
+            };
+
+            // ensure display is initialized (should be from normal use,
+            // but guard against edge cases like immediate sleep after boot)
+            self.epd.init(&mut self.delay);
+
+            // grayscale_pass writes LSB plane to BW RAM and MSB plane to
+            // RED RAM, then triggers a single refresh with the grayscale LUT.
+            // no preceding full_refresh needed — the pass is self-contained.
+            self.epd.grayscale_pass(self.strip, &rs, &draw).await;
+        } else {
+            // fallback: simple text sleep screen
+            self.epd
+                .full_refresh_async(self.strip, &mut self.delay, &|s: &mut StripBuffer| {
+                    let style = MonoTextStyle::new(&FONT_9X18, BinaryColor::On);
+                    let _ = Text::new("(sleep)", Point::new(210, 400), style).draw(s);
+                })
+                .await;
+        }
         info!("sleep: screen rendered ({}ms)", t0.elapsed().as_millis());
 
         self.epd.enter_deep_sleep();
