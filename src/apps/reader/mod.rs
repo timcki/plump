@@ -44,10 +44,16 @@ pub(super) const MARGIN: u16 = 8;
 // screen edge padding (display clips pixels at very edge)
 pub(super) const SCREEN_PAD: u16 = 4;
 
-// bottom chrome: book title + page/chapter info
+// thin bottom progress bar for page-in-chapter progress
+const BOTTOM_BAR_H: u16 = 7;
+const BOTTOM_BAR_BOTTOM_PAD: u16 = 1;
+const BOTTOM_BAR_Y: u16 = SCREEN_H - BOTTOM_BAR_H - BOTTOM_BAR_BOTTOM_PAD;
+
+// bottom chrome: book title + chapter counter, kept above the progress bar
 pub(super) const CHROME_H: u16 = 18;
 pub(super) const CHROME_PAD: u16 = 2;
-pub(super) const CHROME_Y: u16 = SCREEN_H - CHROME_H - SCREEN_PAD;
+const CHROME_BAR_GAP: u16 = 3;
+pub(super) const CHROME_Y: u16 = BOTTOM_BAR_Y - CHROME_H - CHROME_BAR_GAP;
 
 pub(super) const TEXT_Y: u16 = SCREEN_PAD + 4;
 
@@ -66,6 +72,10 @@ pub(super) const HEADER_REGION: Region = Region::new(MARGIN, CHROME_Y, HEADER_W,
 const STATUS_X: u16 = MARGIN + HEADER_W + 8;
 const STATUS_W: u16 = SCREEN_W - STATUS_X - MARGIN;
 pub(super) const STATUS_REGION: Region = Region::new(STATUS_X, CHROME_Y, STATUS_W, CHROME_H);
+
+const BOTTOM_BAR_W: u16 = SCREEN_W - 2 * SCREEN_PAD;
+pub(super) const BOTTOM_BAR_REGION: Region =
+    Region::new(SCREEN_PAD, BOTTOM_BAR_Y, BOTTOM_BAR_W, BOTTOM_BAR_H);
 
 pub(super) const PAGE_REGION: Region = Region::new(0, 0, SCREEN_W, SCREEN_H);
 
@@ -1275,6 +1285,18 @@ impl ReaderApp {
         ((pos * 100) / size).min(100) as u8
     }
 
+    fn chapter_page_bar_fill_width(&self) -> Option<u16> {
+        if !self.is_epub || self.pg.total_pages == 0 {
+            return None;
+        }
+
+        let page = (self.pg.page + 1).min(self.pg.total_pages);
+        let filled = ((BOTTOM_BAR_REGION.w as usize * page) / self.pg.total_pages)
+            .max(1)
+            .min(BOTTOM_BAR_REGION.w as usize);
+        Some(filled as u16)
+    }
+
     // write extended RECENT file: filename\0title\0author\0progress
     fn write_recent(&mut self, k: &mut KernelHandle<'_>) {
         let mut buf = [0u8; 196];
@@ -1379,6 +1401,26 @@ fn draw_chrome_text(
             .draw(strip)
             .unwrap();
     }
+}
+
+fn draw_bottom_fill_bar(strip: &mut StripBuffer, region: Region, filled_w: u16) {
+    region
+        .to_rect()
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+        .draw(strip)
+        .unwrap();
+
+    if filled_w == 0 {
+        return;
+    }
+
+    Rectangle::new(
+        Point::new(region.x as i32, region.y as i32),
+        Size::new(filled_w as u32, region.h as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+    .draw(strip)
+    .unwrap();
 }
 
 fn draw_truncated_text(
@@ -2171,43 +2213,27 @@ impl App<AppId> for ReaderApp {
                 draw_chrome_text(strip, STATUS_REGION, "Contents", Alignment::CenterRight, cf);
             } else if self.is_epub && !self.epub.spine.is_empty() {
                 let mut sbuf = StackFmt::<40>::new();
+                let mut has_status = false;
                 if self.epub.spine.len() > 1 {
-                    if self.pg.fully_indexed {
-                        let _ = write!(
-                            sbuf,
-                            "Ch{}/{} {}/{}",
-                            self.epub.chapter + 1,
-                            self.epub.spine.len(),
-                            self.pg.page + 1,
-                            self.pg.total_pages
-                        );
-                    } else {
-                        let _ = write!(
-                            sbuf,
-                            "Ch{}/{} p{}",
-                            self.epub.chapter + 1,
-                            self.epub.spine.len(),
-                            self.pg.page + 1
-                        );
-                    }
-                } else if self.pg.fully_indexed {
-                    let _ = write!(sbuf, "{}/{}", self.pg.page + 1, self.pg.total_pages);
-                } else {
-                    let _ = write!(sbuf, "p{}", self.pg.page + 1);
+                    let _ = write!(sbuf, "{}/{}", self.epub.chapter + 1, self.epub.spine.len());
+                    has_status = true;
                 }
                 if self.epub.bg_cache != BgCacheState::Idle {
+                    if has_status {
+                        let _ = write!(sbuf, " ");
+                    }
                     let cached = self.cached_chapter_count();
                     let total = self.epub.spine.len();
                     if cached < total {
-                        let _ = write!(sbuf, " [{}/{}]", cached, total);
+                        let _ = write!(sbuf, "[{}/{}]", cached, total);
                     } else if self.epub.img_found_count > 0 {
                         let _ = write!(
                             sbuf,
-                            " [img {}/{}]",
+                            "[img {}/{}]",
                             self.epub.img_cached_count, self.epub.img_found_count,
                         );
                     } else {
-                        let _ = write!(sbuf, " [img]");
+                        let _ = write!(sbuf, "[img]");
                     }
                 }
                 draw_chrome_text(
@@ -2217,6 +2243,9 @@ impl App<AppId> for ReaderApp {
                     Alignment::CenterRight,
                     cf,
                 );
+                if let Some(filled_w) = self.chapter_page_bar_fill_width() {
+                    draw_bottom_fill_bar(strip, BOTTOM_BAR_REGION, filled_w);
+                }
             } else if self.file_size > 0 {
                 let mut sbuf = StackFmt::<24>::new();
                 if self.pg.fully_indexed {
