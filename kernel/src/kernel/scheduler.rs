@@ -738,24 +738,21 @@ impl super::Kernel {
                 }
             };
 
-            // Clear to solid white with a full GC refresh first. The grayscale
-            // LUT maps 00 to "no change", so white wallpaper pixels only stay
-            // white if the panel is already white underneath.
+            // Establish the base black/white image first, then overlay the
+            // intermediate gray levels with the grayscale LUT. This matches
+            // the normal grayscale text AA flow more closely than a white clear.
             let t1 = Instant::now();
             self.epd
-                .full_refresh_async(self.strip, &mut self.delay, &|_: &mut StripBuffer| {})
+                .full_refresh_async(self.strip, &mut self.delay, &draw)
                 .await;
-            info!(
-                "sleep: wallpaper white clear ({}ms)",
-                t1.elapsed().as_millis()
-            );
+            info!("sleep: wallpaper base BW ({}ms)", t1.elapsed().as_millis());
 
             let t1 = Instant::now();
             // grayscale_pass writes LSB plane to BW RAM and MSB plane to
             // RED RAM, then triggers a single refresh with the grayscale LUT.
             self.epd.grayscale_pass(self.strip, &rs, &draw).await;
             info!(
-                "sleep: wallpaper grayscale pass ({}ms)",
+                "sleep: wallpaper grayscale overlay ({}ms)",
                 t1.elapsed().as_millis()
             );
         } else {
