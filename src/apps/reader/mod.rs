@@ -372,6 +372,7 @@ pub struct ReaderApp {
     pub(super) pending_toc_parse: bool,
     pub(super) pending_title_save: bool,
     pub(super) pending_cover_thumb: bool,
+    pub(super) loading_cover: Option<DecodedImage>,
 
     pub(super) page_img: Option<DecodedImage>,
     pub(super) fullscreen_img: bool,
@@ -439,6 +440,7 @@ impl ReaderApp {
             pending_toc_parse: false,
             pending_title_save: false,
             pending_cover_thumb: false,
+            loading_cover: None,
 
             page_img: None,
             fullscreen_img: false,
@@ -600,6 +602,74 @@ impl ReaderApp {
 
         let content = self.loading_visual_region();
         let bar_w = content.w.saturating_sub(48).max(160);
+
+        if let Some(img) = self.loading_cover.as_ref() {
+            let title_font = title.map(|title| {
+                if title.len() > 28 {
+                    fonts::heading_font(2)
+                } else {
+                    fonts::heading_font(3)
+                }
+            });
+            let title_h = title_font.map_or(0, |font| font.line_height);
+            let pre_stage_gap = if title_h > 0 { 24 + title_h + 14 } else { 18 };
+            let total_h = img
+                .height
+                .saturating_add(pre_stage_gap)
+                .saturating_add(stage_font.line_height)
+                .saturating_add(20)
+                .saturating_add(10);
+            let mut y = content.y + content.h.saturating_sub(total_h) / 2;
+            let img_x = content.x + content.w.saturating_sub(img.width) / 2;
+
+            strip.blit_1bpp(
+                &img.data,
+                0,
+                img.width as usize,
+                img.height as usize,
+                img.stride,
+                img_x as i32,
+                y as i32,
+                true,
+            );
+            y = y.saturating_add(img.height);
+
+            if let Some(title) = title {
+                y = y.saturating_add(24);
+                let font = title_font.unwrap();
+                let title_region = Region::new(content.x, y, content.w, font.line_height);
+                draw_truncated_text(
+                    strip,
+                    font,
+                    title_region,
+                    title,
+                    Alignment::Center,
+                    BinaryColor::On,
+                );
+                y = y.saturating_add(font.line_height).saturating_add(14);
+            } else {
+                y = y.saturating_add(18);
+            }
+
+            let stage_region = Region::new(content.x, y, content.w, stage_font.line_height);
+            let bar_region = Region::new(
+                content.x + (content.w.saturating_sub(bar_w)) / 2,
+                stage_region.y + stage_region.h + 20,
+                bar_w,
+                10,
+            );
+
+            draw_truncated_text(
+                strip,
+                stage_font,
+                stage_region,
+                stage,
+                Alignment::Center,
+                BinaryColor::On,
+            );
+            draw_progress_bar(strip, bar_region, pct);
+            return;
+        }
 
         if let Some(title) = title {
             let title_font = if title.len() > 28 {
@@ -1076,6 +1146,7 @@ impl ReaderApp {
         self.pending_toc_parse = false;
         self.pending_title_save = false;
         self.pending_cover_thumb = false;
+        self.loading_cover = None;
         self.apply_font_metrics();
 
         // reading statistics
@@ -1143,6 +1214,29 @@ impl ReaderApp {
             core::str::from_utf8(&self.title[..self.title_len as usize]).unwrap_or(self.name())
         } else {
             self.name()
+        }
+    }
+
+    fn try_load_cached_cover_thumb(&mut self, k: &mut KernelHandle<'_>) -> bool {
+        if !self.is_epub || self.filename_len == 0 || self.loading_cover.is_some() {
+            return false;
+        }
+
+        let dir_buf =
+            crate::apps::cover_cache::cache_dir_for_filename(&self.filename[..self.filename_len]);
+        let dir = cache::dir_name_str(&dir_buf);
+        self.loading_cover = crate::apps::cover_cache::load_cover_thumb(k, dir);
+
+        if let Some(ref img) = self.loading_cover {
+            log::info!(
+                "reader: loaded cached cover thumb {}x{} for {}",
+                img.width,
+                img.height,
+                self.name()
+            );
+            true
+        } else {
+            false
         }
     }
 
@@ -1315,7 +1409,7 @@ fn draw_truncated_text(
 }
 
 impl App<AppId> for ReaderApp {
-    fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
+    fn on_enter(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
         let msg = ctx.message();
         let len = msg.len().min(32);
         self.filename[..len].copy_from_slice(&msg[..len]);
@@ -1355,8 +1449,11 @@ impl App<AppId> for ReaderApp {
         self.pending_toc_parse = false;
         self.pending_title_save = false;
         self.pending_cover_thumb = false;
+        self.loading_cover = None;
 
         self.apply_font_metrics();
+
+        let _ = self.try_load_cached_cover_thumb(k);
 
         // load existing stats for this book
         self.stats_last_uptime = crate::kernel::uptime_secs();
@@ -1390,6 +1487,7 @@ impl App<AppId> for ReaderApp {
         self.pending_toc_parse = false;
         self.pending_title_save = false;
         self.pending_cover_thumb = false;
+        self.loading_cover = None;
         self.show_position = false;
         self.epub.ch_cache = Vec::new();
         self.page_img = None;
@@ -1438,6 +1536,9 @@ impl App<AppId> for ReaderApp {
                     let t0 = Instant::now();
                     self.bookmark_load(k.bookmark_cache());
                     self.stats_load(k);
+                    if self.try_load_cached_cover_thumb(k) {
+                        ctx.mark_dirty(self.loading_visual_region());
+                    }
 
                     if self.is_epub {
                         self.epub.zip.clear();
