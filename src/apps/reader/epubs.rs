@@ -342,6 +342,40 @@ impl EpubState {
 }
 
 impl ReaderApp {
+    pub(super) fn try_prefill_title_from_cache_header(&mut self, k: &mut KernelHandle<'_>) -> bool {
+        let cf = self.epub.cache_file;
+        let cf_str = cache::cache_filename_str(&cf);
+        let mut hdr_buf = [0u8; cache::HEADER_SIZE];
+
+        let Ok(n) = k.read_cache_chunk(cf_str, 0, &mut hdr_buf) else {
+            return false;
+        };
+        if n < cache::HEADER_SIZE {
+            return false;
+        }
+
+        let Ok(hdr) = cache::parse_v3_header(&hdr_buf) else {
+            return false;
+        };
+        if hdr.epub_size != self.epub.archive_size
+            || hdr.name_hash != self.epub.name_hash
+            || !hdr.chapters_complete()
+            || hdr.title_len == 0
+        {
+            return false;
+        }
+
+        let n = (hdr.title_len as usize).min(self.title.len());
+        self.title[..n].copy_from_slice(&hdr.title[..n]);
+        self.title_len = n as u8;
+        self.title_is_real = true;
+        log::info!(
+            "epub: prefilling title from cache header: {}",
+            hdr.title_str()
+        );
+        true
+    }
+
     pub(super) fn epub_init_opf(&mut self, k: &mut KernelHandle<'_>) -> crate::error::Result<()> {
         let (nb, nl) = self.name_copy();
         let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
@@ -404,6 +438,7 @@ impl ReaderApp {
             let n = tlen.min(self.title.len());
             self.title[..n].copy_from_slice(&self.epub.meta.title[..n]);
             self.title_len = n as u8;
+            self.title_is_real = true;
         }
 
         self.epub.toc = None;

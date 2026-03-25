@@ -494,8 +494,11 @@ impl AppManager {
         let active = self.launcher.active();
         with_app_ref!(active, self, |app| app.draw(strip));
 
-        // loading indicator: after app content, before overlays
-        if self.launcher.ctx.loading_active() {
+        // loading indicator: after app content, before overlays.
+        // the reader draws its own centered loading screen while a
+        // book is opening, so suppress the generic indicator there.
+        let suppress_loading = active == AppId::Reader && self.reader.shows_loading_screen();
+        if self.launcher.ctx.loading_active() && !suppress_loading {
             let region = self.launcher.ctx.loading_region();
             if region.intersects(strip.logical_window()) {
                 crate::ui::draw_loading_indicator(

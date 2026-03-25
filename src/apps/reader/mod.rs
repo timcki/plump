@@ -352,6 +352,7 @@ pub struct ReaderApp {
     pub(super) filename_len: usize,
     pub(super) title: [u8; 64],
     pub(super) title_len: u8,
+    pub(super) title_is_real: bool,
     pub(super) file_size: u32,
 
     pub(super) pg: PageState,
@@ -418,6 +419,7 @@ impl ReaderApp {
             filename_len: 0,
             title: [0u8; 64],
             title_len: 0,
+            title_is_real: false,
             file_size: 0,
 
             pg: PageState::new(),
@@ -520,6 +522,34 @@ impl ReaderApp {
         matches!(self.state, State::Ready | State::ShowToc)
     }
 
+    pub fn shows_loading_screen(&self) -> bool {
+        !matches!(self.state, State::Ready | State::ShowToc | State::Error)
+    }
+
+    fn loading_visual_region(&self) -> Region {
+        Region::new(
+            self.text_margin,
+            self.text_y,
+            self.text_w as u16,
+            self.text_area_h,
+        )
+    }
+
+    fn set_loading_ui(&self, ctx: &mut AppContext, msg: &str, pct: u8) {
+        ctx.set_loading(LOADING_REGION, msg, pct);
+        if self.shows_loading_screen() {
+            ctx.mark_dirty(self.loading_visual_region());
+        }
+    }
+
+    fn loading_title(&self) -> Option<&str> {
+        if self.title_is_real && self.title_len > 0 {
+            Some(self.display_name())
+        } else {
+            None
+        }
+    }
+
     fn loading_visual(&self) -> (&'static str, u8) {
         match self.state {
             State::NeedBookmark => ("Opening book", 0),
@@ -564,54 +594,72 @@ impl ReaderApp {
             return;
         }
 
-        let title = self.display_name();
-        let title_font = if title.len() > 28 {
-            fonts::heading_font(2)
-        } else {
-            fonts::heading_font(3)
-        };
+        let title = self.loading_title();
         let stage_font = fonts::body_font(1);
         let (stage, pct) = self.loading_visual();
 
-        let content = Region::new(
-            self.text_margin,
-            self.text_y,
-            self.text_w as u16,
-            self.text_area_h,
-        );
-        let title_y = content.y + content.h / 3;
-        let title_region = Region::new(content.x, title_y, content.w, title_font.line_height);
-        let stage_region = Region::new(
-            content.x,
-            title_region.y + title_region.h + 14,
-            content.w,
-            stage_font.line_height,
-        );
+        let content = self.loading_visual_region();
         let bar_w = content.w.saturating_sub(48).max(160);
-        let bar_region = Region::new(
-            content.x + (content.w.saturating_sub(bar_w)) / 2,
-            stage_region.y + stage_region.h + 20,
-            bar_w,
-            10,
-        );
 
-        draw_truncated_text(
-            strip,
-            title_font,
-            title_region,
-            title,
-            Alignment::Center,
-            BinaryColor::On,
-        );
-        draw_truncated_text(
-            strip,
-            stage_font,
-            stage_region,
-            stage,
-            Alignment::Center,
-            BinaryColor::On,
-        );
-        draw_progress_bar(strip, bar_region, pct);
+        if let Some(title) = title {
+            let title_font = if title.len() > 28 {
+                fonts::heading_font(2)
+            } else {
+                fonts::heading_font(3)
+            };
+            let title_y = content.y + content.h / 3;
+            let title_region = Region::new(content.x, title_y, content.w, title_font.line_height);
+            let stage_region = Region::new(
+                content.x,
+                title_region.y + title_region.h + 14,
+                content.w,
+                stage_font.line_height,
+            );
+            let bar_region = Region::new(
+                content.x + (content.w.saturating_sub(bar_w)) / 2,
+                stage_region.y + stage_region.h + 20,
+                bar_w,
+                10,
+            );
+
+            draw_truncated_text(
+                strip,
+                title_font,
+                title_region,
+                title,
+                Alignment::Center,
+                BinaryColor::On,
+            );
+            draw_truncated_text(
+                strip,
+                stage_font,
+                stage_region,
+                stage,
+                Alignment::Center,
+                BinaryColor::On,
+            );
+            draw_progress_bar(strip, bar_region, pct);
+        } else {
+            let heading_font = fonts::heading_font(2);
+            let stage_y = content.y + content.h / 3 + 6;
+            let stage_region = Region::new(content.x, stage_y, content.w, heading_font.line_height);
+            let bar_region = Region::new(
+                content.x + (content.w.saturating_sub(bar_w)) / 2,
+                stage_region.y + stage_region.h + 22,
+                bar_w,
+                10,
+            );
+
+            draw_truncated_text(
+                strip,
+                heading_font,
+                stage_region,
+                stage,
+                Alignment::Center,
+                BinaryColor::On,
+            );
+            draw_progress_bar(strip, bar_region, pct);
+        }
     }
 
     pub fn has_bg_work(&self) -> bool {
@@ -639,7 +687,7 @@ impl ReaderApp {
     }
 
     fn save_title_mapping(&self, k: &mut KernelHandle<'_>) {
-        if self.title_len == 0 || self.filename_len == 0 {
+        if !self.title_is_real || self.title_len == 0 || self.filename_len == 0 {
             return;
         }
 
@@ -994,6 +1042,7 @@ impl ReaderApp {
         let n = self.filename_len.min(self.title.len());
         self.title[..n].copy_from_slice(&self.filename[..n]);
         self.title_len = n as u8;
+        self.title_is_real = false;
 
         self.is_epub = is_epub;
         self.epub.chapter = chapter;
@@ -1275,6 +1324,7 @@ impl App<AppId> for ReaderApp {
         let n = self.filename_len.min(self.title.len());
         self.title[..n].copy_from_slice(&self.filename[..n]);
         self.title_len = n as u8;
+        self.title_is_real = false;
 
         // Bump to a new work-queue generation and drain stale work
         // from any previous book (covers the case where on_enter is
@@ -1316,7 +1366,7 @@ impl App<AppId> for ReaderApp {
 
         log::info!("reader: opening {}", self.name());
 
-        ctx.set_loading(LOADING_REGION, "Opening", 0);
+        self.set_loading_ui(ctx, "Opening", 0);
         ctx.mark_dirty(PAGE_REGION);
     }
 
@@ -1396,10 +1446,10 @@ impl App<AppId> for ReaderApp {
                         self.epub.chapters_cached = false;
                         self.goto_last_page = false;
                         self.state = State::NeedInit;
-                        ctx.set_loading(LOADING_REGION, "Loading", 10);
+                        self.set_loading_ui(ctx, "Loading", 10);
                     } else {
                         self.state = State::NeedPage;
-                        ctx.set_loading(LOADING_REGION, "Loading", 50);
+                        self.set_loading_ui(ctx, "Loading", 50);
                     }
                     log::info!(
                         "reader:bg NeedBookmark -> {:?} loading='{}' pct={} ({}ms)",
@@ -1417,8 +1467,9 @@ impl App<AppId> for ReaderApp {
                     let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
                     match self.epub.init_zip(k, name, &mut self.pg.buf) {
                         Ok(()) => {
+                            self.try_prefill_title_from_cache_header(k);
                             self.state = State::NeedOpf;
-                            ctx.set_loading(LOADING_REGION, "Loading", 25);
+                            self.set_loading_ui(ctx, "Loading", 25);
                             log::info!(
                                 "reader:bg NeedInit -> {:?} loading='{}' pct={} ({}ms)",
                                 self.state,
@@ -1451,10 +1502,10 @@ impl App<AppId> for ReaderApp {
                             // defer RECENT/title/TOC/cover work until after
                             // the first page is visible.
                             self.pending_recent_write = true;
-                            self.pending_title_save = self.title_len > 0;
+                            self.pending_title_save = self.title_is_real;
                             self.pending_cover_thumb = self.epub.meta.has_cover();
                             self.state = State::NeedToc;
-                            ctx.set_loading(LOADING_REGION, "Loading", 40);
+                            self.set_loading_ui(ctx, "Loading", 40);
                             log::info!(
                                 "reader:bg NeedOpf -> {:?} loading='{}' pct={} ({}ms)",
                                 self.state,
@@ -1479,7 +1530,7 @@ impl App<AppId> for ReaderApp {
                     let t0 = Instant::now();
                     self.pending_toc_parse = self.epub.toc_source.is_some();
                     self.state = State::NeedCache;
-                    ctx.set_loading(LOADING_REGION, "Caching", 55);
+                    self.set_loading_ui(ctx, "Caching", 55);
                     log::info!(
                         "reader:bg NeedToc -> {:?} loading='{}' pct={} ({}ms)",
                         self.state,
@@ -1494,7 +1545,7 @@ impl App<AppId> for ReaderApp {
                     match self.epub.check_cache(k, &mut self.pg.buf) {
                         Ok(true) => {
                             self.state = State::NeedIndex;
-                            ctx.set_loading(LOADING_REGION, "Indexing", 75);
+                            self.set_loading_ui(ctx, "Indexing", 75);
                             log::info!(
                                 "reader:bg NeedCache(cache-hit) -> {:?} loading='{}' pct={} ({}ms)",
                                 self.state,
@@ -1525,7 +1576,7 @@ impl App<AppId> for ReaderApp {
                                     }
 
                                     self.state = State::NeedIndex;
-                                    ctx.set_loading(LOADING_REGION, "Indexing", 75);
+                                    self.set_loading_ui(ctx, "Indexing", 75);
                                     log::info!(
                                         "reader:bg NeedCache(cache-build) -> {:?} loading='{}' pct={} ({}ms)",
                                         self.state,
@@ -1617,7 +1668,7 @@ impl App<AppId> for ReaderApp {
                         }
                     } else {
                         self.state = State::NeedPage;
-                        ctx.set_loading(LOADING_REGION, "Loading page", 90);
+                        self.set_loading_ui(ctx, "Loading page", 90);
                         log::info!(
                             "reader:bg NeedIndex -> {:?} loading='{}' pct={} ({}ms)",
                             self.state,
@@ -2006,7 +2057,7 @@ impl App<AppId> for ReaderApp {
         let cf = self.chrome_font;
         let gray_pass = strip.gray_mode() != GrayMode::Bw;
 
-        if self.show_chrome && !gray_pass {
+        if self.show_chrome && !gray_pass && matches!(self.state, State::Ready | State::ShowToc) {
             draw_chrome_text(
                 strip,
                 HEADER_REGION,
@@ -2095,9 +2146,9 @@ impl App<AppId> for ReaderApp {
             return;
         }
 
-        // loading states: keep the kernel loading indicator for the
-        // precise status text, but also draw a centered title +
-        // progress block so the screen does not feel empty.
+        // loading states: draw a centered loading screen and hide the
+        // normal reader chrome so the page feels intentional instead
+        // of showing duplicated filename/progress UI.
         if self.state != State::Ready && self.state != State::Error && self.state != State::ShowToc
         {
             self.draw_loading_screen(strip);
