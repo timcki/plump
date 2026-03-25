@@ -30,6 +30,10 @@ pub const CHUNK_COUNT: usize = 6;
 /// Rows per chunk (last chunk may have fewer).
 const ROWS_PER_CHUNK: usize = (IMG_H + CHUNK_COUNT - 1) / CHUNK_COUNT; // 134
 
+/// Target cap for a temporary batched SD read buffer.
+/// This stays on the heap so we don't eat into the ~11KB stack margin.
+const MAX_BATCH_BYTES: usize = 16 * 1024;
+
 /// 2bpp packed grayscale image ready for `blit_2bpp`, stored in chunks.
 /// Pixel values: 0=white, 1=light gray, 2=dark gray, 3=black.
 pub struct SleepImage {
@@ -143,6 +147,53 @@ fn parse_header(sd: &SdStorage) -> Option<(u32, u16, [u8; MAX_PALETTE])> {
     Some((pixel_offset, bpp, palette_lum))
 }
 
+#[inline]
+fn bmp_row_stride(bpp: u16) -> Option<usize> {
+    match bpp {
+        8 => Some(IMG_W),
+        24 => Some((IMG_W * 3 + 3) & !3),
+        1 => Some(((IMG_W + 31) / 32) * 4),
+        _ => None,
+    }
+}
+
+fn alloc_read_batch(row_stride: usize) -> Option<Vec<u8>> {
+    let mut rows = (MAX_BATCH_BYTES / row_stride).max(1);
+    let target_rows = rows;
+
+    loop {
+        let len = rows * row_stride;
+        let mut buf = Vec::new();
+        match buf.try_reserve_exact(len) {
+            Ok(()) => {
+                buf.resize(len, 0);
+                if rows < target_rows {
+                    info!(
+                        "sleep_image: using reduced read batch ({} rows, {} bytes)",
+                        rows, len
+                    );
+                }
+                return Some(buf);
+            }
+            Err(_) if rows > 1 => {
+                let next_rows = (rows / 2).max(1);
+                info!(
+                    "sleep_image: read batch alloc failed at {} bytes, retrying with {} rows",
+                    len, next_rows
+                );
+                rows = next_rows;
+            }
+            Err(_) => {
+                info!(
+                    "sleep_image: failed to allocate even a 1-row read batch ({} bytes)",
+                    len
+                );
+                return None;
+            }
+        }
+    }
+}
+
 /// Quantize a luminance value to the nearest of the 4 gray levels.
 /// Returns (quantized_level 0..3, quantized_luminance 0/85/170/255).
 #[inline]
@@ -158,56 +209,43 @@ fn quantize4(lum: i16) -> (u8, i16) {
     }
 }
 
-/// Read BMP row data for a single row and convert to luminance values.
-/// BMP rows are bottom-up, so `bmp_row` 0 is the bottom of the image.
-fn read_row_lum(
-    sd: &SdStorage,
-    pixel_offset: u32,
-    bmp_row: usize,
+/// Convert one BMP row already loaded in memory into per-pixel luminance values.
+fn decode_row_lum(
+    row: &[u8],
     bpp: u16,
     palette_lum: &[u8; MAX_PALETTE],
     lum_out: &mut [i16; IMG_W],
 ) -> bool {
     match bpp {
         8 => {
-            let row_stride = IMG_W; // 480 bytes, already 4-byte aligned
-            let offset = pixel_offset + (bmp_row * row_stride) as u32;
-            let mut row_buf = [0u8; IMG_W];
-            if storage::read_file_chunk(sd, FILENAME, offset, &mut row_buf).is_err() {
+            if row.len() < IMG_W {
                 return false;
             }
             for x in 0..IMG_W {
-                lum_out[x] = palette_lum[row_buf[x] as usize] as i16;
+                lum_out[x] = palette_lum[row[x] as usize] as i16;
             }
             true
         }
         24 => {
-            let row_stride = (IMG_W * 3 + 3) & !3; // pad to 4 bytes
-            let offset = pixel_offset + (bmp_row * row_stride) as u32;
-            let mut row_buf = [0u8; IMG_W * 3 + 3]; // 1443 bytes max
-            let read_len = row_stride;
-            if storage::read_file_chunk(sd, FILENAME, offset, &mut row_buf[..read_len]).is_err() {
+            if row.len() < IMG_W * 3 {
                 return false;
             }
             for x in 0..IMG_W {
                 let off = x * 3;
-                let b = row_buf[off] as u32;
-                let g = row_buf[off + 1] as u32;
-                let r = row_buf[off + 2] as u32;
+                let b = row[off] as u32;
+                let g = row[off + 1] as u32;
+                let r = row[off + 2] as u32;
                 lum_out[x] = ((77 * r + 150 * g + 29 * b) >> 8) as i16;
             }
             true
         }
         1 => {
-            let row_stride = ((IMG_W + 31) / 32) * 4; // pad to 4 bytes
-            let offset = pixel_offset + (bmp_row * row_stride) as u32;
-            let mut row_buf = [0u8; (IMG_W + 7) / 8 + 4]; // 64 bytes
-            if storage::read_file_chunk(sd, FILENAME, offset, &mut row_buf[..row_stride]).is_err()
-            {
+            let min_len = (IMG_W + 7) / 8;
+            if row.len() < min_len {
                 return false;
             }
             for x in 0..IMG_W {
-                let bit = (row_buf[x / 8] >> (7 - (x & 7))) & 1;
+                let bit = (row[x / 8] >> (7 - (x & 7))) & 1;
                 lum_out[x] = palette_lum[bit as usize] as i16;
             }
             true
@@ -219,11 +257,13 @@ fn read_row_lum(
 /// Load `SLEEP.BMP` from SD root and convert to 2bpp grayscale via
 /// Atkinson dithering. Returns `None` if the file is missing or invalid.
 ///
-/// Reads row-by-row from SD to avoid holding the full BMP in RAM.
+/// Reads BMP rows in heap-backed batches to avoid the 800 open/seek/read
+/// cycles of row-at-a-time loading while still keeping stack usage flat.
 /// Output is 96,000 bytes (480×800 at 2 bits per pixel) split across
 /// 6 chunks of ~16KB each, packed MSB-first (4 pixels per byte).
 pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
     let (pixel_offset, bpp, palette_lum) = parse_header(sd)?;
+    let row_stride = bmp_row_stride(bpp)?;
     info!(
         "sleep_image: {}x{} {}bpp, pixel data at offset {}",
         IMG_W, IMG_H, bpp, pixel_offset
@@ -240,71 +280,110 @@ pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
         vec![0u8; rows * OUT_STRIDE]
     });
 
+    // allocate the temporary read buffer after the output chunks so the
+    // permanent image storage gets first pick of the heap; if this extra
+    // batch buffer cannot fit we back off to smaller batches instead of OOMing.
+    let mut read_batch = alloc_read_batch(row_stride)?;
+    let batch_rows = read_batch.len() / row_stride;
+    info!(
+        "sleep_image: row_stride={} batch_rows={} batch_bytes={}",
+        row_stride,
+        batch_rows,
+        read_batch.len()
+    );
+
     // Atkinson dithering needs error buffers for current + next + next-next row.
     // We process BMP rows bottom-up (row 799..0 in BMP order) and write
     // output top-down (output row 0 = BMP row 799).
     let mut err: [[i16; IMG_W]; 3] = [[0i16; IMG_W]; 3];
     let mut cur = 0usize;
+    let mut out_y = 0usize;
 
-    for out_y in 0..IMG_H {
-        let bmp_row = IMG_H - 1 - out_y;
+    while out_y < IMG_H {
+        let rows = batch_rows.min(IMG_H - out_y);
+        let first_bmp_row = IMG_H - out_y - rows;
+        let batch_len = rows * row_stride;
+        let offset = pixel_offset + (first_bmp_row * row_stride) as u32;
 
-        let mut lum = [0i16; IMG_W];
-        if !read_row_lum(sd, pixel_offset, bmp_row, bpp, &palette_lum, &mut lum) {
-            info!("sleep_image: read error at row {}", bmp_row);
-            return None;
-        }
-
-        // add accumulated error from previous rows
-        for x in 0..IMG_W {
-            lum[x] = (lum[x] + err[cur][x]).clamp(0, 255);
-        }
-
-        // clear current error row for reuse as the row-after-next
-        err[cur] = [0i16; IMG_W];
-
-        let next = (cur + 1) % 3;
-        let next2 = (cur + 2) % 3;
-
-        // find the correct chunk and row within it
-        let chunk_idx = (out_y / ROWS_PER_CHUNK).min(CHUNK_COUNT - 1);
-        let row_in_chunk = out_y - chunk_idx * ROWS_PER_CHUNK;
-        let out_row =
-            &mut chunks[chunk_idx][row_in_chunk * OUT_STRIDE..(row_in_chunk + 1) * OUT_STRIDE];
-
-        // quantize + Atkinson error diffusion
-        for x in 0..IMG_W {
-            let (level, quant_lum) = quantize4(lum[x]);
-            let error = (lum[x] - quant_lum) / 8;
-
-            // pack 2bpp: MSB first, 4 pixels per byte
-            let byte_idx = x / 4;
-            let shift = 6 - (x & 3) * 2;
-            out_row[byte_idx] |= level << shift;
-
-            // Atkinson diffusion to 6 neighbors:
-            //       *   1/8  1/8
-            // 1/8  1/8  1/8
-            //       1/8
-            if error != 0 {
-                if x + 1 < IMG_W {
-                    lum[x + 1] += error;
-                }
-                if x + 2 < IMG_W {
-                    lum[x + 2] += error;
-                }
-                if x > 0 {
-                    err[next][x - 1] += error;
-                }
-                err[next][x] += error;
-                if x + 1 < IMG_W {
-                    err[next][x + 1] += error;
-                }
-                err[next2][x] += error;
+        match storage::read_file_chunk(sd, FILENAME, offset, &mut read_batch[..batch_len]) {
+            Ok(n) if n == batch_len => {}
+            Ok(n) => {
+                info!(
+                    "sleep_image: short read at row {} (got {}, need {})",
+                    first_bmp_row, n, batch_len
+                );
+                return None;
+            }
+            Err(_) => {
+                info!("sleep_image: read error at row {}", first_bmp_row);
+                return None;
             }
         }
 
-        cur = next;
+        // read a contiguous bottom-up BMP span, then process the rows in
+        // reverse so output remains top-down for the dither state machine.
+        for batch_row in (0..rows).rev() {
+            let bmp_row = first_bmp_row + batch_row;
+            let row = &read_batch[batch_row * row_stride..(batch_row + 1) * row_stride];
+
+            let mut lum = [0i16; IMG_W];
+            if !decode_row_lum(row, bpp, &palette_lum, &mut lum) {
+                info!("sleep_image: decode error at row {}", bmp_row);
+                return None;
+            }
+
+            // add accumulated error from previous rows
+            for x in 0..IMG_W {
+                lum[x] = (lum[x] + err[cur][x]).clamp(0, 255);
+            }
+
+            // clear current error row for reuse as the row-after-next
+            err[cur].fill(0);
+
+            let next = (cur + 1) % 3;
+            let next2 = (cur + 2) % 3;
+
+            // find the correct chunk and row within it
+            let chunk_idx = (out_y / ROWS_PER_CHUNK).min(CHUNK_COUNT - 1);
+            let row_in_chunk = out_y - chunk_idx * ROWS_PER_CHUNK;
+            let out_row =
+                &mut chunks[chunk_idx][row_in_chunk * OUT_STRIDE..(row_in_chunk + 1) * OUT_STRIDE];
+
+            // quantize + Atkinson error diffusion
+            for x in 0..IMG_W {
+                let (level, quant_lum) = quantize4(lum[x]);
+                let error = (lum[x] - quant_lum) / 8;
+
+                // pack 2bpp: MSB first, 4 pixels per byte
+                let byte_idx = x / 4;
+                let shift = 6 - (x & 3) * 2;
+                out_row[byte_idx] |= level << shift;
+
+                // Atkinson diffusion to 6 neighbors:
+                //       *   1/8  1/8
+                // 1/8  1/8  1/8
+                //       1/8
+                if error != 0 {
+                    if x + 1 < IMG_W {
+                        lum[x + 1] += error;
+                    }
+                    if x + 2 < IMG_W {
+                        lum[x + 2] += error;
+                    }
+                    if x > 0 {
+                        err[next][x - 1] += error;
+                    }
+                    err[next][x] += error;
+                    if x + 1 < IMG_W {
+                        err[next][x + 1] += error;
+                    }
+                    err[next2][x] += error;
+                }
+            }
+
+            cur = next;
+            out_y += 1;
+        }
     }
 
     info!(
