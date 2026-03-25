@@ -131,11 +131,20 @@ impl FilesApp {
         self.total
     }
 
+    // restore files state from RTC session data
+    //
+    // sets up ALL state needed to resume without calling on_enter().
+    // on_enter() would reset scroll=0 and selected=0, clobbering
+    // the restored cursor position.
     pub fn restore_state(&mut self, scroll: usize, selected: usize, total: usize) {
         self.scroll = scroll;
         self.selected = selected;
         self.total = total;
-        self.needs_load = true; // trigger page reload
+        self.needs_load = true; // trigger page reload from SD
+        self.stale_cache = true; // dir cache needs refresh
+        self.error = None;
+        self.title_scan_idx = 0;
+        self.title_scanning = true;
         log::info!(
             "files: restore_state scroll={} selected={} total={}",
             scroll,

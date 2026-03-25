@@ -249,6 +249,13 @@ impl AppManager {
     }
 
     // restore session from RTC memory; returns true if successful
+    //
+    // IMPORTANT: this does NOT call on_enter() on any app. the previous
+    // code called on_enter() after restore_state(), which clobbered the
+    // restored values (home.selected, files.scroll, reader.chapter, etc).
+    // instead, each app's restore_state() is now responsible for setting
+    // up ALL state needed to resume, and the reader enters at NeedBookmark
+    // with its chapter/offset pre-populated from the RTC session.
     pub fn apply_session(
         &mut self,
         session: &crate::kernel::rtc_session::RtcSession,
@@ -281,12 +288,16 @@ impl AppManager {
         );
 
         // restore home state (always in stack)
+        // restore_state sets state/selected/bm cursors without
+        // resetting them like on_enter() would
         self.home.restore_state(
             session.home_state,
             session.home_selected as usize,
             session.home_bm_selected as usize,
             session.home_bm_scroll as usize,
         );
+        // battery percentage for status display
+        self.home.set_battery(k.battery_mv());
 
         // restore files state if in stack
         if self.launcher.contains(AppId::Files) {
@@ -310,58 +321,27 @@ impl AppManager {
             );
         }
 
-        // propagate fonts before entering apps
+        // propagate fonts (uses settings already loaded)
         self.propagate_fonts();
 
-        // enter apps in stack order (bottom to top)
-        // Home is always at bottom
-        self.home.on_enter(&mut self.launcher.ctx, k);
-
-        // for apps above Home, call on_suspend for suspended ones, on_enter for active
-        let depth = self.launcher.depth();
-        for i in 1..depth {
-            let app_id = self.launcher.stack_at(i);
-            let is_active = i == depth - 1;
-
-            match app_id {
-                AppId::Files => {
-                    if is_active {
-                        self.files.on_enter(&mut self.launcher.ctx, k);
-                    } else {
-                        // Files was pushed then another app pushed on top
-                        self.files.on_enter(&mut self.launcher.ctx, k);
-                        self.files.on_suspend();
-                    }
-                }
-                AppId::Reader => {
-                    if is_active {
-                        // set message for reader to know filename
-                        let filename =
-                            &session.reader_filename[..session.reader_filename_len as usize];
-                        self.launcher.ctx.set_message(filename);
-                        self.reader.on_enter(&mut self.launcher.ctx, k);
-                    }
-                }
-                AppId::Settings => {
-                    if is_active {
-                        self.settings.on_enter(&mut self.launcher.ctx, k);
-                    }
-                }
-                _ => {}
-            }
-
-            // suspend apps that aren't the top
-            if !is_active {
-                match app_id {
-                    AppId::Home => self.home.on_suspend(),
-                    AppId::Files => {} // already handled above
-                    _ => {}
-                }
-            }
+        // set loading indicator for reader if it's the active app,
+        // so the first frame shows "Opening" instead of blank content
+        if self.launcher.active() == AppId::Reader {
+            self.launcher.ctx.set_loading(
+                crate::apps::reader::LOADING_REGION,
+                "Resuming",
+                0,
+            );
         }
 
-        // mark full redraw needed
+        // mark full redraw needed — the next render will draw the
+        // active app's content using the restored state
         self.launcher.ctx.request_full_redraw();
+
+        log::info!(
+            "session: restore complete, active={:?}",
+            self.launcher.active()
+        );
 
         true
     }

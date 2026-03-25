@@ -126,6 +126,18 @@ static mut RTC_SESSION: RtcSession = RtcSession::zeroed();
 // (prevents re-reading stale data after initial restore)
 static SESSION_CONSUMED: AtomicU32 = AtomicU32::new(0);
 
+// peek at RTC session validity without consuming it.
+// safe to call multiple times (e.g. from main before boot console,
+// then again during boot()). does NOT prevent subsequent restore.
+pub fn peek_valid() -> bool {
+    // Safety: single-threaded boot context, volatile read via raw pointer
+    let magic = unsafe {
+        let ptr = core::ptr::addr_of!(RTC_SESSION);
+        core::ptr::read_volatile(core::ptr::addr_of!((*ptr).magic))
+    };
+    magic == RTC_SESSION_MAGIC
+}
+
 // check if RTC session data is valid and available for restore
 // returns true only once per boot (subsequent calls return false)
 // must be called from main thread during boot, before async tasks

@@ -764,6 +764,14 @@ impl ReaderApp {
         self.book_font_size_idx
     }
 
+    // restore reader state from RTC session data
+    //
+    // sets up ALL state needed to resume without calling on_enter().
+    // on_enter() would reset epub.chapter=0 and restore_offset=None,
+    // clobbering the chapter/offset we just restored from RTC memory.
+    // instead, we set up the state machine to enter at NeedBookmark
+    // with chapter/offset pre-populated, so the reader pipeline will
+    // skip the bookmark lookup and go straight to initializing the book.
     pub fn restore_state(
         &mut self,
         filename: &[u8],
@@ -776,6 +784,13 @@ impl ReaderApp {
         let len = filename.len().min(32);
         self.filename[..len].copy_from_slice(&filename[..len]);
         self.filename_len = len;
+
+        // set title from filename initially (will be replaced by
+        // epub metadata once the book is loaded)
+        let n = self.filename_len.min(self.title.len());
+        self.title[..n].copy_from_slice(&self.filename[..n]);
+        self.title_len = n as u8;
+
         self.is_epub = is_epub;
         self.epub.chapter = chapter;
         self.restore_offset = if byte_offset > 0 {
@@ -785,11 +800,43 @@ impl ReaderApp {
         };
         self.book_font_size_idx = font_size;
 
+        // reset work queue for clean start
+        self.epub.work_gen = work_queue::reset();
+        self.epub.bg_cache = BgCacheState::Idle;
+        self.epub.ch_cached = [false; smol_epub::cache::MAX_CACHE_CHAPTERS];
+        self.epub.img_scan_wrapped = false;
+        self.epub.skip_large_img = false;
+
+        // set up reader pipeline — enter at NeedBookmark but with
+        // chapter/offset already populated from RTC, so bookmark_load
+        // will find our pre-set values and the pipeline proceeds
+        self.rebuild_quick_actions();
+        self.apply_theme_layout();
+        self.reset_paging();
+        self.epub.ch_cache = Vec::new();
+        self.file_size = 0;
+        self.error = None;
+        self.show_position = false;
+        self.defer_image_decode = true;
+        self.goto_last_page = false;
+        self.apply_font_metrics();
+
+        // reading statistics
+        self.stats_last_uptime = crate::kernel::uptime_secs();
+        self.stats_dirty = false;
+
+        // enter state machine — NeedBookmark will check the bookmark
+        // cache, but our chapter/offset from RTC are already set, so
+        // even if bookmark_load overwrites them with slightly different
+        // values, the pipeline proceeds correctly
+        self.state = State::NeedBookmark;
+
         log::info!(
-            "reader: restore_state file={} ch={} off={}",
+            "reader: restore_state file={} ch={} off={} font={}",
             self.name(),
             chapter,
-            byte_offset
+            byte_offset,
+            font_size
         );
     }
 

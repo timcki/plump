@@ -146,8 +146,16 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     );
 
     console.push("kernel: constructed");
-    kernel.show_boot_console(&console).await;
-    drop(console); // reclaim ~3 KB of heap
+
+    // skip boot console on valid RTC wake — saves one full EPD refresh
+    // (~1.6s). the console is only useful for cold boot diagnostics.
+    if kernel.has_valid_rtc_session() {
+        info!("boot: skipping boot console (RTC session valid)");
+        drop(console); // reclaim ~3 KB of heap
+    } else {
+        kernel.show_boot_console(&console).await;
+        drop(console); // reclaim ~3 KB of heap
+    }
 
     kernel.boot(&mut app_mgr).await;
 

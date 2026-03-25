@@ -166,7 +166,17 @@ impl HomeApp {
         self.bm_scroll
     }
 
+    // set battery percentage for status display (used by session restore
+    // since on_enter is not called during restore)
+    pub fn set_battery(&mut self, battery_mv: u16) {
+        self.bat_pct = battery::battery_percentage(battery_mv);
+    }
+
     // restore home state from RTC session data
+    //
+    // this sets up ALL state needed to resume without calling on_enter().
+    // on_enter() would reset state=Menu and selected=0, clobbering
+    // the restored values.
     pub fn restore_state(
         &mut self,
         state_id: u8,
@@ -181,6 +191,9 @@ impl HomeApp {
         self.selected = selected;
         self.bm_selected = bm_selected;
         self.bm_scroll = bm_scroll;
+
+        // trigger background loads for data we need to display
+        self.needs_load_recent = true;
         if self.state == HomeState::ShowBookmarks {
             self.needs_load_bookmarks = true;
         }

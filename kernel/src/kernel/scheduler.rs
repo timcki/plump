@@ -47,21 +47,38 @@ impl super::Kernel {
             .await;
     }
 
+    // check for valid RTC session early (before boot console) so we
+    // can skip the console render on fast wake. call this from main()
+    // before show_boot_console().
+    pub fn has_valid_rtc_session(&self) -> bool {
+        use super::rtc_session;
+        // peek at RTC memory without consuming the session
+        rtc_session::peek_valid()
+    }
+
     // one-time boot: load caches, settings, render the home screen
     // if waking from deep sleep with valid RTC session, restore it
     pub async fn boot<A: AppLayer>(&mut self, app_mgr: &mut A) {
         use super::rtc_session;
+        use embassy_time::Instant;
 
+        let boot_start = Instant::now();
+
+        let t0 = Instant::now();
         self.bm_cache.ensure_loaded(&self.sd);
+        let bm_ms = t0.elapsed().as_millis();
+        info!("boot: bookmark cache loaded ({}ms)", bm_ms);
 
         // check for valid RTC session before loading settings
         // (session may contain cached settings to skip SD reads)
+        let t0 = Instant::now();
         let has_rtc_session = rtc_session::is_valid_session();
         let rtc_session_data = if has_rtc_session {
             let session = rtc_session::load();
             info!(
-                "boot: RTC session valid (wake count {})",
-                session.wake_count()
+                "boot: RTC session valid (wake count {}) ({}ms)",
+                session.wake_count(),
+                t0.elapsed().as_millis()
             );
             Some(session)
         } else {
@@ -69,11 +86,33 @@ impl super::Kernel {
             None
         };
 
-        // load settings - may use cached values from RTC session
+        // load settings from SD
+        let t0 = Instant::now();
         {
             let mut handle = self.handle();
             app_mgr.load_eager_settings(&mut handle);
-            app_mgr.load_initial_state(&mut handle);
+        }
+        info!("boot: settings loaded ({}ms)", t0.elapsed().as_millis());
+
+        // only load home recent data if we're not restoring into a
+        // different app — saves SD I/O when waking directly to reader
+        let skip_home_load = rtc_session_data.as_ref().map_or(false, |s| {
+            // active app is the top of the stack
+            s.nav_depth > 0 && s.nav_stack[(s.nav_depth - 1) as usize] != 0 // 0 = Home
+        });
+
+        if !skip_home_load {
+            let t0 = Instant::now();
+            {
+                let mut handle = self.handle();
+                app_mgr.load_initial_state(&mut handle);
+            }
+            info!(
+                "boot: home recent loaded ({}ms)",
+                t0.elapsed().as_millis()
+            );
+        } else {
+            info!("boot: skipped home recent load (not waking to home)");
         }
 
         tasks::set_idle_timeout(app_mgr.system_settings().sleep_timeout);
@@ -81,8 +120,15 @@ impl super::Kernel {
         self.log_stats();
 
         // try to restore session from RTC memory
+        let t0 = Instant::now();
         let restored = if let Some(session) = rtc_session_data {
-            app_mgr.apply_session(&session, &mut self.handle())
+            let ok = app_mgr.apply_session(&session, &mut self.handle());
+            info!(
+                "boot: apply_session {} ({}ms)",
+                if ok { "ok" } else { "failed" },
+                t0.elapsed().as_millis()
+            );
+            ok
         } else {
             false
         };
@@ -92,14 +138,23 @@ impl super::Kernel {
         }
 
         {
+            let t0 = Instant::now();
             let draw = |s: &mut StripBuffer| app_mgr.draw(s);
             self.epd
                 .full_refresh_async(self.strip, &mut self.delay, &draw)
                 .await;
+            info!(
+                "boot: first EPD refresh ({}ms)",
+                t0.elapsed().as_millis()
+            );
         }
         let _ = app_mgr.take_redraw();
 
-        info!("ui ready.");
+        info!(
+            "boot: ui ready (total {}ms, path={})",
+            boot_start.elapsed().as_millis(),
+            if restored { "rtc-restore" } else { "cold-boot" }
+        );
     }
 
     // event-driven main loop; never returns
@@ -486,8 +541,12 @@ impl super::Kernel {
     // instead of enter_sleep directly to ensure session state is persisted
     async fn sleep_with_session<A: AppLayer>(&mut self, app_mgr: &mut A, reason: &str) {
         use super::rtc_session;
+        use embassy_time::Instant;
+
+        let sleep_start = Instant::now();
 
         // collect session state from app layer
+        let t0 = Instant::now();
         let mut session = rtc_session::RtcSession::zeroed();
         app_mgr.collect_session(&mut session);
 
@@ -496,9 +555,12 @@ impl super::Kernel {
 
         // save to RTC memory (will be valid on next wake)
         rtc_session::save(&session);
-        info!("session: saved to RTC memory");
+        info!(
+            "sleep: session saved to RTC ({}ms)",
+            t0.elapsed().as_millis()
+        );
 
-        self.enter_sleep(reason).await;
+        self.enter_sleep(reason, sleep_start).await;
     }
 
     // flush bookmarks, render sleep screen, enter MCU deep sleep;
@@ -506,7 +568,8 @@ impl super::Kernel {
     //
     // uses a custom sleep config that keeps RTC FAST memory powered
     // so session state survives the sleep cycle (~1-2µA extra)
-    async fn enter_sleep(&mut self, reason: &str) {
+    async fn enter_sleep(&mut self, reason: &str, sleep_start: embassy_time::Instant) {
+        use embassy_time::Instant;
         use embedded_graphics::mono_font::MonoTextStyle;
         use embedded_graphics::mono_font::ascii::FONT_9X18;
         use embedded_graphics::pixelcolor::BinaryColor;
@@ -518,22 +581,30 @@ impl super::Kernel {
 
         info!("{}: entering sleep...", reason);
 
+        let t0 = Instant::now();
         if self.bm_cache.is_dirty() {
             self.bm_cache.flush(&self.sd);
         }
+        info!("sleep: bookmark flush ({}ms)", t0.elapsed().as_millis());
 
+        let t0 = Instant::now();
         self.sd_card_sleep();
+        info!("sleep: SD card sleep ({}ms)", t0.elapsed().as_millis());
 
+        let t0 = Instant::now();
         self.epd
             .full_refresh_async(self.strip, &mut self.delay, &|s: &mut StripBuffer| {
                 let style = MonoTextStyle::new(&FONT_9X18, BinaryColor::On);
                 let _ = Text::new("(sleep)", Point::new(210, 400), style).draw(s);
             })
             .await;
-        info!("display: sleep screen rendered");
+        info!("sleep: screen rendered ({}ms)", t0.elapsed().as_millis());
 
         self.epd.enter_deep_sleep();
-        info!("display: deep sleep mode 1");
+        info!(
+            "sleep: EPD deep sleep, total sleep entry {}ms",
+            sleep_start.elapsed().as_millis()
+        );
 
         // safety: deep sleep never returns, the MCU resets on wake, so
         // these stolen peripherals cannot alias with their original
