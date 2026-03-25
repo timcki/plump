@@ -47,13 +47,19 @@ impl super::Kernel {
             .await;
     }
 
-    // check for valid RTC session early (before boot console) so we
-    // can skip the console render on fast wake. call this from main()
-    // before show_boot_console().
-    pub fn has_valid_rtc_session(&self) -> bool {
+    // check for valid session early (before boot console) so we can
+    // skip the console render on fast wake. checks RTC first (free),
+    // then SD fallback (one file read).
+    pub fn has_valid_session(&self) -> bool {
         use super::rtc_session;
-        // peek at RTC memory without consuming the session
-        rtc_session::peek_valid()
+        // RTC check is a single volatile read — essentially free
+        if rtc_session::peek_valid() {
+            return true;
+        }
+        // SD fallback: check if session file exists and is valid.
+        // this costs one SD read (~20ms) but saves ~1.6s of EPD refresh
+        // when the session is valid.
+        rtc_session::load_from_sd(&self.sd).is_some()
     }
 
     // one-time boot: load caches, settings, render the home screen
@@ -83,8 +89,11 @@ impl super::Kernel {
         let bm_ms = t0.elapsed().as_millis();
         info!("boot: bookmark cache loaded ({}ms)", bm_ms);
 
-        // check for valid RTC session before loading settings
-        // (session may contain cached settings to skip SD reads)
+        // check for valid session: try RTC first (fast), then SD fallback.
+        //
+        // on battery wake, the brownout detector fires during the voltage
+        // sag, causing a full system reset that wipes RTC FAST memory.
+        // the SD-backed session survives this and provides reliable resume.
         let t0 = Instant::now();
         let has_rtc_session = rtc_session::is_valid_session();
         let rtc_session_data = if has_rtc_session {
@@ -96,8 +105,22 @@ impl super::Kernel {
             );
             Some(session)
         } else {
-            info!("boot: no RTC session (power-on or first boot)");
-            None
+            // RTC invalid — try SD fallback (typical on battery wake)
+            let t1 = Instant::now();
+            match rtc_session::load_from_sd(&self.sd) {
+                Some(session) => {
+                    info!(
+                        "boot: SD session valid (wake count {}) ({}ms)",
+                        session.wake_count(),
+                        t1.elapsed().as_millis()
+                    );
+                    Some(session)
+                }
+                None => {
+                    info!("boot: no session (power-on or first boot)");
+                    None
+                }
+            }
         };
 
         // load settings from SD
@@ -551,8 +574,11 @@ impl super::Kernel {
         (deferred, sleep_requested)
     }
 
-    // save session to RTC memory and enter deep sleep; call this
-    // instead of enter_sleep directly to ensure session state is persisted
+    // save session to RTC memory + SD card and enter deep sleep.
+    //
+    // RTC FAST memory is the fast path but is lost on battery wake
+    // due to brownout resets (voltage sag wipes the RTC power domain).
+    // the SD copy is the reliable fallback (~20ms extra).
     async fn sleep_with_session<A: AppLayer>(&mut self, app_mgr: &mut A, reason: &str) {
         use super::rtc_session;
         use embassy_time::Instant;
@@ -567,10 +593,16 @@ impl super::Kernel {
         // increment wake count for debugging
         session.increment_wake_count();
 
-        // save to RTC memory (will be valid on next wake)
+        // mark valid BEFORE saving so both RTC and SD get the magic
+        session.mark_valid();
+
+        // save to RTC memory (fast path, works on USB / stable power)
         rtc_session::save(&session);
+
+        // save to SD card (reliable fallback for battery wake)
+        rtc_session::save_to_sd(&session, &self.sd);
         info!(
-            "sleep: session saved to RTC ({}ms)",
+            "sleep: session saved to RTC + SD ({}ms)",
             t0.elapsed().as_millis()
         );
 
@@ -636,27 +668,7 @@ impl super::Kernel {
         let mut sleep_config = RtcSleepConfig::deep();
         sleep_config.set_rtc_fastmem_pd_en(false); // keep RTC FAST powered
 
-        // disable brownout detector before entering deep sleep.
-        //
-        // on battery power, the CPU wake-up causes a brief voltage sag that
-        // triggers the brownout detector. this produces a BROWNOUT reset
-        // instead of a DEEPSLEEP_RESET, and the bootloader then zeros all
-        // RTC memory (destroying our saved session). disabling the detector
-        // before sleep ensures the wake is classified correctly.
-        //
-        // the brownout detector is re-enabled by the ROM/bootloader on the
-        // next boot, so this only affects the wake transition window.
-        //
-        // RTC_CNTL_BROWN_OUT_REG is at 0x6000_80D4; bit 30 is BROWN_OUT_ENA.
-        // safety: we are about to halt the CPU; no concurrent access.
-        unsafe {
-            const RTC_CNTL_BROWN_OUT_REG: *mut u32 = 0x6000_80D4 as *mut u32;
-            let val = core::ptr::read_volatile(RTC_CNTL_BROWN_OUT_REG);
-            core::ptr::write_volatile(RTC_CNTL_BROWN_OUT_REG, val & !(1 << 30));
-        }
-        info!("sleep: brownout detector disabled for clean wake");
-
-        info!("mcu: entering deep sleep (power button to wake, RTC FAST retained)");
+        info!("mcu: entering deep sleep (power button to wake)");
         rtc.sleep(&sleep_config, &[&rtcio]);
 
         // deep sleep resets the MCU; backstop if sleep returns

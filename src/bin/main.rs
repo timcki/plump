@@ -149,7 +149,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
     // skip boot console on valid RTC wake — saves one full EPD refresh
     // (~1.6s). the console is only useful for cold boot diagnostics.
-    if kernel.has_valid_rtc_session() {
+    if kernel.has_valid_session() {
         info!("boot: skipping boot console (RTC session valid)");
         drop(console); // reclaim ~3 KB of heap
     } else {

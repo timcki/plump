@@ -197,3 +197,73 @@ pub fn wake_count() -> u32 {
         core::ptr::read_volatile(core::ptr::addr_of!((*ptr).wake_count))
     }
 }
+
+// --- SD-based session persistence (fallback for battery wake) ---
+//
+// on battery, the brownout detector fires during the deep sleep wake
+// voltage sag, causing a full system reset that wipes RTC FAST memory.
+// we save the session to SD as a fallback so it can be restored even
+// when RTC data is lost.
+
+pub const SESSION_FILE: &str = "SESSION.BIN";
+
+// size of the raw session data on SD (must match struct size)
+const SESSION_SIZE: usize = core::mem::size_of::<RtcSession>();
+
+// save session to SD card as raw bytes
+pub fn save_to_sd(session: &RtcSession, sd: &crate::drivers::sdcard::SdStorage) {
+    // safety: RtcSession is #[repr(C)] with only primitive types;
+    // reinterpreting as bytes is well-defined
+    let bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(session as *const RtcSession as *const u8, SESSION_SIZE)
+    };
+    match crate::drivers::storage::write_in_pulp(sd, SESSION_FILE, bytes) {
+        Ok(()) => log::info!("session: saved to SD ({} bytes)", SESSION_SIZE),
+        Err(e) => log::warn!("session: SD save failed: {}", e),
+    }
+}
+
+// load session from SD card; returns Some if valid
+pub fn load_from_sd(sd: &crate::drivers::sdcard::SdStorage) -> Option<RtcSession> {
+    // align the read buffer to match RtcSession's align(4) requirement;
+    // a plain [u8] has align 1 which causes UB with ptr::read on RISC-V
+    #[repr(C, align(4))]
+    struct AlignedBuf([u8; SESSION_SIZE]);
+    let mut buf = AlignedBuf([0u8; SESSION_SIZE]);
+
+    match crate::drivers::storage::read_chunk_in_pulp(sd, SESSION_FILE, 0, &mut buf.0) {
+        Ok(n) if n >= SESSION_SIZE => {
+            // safety: buf is properly aligned (align 4) and contains
+            // SESSION_SIZE bytes with the same layout as RtcSession
+            let session: RtcSession =
+                unsafe { core::ptr::read(buf.0.as_ptr() as *const RtcSession) };
+            if session.is_valid() {
+                log::info!(
+                    "session: loaded from SD (wake count {})",
+                    session.wake_count()
+                );
+                Some(session)
+            } else {
+                log::warn!(
+                    "session: SD file magic {:08x} != {:08x} (read {} bytes, first 8: {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x})",
+                    session.magic,
+                    RTC_SESSION_MAGIC,
+                    n,
+                    buf.0[0], buf.0[1], buf.0[2], buf.0[3],
+                    buf.0[4], buf.0[5], buf.0[6], buf.0[7],
+                );
+                None
+            }
+        }
+        Ok(n) => {
+            log::info!("session: SD file too small ({} < {})", n, SESSION_SIZE);
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+// delete session file from SD (e.g. after successful cold boot)
+pub fn clear_sd(sd: &crate::drivers::sdcard::SdStorage) {
+    let _ = crate::drivers::storage::delete_in_pulp(sd, SESSION_FILE);
+}
