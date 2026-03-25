@@ -710,6 +710,7 @@ impl super::Kernel {
         if let Some(ref img) = sleep_img {
             // render 4-level grayscale wallpaper via dual-plane grayscale pass
             use crate::drivers::ssd1677::{HEIGHT, RenderState, WIDTH};
+            use super::sleep_image::CHUNK_COUNT;
 
             let rs = RenderState {
                 px: 0,
@@ -720,17 +721,21 @@ impl super::Kernel {
                 right_mask: 0,
             };
 
+            // blit all 6 chunks each strip call; blit_2bpp clips to the
+            // current strip window so only the overlapping chunk draws pixels
             let draw = |s: &mut StripBuffer| {
-                s.blit_2bpp(
-                    &img.data,
-                    0,
-                    img.width as usize,
-                    img.height as usize,
-                    img.stride as usize,
-                    0,
-                    0,
-                    true,
-                );
+                for i in 0..CHUNK_COUNT {
+                    s.blit_2bpp(
+                        &img.chunks[i],
+                        0,
+                        img.width as usize,
+                        img.chunk_rows(i),
+                        img.stride as usize,
+                        0,
+                        img.chunk_start_row(i) as i32,
+                        true,
+                    );
+                }
             };
 
             // ensure display is initialized (should be from normal use,

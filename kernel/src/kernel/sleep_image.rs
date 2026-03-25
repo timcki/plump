@@ -4,6 +4,10 @@
 // supports uncompressed BMP files (1-bit, 8-bit palette, 24-bit RGB)
 // at exactly 480×800. uses Atkinson dithering to quantize to 4 gray
 // levels for the SSD1677's dual-plane grayscale mode.
+//
+// the image is stored in 6 chunks of ~16KB each to avoid needing a
+// single 96KB contiguous allocation (the ESP32-C3 has two disjoint
+// heap pools of 108KB and 62KB — neither can hold 96KB).
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -16,14 +20,41 @@ use crate::drivers::storage;
 const IMG_W: usize = SCREEN_W as usize; // 480
 const IMG_H: usize = SCREEN_H as usize; // 800
 
-/// 2bpp packed grayscale image ready for `blit_2bpp`.
+/// Bytes per row in the 2bpp packed output.
+const OUT_STRIDE: usize = IMG_W / 4; // 120
+
+/// Number of chunks to split the image into.
+/// Each chunk is ~16KB, fitting comfortably in either heap pool.
+pub const CHUNK_COUNT: usize = 6;
+
+/// Rows per chunk (last chunk may have fewer).
+const ROWS_PER_CHUNK: usize = (IMG_H + CHUNK_COUNT - 1) / CHUNK_COUNT; // 134
+
+/// 2bpp packed grayscale image ready for `blit_2bpp`, stored in chunks.
 /// Pixel values: 0=white, 1=light gray, 2=dark gray, 3=black.
 pub struct SleepImage {
-    pub data: Vec<u8>,
+    pub chunks: [Vec<u8>; CHUNK_COUNT],
     pub width: u16,
     pub height: u16,
-    /// Bytes per row in the packed 2bpp output (width / 4).
     pub stride: u16,
+}
+
+impl SleepImage {
+    /// Number of rows in the given chunk.
+    #[inline]
+    pub fn chunk_rows(&self, chunk: usize) -> usize {
+        if chunk < CHUNK_COUNT - 1 {
+            ROWS_PER_CHUNK
+        } else {
+            IMG_H - ROWS_PER_CHUNK * (CHUNK_COUNT - 1)
+        }
+    }
+
+    /// First logical row of the given chunk.
+    #[inline]
+    pub fn chunk_start_row(&self, chunk: usize) -> usize {
+        chunk * ROWS_PER_CHUNK
+    }
 }
 
 /// File name to look for on the SD card root.
@@ -67,7 +98,10 @@ fn parse_header(sd: &SdStorage) -> Option<(u32, u16, [u8; MAX_PALETTE])> {
     }
 
     if compression != 0 {
-        info!("sleep_image: compressed BMP not supported (type={})", compression);
+        info!(
+            "sleep_image: compressed BMP not supported (type={})",
+            compression
+        );
         return None;
     }
 
@@ -92,7 +126,6 @@ fn parse_header(sd: &SdStorage) -> Option<(u32, u16, [u8; MAX_PALETTE])> {
             palette_lum[i] = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
         }
     } else if bpp == 1 {
-        // 1-bit: 2-entry palette
         let palette_start = BMP_HEADER_SIZE;
         if n < palette_start + 2 * 4 {
             info!("sleep_image: truncated 1-bit palette");
@@ -114,7 +147,6 @@ fn parse_header(sd: &SdStorage) -> Option<(u32, u16, [u8; MAX_PALETTE])> {
 /// Returns (quantized_level 0..3, quantized_luminance 0/85/170/255).
 #[inline]
 fn quantize4(lum: i16) -> (u8, i16) {
-    // thresholds: midpoints between levels 0, 85, 170, 255
     if lum < 43 {
         (3, 0) // black
     } else if lum < 128 {
@@ -126,9 +158,8 @@ fn quantize4(lum: i16) -> (u8, i16) {
     }
 }
 
-/// Read BMP row data for a single row and return luminance values.
+/// Read BMP row data for a single row and convert to luminance values.
 /// BMP rows are bottom-up, so `bmp_row` 0 is the bottom of the image.
-/// Returns the number of pixels written (should be IMG_W).
 fn read_row_lum(
     sd: &SdStorage,
     pixel_offset: u32,
@@ -189,8 +220,8 @@ fn read_row_lum(
 /// Atkinson dithering. Returns `None` if the file is missing or invalid.
 ///
 /// Reads row-by-row from SD to avoid holding the full BMP in RAM.
-/// Output is 96,000 bytes (480×800 at 2 bits per pixel), top-down,
-/// packed MSB-first (4 pixels per byte).
+/// Output is 96,000 bytes (480×800 at 2 bits per pixel) split across
+/// 6 chunks of ~16KB each, packed MSB-first (4 pixels per byte).
 pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
     let (pixel_offset, bpp, palette_lum) = parse_header(sd)?;
     info!(
@@ -198,22 +229,26 @@ pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
         IMG_W, IMG_H, bpp, pixel_offset
     );
 
-    let out_stride = IMG_W / 4; // 120 bytes per row
-    let mut data: Vec<u8> = vec![0u8; out_stride * IMG_H]; // 96,000 bytes
+    // allocate 6 chunks — each ~16KB, fits in either heap pool
+    let last_chunk_rows = IMG_H - ROWS_PER_CHUNK * (CHUNK_COUNT - 1);
+    let mut chunks: [Vec<u8>; CHUNK_COUNT] = core::array::from_fn(|i| {
+        let rows = if i < CHUNK_COUNT - 1 {
+            ROWS_PER_CHUNK
+        } else {
+            last_chunk_rows
+        };
+        vec![0u8; rows * OUT_STRIDE]
+    });
 
     // Atkinson dithering needs error buffers for current + next + next-next row.
     // We process BMP rows bottom-up (row 799..0 in BMP order) and write
     // output top-down (output row 0 = BMP row 799).
-    //
-    // error buffers are indexed 0/1/2 and rotated each row
     let mut err: [[i16; IMG_W]; 3] = [[0i16; IMG_W]; 3];
-    let mut cur = 0usize; // index of current error row
+    let mut cur = 0usize;
 
     for out_y in 0..IMG_H {
-        // BMP row for this output row (bottom-up → top-down flip)
         let bmp_row = IMG_H - 1 - out_y;
 
-        // read raw luminance
         let mut lum = [0i16; IMG_W];
         if !read_row_lum(sd, pixel_offset, bmp_row, bpp, &palette_lum, &mut lum) {
             info!("sleep_image: read error at row {}", bmp_row);
@@ -231,14 +266,18 @@ pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
         let next = (cur + 1) % 3;
         let next2 = (cur + 2) % 3;
 
+        // find the correct chunk and row within it
+        let chunk_idx = (out_y / ROWS_PER_CHUNK).min(CHUNK_COUNT - 1);
+        let row_in_chunk = out_y - chunk_idx * ROWS_PER_CHUNK;
+        let out_row =
+            &mut chunks[chunk_idx][row_in_chunk * OUT_STRIDE..(row_in_chunk + 1) * OUT_STRIDE];
+
         // quantize + Atkinson error diffusion
-        let out_row = &mut data[out_y * out_stride..(out_y + 1) * out_stride];
         for x in 0..IMG_W {
             let (level, quant_lum) = quantize4(lum[x]);
             let error = (lum[x] - quant_lum) / 8;
 
             // pack 2bpp: MSB first, 4 pixels per byte
-            // pixel 0 in bits 7:6, pixel 1 in bits 5:4, etc.
             let byte_idx = x / 4;
             let shift = 6 - (x & 3) * 2;
             out_row[byte_idx] |= level << shift;
@@ -249,30 +288,34 @@ pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
             //       1/8
             if error != 0 {
                 if x + 1 < IMG_W {
-                    lum[x + 1] += error; // (x+1, y) — still in current row
+                    lum[x + 1] += error;
                 }
                 if x + 2 < IMG_W {
-                    lum[x + 2] += error; // (x+2, y) — still in current row
+                    lum[x + 2] += error;
                 }
                 if x > 0 {
-                    err[next][x - 1] += error; // (x-1, y+1)
+                    err[next][x - 1] += error;
                 }
-                err[next][x] += error; // (x, y+1)
+                err[next][x] += error;
                 if x + 1 < IMG_W {
-                    err[next][x + 1] += error; // (x+1, y+1)
+                    err[next][x + 1] += error;
                 }
-                err[next2][x] += error; // (x, y+2)
+                err[next2][x] += error;
             }
         }
 
         cur = next;
     }
 
-    info!("sleep_image: converted to 2bpp ({} bytes)", data.len());
+    info!(
+        "sleep_image: converted to 2bpp ({} chunks, {} bytes total)",
+        CHUNK_COUNT,
+        chunks.iter().map(|c| c.len()).sum::<usize>()
+    );
     Some(SleepImage {
-        data,
+        chunks,
         width: IMG_W as u16,
         height: IMG_H as u16,
-        stride: out_stride as u16,
+        stride: OUT_STRIDE as u16,
     })
 }
