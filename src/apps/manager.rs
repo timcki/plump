@@ -198,6 +198,12 @@ impl AppManager {
         self.home.on_enter(&mut self.launcher.ctx, k);
     }
 
+    // save active app state to bookmark cache before sleep
+    pub fn save_active_state(&mut self, bm: &mut crate::kernel::bookmarks::BookmarkCache) {
+        let active = self.launcher.active();
+        with_app!(active, self, |app| app.save_state(bm));
+    }
+
     // collect session state to RTC memory struct before sleep
     pub fn collect_session(&self, session: &mut crate::kernel::rtc_session::RtcSession) {
         use crate::kernel::rtc_session::MAX_NAV_STACK;
@@ -659,6 +665,10 @@ impl AppLayer for AppManager {
 
     fn enter_initial(&mut self, k: &mut KernelHandle<'_>) {
         AppManager::enter_initial(self, k);
+    }
+
+    fn save_active_state(&mut self, bm: &mut crate::kernel::bookmarks::BookmarkCache) {
+        AppManager::save_active_state(self, bm);
     }
 
     fn collect_session(&self, session: &mut crate::kernel::rtc_session::RtcSession) {

@@ -585,6 +585,10 @@ impl super::Kernel {
 
         let sleep_start = Instant::now();
 
+        // save active app state (reader position) to bookmark cache
+        // before collecting session, so bookmarks stay in sync
+        app_mgr.save_active_state(&mut *self.bm_cache);
+
         // collect session state from app layer
         let t0 = Instant::now();
         let mut session = rtc_session::RtcSession::zeroed();

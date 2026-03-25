@@ -478,6 +478,11 @@ pub trait AppLayer {
     fn load_initial_state(&mut self, k: &mut KernelHandle<'_>);
     fn enter_initial(&mut self, k: &mut KernelHandle<'_>);
 
+    // save active app's ephemeral state (e.g. reader position) to the
+    // bookmark cache; called before collect_session during sleep so
+    // bookmarks and session stay in sync
+    fn save_active_state(&mut self, bm: &mut BookmarkCache);
+
     // session persistence: save/restore active app across sleep/wake
     // using RTC FAST memory (survives deep sleep, zeroed on power-on)
     //

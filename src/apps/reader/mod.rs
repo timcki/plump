@@ -851,6 +851,20 @@ impl ReaderApp {
     }
 
     fn bookmark_load(&mut self, bm: &bookmarks::BookmarkCache) -> bool {
+        // if restore_offset is already set (from RTC/SD session restore),
+        // keep it — the session has the most recent position, while the
+        // bookmark cache may be stale (only flushed periodically or on
+        // navigation, not on every page turn)
+        if self.restore_offset.is_some() {
+            log::info!(
+                "bookmark: skipping load, session restore_offset={} ch={} for {}",
+                self.restore_offset.unwrap_or(0),
+                self.epub.chapter,
+                self.name(),
+            );
+            return true;
+        }
+
         if let Some(slot) = bm.find(&self.filename[..self.filename_len]) {
             log::info!(
                 "bookmark: restoring off={} ch={} for {}",
