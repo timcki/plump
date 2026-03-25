@@ -709,8 +709,8 @@ impl super::Kernel {
         let t0 = Instant::now();
         if let Some(ref img) = sleep_img {
             // render 4-level grayscale wallpaper via dual-plane grayscale pass
-            use crate::drivers::ssd1677::{HEIGHT, RenderState, WIDTH};
             use super::sleep_image::CHUNK_COUNT;
+            use crate::drivers::ssd1677::{HEIGHT, RenderState, WIDTH};
 
             let rs = RenderState {
                 px: 0,
@@ -738,14 +738,26 @@ impl super::Kernel {
                 }
             };
 
-            // ensure display is initialized (should be from normal use,
-            // but guard against edge cases like immediate sleep after boot)
-            self.epd.init(&mut self.delay);
+            // Clear to solid white with a full GC refresh first. The grayscale
+            // LUT maps 00 to "no change", so white wallpaper pixels only stay
+            // white if the panel is already white underneath.
+            let t1 = Instant::now();
+            self.epd
+                .full_refresh_async(self.strip, &mut self.delay, &|_: &mut StripBuffer| {})
+                .await;
+            info!(
+                "sleep: wallpaper white clear ({}ms)",
+                t1.elapsed().as_millis()
+            );
 
+            let t1 = Instant::now();
             // grayscale_pass writes LSB plane to BW RAM and MSB plane to
             // RED RAM, then triggers a single refresh with the grayscale LUT.
-            // no preceding full_refresh needed — the pass is self-contained.
             self.epd.grayscale_pass(self.strip, &rs, &draw).await;
+            info!(
+                "sleep: wallpaper grayscale pass ({}ms)",
+                t1.elapsed().as_millis()
+            );
         } else {
             // fallback: simple text sleep screen
             self.epd
