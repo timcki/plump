@@ -21,7 +21,7 @@ use embedded_graphics::text::Text;
 use crate::apps::{App, AppContext, AppId, RECENT_FILE, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
-use crate::drivers::strip::StripBuffer;
+use crate::drivers::strip::{GrayMode, StripBuffer};
 use crate::error::{Error, ErrorKind};
 use crate::fonts;
 use crate::kernel::KernelHandle;
@@ -29,7 +29,7 @@ use crate::kernel::QuickAction;
 use crate::kernel::bookmarks;
 use crate::kernel::work_queue;
 use crate::kernel::work_queue::DecodedImage;
-use crate::ui::{Alignment, HEADER_W, Region, StackFmt};
+use crate::ui::{Alignment, HEADER_W, Region, StackFmt, draw_progress_bar};
 use smol_epub::cache;
 use smol_epub::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
 use smol_epub::html_strip::{
@@ -514,6 +514,104 @@ impl ReaderApp {
 
     pub fn set_chrome_font(&mut self, font: &'static BitmapFont) {
         self.chrome_font = Some(font);
+    }
+
+    pub fn wants_grayscale(&self) -> bool {
+        matches!(self.state, State::Ready | State::ShowToc)
+    }
+
+    fn loading_visual(&self) -> (&'static str, u8) {
+        match self.state {
+            State::NeedBookmark => ("Opening book", 0),
+            State::NeedInit => ("Reading file", 10),
+            State::NeedOpf => ("Reading metadata", 25),
+            State::NeedToc => ("Preparing contents", 40),
+            State::NeedCache => {
+                let cached_ch = self.cached_chapter_count();
+                let total_ch = self.epub.spine.len();
+                let img_found = self.epub.img_found_count as usize;
+                let img_cached = self.epub.img_cached_count as usize;
+                let in_chapter_phase = matches!(
+                    self.epub.bg_cache,
+                    BgCacheState::CacheChapter | BgCacheState::WaitNearbyImage
+                ) && cached_ch < total_ch;
+
+                if in_chapter_phase {
+                    let pct = if total_ch > 0 {
+                        55 + ((cached_ch * 25) / total_ch).min(25) as u8
+                    } else {
+                        55
+                    };
+                    ("Caching chapters", pct)
+                } else {
+                    let pct = if img_found > 0 {
+                        80 + ((img_cached * 20) / img_found).min(20) as u8
+                    } else {
+                        80
+                    };
+                    ("Caching images", pct)
+                }
+            }
+            State::NeedIndex => ("Building pages", 75),
+            State::NeedPage => ("Opening page", 90),
+            State::Ready | State::ShowToc => ("Ready", 100),
+            State::Error => ("Error", 0),
+        }
+    }
+
+    fn draw_loading_screen(&self, strip: &mut StripBuffer) {
+        if strip.gray_mode() != GrayMode::Bw {
+            return;
+        }
+
+        let title = self.display_name();
+        let title_font = if title.len() > 28 {
+            fonts::heading_font(2)
+        } else {
+            fonts::heading_font(3)
+        };
+        let stage_font = fonts::body_font(1);
+        let (stage, pct) = self.loading_visual();
+
+        let content = Region::new(
+            self.text_margin,
+            self.text_y,
+            self.text_w as u16,
+            self.text_area_h,
+        );
+        let title_y = content.y + content.h / 3;
+        let title_region = Region::new(content.x, title_y, content.w, title_font.line_height);
+        let stage_region = Region::new(
+            content.x,
+            title_region.y + title_region.h + 14,
+            content.w,
+            stage_font.line_height,
+        );
+        let bar_w = content.w.saturating_sub(48).max(160);
+        let bar_region = Region::new(
+            content.x + (content.w.saturating_sub(bar_w)) / 2,
+            stage_region.y + stage_region.h + 20,
+            bar_w,
+            10,
+        );
+
+        draw_truncated_text(
+            strip,
+            title_font,
+            title_region,
+            title,
+            Alignment::Center,
+            BinaryColor::On,
+        );
+        draw_truncated_text(
+            strip,
+            stage_font,
+            stage_region,
+            stage,
+            Alignment::Center,
+            BinaryColor::On,
+        );
+        draw_progress_bar(strip, bar_region, pct);
     }
 
     pub fn has_bg_work(&self) -> bool {
@@ -1138,6 +1236,33 @@ fn draw_chrome_text(
             .draw(strip)
             .unwrap();
     }
+}
+
+fn draw_truncated_text(
+    strip: &mut StripBuffer,
+    font: &'static BitmapFont,
+    region: Region,
+    text: &str,
+    align: Alignment,
+    fg: BinaryColor,
+) {
+    let cut = font.truncate_len(text, region.w);
+    if cut >= text.len() {
+        font.draw_aligned(strip, region, text, align, fg);
+        return;
+    }
+
+    let mut buf = [0u8; 96];
+    let mut n = cut.min(buf.len().saturating_sub(3));
+    while n > 0 && !text.is_char_boundary(n) {
+        n -= 1;
+    }
+    buf[..n].copy_from_slice(&text.as_bytes()[..n]);
+    buf[n] = 0xE2;
+    buf[n + 1] = 0x80;
+    buf[n + 2] = 0xA6;
+    let truncated = core::str::from_utf8(&buf[..n + 3]).unwrap_or(text);
+    font.draw_aligned(strip, region, truncated, align, fg);
 }
 
 impl App<AppId> for ReaderApp {
@@ -1879,8 +2004,9 @@ impl App<AppId> for ReaderApp {
 
     fn draw(&self, strip: &mut StripBuffer) {
         let cf = self.chrome_font;
+        let gray_pass = strip.gray_mode() != GrayMode::Bw;
 
-        if self.show_chrome {
+        if self.show_chrome && !gray_pass {
             draw_chrome_text(
                 strip,
                 HEADER_REGION,
@@ -1969,10 +2095,12 @@ impl App<AppId> for ReaderApp {
             return;
         }
 
-        // loading states: the kernel loading indicator (drawn by
-        // AppManager) handles feedback text; nothing else to draw
+        // loading states: keep the kernel loading indicator for the
+        // precise status text, but also draw a centered title +
+        // progress block so the screen does not feel empty.
         if self.state != State::Ready && self.state != State::Error && self.state != State::ShowToc
         {
+            self.draw_loading_screen(strip);
             return;
         }
 
@@ -2227,6 +2355,7 @@ impl App<AppId> for ReaderApp {
 
         if self.show_position
             && self.state == State::Ready
+            && !gray_pass
             && POSITION_OVERLAY.intersects(strip.logical_window())
         {
             let mut pbuf = StackFmt::<48>::new();

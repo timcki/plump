@@ -646,7 +646,9 @@ impl AppLayer for AppManager {
     }
 
     fn wants_grayscale(&self) -> bool {
-        self.launcher.active() == AppId::Reader && !self.quick_menu.open
+        self.launcher.active() == AppId::Reader
+            && !self.quick_menu.open
+            && self.reader.wants_grayscale()
     }
 
     fn wifi_config(&self) -> &WifiConfig {
