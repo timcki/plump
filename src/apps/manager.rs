@@ -333,11 +333,9 @@ impl AppManager {
         // set loading indicator for reader if it's the active app,
         // so the first frame shows "Opening" instead of blank content
         if self.launcher.active() == AppId::Reader {
-            self.launcher.ctx.set_loading(
-                crate::apps::reader::LOADING_REGION,
-                "Resuming",
-                0,
-            );
+            self.launcher
+                .ctx
+                .set_loading(crate::apps::reader::LOADING_REGION, "Resuming", 0);
         }
 
         // mark full redraw needed — the next render will draw the

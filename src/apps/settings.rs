@@ -219,11 +219,7 @@ impl SettingsApp {
                 );
             }
             7 => {
-                let _ = write!(
-                    buf,
-                    "{}",
-                    if self.settings.text_aa { "On" } else { "Off" }
-                );
+                let _ = write!(buf, "{}", if self.settings.text_aa { "On" } else { "Off" });
             }
             8 => {
                 let _ = write!(

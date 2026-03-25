@@ -766,12 +766,8 @@ where
     ///
     /// After this, BW and RED RAM contain gray plane data (not BW content),
     /// so the caller should mark red_stale = true.
-    pub async fn grayscale_pass<F>(
-        &mut self,
-        strip: &mut StripBuffer,
-        rs: &RenderState,
-        draw: &F,
-    ) where
+    pub async fn grayscale_pass<F>(&mut self, strip: &mut StripBuffer, rs: &RenderState, draw: &F)
+    where
         F: Fn(&mut StripBuffer),
     {
         // LSB pass → BW RAM

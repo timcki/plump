@@ -115,8 +115,8 @@ pub struct SystemSettings {
     pub text_aa: bool,      // antialiased text via grayscale LUT (slower page turns)
 
     // reader settings
-    pub reader_status: bool,    // show book title + page info bar at bottom of reader
-    pub text_alignment: u8,     // 0 = Left, 1 = Justify (index into TEXT_ALIGNMENT_NAMES)
+    pub reader_status: bool, // show book title + page info bar at bottom of reader
+    pub text_alignment: u8,  // 0 = Left, 1 = Justify (index into TEXT_ALIGNMENT_NAMES)
 }
 
 impl Default for SystemSettings {

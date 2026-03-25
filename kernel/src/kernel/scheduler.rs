@@ -144,16 +144,14 @@ impl super::Kernel {
                 let mut handle = self.handle();
                 app_mgr.load_initial_state(&mut handle);
             }
-            info!(
-                "boot: home recent loaded ({}ms)",
-                t0.elapsed().as_millis()
-            );
+            info!("boot: home recent loaded ({}ms)", t0.elapsed().as_millis());
         } else {
             info!("boot: skipped home recent load (not waking to home)");
         }
 
         tasks::set_idle_timeout(app_mgr.system_settings().sleep_timeout);
-        self.epd.set_sunlight_mode(app_mgr.system_settings().sunlight_fix);
+        self.epd
+            .set_sunlight_mode(app_mgr.system_settings().sunlight_fix);
         self.log_stats();
 
         // try to restore session from RTC memory
@@ -180,10 +178,7 @@ impl super::Kernel {
             self.epd
                 .full_refresh_async(self.strip, &mut self.delay, &draw)
                 .await;
-            info!(
-                "boot: first EPD refresh ({}ms)",
-                t0.elapsed().as_millis()
-            );
+            info!("boot: first EPD refresh ({}ms)", t0.elapsed().as_millis());
         }
         let _ = app_mgr.take_redraw();
 
@@ -349,7 +344,8 @@ impl super::Kernel {
             self.log_stats();
             if app_mgr.settings_loaded() {
                 tasks::set_idle_timeout(app_mgr.system_settings().sleep_timeout);
-                self.epd.set_sunlight_mode(app_mgr.system_settings().sunlight_fix);
+                self.epd
+                    .set_sunlight_mode(app_mgr.system_settings().sunlight_fix);
             }
         }
     }
@@ -436,9 +432,7 @@ impl super::Kernel {
                                 && !app_mgr.has_redraw()
                             {
                                 let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                                self.epd
-                                    .grayscale_pass(self.strip, &rs, &draw)
-                                    .await;
+                                self.epd.grayscale_pass(self.strip, &rs, &draw).await;
 
                                 // restore BW content to both RAM planes so
                                 // subsequent DU refreshes compute correct

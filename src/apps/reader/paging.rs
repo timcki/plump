@@ -104,6 +104,38 @@ impl ReaderApp {
         self.fullscreen_img = false;
     }
 
+    pub(super) fn locate_page_for_offset(
+        &self,
+        target_off: u32,
+        page_hint: Option<usize>,
+    ) -> usize {
+        let total = self.pg.total_pages.max(1);
+
+        if let Some(page) = page_hint.filter(|&page| page < total) {
+            let start = self.pg.offsets[page];
+            let end = if page + 1 < total {
+                self.pg.offsets[page + 1]
+            } else {
+                u32::MAX
+            };
+            if target_off >= start && target_off < end {
+                return page;
+            }
+        }
+
+        let mut lo = 0usize;
+        let mut hi = total;
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.pg.offsets[mid] <= target_off {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
     pub(super) fn load_and_prefetch(
         &mut self,
         k: &mut KernelHandle<'_>,

@@ -50,10 +50,7 @@ pub fn save_cover_thumb(
 /// Load a 1-bit cover thumbnail from the per-book cache directory.
 ///
 /// Returns `None` if the file doesn't exist or is invalid.
-pub fn load_cover_thumb(
-    k: &mut KernelHandle<'_>,
-    dir: &str,
-) -> Option<DecodedImage> {
+pub fn load_cover_thumb(k: &mut KernelHandle<'_>, dir: &str) -> Option<DecodedImage> {
     let size = k.file_size_app_subdir(dir, COVER_THUMB_FILE).ok()?;
     if size < 5 {
         return None;

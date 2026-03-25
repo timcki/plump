@@ -404,10 +404,6 @@ impl ReaderApp {
             let n = tlen.min(self.title.len());
             self.title[..n].copy_from_slice(&self.epub.meta.title[..n]);
             self.title_len = n as u8;
-
-            if let Err(e) = k.save_title(name, self.epub.meta.title_str()) {
-                log::warn!("epub: failed to save title mapping: {}", e);
-            }
         }
 
         self.epub.toc = None;

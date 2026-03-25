@@ -20,8 +20,7 @@ const STATUS_Y: u16 = CONTENT_TOP + 4;
 const STATUS_H: u16 = 20;
 const STATUS_PAD: u16 = 12;
 const STATUS_TITLE_REGION: Region = Region::new(STATUS_PAD, STATUS_Y, 160, STATUS_H);
-const STATUS_BAT_REGION: Region =
-    Region::new(SCREEN_W - STATUS_PAD - 80, STATUS_Y, 80, STATUS_H);
+const STATUS_BAT_REGION: Region = Region::new(SCREEN_W - STATUS_PAD - 80, STATUS_Y, 80, STATUS_H);
 
 // book card (shown when a recent book exists)
 const CARD_X: u16 = 40;
@@ -212,11 +211,9 @@ impl HomeApp {
         }
         // load reading stats and cover thumb for the recent book
         if self.recent_book_len > 0 {
-            let fname = core::str::from_utf8(&self.recent_book[..self.recent_book_len])
-                .unwrap_or("");
-            if let Some((pages, time, _sessions)) =
-                crate::apps::stats::load_book_stats(k, fname)
-            {
+            let fname =
+                core::str::from_utf8(&self.recent_book[..self.recent_book_len]).unwrap_or("");
+            if let Some((pages, time, _sessions)) = crate::apps::stats::load_book_stats(k, fname) {
                 self.recent_stats_pages = pages;
                 self.recent_stats_time = time;
             } else {
@@ -423,8 +420,8 @@ impl App<AppId> for HomeApp {
             }
             // load reading stats for the recent book
             if self.recent_book_len > 0 {
-                let fname = core::str::from_utf8(&self.recent_book[..self.recent_book_len])
-                    .unwrap_or("");
+                let fname =
+                    core::str::from_utf8(&self.recent_book[..self.recent_book_len]).unwrap_or("");
                 if let Some((pages, time, _sessions)) =
                     crate::apps::stats::load_book_stats(k, fname)
                 {
@@ -672,7 +669,8 @@ impl HomeApp {
                 const COVER_GAP: u16 = 16;
                 let (text_x, text_w, text_align) = if let Some(ref img) = self.recent_cover {
                     let img_x = inner_x as i32;
-                    let img_y = CARD_Y as i32 + CARD_PAD as i32
+                    let img_y = CARD_Y as i32
+                        + CARD_PAD as i32
                         + ((CARD_H - 2 * CARD_PAD) as i32 - img.height as i32) / 2;
                     strip.blit_1bpp(
                         &img.data,
@@ -697,18 +695,24 @@ impl HomeApp {
                 let title = self.recent_display_title();
                 let title_cut = self.ui_fonts.heading.truncate_len(title, text_w);
                 if title_cut >= title.len() {
-                    self.ui_fonts.heading.draw_aligned(
-                        strip, title_region, title, text_align, fg,
-                    );
+                    self.ui_fonts
+                        .heading
+                        .draw_aligned(strip, title_region, title, text_align, fg);
                 } else {
                     let mut tbuf = [0u8; 68]; // 64 + "…"
                     let n = title_cut.min(64);
                     tbuf[..n].copy_from_slice(&title.as_bytes()[..n]);
                     // append UTF-8 for '…' (0xE2 0x80 0xA6)
-                    tbuf[n] = 0xE2; tbuf[n+1] = 0x80; tbuf[n+2] = 0xA6;
+                    tbuf[n] = 0xE2;
+                    tbuf[n + 1] = 0x80;
+                    tbuf[n + 2] = 0xA6;
                     let truncated = core::str::from_utf8(&tbuf[..n + 3]).unwrap_or(title);
                     self.ui_fonts.heading.draw_aligned(
-                        strip, title_region, truncated, text_align, fg,
+                        strip,
+                        title_region,
+                        truncated,
+                        text_align,
+                        fg,
                     );
                 }
 
@@ -720,16 +724,26 @@ impl HomeApp {
                     let author_cut = self.ui_fonts.body.truncate_len(author, text_w);
                     if author_cut >= author.len() {
                         self.ui_fonts.body.draw_aligned(
-                            strip, author_region, author, text_align, fg,
+                            strip,
+                            author_region,
+                            author,
+                            text_align,
+                            fg,
                         );
                     } else {
                         let mut abuf = [0u8; 68];
                         let n = author_cut.min(64);
                         abuf[..n].copy_from_slice(&author.as_bytes()[..n]);
-                        abuf[n] = 0xE2; abuf[n+1] = 0x80; abuf[n+2] = 0xA6;
+                        abuf[n] = 0xE2;
+                        abuf[n + 1] = 0x80;
+                        abuf[n + 2] = 0xA6;
                         let truncated = core::str::from_utf8(&abuf[..n + 3]).unwrap_or(author);
                         self.ui_fonts.body.draw_aligned(
-                            strip, author_region, truncated, text_align, fg,
+                            strip,
+                            author_region,
+                            truncated,
+                            text_align,
+                            fg,
                         );
                     }
                 }
@@ -787,8 +801,11 @@ impl HomeApp {
                 let center_y = CARD_Y + (CARD_H - line_h) / 2;
                 let center_region = Region::new(inner_x, center_y, inner_w, line_h);
                 self.ui_fonts.body.draw_aligned(
-                    strip, center_region, "No book opened yet",
-                    Alignment::Center, fg,
+                    strip,
+                    center_region,
+                    "No book opened yet",
+                    Alignment::Center,
+                    fg,
                 );
             }
         }
@@ -812,9 +829,9 @@ impl HomeApp {
                 .into_styled(PrimitiveStyle::with_fill(bg))
                 .draw(strip)
                 .unwrap();
-            self.ui_fonts.body.draw_aligned(
-                strip, region, label, Alignment::Center, fg,
-            );
+            self.ui_fonts
+                .body
+                .draw_aligned(strip, region, label, Alignment::Center, fg);
         }
     }
 

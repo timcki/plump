@@ -16,7 +16,7 @@ use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::kernel::KernelHandle;
 use crate::ui::{
-    Alignment, BitmapDynLabel, BitmapLabel, BUTTON_BAR_H, CONTENT_TOP, FULL_CONTENT_W, HEADER_W,
+    Alignment, BUTTON_BAR_H, BitmapDynLabel, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, HEADER_W,
     LARGE_MARGIN, Region, SECTION_GAP, StackFmt, TITLE_Y_OFFSET, wrap_next, wrap_prev,
 };
 
@@ -116,8 +116,15 @@ fn parse_u32(s: &[u8]) -> u32 {
 }
 
 fn trim_bytes(s: &[u8]) -> &[u8] {
-    let start = s.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(s.len());
-    let end = s.iter().rposition(|b| !b.is_ascii_whitespace()).map(|p| p + 1).unwrap_or(start);
+    let start = s
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(s.len());
+    let end = s
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map(|p| p + 1)
+        .unwrap_or(start);
     &s[start..end]
 }
 
@@ -132,7 +139,11 @@ pub fn save_book_stats(
 ) {
     let mut buf = [0u8; 64];
     let mut fmt = StackFmt::<64>::new();
-    let _ = write!(fmt, "pages={}\ntime={}\nsessions={}\n", pages, time_secs, sessions);
+    let _ = write!(
+        fmt,
+        "pages={}\ntime={}\nsessions={}\n",
+        pages, time_secs, sessions
+    );
     let s = fmt.as_str().as_bytes();
     let len = s.len().min(buf.len());
     buf[..len].copy_from_slice(&s[..len]);
@@ -140,12 +151,11 @@ pub fn save_book_stats(
     let _ = k.write_app_subdir(STATS_DIR, filename, &buf[..len]);
 }
 
-pub fn load_book_stats(
-    k: &mut KernelHandle<'_>,
-    filename: &str,
-) -> Option<(u32, u32, u16)> {
+pub fn load_book_stats(k: &mut KernelHandle<'_>, filename: &str) -> Option<(u32, u32, u16)> {
     let mut buf = [0u8; 128];
-    let n = k.read_app_subdir_chunk(STATS_DIR, filename, 0, &mut buf).ok()?;
+    let n = k
+        .read_app_subdir_chunk(STATS_DIR, filename, 0, &mut buf)
+        .ok()?;
     if n == 0 {
         return None;
     }
@@ -232,12 +242,7 @@ impl StatsApp {
 
     fn list_region(&self) -> Region {
         let vis = self.visible_rows() as u16;
-        Region::new(
-            LARGE_MARGIN,
-            self.list_y,
-            FULL_CONTENT_W,
-            ROW_STRIDE * vis,
-        )
+        Region::new(LARGE_MARGIN, self.list_y, FULL_CONTENT_W, ROW_STRIDE * vis)
     }
 
     fn load_stats(&mut self, k: &mut KernelHandle<'_>) {
@@ -254,10 +259,9 @@ impl StatsApp {
 
         // fetch all entries from the dir cache
         let mut entries = [crate::drivers::storage::DirEntry::EMPTY; 128];
-        let page = k.dir_page(0, &mut entries).unwrap_or(crate::drivers::storage::DirPage {
-            total: 0,
-            count: 0,
-        });
+        let page = k
+            .dir_page(0, &mut entries)
+            .unwrap_or(crate::drivers::storage::DirPage { total: 0, count: 0 });
 
         let mut buf = [0u8; 128];
         for i in 0..page.count {
@@ -316,7 +320,12 @@ impl App<AppId> for StatsApp {
         self.selected = 0;
         self.scroll = 0;
         self.loaded = false;
-        ctx.mark_dirty(Region::new(0, CONTENT_TOP, SCREEN_W, SCREEN_H - CONTENT_TOP));
+        ctx.mark_dirty(Region::new(
+            0,
+            CONTENT_TOP,
+            SCREEN_W,
+            SCREEN_H - CONTENT_TOP,
+        ));
     }
 
     fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {
@@ -459,12 +468,10 @@ impl App<AppId> for StatsApp {
                     .unwrap();
 
                 // stats (right side): "342p · 12h 3m"
-                let stat_region =
-                    Region::new(LARGE_MARGIN + title_w, row_y, stat_w, ROW_H);
-                let mut stat_label =
-                    BitmapDynLabel::<24>::new(stat_region, self.ui_fonts.body)
-                        .alignment(Alignment::CenterRight)
-                        .inverted(selected);
+                let stat_region = Region::new(LARGE_MARGIN + title_w, row_y, stat_w, ROW_H);
+                let mut stat_label = BitmapDynLabel::<24>::new(stat_region, self.ui_fonts.body)
+                    .alignment(Alignment::CenterRight)
+                    .inverted(selected);
                 let _ = write!(stat_label, "{}p \u{b7} ", book.pages);
                 fmt_compact_duration(book.time_secs, &mut stat_label);
                 stat_label.draw(strip).unwrap();

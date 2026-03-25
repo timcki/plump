@@ -364,7 +364,13 @@ pub struct ReaderApp {
     pub(super) is_epub: bool,
     pub(super) goto_last_page: bool,
     pub(super) restore_offset: Option<u32>,
+    pub(super) restore_page_hint: Option<usize>,
     pub(super) recent_dirty: bool,
+    pub(super) defer_open_work_once: bool,
+    pub(super) pending_recent_write: bool,
+    pub(super) pending_toc_parse: bool,
+    pub(super) pending_title_save: bool,
+    pub(super) pending_cover_thumb: bool,
 
     pub(super) page_img: Option<DecodedImage>,
     pub(super) fullscreen_img: bool,
@@ -424,7 +430,13 @@ impl ReaderApp {
             is_epub: false,
             goto_last_page: false,
             restore_offset: None,
+            restore_page_hint: None,
             recent_dirty: false,
+            defer_open_work_once: false,
+            pending_recent_write: false,
+            pending_toc_parse: false,
+            pending_title_save: false,
+            pending_cover_thumb: false,
 
             page_img: None,
             fullscreen_img: false,
@@ -513,6 +525,102 @@ impl ReaderApp {
         self.epub.ch_cached[..n].iter().filter(|&&c| c).count()
     }
 
+    #[inline]
+    fn has_pending_open_work(&self) -> bool {
+        self.pending_recent_write
+            || self.pending_toc_parse
+            || self.pending_title_save
+            || self.pending_cover_thumb
+    }
+
+    #[inline]
+    fn arm_deferred_open_work(&mut self) {
+        if self.has_pending_open_work() {
+            self.defer_open_work_once = true;
+        }
+    }
+
+    fn save_title_mapping(&self, k: &mut KernelHandle<'_>) {
+        if self.title_len == 0 || self.filename_len == 0 {
+            return;
+        }
+
+        let (nb, nl) = self.name_copy();
+        let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+        let title = core::str::from_utf8(&self.title[..self.title_len as usize]).unwrap_or("");
+        if let Err(e) = k.save_title(name, title) {
+            log::warn!("epub: failed to save title mapping: {}", e);
+        }
+    }
+
+    fn load_toc(&mut self, k: &mut KernelHandle<'_>) {
+        let Some(source) = self.epub.toc_source.take() else {
+            return;
+        };
+
+        let (nb, nl) = self.name_copy();
+        let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+        let toc_idx = source.zip_index();
+
+        let mut toc_dir_buf = [0u8; 256];
+        let toc_dir_len = {
+            let toc_path = self.epub.zip.entry_name(toc_idx);
+            let dir = toc_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+            let n = dir.len().min(toc_dir_buf.len());
+            toc_dir_buf[..n].copy_from_slice(dir.as_bytes());
+            n
+        };
+        let toc_dir = core::str::from_utf8(&toc_dir_buf[..toc_dir_len]).unwrap_or("");
+
+        match extract_zip_entry(k, name, &self.epub.zip, toc_idx) {
+            Ok(toc_data) => {
+                let mut toc = Box::new(EpubToc::new());
+                epub::parse_toc(
+                    source,
+                    &toc_data,
+                    toc_dir,
+                    &self.epub.spine,
+                    &self.epub.zip,
+                    &mut toc,
+                );
+                log::info!("epub: TOC has {} entries", toc.len());
+                self.epub.toc = Some(toc);
+            }
+            Err(_e) => {
+                log::warn!("epub: failed to read TOC");
+            }
+        }
+    }
+
+    fn run_deferred_open_work(&mut self, k: &mut KernelHandle<'_>) -> bool {
+        if self.pending_recent_write {
+            self.pending_recent_write = false;
+            self.write_recent(k);
+            return true;
+        }
+
+        if self.pending_toc_parse {
+            self.pending_toc_parse = false;
+            self.load_toc(k);
+            self.rebuild_quick_actions();
+            return true;
+        }
+
+        if self.pending_title_save {
+            self.pending_title_save = false;
+            self.save_title_mapping(k);
+            return true;
+        }
+
+        if self.pending_cover_thumb {
+            self.pending_cover_thumb = false;
+            self.generate_cover_thumb(k);
+            return true;
+        }
+
+        false
+    }
+
     // update the kernel loading indicator with current caching progress.
     // uses a unified percentage: chapters contribute 0-80%, images 80-100%.
     fn set_cache_loading(&self, ctx: &mut AppContext) {
@@ -567,9 +675,7 @@ impl ReaderApp {
 
     // load stats from SD for the current book
     fn stats_load(&mut self, k: &mut KernelHandle<'_>) {
-        if let Some((pages, time, sessions)) =
-            crate::apps::stats::load_book_stats(k, self.name())
-        {
+        if let Some((pages, time, sessions)) = crate::apps::stats::load_book_stats(k, self.name()) {
             self.stats_pages = pages;
             self.stats_time_secs = time;
             self.stats_sessions = sessions;
@@ -777,7 +883,7 @@ impl ReaderApp {
         filename: &[u8],
         is_epub: bool,
         chapter: u16,
-        _page: usize,
+        page: usize,
         byte_offset: u32,
         font_size: u8,
     ) {
@@ -793,11 +899,8 @@ impl ReaderApp {
 
         self.is_epub = is_epub;
         self.epub.chapter = chapter;
-        self.restore_offset = if byte_offset > 0 {
-            Some(byte_offset)
-        } else {
-            None
-        };
+        self.restore_offset = Some(byte_offset);
+        self.restore_page_hint = Some(page);
         self.book_font_size_idx = font_size;
 
         // reset work queue for clean start
@@ -819,6 +922,13 @@ impl ReaderApp {
         self.show_position = false;
         self.defer_image_decode = true;
         self.goto_last_page = false;
+        self.recent_dirty = false;
+        self.pending_position_change = Some(PendingPositionChange::RestoreReady);
+        self.defer_open_work_once = false;
+        self.pending_recent_write = true;
+        self.pending_toc_parse = false;
+        self.pending_title_save = false;
+        self.pending_cover_thumb = false;
         self.apply_font_metrics();
 
         // reading statistics
@@ -873,11 +983,8 @@ impl ReaderApp {
                 slot.filename_str(),
             );
             self.epub.chapter = slot.chapter;
-            self.restore_offset = if slot.byte_offset > 0 {
-                Some(slot.byte_offset)
-            } else {
-                None
-            };
+            self.restore_offset = Some(slot.byte_offset);
+            self.restore_page_hint = None;
             true
         } else {
             false
@@ -1065,6 +1172,14 @@ impl App<AppId> for ReaderApp {
         self.defer_image_decode = true;
         self.goto_last_page = false;
         self.restore_offset = None;
+        self.restore_page_hint = None;
+        self.recent_dirty = false;
+        self.pending_position_change = Some(PendingPositionChange::OpenReady);
+        self.defer_open_work_once = false;
+        self.pending_recent_write = true;
+        self.pending_toc_parse = false;
+        self.pending_title_save = false;
+        self.pending_cover_thumb = false;
 
         self.apply_font_metrics();
 
@@ -1093,6 +1208,13 @@ impl App<AppId> for ReaderApp {
         self.pg.prefetch_page = NO_PREFETCH;
         self.pg.prefetch_len = 0;
         self.restore_offset = None;
+        self.restore_page_hint = None;
+        self.recent_dirty = false;
+        self.defer_open_work_once = false;
+        self.pending_recent_write = false;
+        self.pending_toc_parse = false;
+        self.pending_title_save = false;
+        self.pending_cover_thumb = false;
         self.show_position = false;
         self.epub.ch_cache = Vec::new();
         self.page_img = None;
@@ -1139,8 +1261,6 @@ impl App<AppId> for ReaderApp {
                     self.bookmark_load(k.bookmark_cache());
                     self.stats_load(k);
 
-                    self.write_recent(k);
-
                     if self.is_epub {
                         self.epub.zip.clear();
                         self.epub.meta = EpubMeta::new();
@@ -1178,11 +1298,11 @@ impl App<AppId> for ReaderApp {
                         if spine_len > 0 && self.epub.chapter as usize >= spine_len {
                             self.epub.chapter = (spine_len - 1) as u16;
                         }
-                        // rewrite RECENT now that title/author are known
-                        self.write_recent(k);
-                        // generate home-screen cover thumbnail (no-op if
-                        // already cached or no cover metadata)
-                        self.generate_cover_thumb(k);
+                        // defer RECENT/title/TOC/cover work until after
+                        // the first page is visible.
+                        self.pending_recent_write = true;
+                        self.pending_title_save = self.title_len > 0;
+                        self.pending_cover_thumb = self.epub.meta.has_cover();
                         self.state = State::NeedToc;
                         ctx.set_loading(LOADING_REGION, "Loading", 40);
                     }
@@ -1193,42 +1313,7 @@ impl App<AppId> for ReaderApp {
                 },
 
                 State::NeedToc => {
-                    if let Some(source) = self.epub.toc_source.take() {
-                        let (nb, nl) = self.name_copy();
-                        let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
-                        let toc_idx = source.zip_index();
-
-                        let mut toc_dir_buf = [0u8; 256];
-                        let toc_dir_len = {
-                            let toc_path = self.epub.zip.entry_name(toc_idx);
-                            let dir = toc_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-                            let n = dir.len().min(toc_dir_buf.len());
-                            toc_dir_buf[..n].copy_from_slice(dir.as_bytes());
-                            n
-                        };
-                        let toc_dir =
-                            core::str::from_utf8(&toc_dir_buf[..toc_dir_len]).unwrap_or("");
-
-                        match extract_zip_entry(k, name, &self.epub.zip, toc_idx) {
-                            Ok(toc_data) => {
-                                let mut toc = Box::new(EpubToc::new());
-                                epub::parse_toc(
-                                    source,
-                                    &toc_data,
-                                    toc_dir,
-                                    &self.epub.spine,
-                                    &self.epub.zip,
-                                    &mut toc,
-                                );
-                                log::info!("epub: TOC has {} entries", toc.len());
-                                self.epub.toc = Some(toc);
-                            }
-                            Err(_e) => {
-                                log::warn!("epub: failed to read TOC");
-                            }
-                        }
-                    }
-                    self.rebuild_quick_actions();
+                    self.pending_toc_parse = self.epub.toc_source.is_some();
                     self.state = State::NeedCache;
                     ctx.set_loading(LOADING_REGION, "Caching", 55);
                 }
@@ -1307,6 +1392,7 @@ impl App<AppId> for ReaderApp {
                             Ok(()) => {
                                 self.defer_image_decode = false;
                                 self.state = State::Ready;
+                                self.arm_deferred_open_work();
                                 ctx.clear_loading();
                                 ctx.mark_dirty(PAGE_REGION);
                             }
@@ -1319,27 +1405,36 @@ impl App<AppId> for ReaderApp {
                 }
 
                 State::NeedPage => {
+                    let page_hint = self.restore_page_hint.take();
                     if let Some(target_off) = self.restore_offset.take() {
-                        self.pg.page = 0;
-                        loop {
-                            match self.load_and_prefetch(k) {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    self.enter_error(ctx, e);
+                        if self.pg.fully_indexed && self.pg.total_pages > 0 {
+                            self.pg.page = self.locate_page_for_offset(target_off, page_hint);
+                            if let Err(e) = self.load_and_prefetch(k) {
+                                self.enter_error(ctx, e);
+                            }
+                        } else {
+                            self.pg.page = 0;
+                            loop {
+                                match self.load_and_prefetch(k) {
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        self.enter_error(ctx, e);
+                                        break;
+                                    }
+                                }
+                                if self.pg.page + 1 >= self.pg.total_pages {
                                     break;
                                 }
+                                if self.pg.offsets[self.pg.page + 1] > target_off {
+                                    break;
+                                }
+                                self.pg.page += 1;
                             }
-                            if self.pg.page + 1 >= self.pg.total_pages {
-                                break;
-                            }
-                            if self.pg.offsets[self.pg.page + 1] > target_off {
-                                break;
-                            }
-                            self.pg.page += 1;
                         }
                         if self.state != State::Error {
                             self.defer_image_decode = false;
                             self.state = State::Ready;
+                            self.arm_deferred_open_work();
                             ctx.clear_loading();
                             ctx.mark_dirty(PAGE_REGION);
                         }
@@ -1348,6 +1443,7 @@ impl App<AppId> for ReaderApp {
                             Ok(()) => {
                                 self.defer_image_decode = false;
                                 self.state = State::Ready;
+                                self.arm_deferred_open_work();
                                 ctx.clear_loading();
                                 ctx.mark_dirty(PAGE_REGION);
                             }
@@ -1362,6 +1458,16 @@ impl App<AppId> for ReaderApp {
                 _ => {}
             }
             break;
+        }
+
+        if matches!(self.state, State::Ready | State::ShowToc) {
+            if self.defer_open_work_once {
+                self.defer_open_work_once = false;
+                return;
+            }
+            if self.run_deferred_open_work(k) {
+                return;
+            }
         }
 
         // flush recent progress and reading stats to SD if dirty

@@ -89,7 +89,6 @@ const HEADING_PX: [(f32, &str); 5] = [
     (46.0, "XLARGE"),
 ];
 
-
 // ASCII range (direct-indexed)
 const FIRST_CHAR: u8 = 0x20;
 const LAST_CHAR: u8 = 0x7E;
