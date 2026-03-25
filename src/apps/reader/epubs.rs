@@ -460,7 +460,10 @@ impl ReaderApp {
             return;
         }
 
-        let dir = self.epub.cache_dir_str();
+        // copy cache dir to a local so the borrow on self.epub is released
+        // before oom_retry takes &mut self.epub
+        let dir_buf = self.epub.cache_dir;
+        let dir = smol_epub::cache::dir_name_str(&dir_buf);
         if cover_cache::has_cover_thumb(k, dir) {
             log::info!("epub: cover thumb already cached");
             return;
@@ -499,6 +502,19 @@ impl ReaderApp {
         let entry = *self.epub.zip.entry(cover_idx);
         let (nb, nl) = self.name_copy();
         let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+
+        // proactively free ch_cache before decode: cover thumbnails are
+        // generated once after OPF parse, and large DEFLATED JPEGs need
+        // ~79 KB peak heap for the decoder.  freeing ch_cache avoids both
+        // OOM and heap-fragmentation issues from a failed first attempt.
+        // the cache is lazily reloaded on the next page turn.
+        if !self.epub.ch_cache.is_empty() {
+            log::info!(
+                "cover thumb: releasing {} KB ch_cache before decode",
+                self.epub.ch_cache.len() / 1024,
+            );
+            self.epub.ch_cache = Vec::new();
+        }
 
         let result = super::images::decode_image_streaming(
             k,

@@ -349,6 +349,37 @@ impl EpubState {
             0
         }
     }
+
+    /// Try `f()` once; on failure, drop `ch_cache` to free heap and retry.
+    ///
+    /// The chapter cache can hold up to 96 KB.  Large DEFLATED cover/inline
+    /// JPEGs need ~90 KB for the decoder, so both cannot coexist on the
+    /// 172 KB heap.  After a successful retry the cache stays empty — it is
+    /// lazily reloaded on the next chapter navigation via `try_cache_chapter`.
+    pub(super) fn oom_retry<E: core::fmt::Display, F>(
+        &mut self,
+        label: &str,
+        mut f: F,
+    ) -> Result<DecodedImage, E>
+    where
+        F: FnMut() -> Result<DecodedImage, E>,
+    {
+        let result = f();
+        match result {
+            Ok(_) => result,
+            Err(e) if !self.ch_cache.is_empty() => {
+                log::info!(
+                    "{}: decode failed ({}), releasing {} KB ch_cache and retrying",
+                    label,
+                    e,
+                    self.ch_cache.len() / 1024,
+                );
+                self.ch_cache = Vec::new();
+                f()
+            }
+            Err(_) => result,
+        }
+    }
 }
 
 impl Default for ReaderApp {

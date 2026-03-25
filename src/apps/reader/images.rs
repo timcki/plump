@@ -282,22 +282,7 @@ impl ReaderApp {
             raw.map(from_smol_image)
         };
 
-        let result = do_decode(k);
-
-        // OOM fallback: release chapter cache and retry
-        let result = match result {
-            Ok(img) => Ok(img),
-            Err(e) if !self.epub.ch_cache.is_empty() => {
-                log::info!(
-                    "reader: decode failed ({}), releasing {} KB chapter cache and retrying",
-                    e,
-                    self.epub.ch_cache.len() / 1024,
-                );
-                self.epub.ch_cache = Vec::new();
-                do_decode(k)
-            }
-            Err(e) => Err(e),
-        };
+        let result = self.epub.oom_retry("reader", || do_decode(k));
 
         match result {
             Ok(img) => {
@@ -560,23 +545,9 @@ impl ReaderApp {
                     );
                     let img_w = self.text_w as u16;
                     let img_h = self.text_area_h;
-                    let result =
-                        decode_image_streaming(k, epub_name, &entry, is_jpeg, img_w, img_h);
-
-                    // OOM fallback: release chapter cache and retry
-                    let result = match result {
-                        Ok(img) => Ok(img),
-                        Err(e) if !self.epub.ch_cache.is_empty() => {
-                            log::info!(
-                                "precache: streaming failed ({}), releasing {} KB ch_cache and retrying",
-                                e,
-                                self.epub.ch_cache.len() / 1024,
-                            );
-                            self.epub.ch_cache = Vec::new();
-                            decode_image_streaming(k, epub_name, &entry, is_jpeg, img_w, img_h)
-                        }
-                        Err(e) => Err(e),
-                    };
+                    let result = self.epub.oom_retry("precache", || {
+                        decode_image_streaming(k, epub_name, &entry, is_jpeg, img_w, img_h)
+                    });
 
                     match result {
                         Ok(img) => {
@@ -858,9 +829,10 @@ pub(super) fn decode_image_streaming(
             max_h,
         )
     };
-    result
-        .map(from_smol_image)
-        .map_err(|msg| Error::from(msg).with_source("decode_image_streaming"))
+    result.map(from_smol_image).map_err(|msg| {
+        log::warn!("decode_image_streaming: {}", msg);
+        Error::from(msg).with_source("decode_image_streaming")
+    })
 }
 
 pub(super) fn load_cached_image(
