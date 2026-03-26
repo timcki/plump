@@ -12,6 +12,7 @@ pub mod config;
 pub mod console;
 pub mod dir_cache;
 pub mod handle;
+pub mod input_policy;
 pub mod rtc_session;
 pub mod scheduler;
 pub mod sleep_image;
@@ -33,6 +34,7 @@ pub use app::{
 pub use bookmarks::BookmarkCache;
 pub use console::BootConsole;
 pub use handle::KernelHandle;
+pub use input_policy::SemanticInput;
 pub use wake::uptime_secs;
 
 use esp_hal::delay::Delay;
@@ -59,6 +61,10 @@ pub struct Kernel {
     // true when RED RAM is out of sync with BW after a skipped
     // phase3_sync (rapid navigation); next partial uses inv_red
     pub(crate) red_stale: bool,
+
+    // power-button policy state machine; resolves raw power events
+    // into semantic inputs (MenuTap) or sleep requests
+    pub(crate) input_policy: input_policy::InputPolicyState,
 }
 
 impl Kernel {
@@ -84,6 +90,7 @@ impl Kernel {
             cached_battery_mv: battery_mv,
             partial_refreshes: 0,
             red_stale: false,
+            input_policy: input_policy::InputPolicyState::new(),
         }
     }
 

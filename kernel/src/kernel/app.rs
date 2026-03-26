@@ -22,6 +22,7 @@ use crate::drivers::input::Event;
 use crate::drivers::sdcard::SdStorage;
 #[allow(unused_imports)]
 use crate::drivers::strip::StripBuffer;
+use crate::kernel::input_policy::SemanticInput;
 use crate::ui::Region;
 
 use super::KernelHandle;
@@ -506,6 +507,16 @@ pub trait AppLayer {
     // active app and event dispatch
     fn active(&self) -> Self::Id;
     fn dispatch_event(&mut self, event: Event, bm: &mut BookmarkCache) -> Transition<Self::Id>;
+
+    /// Handle a semantic input produced by the input policy layer.
+    ///
+    /// Semantic inputs bypass the ButtonMapper → ActionEvent path and
+    /// carry higher-level intent (e.g. `MenuTap` = toggle quick menu).
+    /// Default implementation is a no-op returning `Transition::None`.
+    fn dispatch_semantic(&mut self, _input: SemanticInput) -> Transition<Self::Id> {
+        Transition::None
+    }
+
     fn apply_transition(&mut self, t: Transition<Self::Id>, k: &mut KernelHandle<'_>);
 
     // background work (SD I/O, caching); async for epub streaming

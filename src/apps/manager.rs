@@ -26,6 +26,7 @@ use crate::kernel::KernelHandle;
 use crate::kernel::app::AppLayer;
 use crate::kernel::bookmarks::BookmarkCache;
 use crate::kernel::config::{SystemSettings, WifiConfig};
+use crate::kernel::input_policy::SemanticInput;
 use crate::ui::Region;
 
 // monomorphized dispatch from AppId to concrete app type
@@ -352,6 +353,40 @@ impl AppManager {
         true
     }
 
+    /// Open the quick menu for the active app.
+    fn open_quick_menu(&mut self) {
+        let active = self.launcher.active();
+        let actions: &[_] = with_app!(active, self, |app| app.quick_actions());
+        self.quick_menu.show(actions);
+        self.launcher.ctx.mark_dirty(self.quick_menu.region());
+    }
+
+    /// Close the quick menu, propagating any changed cycle values
+    /// and pending settings to the active app.
+    ///
+    /// Idempotent: safe to call even if `hide()` was already called
+    /// (e.g. from `QuickMenu::on_action`).
+    fn close_quick_menu(&mut self) {
+        let region = self.quick_menu.region();
+        self.quick_menu.hide();
+        self.sync_quick_menu();
+        self.launcher.ctx.mark_dirty(region);
+    }
+
+    /// Handle a semantic input from the input policy layer.
+    pub fn dispatch_semantic_input(&mut self, input: SemanticInput) -> Transition {
+        match input {
+            SemanticInput::MenuTap => {
+                if self.quick_menu.open {
+                    self.close_quick_menu();
+                } else {
+                    self.open_quick_menu();
+                }
+                Transition::None
+            }
+        }
+    }
+
     // power-button long-press must be intercepted by the scheduler
     // before calling this method
     pub fn dispatch_event(&mut self, hw_event: Event, bm_cache: &mut BookmarkCache) -> Transition {
@@ -362,10 +397,7 @@ impl AppManager {
         }
 
         if matches!(event, ActionEvent::Press(Action::Menu)) {
-            let active = self.launcher.active();
-            let actions: &[_] = with_app!(active, self, |app| app.quick_actions());
-            self.quick_menu.show(actions);
-            self.launcher.ctx.mark_dirty(self.quick_menu.region());
+            self.open_quick_menu();
             return Transition::None;
         }
 
@@ -397,27 +429,26 @@ impl AppManager {
             }
 
             QuickMenuResult::Close => {
-                let region = self.quick_menu.region();
-                self.sync_quick_menu();
-                self.launcher.ctx.mark_dirty(region);
+                // hide() already called by on_action; close_quick_menu
+                // is idempotent and handles sync + dirty marking
+                self.close_quick_menu();
                 Transition::None
             }
 
             QuickMenuResult::RefreshScreen => {
-                self.sync_quick_menu();
+                self.close_quick_menu();
                 self.launcher.ctx.request_full_redraw();
                 Transition::None
             }
 
             QuickMenuResult::GoHome => {
-                self.sync_quick_menu();
+                self.close_quick_menu();
                 Transition::Home
             }
 
             QuickMenuResult::AppTrigger(id) => {
                 let active = self.launcher.active();
-                let region = self.quick_menu.region();
-                self.sync_quick_menu();
+                self.close_quick_menu();
 
                 with_app!(active, self, |app| {
                     app.on_quick_trigger(id, &mut self.launcher.ctx);
@@ -426,7 +457,6 @@ impl AppManager {
                     app.save_state(bm_cache);
                 });
 
-                self.launcher.ctx.mark_dirty(region);
                 Transition::None
             }
         }
@@ -649,6 +679,10 @@ impl AppLayer for AppManager {
 
     fn dispatch_event(&mut self, event: Event, bm: &mut BookmarkCache) -> Transition {
         AppManager::dispatch_event(self, event, bm)
+    }
+
+    fn dispatch_semantic(&mut self, input: SemanticInput) -> Transition {
+        AppManager::dispatch_semantic_input(self, input)
     }
 
     fn apply_transition(&mut self, t: Transition, k: &mut KernelHandle<'_>) {

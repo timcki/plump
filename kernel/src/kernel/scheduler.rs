@@ -19,7 +19,7 @@ use embassy_time::{Duration, Ticker, with_timeout};
 use log::{debug, info};
 
 use super::app::{AppLayer, Redraw, Transition};
-use crate::board::button::Button;
+use super::input_policy::{ResolvedInput, SemanticInput};
 use crate::drivers::battery;
 use crate::drivers::input::Event;
 use crate::drivers::strip::StripBuffer;
@@ -29,12 +29,24 @@ use crate::ui::{free_stack_bytes, stack_high_water_mark};
 
 use super::timing;
 
-#[inline]
-fn is_power_event(ev: Event) -> bool {
-    matches!(
-        ev,
-        Event::Press(Button::Power) | Event::Release(Button::Power)
-    )
+/// Outcome of resolving a hardware event through the input policy.
+enum InputResult<Id> {
+    /// Event was ignored or handled with no state change.
+    Nothing,
+    /// Forwarded raw input produced a transition.
+    Transition(Transition<Id>),
+    /// Forwarded raw input changed overlay state with no transition.
+    OverlayChanged,
+    /// Semantic input should be handled by the app layer.
+    Semantic(SemanticInput),
+    /// Sleep was requested.
+    Sleep,
+}
+
+/// Action deferred until the EPD waveform completes.
+enum DeferredAction<Id> {
+    Transition(Transition<Id>),
+    Semantic(SemanticInput),
 }
 
 impl super::Kernel {
@@ -322,38 +334,88 @@ impl super::Kernel {
         app_mgr.request_full_redraw();
     }
 
+    /// Shared helper: run a hardware event through the input policy and
+    /// dispatch forwarded raw events to the app layer.
+    ///
+    /// Both `handle_input` (normal path) and `busy_wait_with_background`
+    /// (waveform path) call this so the policy resolution logic cannot
+    /// drift between the two sites. Semantic inputs are returned to the
+    /// caller so the waveform path can defer them until refresh completes.
+    ///
+    /// `suppress_forward`: when true, forwarded raw events are dropped
+    /// (used during EPD waveform when the quick-menu overlay is open).
+    fn resolve_input<A: AppLayer>(
+        &mut self,
+        hw_event: Event,
+        app_mgr: &mut A,
+        suppress_forward: bool,
+    ) -> InputResult<A::Id> {
+        match self.input_policy.resolve(hw_event) {
+            ResolvedInput::RequestSleep => {
+                info!("input_policy: RequestSleep");
+                InputResult::Sleep
+            }
+            ResolvedInput::Semantic(s) => InputResult::Semantic(s),
+            ResolvedInput::Forward(ev) => {
+                if suppress_forward {
+                    return InputResult::Nothing;
+                }
+                let suppressed_before = app_mgr.suppress_deferred_input();
+                let t = app_mgr.dispatch_event(ev, &mut *self.bm_cache);
+                if t != Transition::None {
+                    InputResult::Transition(t)
+                } else if app_mgr.suppress_deferred_input() != suppressed_before {
+                    InputResult::OverlayChanged
+                } else {
+                    InputResult::Nothing
+                }
+            }
+            ResolvedInput::Ignore => InputResult::Nothing,
+        }
+    }
+
+    fn apply_deferred_action<A: AppLayer>(
+        &mut self,
+        action: DeferredAction<A::Id>,
+        app_mgr: &mut A,
+    ) {
+        match action {
+            DeferredAction::Transition(t) => {
+                app_mgr.apply_transition(t, &mut self.handle());
+            }
+            DeferredAction::Semantic(input) => {
+                let t = app_mgr.dispatch_semantic(input);
+                if t != Transition::None {
+                    app_mgr.apply_transition(t, &mut self.handle());
+                }
+            }
+        }
+    }
+
     // returns true if caller should call enter_sleep
-    //
-    // note: the original async version called enter_sleep inline
-    // on power-long-press and then fell through to dispatch_event
-    // if sleep_deep somehow returned; this version correctly returns
-    // early so the caller can enter_sleep and continue the loop
     fn handle_input<A: AppLayer>(&mut self, hw_event: Event, app_mgr: &mut A) -> bool {
         let _ = tasks::IDLE_SLEEP_DUE.try_take();
 
-        if hw_event == Event::LongPress(Button::Power) {
-            info!("handle_input: LongPress(Power) detected, triggering sleep");
-            return true;
-        }
-
-        let suppressed_before = app_mgr.suppress_deferred_input();
-        let transition = app_mgr.dispatch_event(hw_event, &mut *self.bm_cache);
-        let power = is_power_event(hw_event);
-
-        if transition != Transition::None {
-            app_mgr.apply_transition(transition, &mut self.handle());
-            // don't consume hold for power button - we still want LongPress for sleep
-            if !power {
+        match self.resolve_input(hw_event, app_mgr, false) {
+            InputResult::Sleep => true,
+            InputResult::Transition(t) => {
+                app_mgr.apply_transition(t, &mut self.handle());
                 tasks::request_hold_reset();
+                false
             }
-        } else if app_mgr.suppress_deferred_input() != suppressed_before {
-            // quick menu opened/closed; don't consume hold for power button
-            if !power {
+            InputResult::OverlayChanged => {
                 tasks::request_hold_reset();
+                false
             }
+            InputResult::Semantic(input) => {
+                let t = app_mgr.dispatch_semantic(input);
+                if t != Transition::None {
+                    app_mgr.apply_transition(t, &mut self.handle());
+                }
+                false
+            }
+            InputResult::Nothing => false,
         }
-
-        false
     }
 
     // shared housekeeping body: battery, sd probe, bookmark flush, stats
@@ -490,7 +552,7 @@ impl super::Kernel {
                         );
 
                         // skip phase 3 when content changed mid-DU or
-                        // a deferred transition is queued (the screen
+                        // a deferred action is queued (the screen
                         // will be redrawn immediately after); the next
                         // partial will use inv_red to compensate for
                         // the desynchronised RED RAM
@@ -526,8 +588,8 @@ impl super::Kernel {
                             }
                         }
 
-                        if let Some(transition) = deferred {
-                            app_mgr.apply_transition(transition, &mut self.handle());
+                        if let Some(action) = deferred {
+                            self.apply_deferred_action(action, app_mgr);
                         }
 
                         break 'render;
@@ -577,8 +639,8 @@ impl super::Kernel {
                 self.partial_refreshes = 0;
                 self.red_stale = false;
 
-                if let Some(transition) = deferred {
-                    app_mgr.apply_transition(transition, &mut self.handle());
+                if let Some(action) = deferred {
+                    self.apply_deferred_action(action, app_mgr);
                 }
             }
         } // 'render
@@ -614,17 +676,17 @@ impl super::Kernel {
     // the TICK_MS timeout ensures is_busy is re-checked regularly
     // even during long background operations.
     //
-    // first non-None transition wins; hold reset prevents the held
+    // first deferred action wins; hold reset prevents the held
     // button from re-firing LongPress/Repeat for the waveform
     //
-    // returns (deferred_transition, sleep_requested) so the caller
+    // returns (deferred_action, sleep_requested) so the caller
     // can enter sleep after the EPD finishes if power-long-press
     // arrived during the waveform
     async fn busy_wait_with_background<A: AppLayer>(
         &mut self,
         app_mgr: &mut A,
-    ) -> (Option<Transition<A::Id>>, bool) {
-        let mut deferred: Option<Transition<A::Id>> = None;
+    ) -> (Option<DeferredAction<A::Id>>, bool) {
+        let mut deferred: Option<DeferredAction<A::Id>> = None;
         let mut sleep_requested = false;
 
         loop {
@@ -652,27 +714,28 @@ impl super::Kernel {
 
             if let Some(hw_event) = ev {
                 let _ = tasks::IDLE_SLEEP_DUE.try_take();
+                let suppress = app_mgr.suppress_deferred_input();
 
-                // power long-press triggers sleep after EPD finishes
-                if hw_event == Event::LongPress(Button::Power) {
-                    info!("busy_wait: LongPress(Power) during waveform, will sleep after");
-                    sleep_requested = true;
-                    continue;
-                }
-
-                let suppressed_before = app_mgr.suppress_deferred_input();
-                if !suppressed_before {
-                    let t = app_mgr.dispatch_event(hw_event, &mut *self.bm_cache);
-                    let power = is_power_event(hw_event);
-
-                    if t != Transition::None && deferred.is_none() {
-                        deferred = Some(t);
-                        if !power {
+                match self.resolve_input(hw_event, app_mgr, suppress) {
+                    InputResult::Sleep => {
+                        info!("busy_wait: sleep requested during waveform, will sleep after");
+                        sleep_requested = true;
+                    }
+                    InputResult::Transition(t) => {
+                        if deferred.is_none() {
+                            deferred = Some(DeferredAction::Transition(t));
                             tasks::request_hold_reset();
                         }
-                    } else if app_mgr.suppress_deferred_input() != suppressed_before && !power {
+                    }
+                    InputResult::OverlayChanged => {
                         tasks::request_hold_reset();
                     }
+                    InputResult::Semantic(input) => {
+                        if !suppress && deferred.is_none() {
+                            deferred = Some(DeferredAction::Semantic(input));
+                        }
+                    }
+                    InputResult::Nothing => {}
                 }
             }
 
