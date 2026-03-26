@@ -11,7 +11,7 @@ use crate::kernel::KernelHandle;
 
 use super::{
     DEFAULT_IMG_H, INDENT_PX, LINES_PER_PAGE, LineSpan, MAX_PAGES, NO_PREFETCH, PAGE_BUF,
-    ReaderApp, State, decode_utf8_char,
+    PendingPositionChange, ReaderApp, State, decode_utf8_char,
 };
 
 impl ReaderApp {
@@ -404,8 +404,7 @@ impl ReaderApp {
 
         if self.pg.page + 1 < self.pg.total_pages {
             self.pg.page += 1;
-            self.recent_dirty = true;
-            self.stats_record_page_turn();
+            self.queue_position_change(PendingPositionChange::PageTurn);
             self.state = State::NeedPage;
             return true;
         }
@@ -415,8 +414,7 @@ impl ReaderApp {
             && (self.epub.chapter as usize + 1) < self.epub.spine.len()
         {
             self.epub.chapter += 1;
-            self.recent_dirty = true;
-            self.stats_record_page_turn();
+            self.queue_position_change(PendingPositionChange::PageTurn);
             self.goto_last_page = false;
             self.state = State::NeedIndex;
             return true;
@@ -432,15 +430,14 @@ impl ReaderApp {
 
         if self.pg.page > 0 {
             self.pg.page -= 1;
-            self.recent_dirty = true;
-            self.stats_record_page_turn();
+            self.queue_position_change(PendingPositionChange::PageTurn);
             self.state = State::NeedPage;
             return true;
         }
 
         if self.is_epub && self.epub.chapter > 0 {
             self.epub.chapter -= 1;
-            self.recent_dirty = true;
+            self.queue_position_change(PendingPositionChange::PageTurn);
             self.goto_last_page = true;
             self.state = State::NeedIndex;
             return true;
@@ -457,6 +454,8 @@ impl ReaderApp {
         if self.is_epub {
             if (self.epub.chapter as usize + 1) < self.epub.spine.len() {
                 self.epub.chapter += 1;
+                // jump: update RECENT but don't count as page turn
+                self.queue_position_change(PendingPositionChange::Jump);
                 self.goto_last_page = false;
                 self.state = State::NeedIndex;
                 return true;
@@ -470,6 +469,8 @@ impl ReaderApp {
             let target = (self.pg.page + 10).min(last);
             if target != self.pg.page {
                 self.pg.page = target;
+                // jump: update RECENT but don't count as page turn
+                self.queue_position_change(PendingPositionChange::Jump);
                 self.state = State::NeedPage;
                 return true;
             }
@@ -485,6 +486,8 @@ impl ReaderApp {
         if self.is_epub {
             if self.epub.chapter > 0 {
                 self.epub.chapter -= 1;
+                // jump: update RECENT but don't count as page turn
+                self.queue_position_change(PendingPositionChange::Jump);
                 self.goto_last_page = false;
                 self.state = State::NeedIndex;
                 return true;
@@ -493,6 +496,8 @@ impl ReaderApp {
             let target = self.pg.page.saturating_sub(10);
             if target != self.pg.page {
                 self.pg.page = target;
+                // jump: update RECENT but don't count as page turn
+                self.queue_position_change(PendingPositionChange::Jump);
                 self.state = State::NeedPage;
                 return true;
             }

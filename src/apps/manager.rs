@@ -430,13 +430,56 @@ impl AppManager {
         }
     }
 
+    /// Flush deferred persistence for all app singletons.
+    ///
+    /// Dispatches to every concrete app so that failed flushes can
+    /// retry even when the owning app is suspended (e.g. reader
+    /// dirty state retries while Home is active).
+    pub fn flush_deferred_persistence(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+        force: bool,
+    ) -> crate::error::Result<()> {
+        // today only ReaderApp does real work; others inherit the
+        // default no-op. iterate all singletons for retry semantics.
+        let mut first_error = None;
+        for &id in &[
+            AppId::Home,
+            AppId::Files,
+            AppId::Reader,
+            AppId::Settings,
+            AppId::Stats,
+        ] {
+            let result = with_app!(id, self, |app| app.flush_deferred_persistence(k, force));
+            if let Err(e) = result {
+                log::warn!("flush_deferred_persistence({:?}): {}", id, e);
+                first_error.get_or_insert(e);
+            }
+        }
+
+        if let Some(err) = first_error {
+            Err(err)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn apply_transition(&mut self, transition: Transition, k: &mut KernelHandle<'_>) {
         if let Some(nav) = self.launcher.apply(transition) {
             log::debug!("app: {:?} -> {:?}", nav.from, nav.to);
 
             if nav.from != AppId::Upload {
+                with_app!(nav.from, self, |app| app.save_state(k.bookmark_cache_mut()));
+
+                // force flush deferred persistence for all app singletons
+                // before leaving the current app so inactive retries still
+                // run and reader dirty state gets one last chance before the
+                // singleton is potentially reused for another book.
+                if let Err(e) = self.flush_deferred_persistence(k, true) {
+                    log::warn!("flush on leave {:?}: {}", nav.from, e);
+                }
+
                 with_app!(nav.from, self, |app| {
-                    app.save_state(k.bookmark_cache_mut());
                     if nav.suspend {
                         app.on_suspend();
                     } else {
@@ -672,6 +715,14 @@ impl AppLayer for AppManager {
 
     fn save_active_state(&mut self, bm: &mut crate::kernel::bookmarks::BookmarkCache) {
         AppManager::save_active_state(self, bm);
+    }
+
+    fn flush_deferred_persistence(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+        force: bool,
+    ) -> crate::error::Result<()> {
+        AppManager::flush_deferred_persistence(self, k, force)
     }
 
     fn collect_session(&self, session: &mut crate::kernel::rtc_session::RtcSession) {

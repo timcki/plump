@@ -136,7 +136,7 @@ pub fn save_book_stats(
     pages: u32,
     time_secs: u32,
     sessions: u16,
-) {
+) -> crate::error::Result<()> {
     let mut buf = [0u8; 64];
     let mut fmt = StackFmt::<64>::new();
     let _ = write!(
@@ -147,8 +147,8 @@ pub fn save_book_stats(
     let s = fmt.as_str().as_bytes();
     let len = s.len().min(buf.len());
     buf[..len].copy_from_slice(&s[..len]);
-    let _ = k.ensure_app_subdir(STATS_DIR);
-    let _ = k.write_app_subdir(STATS_DIR, filename, &buf[..len]);
+    k.ensure_app_subdir(STATS_DIR)?;
+    k.write_app_subdir(STATS_DIR, filename, &buf[..len])
 }
 
 pub fn load_book_stats(k: &mut KernelHandle<'_>, filename: &str) -> Option<(u32, u32, u16)> {

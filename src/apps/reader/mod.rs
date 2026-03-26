@@ -388,6 +388,14 @@ impl Default for ReaderApp {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingPositionChange {
+    OpenReady,
+    RestoreReady,
+    PageTurn,
+    Jump,
+}
+
 pub struct ReaderApp {
     pub(super) filename: [u8; 32],
     pub(super) filename_len: usize,
@@ -408,8 +416,8 @@ pub struct ReaderApp {
     pub(super) restore_offset: Option<u32>,
     pub(super) restore_page_hint: Option<usize>,
     pub(super) recent_dirty: bool,
+    pending_position_change: Option<PendingPositionChange>,
     pub(super) defer_open_work_once: bool,
-    pub(super) pending_recent_write: bool,
     pub(super) pending_toc_parse: bool,
     pub(super) pending_title_save: bool,
     pub(super) pending_cover_thumb: bool,
@@ -452,6 +460,10 @@ pub struct ReaderApp {
     pub(super) stats_sessions: u16,
     pub(super) stats_last_uptime: u32, // uptime_secs at last page turn / enter
     pub(super) stats_dirty: bool,
+    pub(super) stats_clock_running: bool, // false when suspended/exited
+
+    // deferred persistence: debounce deadline (uptime_secs)
+    pub(super) persist_next_flush_at: Option<u32>,
 }
 
 impl ReaderApp {
@@ -476,8 +488,8 @@ impl ReaderApp {
             restore_offset: None,
             restore_page_hint: None,
             recent_dirty: false,
+            pending_position_change: None,
             defer_open_work_once: false,
-            pending_recent_write: false,
             pending_toc_parse: false,
             pending_title_save: false,
             pending_cover_thumb: false,
@@ -516,6 +528,9 @@ impl ReaderApp {
             stats_sessions: 0,
             stats_last_uptime: 0,
             stats_dirty: false,
+            stats_clock_running: false,
+
+            persist_next_flush_at: None,
         }
     }
 
@@ -784,10 +799,7 @@ impl ReaderApp {
 
     #[inline]
     fn has_pending_open_work(&self) -> bool {
-        self.pending_recent_write
-            || self.pending_toc_parse
-            || self.pending_title_save
-            || self.pending_cover_thumb
+        self.pending_toc_parse || self.pending_title_save || self.pending_cover_thumb
     }
 
     #[inline]
@@ -850,12 +862,6 @@ impl ReaderApp {
     }
 
     fn run_deferred_open_work(&mut self, k: &mut KernelHandle<'_>) -> bool {
-        if self.pending_recent_write {
-            self.pending_recent_write = false;
-            self.write_recent(k);
-            return true;
-        }
-
         if self.pending_toc_parse {
             self.pending_toc_parse = false;
             self.load_toc(k);
@@ -915,6 +921,71 @@ impl ReaderApp {
         ctx.set_loading(LOADING_REGION, lbuf.as_str(), pct);
     }
 
+    // ── deferred persistence ────────────────────────────────────────
+
+    const PERSIST_DEBOUNCE_SECS: u32 = 30;
+
+    /// Schedule a deferred flush in PERSIST_DEBOUNCE_SECS from now.
+    fn arm_persist_debounce(&mut self) {
+        let deadline = crate::kernel::uptime_secs() + Self::PERSIST_DEBOUNCE_SECS;
+        self.persist_next_flush_at = Some(deadline);
+    }
+
+    /// Queue a position change to be committed once the target page is visible.
+    fn queue_position_change(&mut self, change: PendingPositionChange) {
+        self.pending_position_change = Some(change);
+    }
+
+    /// Commit a visible position change and schedule deferred persistence.
+    fn commit_position_change(&mut self, change: PendingPositionChange) {
+        self.recent_dirty = true;
+        match change {
+            PendingPositionChange::PageTurn => self.stats_record_page_turn(),
+            PendingPositionChange::OpenReady | PendingPositionChange::RestoreReady => {
+                self.stats_resume_clock();
+            }
+            PendingPositionChange::Jump => {}
+        }
+        self.arm_persist_debounce();
+    }
+
+    /// Finalize a Ready transition once the target page is fully loaded.
+    fn finish_ready_transition(&mut self, ctx: &mut AppContext) {
+        self.defer_image_decode = false;
+        self.state = State::Ready;
+        self.arm_deferred_open_work();
+        if let Some(change) = self.pending_position_change.take() {
+            self.commit_position_change(change);
+        }
+        ctx.clear_loading();
+        ctx.mark_dirty(PAGE_REGION);
+    }
+
+    /// Pause the reading-time clock (call on suspend/exit).
+    /// Accumulates any elapsed time so deferred flushes don't
+    /// count non-reader time.
+    ///
+    /// Returns true if new reading time was accumulated.
+    fn stats_pause_clock(&mut self) -> bool {
+        let mut added_elapsed = false;
+        if self.stats_clock_running {
+            let now = crate::kernel::uptime_secs();
+            let delta = now.saturating_sub(self.stats_last_uptime);
+            if delta > 0 && delta < 600 {
+                self.stats_time_secs = self.stats_time_secs.saturating_add(delta);
+                added_elapsed = true;
+            }
+            self.stats_clock_running = false;
+        }
+        added_elapsed
+    }
+
+    /// Resume the reading-time clock (call on resume/enter-ready).
+    fn stats_resume_clock(&mut self) {
+        self.stats_last_uptime = crate::kernel::uptime_secs();
+        self.stats_clock_running = true;
+    }
+
     // ── reading statistics ──────────────────────────────────────────
 
     // call on each page turn to accumulate time and increment page count
@@ -946,19 +1017,21 @@ impl ReaderApp {
         self.stats_dirty = true;
     }
 
-    // flush stats to SD
-    fn stats_flush(&mut self, k: &mut KernelHandle<'_>) {
+    // flush stats to SD; returns Err on write failure (dirty state kept)
+    fn stats_flush(&mut self, k: &mut KernelHandle<'_>) -> crate::error::Result<()> {
         if !self.stats_dirty || self.filename_len == 0 {
-            return;
+            return Ok(());
         }
         pulp_kernel::perf_begin!(_sf_t0);
-        // accumulate any unrecorded time
-        let now = crate::kernel::uptime_secs();
-        let delta = now.saturating_sub(self.stats_last_uptime);
-        if delta < 600 {
-            self.stats_time_secs = self.stats_time_secs.saturating_add(delta);
+        // accumulate any unrecorded time only if the clock is running
+        if self.stats_clock_running {
+            let now = crate::kernel::uptime_secs();
+            let delta = now.saturating_sub(self.stats_last_uptime);
+            if delta < 600 {
+                self.stats_time_secs = self.stats_time_secs.saturating_add(delta);
+            }
+            self.stats_last_uptime = now;
         }
-        self.stats_last_uptime = now;
 
         crate::apps::stats::save_book_stats(
             k,
@@ -966,7 +1039,7 @@ impl ReaderApp {
             self.stats_pages,
             self.stats_time_secs,
             self.stats_sessions,
-        );
+        )?;
         self.stats_dirty = false;
         pulp_kernel::perf_event!(
             "reader",
@@ -975,6 +1048,7 @@ impl ReaderApp {
             self.stats_time_secs,
             _sf_t0.elapsed().as_millis()
         );
+        Ok(())
     }
 
     // public accessors for home screen display
@@ -984,6 +1058,11 @@ impl ReaderApp {
 
     // transition to error state with consistent handling
     fn enter_error(&mut self, ctx: &mut AppContext, e: Error) {
+        if self.stats_pause_clock() {
+            self.stats_dirty = true;
+            self.arm_persist_debounce();
+        }
+        self.pending_position_change = None;
         self.error = Some(e);
         self.state = State::Error;
         ctx.clear_loading();
@@ -1191,16 +1270,17 @@ impl ReaderApp {
         self.recent_dirty = false;
         self.pending_position_change = Some(PendingPositionChange::RestoreReady);
         self.defer_open_work_once = false;
-        self.pending_recent_write = true;
         self.pending_toc_parse = false;
         self.pending_title_save = false;
         self.pending_cover_thumb = false;
         self.loading_cover = None;
+        self.persist_next_flush_at = None;
         self.apply_font_metrics();
 
         // reading statistics
         self.stats_last_uptime = crate::kernel::uptime_secs();
         self.stats_dirty = false;
+        self.stats_clock_running = false;
 
         // enter state machine — NeedBookmark will check the bookmark
         // cache, but our chapter/offset from RTC are already set, so
@@ -1337,7 +1417,8 @@ impl ReaderApp {
     }
 
     // write extended RECENT file: filename\0title\0author\0progress
-    fn write_recent(&mut self, k: &mut KernelHandle<'_>) {
+    // returns Err on write failure (dirty state kept for retry)
+    fn write_recent(&mut self, k: &mut KernelHandle<'_>) -> crate::error::Result<()> {
         pulp_kernel::perf_begin!(_wr_t0);
         let mut buf = [0u8; 196];
         let mut pos = 0usize;
@@ -1373,7 +1454,7 @@ impl ReaderApp {
         buf[pos] = self.progress_pct();
         pos += 1;
 
-        let _ = k.write_app_data(RECENT_FILE, &buf[..pos]);
+        k.write_app_data(RECENT_FILE, &buf[..pos])?;
         self.recent_dirty = false;
         pulp_kernel::perf_event!(
             "reader",
@@ -1381,6 +1462,7 @@ impl ReaderApp {
             pos,
             _wr_t0.elapsed().as_millis()
         );
+        Ok(())
     }
 }
 
@@ -1533,11 +1615,11 @@ impl App<AppId> for ReaderApp {
         self.recent_dirty = false;
         self.pending_position_change = Some(PendingPositionChange::OpenReady);
         self.defer_open_work_once = false;
-        self.pending_recent_write = true;
         self.pending_toc_parse = false;
         self.pending_title_save = false;
         self.pending_cover_thumb = false;
         self.loading_cover = None;
+        self.persist_next_flush_at = None;
 
         self.apply_font_metrics();
 
@@ -1546,6 +1628,7 @@ impl App<AppId> for ReaderApp {
         // load existing stats for this book
         self.stats_last_uptime = crate::kernel::uptime_secs();
         self.stats_dirty = false;
+        self.stats_clock_running = false;
 
         self.state = State::NeedBookmark;
 
@@ -1566,12 +1649,19 @@ impl App<AppId> for ReaderApp {
         self.pg.line_count = 0;
         self.pg.buf_len = 0;
         self.pg.prefetch_page = NO_PREFETCH;
+        if self.stats_pause_clock() {
+            self.stats_dirty = true;
+            self.arm_persist_debounce();
+        }
+
         self.pg.prefetch_len = 0;
         self.restore_offset = None;
         self.restore_page_hint = None;
-        self.recent_dirty = false;
+        // NOTE: recent_dirty / stats_dirty intentionally NOT cleared here;
+        // flush_deferred_persistence(force=true) runs before on_exit and
+        // handles them. if it failed, dirty state is kept for retry.
+        self.pending_position_change = None;
         self.defer_open_work_once = false;
-        self.pending_recent_write = false;
         self.pending_toc_parse = false;
         self.pending_title_save = false;
         self.pending_cover_thumb = false;
@@ -1587,11 +1677,19 @@ impl App<AppId> for ReaderApp {
     }
 
     fn on_suspend(&mut self) {
+        // pause the reading-time clock so menu/Home time isn't counted
+        if self.stats_pause_clock() {
+            self.stats_dirty = true;
+            self.arm_persist_debounce();
+        }
         // background caching continues while suspended -- the worker
         // task runs independently and our work_gen stays valid
     }
 
     fn on_resume(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
+        // resume reading-time clock
+        self.stats_resume_clock();
+
         // Restore our generation so the worker considers in-flight
         // results current again (another app may have submitted work
         // under a different generation while we were suspended).
@@ -1709,9 +1807,9 @@ impl App<AppId> for ReaderApp {
                             if spine_len > 0 && self.epub.chapter as usize >= spine_len {
                                 self.epub.chapter = (spine_len - 1) as u16;
                             }
-                            // defer RECENT/title/TOC/cover work until after
-                            // the first page is visible.
-                            self.pending_recent_write = true;
+                            // defer title/TOC/cover work until after
+                            // the first page is visible. RECENT is now
+                            // handled by the deferred persistence system.
                             self.pending_title_save = self.title_is_real;
                             self.pending_cover_thumb = self.epub.meta.has_cover();
                             self.state = State::NeedToc;
@@ -1906,11 +2004,7 @@ impl App<AppId> for ReaderApp {
                     if want_last {
                         match self.scan_to_last_page(k) {
                             Ok(()) => {
-                                self.defer_image_decode = false;
-                                self.state = State::Ready;
-                                self.arm_deferred_open_work();
-                                ctx.clear_loading();
-                                ctx.mark_dirty(PAGE_REGION);
+                                self.finish_ready_transition(ctx);
                                 log::debug!(
                                     "reader:bg NeedIndex(last-page) -> {:?} loading_active={} ({}ms)",
                                     self.state,
@@ -2013,11 +2107,7 @@ impl App<AppId> for ReaderApp {
                             }
                         }
                         if self.state != State::Error {
-                            self.defer_image_decode = false;
-                            self.state = State::Ready;
-                            self.arm_deferred_open_work();
-                            ctx.clear_loading();
-                            ctx.mark_dirty(PAGE_REGION);
+                            self.finish_ready_transition(ctx);
                             log::debug!(
                                 "reader:bg NeedPage(restore) -> {:?} page={} loading_active={} ({}ms)",
                                 self.state,
@@ -2040,11 +2130,7 @@ impl App<AppId> for ReaderApp {
                     } else {
                         match self.load_and_prefetch(k) {
                             Ok(()) => {
-                                self.defer_image_decode = false;
-                                self.state = State::Ready;
-                                self.arm_deferred_open_work();
-                                ctx.clear_loading();
-                                ctx.mark_dirty(PAGE_REGION);
+                                self.finish_ready_transition(ctx);
                                 log::debug!(
                                     "reader:bg NeedPage(open) -> {:?} page={} loading_active={} ({}ms)",
                                     self.state,
@@ -2099,13 +2185,9 @@ impl App<AppId> for ReaderApp {
             }
         }
 
-        // flush recent progress and reading stats to SD if dirty
-        if self.recent_dirty && self.state == State::Ready {
-            self.write_recent(k);
-        }
-        if self.stats_dirty && self.state == State::Ready {
-            self.stats_flush(k);
-        }
+        // RECENT and stats writes are now deferred — flushed via
+        // flush_deferred_persistence() in safe no-redraw windows,
+        // on app transitions, and before sleep.
 
         // background caching; runs whenever the page content is
         // settled and there is work to do. NeedIndex is included so
@@ -2194,6 +2276,8 @@ impl App<AppId> for ReaderApp {
                         );
                         self.epub.chapter = entry.spine_idx;
                         self.pg.page = 0;
+                        // TOC jump: update RECENT but don't count as page turn
+                        self.queue_position_change(PendingPositionChange::Jump);
                         self.goto_last_page = false;
                         self.state = State::NeedIndex;
                         ctx.mark_dirty(PAGE_REGION);
@@ -2274,6 +2358,8 @@ impl App<AppId> for ReaderApp {
             ActionEvent::LongPress(Action::NextJump) => {
                 if self.state == State::Ready && self.pg.total_pages > 0 {
                     self.pg.page = self.pg.total_pages - 1;
+                    // jump: update RECENT but don't count as page turn
+                    self.commit_position_change(PendingPositionChange::Jump);
                     ctx.mark_dirty(PAGE_REGION);
                 }
                 Transition::None
@@ -2283,6 +2369,8 @@ impl App<AppId> for ReaderApp {
             ActionEvent::LongPress(Action::PrevJump) => {
                 if self.state == State::Ready {
                     self.pg.page = 0;
+                    // jump: update RECENT but don't count as page turn
+                    self.commit_position_change(PendingPositionChange::Jump);
                     ctx.mark_dirty(PAGE_REGION);
                 }
                 Transition::None
@@ -2303,6 +2391,8 @@ impl App<AppId> for ReaderApp {
             QA_PREV_CHAPTER => {
                 if self.is_epub && self.epub.chapter > 0 {
                     self.epub.chapter -= 1;
+                    // jump: update RECENT but don't count as page turn
+                    self.queue_position_change(PendingPositionChange::Jump);
                     self.goto_last_page = false;
                     self.state = State::NeedIndex;
                 }
@@ -2310,6 +2400,8 @@ impl App<AppId> for ReaderApp {
             QA_NEXT_CHAPTER => {
                 if self.is_epub && (self.epub.chapter as usize + 1) < self.epub.spine.len() {
                     self.epub.chapter += 1;
+                    // jump: update RECENT but don't count as page turn
+                    self.queue_position_change(PendingPositionChange::Jump);
                     self.goto_last_page = false;
                     self.state = State::NeedIndex;
                 }
@@ -2367,6 +2459,55 @@ impl App<AppId> for ReaderApp {
 
     fn save_state(&self, bm: &mut bookmarks::BookmarkCache) {
         self.save_position(bm);
+    }
+
+    fn flush_deferred_persistence(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+        force: bool,
+    ) -> crate::error::Result<()> {
+        if force && self.stats_pause_clock() {
+            self.stats_dirty = true;
+        }
+
+        let any_dirty = self.recent_dirty || self.stats_dirty;
+        if !any_dirty {
+            return Ok(());
+        }
+
+        // non-forced: respect debounce deadline
+        if !force {
+            match self.persist_next_flush_at {
+                Some(deadline) if crate::kernel::uptime_secs() < deadline => return Ok(()),
+                None => return Ok(()), // no deadline armed = nothing pending
+                _ => {}
+            }
+        }
+
+        let mut first_error = None;
+
+        if self.recent_dirty {
+            if let Err(e) = self.write_recent(k) {
+                log::warn!("reader: deferred write_recent failed: {}", e);
+                first_error.get_or_insert(e);
+            }
+        }
+
+        if self.stats_dirty {
+            if let Err(e) = self.stats_flush(k) {
+                log::warn!("reader: deferred stats_flush failed: {}", e);
+                first_error.get_or_insert(e);
+            }
+        }
+
+        if let Some(err) = first_error {
+            // re-arm debounce for retry
+            self.arm_persist_debounce();
+            Err(err)
+        } else {
+            self.persist_next_flush_at = None;
+            Ok(())
+        }
     }
 
     fn has_background_when_suspended(&self) -> bool {

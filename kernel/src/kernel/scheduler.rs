@@ -289,6 +289,15 @@ impl super::Kernel {
                 continue;
             }
 
+            // opportunistic flush of deferred app persistence (RECENT,
+            // reading stats) in safe no-redraw windows. apps own their
+            // debounce logic so most calls are cheap no-ops.
+            if !app_mgr.has_redraw() {
+                if let Err(e) = app_mgr.flush_deferred_persistence(&mut self.handle(), false) {
+                    debug!("scheduler: opportunistic flush error: {}", e);
+                }
+            }
+
             if app_mgr.ctx_mut().render_ready() {
                 let redraw = app_mgr.take_redraw();
                 if self.render(app_mgr, redraw).await {
@@ -684,6 +693,15 @@ impl super::Kernel {
         // save active app state (reader position) to bookmark cache
         // before collecting session, so bookmarks stay in sync
         app_mgr.save_active_state(&mut *self.bm_cache);
+
+        // force flush deferred app persistence (RECENT, reading stats)
+        // before deep sleep so no dirty state is lost
+        // TODO: decide policy on force-flush failure here: keep the
+        // current best-effort behavior, retry, or abort/defer sleep to
+        // preserve durability guarantees more strictly.
+        if let Err(e) = app_mgr.flush_deferred_persistence(&mut self.handle(), true) {
+            info!("sleep: flush_deferred_persistence error: {}", e);
+        }
 
         // collect session state from app layer
         let t0 = Instant::now();

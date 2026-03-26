@@ -203,6 +203,10 @@ impl HomeApp {
         );
     }
 
+    // TODO: deferred reader RECENT/stats flushes are not pushed live
+    // into an already-visible Home screen. Home may show stale
+    // recent/stats data until the next reload (resume / re-enter).
+    // This is intentional for now — see TODO-960fb375 for context.
     pub fn load_recent(&mut self, k: &mut KernelHandle<'_>) {
         let mut buf = [0u8; 196];
         match k.read_app_data_start(RECENT_FILE, &mut buf) {

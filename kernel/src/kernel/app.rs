@@ -322,6 +322,21 @@ pub trait App<Id> {
 
     fn save_state(&self, _bm: &mut BookmarkCache) {}
 
+    /// Flush deferred persistence (e.g. RECENT, reading stats).
+    ///
+    /// Called periodically in safe no-redraw windows (`force=false`)
+    /// and on app transitions / before sleep (`force=true`).
+    /// Implementations should return early when nothing is dirty or
+    /// when the debounce deadline hasn't passed (non-forced).
+    /// Dirty flags must only be cleared on success so failures retry.
+    fn flush_deferred_persistence(
+        &mut self,
+        _k: &mut KernelHandle<'_>,
+        _force: bool,
+    ) -> crate::error::Result<()> {
+        Ok(())
+    }
+
     fn hide_button_bar(&self) -> bool {
         false
     }
@@ -496,6 +511,17 @@ pub trait AppLayer {
     // bookmark cache; called before collect_session during sleep so
     // bookmarks and session stay in sync
     fn save_active_state(&mut self, bm: &mut BookmarkCache);
+
+    /// Flush deferred persistence for all app singletons.
+    ///
+    /// Dispatches to every app (not just the active one) so that
+    /// failed flushes can retry even when the owning app is suspended.
+    /// `force=true` bypasses debounce (used on transitions / sleep).
+    fn flush_deferred_persistence(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+        force: bool,
+    ) -> crate::error::Result<()>;
 
     // session persistence: save/restore active app across sleep/wake
     // using RTC FAST memory (survives deep sleep, zeroed on power-on)
