@@ -241,6 +241,10 @@ pub(super) struct PageState {
     pub(super) lines: [LineSpan; LINES_PER_PAGE],
     pub(super) line_count: usize,
 
+    /// Cached justification metrics per line, precomputed after wrapping.
+    /// Avoids re-running `measure_line()` on every strip pass during draw.
+    pub(super) line_measures: [paging::LineMeasure; LINES_PER_PAGE],
+
     pub(super) prefetch: Vec<u8>,
     pub(super) prefetch_len: usize,
     pub(super) prefetch_page: usize,
@@ -257,6 +261,7 @@ impl PageState {
             buf_len: 0,
             lines: [LineSpan::EMPTY; LINES_PER_PAGE],
             line_count: 0,
+            line_measures: [paging::LineMeasure::ZERO; LINES_PER_PAGE],
             prefetch: Vec::new(),
             prefetch_len: 0,
             prefetch_page: NO_PREFETCH,
@@ -2701,16 +2706,24 @@ impl App<AppId> for ReaderApp {
                         + ((self.text_w as i32 - img.width as i32) / 2).max(0);
                     let img_y = self.text_y as i32
                         + ((self.text_area_h as i32 - img.height as i32) / 2).max(0);
-                    strip.blit_1bpp(
-                        &img.data,
-                        0,
-                        img.width as usize,
-                        img.height as usize,
-                        img.stride,
-                        img_x,
-                        img_y,
-                        true,
+                    let img_region = Region::new(
+                        img_x as u16,
+                        img_y as u16,
+                        img.width,
+                        img.height,
                     );
+                    if img_region.intersects(strip.logical_window()) {
+                        strip.blit_1bpp(
+                            &img.data,
+                            0,
+                            img.width as usize,
+                            img.height as usize,
+                            img.stride,
+                            img_x,
+                            img_y,
+                            true,
+                        );
+                    }
                 }
             } else {
                 let mut img_rendered = false;
@@ -2745,16 +2758,25 @@ impl App<AppId> for ReaderApp {
                                 // center vertically within reserved lines
                                 let y_offset = ((reserved_h - blit_h as i32) / 2).max(0);
 
-                                strip.blit_1bpp(
-                                    &img.data,
-                                    0,
-                                    img.width as usize,
-                                    blit_h,
-                                    img.stride,
-                                    img_x,
-                                    y_top + y_offset,
-                                    true,
+                                // skip blit if image doesn't intersect strip
+                                let img_region = Region::new(
+                                    img_x as u16,
+                                    (y_top + y_offset) as u16,
+                                    img.width,
+                                    blit_h as u16,
                                 );
+                                if img_region.intersects(strip.logical_window()) {
+                                    strip.blit_1bpp(
+                                        &img.data,
+                                        0,
+                                        img.width as usize,
+                                        blit_h,
+                                        img.stride,
+                                        img_x,
+                                        y_top + y_offset,
+                                        true,
+                                    );
+                                }
                                 img_rendered = true;
                             } else {
                                 let baseline = y_top + ascent;
@@ -2785,7 +2807,7 @@ impl App<AppId> for ReaderApp {
                         && span.is_soft_wrap()
                         && (span.flags & LineSpan::FLAG_HEADING) == 0;
                     let (extra_per_gap, remainder) = if justify {
-                        let m = paging::measure_line(&self.pg.buf, span, fs);
+                        let m = self.pg.line_measures[i];
                         let avail = self.text_w.saturating_sub(INDENT_PX * span.indent as u32);
                         let spare = avail.saturating_sub(m.width);
                         // skip if: no gaps, tiny spare (< 3px — invisible),

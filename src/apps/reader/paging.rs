@@ -36,6 +36,23 @@ impl ReaderApp {
         }
     }
 
+    /// Precompute justification metrics for every line on the current page.
+    /// Called once after wrapping so that `draw()` can reuse cached values
+    /// across all strip passes instead of re-running `measure_line()` per strip.
+    pub(super) fn precompute_line_metrics(&mut self) {
+        if let Some(ref fs) = self.fonts {
+            for i in 0..self.pg.line_count {
+                let span = &self.pg.lines[i];
+                // Images and empty spans don't need measurement.
+                if span.is_image() || span.len == 0 {
+                    self.pg.line_measures[i] = LineMeasure::default();
+                } else {
+                    self.pg.line_measures[i] = measure_line(&self.pg.buf, span, fs);
+                }
+            }
+        }
+    }
+
     pub(super) fn wrap_monospace(&mut self, n: usize) -> usize {
         use super::CHARS_PER_LINE;
 
@@ -171,9 +188,10 @@ impl ReaderApp {
 
             pulp_kernel::perf_begin!(_t_wrap);
             self.wrap_lines_counted(n);
+            self.precompute_line_metrics();
             pulp_kernel::perf_event!(
                 "reader",
-                "load_prefetch.wrap lines={} elapsed_ms={}",
+                "load_prefetch.wrap+metrics lines={} elapsed_ms={}",
                 self.pg.line_count,
                 _t_wrap.elapsed().as_millis()
             );
@@ -257,9 +275,10 @@ impl ReaderApp {
 
         pulp_kernel::perf_begin!(_t_wrap);
         let consumed = self.wrap_lines_counted(self.pg.buf_len);
+        self.precompute_line_metrics();
         pulp_kernel::perf_event!(
             "reader",
-            "load_prefetch.wrap lines={} consumed={} elapsed_ms={}",
+            "load_prefetch.wrap+metrics lines={} consumed={} elapsed_ms={}",
             self.pg.line_count,
             consumed,
             _t_wrap.elapsed().as_millis()
@@ -509,11 +528,16 @@ impl ReaderApp {
 // ── Phase 3: line analysis helpers for justification ─────────────────
 
 /// Result of measuring a single line span for justification.
-pub(super) struct LineMeasure {
+#[derive(Clone, Copy, Default)]
+pub(in crate::apps) struct LineMeasure {
     /// Rendered width in pixels (excluding trailing whitespace).
     pub width: u32,
     /// Number of stretchable inter-word gaps (ASCII spaces only; NBSP excluded).
     pub gaps: u16,
+}
+
+impl LineMeasure {
+    pub const ZERO: Self = Self { width: 0, gaps: 0 };
 }
 
 /// Measure one text line's natural rendered width and count stretchable gaps.
