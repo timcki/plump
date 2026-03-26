@@ -12,6 +12,7 @@ pub mod board;
 pub mod drivers;
 pub mod error;
 pub mod kernel;
+pub mod perf;
 pub mod ui;
 pub mod util;
 

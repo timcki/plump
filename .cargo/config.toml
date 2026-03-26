@@ -2,7 +2,24 @@
 runner = "espflash flash --monitor --chip esp32c3"
 
 [env]
-ESP_LOG="info"
+# Log level filter — compiled into the binary by esp-println at build time.
+# Changing this requires a rebuild.
+#
+# Common profiles:
+#   ESP_LOG="debug,esp_hal=info"     — default dev logging with HAL noise reduced
+#   ESP_LOG="info"                   — normal info-level logging
+#   ESP_LOG="warn,perf=info"         — quiet: suppress normal info/debug, show perf only
+#   ESP_LOG="info,perf=off"          — hide perf output, keep normal logging
+#   ESP_LOG="debug"                  — verbose: include HAL internals too
+#
+# The "perf::" target prefix is used by perf_event!/perf_scope!/perf_begin!
+# macros (see kernel/src/perf.rs). Perf output is available in both:
+#   cargo run --features perf
+#   cargo run --release --features perf
+#
+# Note: `ESP_LOG=...,perf=off` hides perf output but does not remove
+# instrumentation cost. Build without `--features perf` for zero-overhead.
+ESP_LOG="debug,esp_hal=info"
 
 [build]
 rustflags = [

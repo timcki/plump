@@ -8,6 +8,10 @@ description  = "no_std async kernel for pulp-os (scheduling, drivers, storage, E
 license      = "MIT"
 repository   = "https://github.com/hansmrtn/pulp-os"
 
+[features]
+default = []
+perf = []
+
 [dependencies]
 esp-hal.workspace             = true
 embassy-executor.workspace    = true

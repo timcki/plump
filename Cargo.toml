@@ -29,6 +29,10 @@ authors      = ["Hans Martin <https://github.com/hansmrtn>"]
 repository   = "https://github.com/hansmrtn/pulp-os"
 license      = "MIT"
 
+[features]
+default = []
+perf = ["pulp-kernel/perf"]
+
 [[bin]]
 name = "pulp-os"
 path = "./src/bin/main.rs"
