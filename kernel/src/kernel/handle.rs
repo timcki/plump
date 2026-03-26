@@ -126,11 +126,6 @@ impl<'k> KernelHandle<'k> {
         storage::file_size_in_pulp_subdir(&self.kernel.sd, dir, name)
     }
 
-    #[inline]
-    pub fn delete_app_subdir(&mut self, dir: &str, name: &str) -> Result<()> {
-        storage::delete_in_pulp_subdir(&self.kernel.sd, dir, name)
-    }
-
     // _PULP/ direct file ops (v3 unified cache files)
 
     #[inline]

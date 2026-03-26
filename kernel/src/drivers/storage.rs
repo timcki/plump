@@ -503,58 +503,6 @@ pub fn read_file_start(
     })
 }
 
-/// Thin wrapper — delegates to [`SdStorage::write_file`].
-pub fn write_file(sd: &SdStorage, name: &str, data: &[u8]) -> crate::error::Result<()> {
-    sd.write_file(name, data)
-}
-
-/// Thin wrapper — delegates to [`SdStorage::append_root_file`].
-pub fn append_root_file(sd: &SdStorage, name: &str, data: &[u8]) -> crate::error::Result<()> {
-    sd.append_root_file(name, data)
-}
-
-/// Thin wrapper — delegates to [`SdStorage::delete_file`].
-pub fn delete_file(sd: &SdStorage, name: &str) -> crate::error::Result<()> {
-    sd.delete_file(name)
-}
-
-/// Thin wrapper — delegates to [`SdStorage::list_root_files`].
-pub fn list_root_files(sd: &SdStorage, buf: &mut [DirEntry]) -> crate::error::Result<usize> {
-    sd.list_root_files(buf)
-}
-
-// directory management
-
-pub fn ensure_dir(sd: &SdStorage, name: &str) -> crate::error::Result<()> {
-    // two poll_once calls so the large make_dir future never shares
-    // a stack frame with open_dir, halving peak stack usage
-    let exists = poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        match inner.mgr.open_dir(inner.root, name).await {
-            Ok(dir) => {
-                let _ = inner.mgr.close_dir(dir);
-                Ok::<_, Error>(true)
-            }
-            Err(_) => Ok(false),
-        }
-    })?;
-
-    if exists {
-        return Ok(());
-    }
-
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        match inner.mgr.make_dir_in_dir(inner.root, name).await {
-            Ok(()) => Ok(()),
-            Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
-            Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_dir")),
-        }
-    })
-}
-
 // single-directory file operations
 
 pub fn write_file_in_dir(
@@ -567,35 +515,6 @@ pub fn write_file_in_dir(
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
         in_dir!(inner, dir, |dir_h| op_write!(inner, dir_h, name, data))
-    })
-}
-
-pub fn append_file_in_dir(
-    sd: &SdStorage,
-    dir: &str,
-    name: &str,
-    data: &[u8],
-) -> crate::error::Result<()> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_dir!(inner, dir, |dir_h| op_append!(inner, dir_h, name, data))
-    })
-}
-
-pub fn read_file_chunk_in_dir(
-    sd: &SdStorage,
-    dir: &str,
-    name: &str,
-    offset: u32,
-    buf: &mut [u8],
-) -> crate::error::Result<usize> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_dir!(inner, dir, |dir_h| op_read_chunk!(
-            inner, dir_h, name, offset, buf
-        ))
     })
 }
 
@@ -842,5 +761,9 @@ pub fn save_title(sd: &SdStorage, filename: &str, title: &str) -> crate::error::
         .copy_from_slice(&title_bytes[..title_len]);
     line[name_bytes.len() + 1 + title_len] = b'\n';
 
-    append_file_in_dir(sd, PULP_DIR, TITLES_FILE, &line[..line_len])
+    poll_once(async {
+        let mut guard = borrow(sd)?;
+        let inner = &mut *guard;
+        in_dir!(inner, PULP_DIR, |dir_h| op_append!(inner, dir_h, TITLES_FILE, &line[..line_len]))
+    })
 }
