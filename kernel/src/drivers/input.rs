@@ -140,7 +140,7 @@ impl InputDriver {
             if !self.long_press_fired && held >= Duration::from_millis(timing::LONG_PRESS_MS) {
                 self.long_press_fired = true;
                 self.last_repeat = now;
-                log::info!("input: LongPress({:?}) after {}ms", btn, held.as_millis());
+                log::debug!("input: LongPress({:?}) after {}ms", btn, held.as_millis());
                 return Some(Event::LongPress(btn));
             }
 

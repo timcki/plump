@@ -368,7 +368,7 @@ impl EpubState {
         match result {
             Ok(_) => result,
             Err(e) if !self.ch_cache.is_empty() => {
-                log::info!(
+                log::debug!(
                     "{}: decode failed ({}), releasing {} KB ch_cache and retrying",
                     label,
                     e,
@@ -840,7 +840,7 @@ impl ReaderApp {
                     &self.epub.zip,
                     &mut toc,
                 );
-                log::info!("epub: TOC has {} entries", toc.len());
+                log::debug!("epub: TOC has {} entries", toc.len());
                 self.epub.toc = Some(toc);
             }
             Err(_e) => {
@@ -951,6 +951,7 @@ impl ReaderApp {
         if !self.stats_dirty || self.filename_len == 0 {
             return;
         }
+        pulp_kernel::perf_begin!(_sf_t0);
         // accumulate any unrecorded time
         let now = crate::kernel::uptime_secs();
         let delta = now.saturating_sub(self.stats_last_uptime);
@@ -967,6 +968,13 @@ impl ReaderApp {
             self.stats_sessions,
         );
         self.stats_dirty = false;
+        pulp_kernel::perf_event!(
+            "reader",
+            "stats_flush pages={} time_s={} elapsed_ms={}",
+            self.stats_pages,
+            self.stats_time_secs,
+            _sf_t0.elapsed().as_millis()
+        );
     }
 
     // public accessors for home screen display
@@ -1062,7 +1070,7 @@ impl ReaderApp {
             self.font_ascent = fs.ascent(fonts::Style::Regular);
             self.max_lines =
                 ((self.text_area_h / self.font_line_h) as usize).min(LINES_PER_PAGE) as u8;
-            log::info!(
+            log::debug!(
                 "font: size_idx={} line_h={} (native {} x {}%) ascent={} max_lines={} margin={}",
                 self.book_font_size_idx,
                 self.font_line_h,
@@ -1200,7 +1208,7 @@ impl ReaderApp {
         // values, the pipeline proceeds correctly
         self.state = State::NeedBookmark;
 
-        log::info!(
+        log::debug!(
             "reader: restore_state file={} ch={} off={} font={}",
             self.name(),
             chapter,
@@ -1225,7 +1233,7 @@ impl ReaderApp {
         // bookmark cache may be stale (only flushed periodically or on
         // navigation, not on every page turn)
         if self.restore_offset.is_some() {
-            log::info!(
+            log::debug!(
                 "bookmark: skipping load, session restore_offset={} ch={} for {}",
                 self.restore_offset.unwrap_or(0),
                 self.epub.chapter,
@@ -1235,7 +1243,7 @@ impl ReaderApp {
         }
 
         if let Some(slot) = bm.find(&self.filename[..self.filename_len]) {
-            log::info!(
+            log::debug!(
                 "bookmark: restoring off={} ch={} for {}",
                 slot.byte_offset,
                 slot.chapter,
@@ -1269,7 +1277,7 @@ impl ReaderApp {
         self.loading_cover = crate::apps::cover_cache::load_cover_thumb(k, dir);
 
         if let Some(ref img) = self.loading_cover {
-            log::info!(
+            log::debug!(
                 "reader: loaded cached cover thumb {}x{} for {}",
                 img.width,
                 img.height,
@@ -1330,6 +1338,7 @@ impl ReaderApp {
 
     // write extended RECENT file: filename\0title\0author\0progress
     fn write_recent(&mut self, k: &mut KernelHandle<'_>) {
+        pulp_kernel::perf_begin!(_wr_t0);
         let mut buf = [0u8; 196];
         let mut pos = 0usize;
 
@@ -1366,6 +1375,12 @@ impl ReaderApp {
 
         let _ = k.write_app_data(RECENT_FILE, &buf[..pos]);
         self.recent_dirty = false;
+        pulp_kernel::perf_event!(
+            "reader",
+            "write_recent bytes={} elapsed_ms={}",
+            pos,
+            _wr_t0.elapsed().as_millis()
+        );
     }
 }
 
@@ -1603,6 +1618,9 @@ impl App<AppId> for ReaderApp {
     async fn background(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
         use embassy_time::Instant;
 
+        // perf: snapshot SD counters at start of background pass
+        let _sd_snap = pulp_kernel::perf::counters::snapshot();
+
         loop {
             match self.state {
                 State::NeedBookmark => {
@@ -1625,11 +1643,17 @@ impl App<AppId> for ReaderApp {
                         self.state = State::NeedPage;
                         self.set_loading_ui(ctx, "Loading", 50);
                     }
-                    log::info!(
+                    log::debug!(
                         "reader:bg NeedBookmark -> {:?} loading='{}' pct={} ({}ms)",
                         self.state,
                         ctx.loading_msg(),
                         ctx.loading_pct(),
+                        t0.elapsed().as_millis()
+                    );
+                    pulp_kernel::perf_event!(
+                        "reader",
+                        "NeedBookmark to={:?} elapsed_ms={}",
+                        self.state,
                         t0.elapsed().as_millis()
                     );
                     continue;
@@ -1644,19 +1668,31 @@ impl App<AppId> for ReaderApp {
                             self.try_prefill_title_from_cache_header(k);
                             self.state = State::NeedOpf;
                             self.set_loading_ui(ctx, "Loading", 25);
-                            log::info!(
+                            log::debug!(
                                 "reader:bg NeedInit -> {:?} loading='{}' pct={} ({}ms)",
                                 self.state,
                                 ctx.loading_msg(),
                                 ctx.loading_pct(),
                                 t0.elapsed().as_millis()
                             );
+                            pulp_kernel::perf_event!(
+                                "reader",
+                                "NeedInit ok to=NeedOpf elapsed_ms={}",
+                                t0.elapsed().as_millis()
+                            );
                         }
                         Err(e) => {
-                            log::info!(
+                            log::debug!(
                                 "reader:bg NeedInit failed after {}ms: {}",
                                 t0.elapsed().as_millis(),
                                 e
+                            );
+                            pulp_kernel::perf_event!(
+                                "reader",
+                                "NeedInit err_kind={:?} err_src={} elapsed_ms={}",
+                                e.kind(),
+                                e.source_tag(),
+                                t0.elapsed().as_millis()
                             );
                             log::info!("reader: epub init (zip) failed: {}", e);
                             self.enter_error(ctx, e);
@@ -1680,19 +1716,32 @@ impl App<AppId> for ReaderApp {
                             self.pending_cover_thumb = self.epub.meta.has_cover();
                             self.state = State::NeedToc;
                             self.set_loading_ui(ctx, "Loading", 40);
-                            log::info!(
+                            log::debug!(
                                 "reader:bg NeedOpf -> {:?} loading='{}' pct={} ({}ms)",
                                 self.state,
                                 ctx.loading_msg(),
                                 ctx.loading_pct(),
                                 t0.elapsed().as_millis()
                             );
+                            pulp_kernel::perf_event!(
+                                "reader",
+                                "NeedOpf ok to=NeedToc spine_len={} elapsed_ms={}",
+                                spine_len,
+                                t0.elapsed().as_millis()
+                            );
                         }
                         Err(e) => {
-                            log::info!(
+                            log::debug!(
                                 "reader:bg NeedOpf failed after {}ms: {}",
                                 t0.elapsed().as_millis(),
                                 e
+                            );
+                            pulp_kernel::perf_event!(
+                                "reader",
+                                "NeedOpf err_kind={:?} err_src={} elapsed_ms={}",
+                                e.kind(),
+                                e.source_tag(),
+                                t0.elapsed().as_millis()
                             );
                             log::info!("reader: epub init (opf) failed: {}", e);
                             self.enter_error(ctx, e);
@@ -1705,11 +1754,16 @@ impl App<AppId> for ReaderApp {
                     self.pending_toc_parse = self.epub.toc_source.is_some();
                     self.state = State::NeedCache;
                     self.set_loading_ui(ctx, "Caching", 55);
-                    log::info!(
+                    log::debug!(
                         "reader:bg NeedToc -> {:?} loading='{}' pct={} ({}ms)",
                         self.state,
                         ctx.loading_msg(),
                         ctx.loading_pct(),
+                        t0.elapsed().as_millis()
+                    );
+                    pulp_kernel::perf_event!(
+                        "reader",
+                        "NeedToc to=NeedCache elapsed_ms={}",
                         t0.elapsed().as_millis()
                     );
                 }
@@ -1720,11 +1774,16 @@ impl App<AppId> for ReaderApp {
                         Ok(true) => {
                             self.state = State::NeedIndex;
                             self.set_loading_ui(ctx, "Indexing", 75);
-                            log::info!(
+                            log::debug!(
                                 "reader:bg NeedCache(cache-hit) -> {:?} loading='{}' pct={} ({}ms)",
                                 self.state,
                                 ctx.loading_msg(),
                                 ctx.loading_pct(),
+                                t0.elapsed().as_millis()
+                            );
+                            pulp_kernel::perf_event!(
+                                "reader",
+                                "NeedCache hit=true to=NeedIndex elapsed_ms={}",
                                 t0.elapsed().as_millis()
                             );
                         }
@@ -1751,19 +1810,33 @@ impl App<AppId> for ReaderApp {
 
                                     self.state = State::NeedIndex;
                                     self.set_loading_ui(ctx, "Indexing", 75);
-                                    log::info!(
+                                    log::debug!(
                                         "reader:bg NeedCache(cache-build) -> {:?} loading='{}' pct={} ({}ms)",
                                         self.state,
                                         ctx.loading_msg(),
                                         ctx.loading_pct(),
                                         t0.elapsed().as_millis()
                                     );
+                                    pulp_kernel::perf_event!(
+                                        "reader",
+                                        "NeedCache hit=false ch={} to=NeedIndex elapsed_ms={}",
+                                        ch,
+                                        t0.elapsed().as_millis()
+                                    );
                                 }
                                 Err(e) => {
-                                    log::info!(
+                                    log::debug!(
                                         "reader:bg NeedCache(cache-build) failed after {}ms: {}",
                                         t0.elapsed().as_millis(),
                                         e
+                                    );
+                                    pulp_kernel::perf_event!(
+                                        "reader",
+                                        "NeedCache err_kind={:?} err_src={} ch={} elapsed_ms={}",
+                                        e.kind(),
+                                        e.source_tag(),
+                                        ch,
+                                        t0.elapsed().as_millis()
                                     );
                                     log::info!("reader: cache ch{} failed: {}", ch, e);
                                     self.enter_error(ctx, e);
@@ -1771,10 +1844,17 @@ impl App<AppId> for ReaderApp {
                             }
                         }
                         Err(e) => {
-                            log::info!(
+                            log::debug!(
                                 "reader:bg NeedCache failed after {}ms: {}",
                                 t0.elapsed().as_millis(),
                                 e
+                            );
+                            pulp_kernel::perf_event!(
+                                "reader",
+                                "NeedCache err_kind={:?} err_src={} elapsed_ms={}",
+                                e.kind(),
+                                e.source_tag(),
+                                t0.elapsed().as_millis()
                             );
                             log::info!("reader: cache check failed: {}", e);
                             self.enter_error(ctx, e);
@@ -1797,10 +1877,17 @@ impl App<AppId> for ReaderApp {
                         let (nb, nl) = self.name_copy();
                         let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
                         if let Err(e) = self.epub.cache_chapter_async(k, ch, epub_name).await {
-                            log::info!(
+                            log::debug!(
                                 "reader:bg NeedIndex cache prerequisite failed after {}ms: {}",
                                 t0.elapsed().as_millis(),
                                 e
+                            );
+                            pulp_kernel::perf_event!(
+                                "reader",
+                                "NeedIndex stage=cache_prereq err_kind={:?} err_src={} elapsed_ms={}",
+                                e.kind(),
+                                e.source_tag(),
+                                t0.elapsed().as_millis()
                             );
                             self.enter_error(ctx, e);
                             break;
@@ -1824,18 +1911,31 @@ impl App<AppId> for ReaderApp {
                                 self.arm_deferred_open_work();
                                 ctx.clear_loading();
                                 ctx.mark_dirty(PAGE_REGION);
-                                log::info!(
+                                log::debug!(
                                     "reader:bg NeedIndex(last-page) -> {:?} loading_active={} ({}ms)",
                                     self.state,
                                     ctx.loading_active(),
                                     t0.elapsed().as_millis()
                                 );
+                                pulp_kernel::perf_event!(
+                                    "reader",
+                                    "NeedIndex mode=last_page to=Ready pages={} elapsed_ms={}",
+                                    self.pg.total_pages,
+                                    t0.elapsed().as_millis()
+                                );
                             }
                             Err(e) => {
-                                log::info!(
+                                log::debug!(
                                     "reader:bg NeedIndex(last-page) failed after {}ms: {}",
                                     t0.elapsed().as_millis(),
                                     e
+                                );
+                                pulp_kernel::perf_event!(
+                                    "reader",
+                                    "NeedIndex mode=last_page err_kind={:?} err_src={} elapsed_ms={}",
+                                    e.kind(),
+                                    e.source_tag(),
+                                    t0.elapsed().as_millis()
                                 );
                                 self.enter_error(ctx, e)
                             }
@@ -1843,11 +1943,18 @@ impl App<AppId> for ReaderApp {
                     } else {
                         self.state = State::NeedPage;
                         self.set_loading_ui(ctx, "Loading page", 90);
-                        log::info!(
+                        log::debug!(
                             "reader:bg NeedIndex -> {:?} loading='{}' pct={} ({}ms)",
                             self.state,
                             ctx.loading_msg(),
                             ctx.loading_pct(),
+                            t0.elapsed().as_millis()
+                        );
+                        pulp_kernel::perf_event!(
+                            "reader",
+                            "NeedIndex to=NeedPage pages={} fully_indexed={} elapsed_ms={}",
+                            self.pg.total_pages,
+                            self.pg.fully_indexed,
                             t0.elapsed().as_millis()
                         );
                     }
@@ -1860,10 +1967,17 @@ impl App<AppId> for ReaderApp {
                         if self.pg.fully_indexed && self.pg.total_pages > 0 {
                             self.pg.page = self.locate_page_for_offset(target_off, page_hint);
                             if let Err(e) = self.load_and_prefetch(k) {
-                                log::info!(
+                                log::debug!(
                                     "reader:bg NeedPage(restore-indexed) failed after {}ms: {}",
                                     t0.elapsed().as_millis(),
                                     e
+                                );
+                                pulp_kernel::perf_event!(
+                                    "reader",
+                                    "NeedPage mode=restore_indexed err_kind={:?} err_src={} elapsed_ms={}",
+                                    e.kind(),
+                                    e.source_tag(),
+                                    t0.elapsed().as_millis()
                                 );
                                 self.enter_error(ctx, e);
                             }
@@ -1873,10 +1987,17 @@ impl App<AppId> for ReaderApp {
                                 match self.load_and_prefetch(k) {
                                     Ok(()) => {}
                                     Err(e) => {
-                                        log::info!(
+                                        log::debug!(
                                             "reader:bg NeedPage(restore-scan) failed after {}ms: {}",
                                             t0.elapsed().as_millis(),
                                             e
+                                        );
+                                        pulp_kernel::perf_event!(
+                                            "reader",
+                                            "NeedPage mode=restore_scan err_kind={:?} err_src={} elapsed_ms={}",
+                                            e.kind(),
+                                            e.source_tag(),
+                                            t0.elapsed().as_millis()
                                         );
                                         self.enter_error(ctx, e);
                                         break;
@@ -1897,13 +2018,24 @@ impl App<AppId> for ReaderApp {
                             self.arm_deferred_open_work();
                             ctx.clear_loading();
                             ctx.mark_dirty(PAGE_REGION);
-                            log::info!(
+                            log::debug!(
                                 "reader:bg NeedPage(restore) -> {:?} page={} loading_active={} ({}ms)",
                                 self.state,
                                 self.pg.page,
                                 ctx.loading_active(),
                                 t0.elapsed().as_millis()
                             );
+                            {
+                                let _d = pulp_kernel::perf::counters::delta(&_sd_snap);
+                                pulp_kernel::perf_event!(
+                                    "reader",
+                                    "NeedPage mode=restore to=Ready page={} sd_reads={} sd_bytes_r={} elapsed_ms={}",
+                                    self.pg.page,
+                                    _d.sd_reads,
+                                    _d.sd_bytes_read,
+                                    t0.elapsed().as_millis()
+                                );
+                            }
                         }
                     } else {
                         match self.load_and_prefetch(k) {
@@ -1913,19 +2045,37 @@ impl App<AppId> for ReaderApp {
                                 self.arm_deferred_open_work();
                                 ctx.clear_loading();
                                 ctx.mark_dirty(PAGE_REGION);
-                                log::info!(
+                                log::debug!(
                                     "reader:bg NeedPage(open) -> {:?} page={} loading_active={} ({}ms)",
                                     self.state,
                                     self.pg.page,
                                     ctx.loading_active(),
                                     t0.elapsed().as_millis()
                                 );
+                                {
+                                    let _d = pulp_kernel::perf::counters::delta(&_sd_snap);
+                                    pulp_kernel::perf_event!(
+                                        "reader",
+                                        "NeedPage mode=open to=Ready page={} sd_reads={} sd_bytes_r={} elapsed_ms={}",
+                                        self.pg.page,
+                                        _d.sd_reads,
+                                        _d.sd_bytes_read,
+                                        t0.elapsed().as_millis()
+                                    );
+                                }
                             }
                             Err(e) => {
-                                log::info!(
+                                log::debug!(
                                     "reader:bg NeedPage(open) failed after {}ms: {}",
                                     t0.elapsed().as_millis(),
                                     e
+                                );
+                                pulp_kernel::perf_event!(
+                                    "reader",
+                                    "NeedPage mode=open err_kind={:?} err_src={} elapsed_ms={}",
+                                    e.kind(),
+                                    e.source_tag(),
+                                    t0.elapsed().as_millis()
                                 );
                                 log::info!("reader: load failed: {}", e);
                                 self.enter_error(ctx, e);
@@ -2037,7 +2187,7 @@ impl App<AppId> for ReaderApp {
                 ActionEvent::Press(Action::Select) | ActionEvent::Press(Action::NextJump) => {
                     let entry = &self.epub.toc.as_ref().unwrap().entries[self.epub.toc_selected];
                     if entry.spine_idx != 0xFFFF {
-                        log::info!(
+                        log::debug!(
                             "toc: jumping to \"{}\" -> spine {}",
                             entry.title_str(),
                             entry.spine_idx
@@ -2167,7 +2317,7 @@ impl App<AppId> for ReaderApp {
             QA_TOC => {
                 if self.is_epub && self.epub.toc.as_ref().map_or(false, |t| !t.is_empty()) {
                     let toc = self.epub.toc.as_ref().unwrap();
-                    log::info!("toc: opening ({} entries)", toc.len());
+                    log::debug!("toc: opening ({} entries)", toc.len());
                     self.epub.toc_selected = 0;
                     self.epub.toc_scroll = 0;
                     for i in 0..toc.len() {

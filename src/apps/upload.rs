@@ -11,7 +11,7 @@ use embassy_time::{Duration, Timer};
 use embedded_io_async::Write as AsyncWrite;
 use esp_hal::delay::Delay;
 use esp_radio::wifi::{ClientConfig, Config, ModeConfig};
-use log::info;
+use log::{debug, info, warn};
 
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
 use crate::board::{Epd, SCREEN_H, SCREEN_W};
@@ -326,14 +326,14 @@ pub async fn run_upload_mode(
                 info!("upload: file saved as '{}'", fname);
             }
             ServerEvent::UploadFailed => {
-                info!("upload: file upload failed");
+                warn!("upload: file upload failed");
             }
             ServerEvent::Deleted { name, name_len } => {
                 let fname = core::str::from_utf8(&name[..name_len as usize]).unwrap_or("???");
                 info!("upload: deleted '{}'", fname);
             }
             ServerEvent::DeleteFailed => {
-                info!("upload: file delete failed");
+                warn!("upload: file delete failed");
             }
             ServerEvent::Nothing => {}
         }
@@ -490,7 +490,7 @@ where
                 };
             }
             Err(e) => {
-                info!("upload: handle_upload error: {}", e);
+                debug!("upload: handle_upload error: {}", e);
                 send_error_response(&mut socket, e).await;
                 close_socket(&mut socket).await;
                 return ServerEvent::UploadFailed;
@@ -546,7 +546,7 @@ where
                 };
             }
             Err(e) => {
-                info!("upload: delete failed for '{}': {}", name, e);
+                debug!("upload: delete failed for '{}': {}", name, e);
                 send_error_response(&mut socket, "delete failed").await;
                 close_socket(&mut socket).await;
                 return ServerEvent::DeleteFailed;
@@ -631,7 +631,7 @@ where
     let name_str = core::str::from_utf8(&file_name_buf[..file_name_len as usize])
         .map_err(|_| "filename encoding error")?;
 
-    info!("upload: receiving file '{}'", name_str);
+    debug!("upload: receiving file '{}'", name_str);
 
     storage::write_file(sd, name_str, &[]).map_err(|_| "write failed")?;
 
@@ -646,7 +646,7 @@ where
                     .map_err(|_| "write failed")?;
                 total_written += pos as u32;
             }
-            info!("upload: complete, {} bytes written", total_written);
+            debug!("upload: complete, {} bytes written", total_written);
             return Ok((file_name_buf, file_name_len));
         }
 
@@ -876,7 +876,7 @@ async fn mdns_respond_once(stack: embassy_net::Stack<'_>, ip_octets: [u8; 4]) {
         return;
     }
 
-    info!("upload: mDNS query for pulp.local -- responding");
+    debug!("upload: mDNS query for pulp.local -- responding");
 
     let mut resp = [0u8; MDNS_RESPONSE_LEN];
     let len = build_mdns_response(&mut resp, ip_octets);

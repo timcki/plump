@@ -230,7 +230,7 @@ impl AppContext {
     // auto-marks the region dirty so the next render shows it.
     pub fn set_loading(&mut self, region: Region, msg: &str, pct: u8) {
         let pct = pct.min(100);
-        log::info!(
+        log::debug!(
             "ui: set_loading msg='{}' pct={} region={:?} redraw_before={:?}",
             msg,
             pct,
@@ -253,7 +253,7 @@ impl AppContext {
     pub fn clear_loading(&mut self) {
         if self.loading_active {
             let region = self.loading_region;
-            log::info!(
+            log::debug!(
                 "ui: clear_loading region={:?} redraw_before={:?}",
                 region,
                 self.redraw

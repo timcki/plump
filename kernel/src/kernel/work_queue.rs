@@ -189,13 +189,13 @@ pub fn drain() {
 pub fn reset() -> u16 {
     let g = next_generation();
     drain();
-    log::info!("[work] reset -> gen {}", g);
+    log::debug!("[work] reset -> gen {}", g);
     g
 }
 
 #[embassy_executor::task]
 pub async fn worker_task() -> ! {
-    log::info!("[work] worker ready");
+    log::debug!("[work] worker ready");
 
     loop {
         set_status(BgStatus::IDLE);
@@ -203,7 +203,7 @@ pub async fn worker_task() -> ! {
 
         let g = item.generation;
         if g != active_generation() {
-            log::info!(
+            log::debug!(
                 "[work] skip stale item (gen {} != active {})",
                 g,
                 active_generation()
@@ -226,7 +226,7 @@ pub async fn worker_task() -> ! {
                 });
 
                 let fmt = if is_jpeg { "JPEG" } else { "PNG" };
-                log::info!(
+                log::debug!(
                     "[work] img {:#010X}: decode {} ({} bytes, {}x{}, gen {})",
                     path_hash,
                     fmt,
@@ -241,7 +241,7 @@ pub async fn worker_task() -> ! {
                 drop(data);
 
                 if g != active_generation() {
-                    log::info!(
+                    log::debug!(
                         "[work] img {:#010X}: discarded (gen {} stale)",
                         path_hash,
                         g,
@@ -251,7 +251,7 @@ pub async fn worker_task() -> ! {
 
                 let outcome = match result {
                     Ok(image) => {
-                        log::info!(
+                        log::debug!(
                             "[work] img {:#010X}: {}x{} ({}B 1-bit)",
                             path_hash,
                             image.width,

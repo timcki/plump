@@ -145,7 +145,7 @@ impl FilesApp {
         self.error = None;
         self.title_scan_idx = 0;
         self.title_scanning = true;
-        log::info!(
+        log::debug!(
             "files: restore_state scroll={} selected={} total={}",
             scroll,
             selected,
@@ -355,11 +355,11 @@ impl App<AppId> for FilesApp {
                     let hash = cache::fnv1a(name.as_bytes());
                     let cf = cache::cache_filename(hash);
                     let cf_str = cache::cache_filename_str(&cf);
-                    log::info!("files: deleting cache for {} ({})", name, cf_str);
+                    log::debug!("files: deleting cache for {} ({})", name, cf_str);
 
                     // delete v3 flat cache file (best effort)
                     match k.delete_cache(cf_str) {
-                        Ok(()) => log::info!("files: cache deleted for {}", name),
+                        Ok(()) => log::debug!("files: cache deleted for {}", name),
                         Err(e) => log::warn!("files: cache delete failed: {}", e),
                     }
                 }
@@ -404,7 +404,7 @@ impl App<AppId> for FilesApp {
                 }
             } else {
                 self.title_scanning = false;
-                log::info!("titles: scan complete");
+                log::debug!("titles: scan complete");
             }
         }
     }
@@ -550,7 +550,7 @@ fn scan_one_epub_title(k: &mut KernelHandle<'_>, from: usize) -> Option<TitleSca
     let name = core::str::from_utf8(&name_buf[..name_len as usize]).unwrap_or("");
     let next_idx = idx + 1;
 
-    log::info!("titles: scanning {} (idx {})", name, idx);
+    log::debug!("titles: scanning {} (idx {})", name, idx);
 
     let result = (|| -> crate::error::Result<()> {
         let file_size = k.file_size(name)?;
@@ -637,7 +637,7 @@ fn scan_one_epub_title(k: &mut KernelHandle<'_>, from: usize) -> Option<TitleSca
             ));
         }
 
-        log::info!("titles: {} -> \"{}\"", name, title);
+        log::debug!("titles: {} -> \"{}\"", name, title);
         let _ = k.save_title(name, title);
         k.dir_cache_mut().set_entry_title(idx, title.as_bytes());
 

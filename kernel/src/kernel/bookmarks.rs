@@ -206,7 +206,7 @@ impl BookmarkCache {
         self.dirty = false;
         self.loaded = true;
 
-        log::info!("bookmarks: loaded {} slots from SD", slot_count);
+        log::debug!("bookmarks: loaded {} slots from SD", slot_count);
     }
 
     pub fn find(&self, filename: &[u8]) -> Option<BookmarkSlot> {
@@ -340,7 +340,7 @@ impl BookmarkCache {
 
         self.dirty = true;
 
-        log::info!(
+        log::debug!(
             "bookmark: cached off={} ch={} gen={} for {:?}",
             byte_offset,
             chapter,
@@ -359,7 +359,7 @@ impl BookmarkCache {
             if slot.valid && slot.name_hash == key && slot.matches_name(filename) {
                 slot.valid = false;
                 self.dirty = true;
-                log::info!(
+                log::debug!(
                     "bookmark: removed {:?}",
                     core::str::from_utf8(filename).unwrap_or("?")
                 );
@@ -385,7 +385,7 @@ impl BookmarkCache {
         match storage::write_file_in_dir(sd, storage::PULP_DIR, BOOKMARK_FILE, &buf[..file_len]) {
             Ok(_) => {
                 self.dirty = false;
-                log::info!("bookmarks: flushed {} slots to SD", self.count);
+                log::debug!("bookmarks: flushed {} slots to SD", self.count);
             }
             Err(e) => {
                 log::warn!("bookmarks: flush failed: {}", e);

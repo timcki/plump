@@ -247,7 +247,7 @@ impl AppManager {
         session.settings_ui_font = ss.ui_font_size_idx;
         session.settings_valid = 1;
 
-        log::info!(
+        log::debug!(
             "session: collected nav_depth={} active={:?}",
             session.nav_depth,
             self.launcher.active()
@@ -287,7 +287,7 @@ impl AppManager {
             },
         );
 
-        log::info!(
+        log::debug!(
             "session: restored nav stack depth={} active={:?}",
             session.nav_depth,
             self.launcher.active()
@@ -342,7 +342,7 @@ impl AppManager {
         // active app's content using the restored state
         self.launcher.ctx.request_full_redraw();
 
-        log::info!(
+        log::debug!(
             "session: restore complete, active={:?}",
             self.launcher.active()
         );
@@ -432,7 +432,7 @@ impl AppManager {
 
     pub fn apply_transition(&mut self, transition: Transition, k: &mut KernelHandle<'_>) {
         if let Some(nav) = self.launcher.apply(transition) {
-            log::info!("app: {:?} -> {:?}", nav.from, nav.to);
+            log::debug!("app: {:?} -> {:?}", nav.from, nav.to);
 
             if nav.from != AppId::Upload {
                 with_app!(nav.from, self, |app| {

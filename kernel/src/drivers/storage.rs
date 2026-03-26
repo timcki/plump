@@ -161,6 +161,10 @@ macro_rules! op_read_chunk {
                     Err(_) => Err(Error::new(ErrorKind::SeekFailed, "read_chunk")),
                 };
                 let _ = $inner.mgr.close_file(file).await;
+                if let Ok(n) = &result {
+                    $crate::perf::counters::inc_sd_reads();
+                    $crate::perf::counters::add_sd_bytes_read(*n as u32);
+                }
                 result
             }
         }
@@ -183,7 +187,12 @@ macro_rules! op_read_start {
                     .await
                     .map_err(|_| Error::new(ErrorKind::ReadFailed, "read_start"));
                 let _ = $inner.mgr.close_file(file).await;
-                result.map(|n| (size, n))
+                let mapped = result.map(|n| {
+                    $crate::perf::counters::inc_sd_reads();
+                    $crate::perf::counters::add_sd_bytes_read(n as u32);
+                    (size, n)
+                });
+                mapped
             }
         }
     };
@@ -198,16 +207,21 @@ macro_rules! op_write {
         {
             Err(_) => Err(Error::new(ErrorKind::OpenFile, "write")),
             Ok(file) => {
-                let result = if ($data).is_empty() {
+                let data_ref = $data;
+                let result = if data_ref.is_empty() {
                     Ok(())
                 } else {
                     $inner
                         .mgr
-                        .write(file, $data)
+                        .write(file, data_ref)
                         .await
                         .map_err(|_| Error::new(ErrorKind::WriteFailed, "write"))
                 };
                 let _ = $inner.mgr.close_file(file).await;
+                if result.is_ok() {
+                    $crate::perf::counters::inc_sd_writes();
+                    $crate::perf::counters::add_sd_bytes_written(data_ref.len() as u32);
+                }
                 result
             }
         }
@@ -223,16 +237,21 @@ macro_rules! op_append {
         {
             Err(_) => Err(Error::new(ErrorKind::OpenFile, "append")),
             Ok(file) => {
-                let result = if ($data).is_empty() {
+                let data_ref = $data;
+                let result = if data_ref.is_empty() {
                     Ok(())
                 } else {
                     $inner
                         .mgr
-                        .write(file, $data)
+                        .write(file, data_ref)
                         .await
                         .map_err(|_| Error::new(ErrorKind::WriteFailed, "append"))
                 };
                 let _ = $inner.mgr.close_file(file).await;
+                if result.is_ok() {
+                    $crate::perf::counters::inc_sd_writes();
+                    $crate::perf::counters::add_sd_bytes_written(data_ref.len() as u32);
+                }
                 result
             }
         }
@@ -693,6 +712,10 @@ pub fn write_at_in_pulp(
                         Err(_) => Err(Error::new(ErrorKind::SeekFailed, "write_at")),
                     };
                     let _ = inner.mgr.close_file(file).await;
+                    if result.is_ok() {
+                        crate::perf::counters::inc_sd_writes();
+                        crate::perf::counters::add_sd_bytes_written(data.len() as u32);
+                    }
                     result
                 }
             }

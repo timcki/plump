@@ -16,7 +16,7 @@
 
 use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Ticker, with_timeout};
-use log::info;
+use log::{debug, info};
 
 use super::app::{AppLayer, Redraw, Transition};
 use crate::board::button::Button;
@@ -199,6 +199,12 @@ impl super::Kernel {
             boot_start.elapsed().as_millis(),
             if restored { "rtc-restore" } else { "cold-boot" }
         );
+        crate::perf_event!(
+            "boot",
+            "ready path={} elapsed_ms={}",
+            if restored { "rtc-restore" } else { "cold-boot" },
+            boot_start.elapsed().as_millis()
+        );
     }
 
     // event-driven main loop; never returns
@@ -224,7 +230,7 @@ impl super::Kernel {
 
             if let Some(ev) = hw_event {
                 if matches!(ev, Event::LongPress(_)) {
-                    info!("scheduler: received {:?}", ev);
+                    debug!("scheduler: received {:?}", ev);
                 }
                 if self.handle_input(ev, app_mgr) {
                     self.sleep_with_session(app_mgr, "power held").await;
@@ -380,12 +386,21 @@ impl super::Kernel {
     // the caller should enter sleep
     async fn render<A: AppLayer>(&mut self, app_mgr: &mut A, redraw: Redraw) -> bool {
         use embassy_time::Instant;
+        crate::perf_begin!(_render_t0);
 
+        #[cfg(feature = "perf")]
+        let requested_mode = match redraw {
+            Redraw::None => "none",
+            Redraw::Partial(_) => "partial",
+            Redraw::Full => "full",
+        };
+        #[cfg(feature = "perf")]
+        let mut actual_mode = "none";
         let mut sleep_requested = false;
         let active = app_mgr.active();
         {
             let ctx = app_mgr.ctx_mut();
-            info!(
+            debug!(
                 "render: begin active={:?} redraw={:?} loading_active={} loading='{}' pct={}",
                 active,
                 redraw,
@@ -429,23 +444,37 @@ impl super::Kernel {
                     };
 
                     if let Some(rs) = rs {
-                        info!(
+                        #[cfg(feature = "perf")]
+                        {
+                            actual_mode = "partial";
+                        }
+                        let write_ms = t_write.elapsed().as_millis();
+                        debug!(
                             "render: partial phase1 region={:?} red_stale={} ({}ms)",
-                            r,
-                            self.red_stale,
-                            t_write.elapsed().as_millis()
+                            r, self.red_stale, write_ms
                         );
                         let t_wave = Instant::now();
                         self.epd.partial_start_du(&rs);
                         let (deferred, sleep) = self.busy_wait_with_background(app_mgr).await;
                         sleep_requested = sleep;
-                        info!(
+                        let wave_ms = t_wave.elapsed().as_millis();
+                        debug!(
                             "render: partial waveform done region={:?} pending_redraw={} deferred={} sleep={} ({}ms)",
                             r,
                             app_mgr.has_redraw(),
                             deferred.is_some(),
                             sleep,
-                            t_wave.elapsed().as_millis()
+                            wave_ms
+                        );
+                        crate::perf_event!(
+                            "render",
+                            "partial write_ms={} wave_ms={} region_x={} region_y={} region_w={} region_h={}",
+                            write_ms,
+                            wave_ms,
+                            r.x,
+                            r.y,
+                            r.w,
+                            r.h
                         );
 
                         // skip phase 3 when content changed mid-DU or
@@ -510,23 +539,27 @@ impl super::Kernel {
                     self.epd
                         .write_full_frame(self.strip, &mut self.delay, &draw);
                 }
-                info!(
-                    "render: full frame written ({}ms)",
-                    t_write.elapsed().as_millis()
-                );
+                #[cfg(feature = "perf")]
+                {
+                    actual_mode = "full";
+                }
+                let write_ms = t_write.elapsed().as_millis();
+                debug!("render: full frame written ({}ms)", write_ms);
 
                 let t_wave = Instant::now();
                 self.epd.start_full_update();
 
                 let (deferred, sleep) = self.busy_wait_with_background(app_mgr).await;
                 sleep_requested = sleep;
-                info!(
+                let wave_ms = t_wave.elapsed().as_millis();
+                debug!(
                     "render: full waveform done pending_redraw={} deferred={} sleep={} ({}ms)",
                     app_mgr.has_redraw(),
                     deferred.is_some(),
                     sleep,
-                    t_wave.elapsed().as_millis()
+                    wave_ms
                 );
+                crate::perf_event!("render", "full write_ms={} wave_ms={}", write_ms, wave_ms);
 
                 self.epd.finish_full_update();
                 self.partial_refreshes = 0;
@@ -538,11 +571,18 @@ impl super::Kernel {
             }
         } // 'render
 
-        info!(
+        debug!(
             "render: end active={:?} pending_redraw={} sleep_requested={}",
             app_mgr.active(),
             app_mgr.has_redraw(),
             sleep_requested
+        );
+        crate::perf_event!(
+            "render",
+            "complete requested={} actual={} elapsed_ms={}",
+            requested_mode,
+            actual_mode,
+            _render_t0.elapsed().as_millis()
         );
 
         sleep_requested
@@ -661,7 +701,7 @@ impl super::Kernel {
 
         // save to SD card (reliable fallback for battery wake)
         rtc_session::save_to_sd(&session, &self.sd);
-        info!(
+        debug!(
             "sleep: session saved to RTC + SD ({}ms)",
             t0.elapsed().as_millis()
         );
@@ -691,20 +731,20 @@ impl super::Kernel {
         if self.bm_cache.is_dirty() {
             self.bm_cache.flush(&self.sd);
         }
-        info!("sleep: bookmark flush ({}ms)", t0.elapsed().as_millis());
+        debug!("sleep: bookmark flush ({}ms)", t0.elapsed().as_millis());
 
         // load sleep wallpaper from SD before putting the card to sleep
         let t0 = Instant::now();
         let sleep_img = super::sleep_image::load_sleep_image(&self.sd);
         if sleep_img.is_some() {
-            info!("sleep: wallpaper loaded ({}ms)", t0.elapsed().as_millis());
+            debug!("sleep: wallpaper loaded ({}ms)", t0.elapsed().as_millis());
         } else {
-            info!("sleep: no wallpaper found ({}ms)", t0.elapsed().as_millis());
+            debug!("sleep: no wallpaper found ({}ms)", t0.elapsed().as_millis());
         }
 
         let t0 = Instant::now();
         self.sd_card_sleep();
-        info!("sleep: SD card sleep ({}ms)", t0.elapsed().as_millis());
+        debug!("sleep: SD card sleep ({}ms)", t0.elapsed().as_millis());
 
         let t0 = Instant::now();
         if let Some(ref img) = sleep_img {
@@ -745,13 +785,13 @@ impl super::Kernel {
             self.epd
                 .full_refresh_async(self.strip, &mut self.delay, &draw)
                 .await;
-            info!("sleep: wallpaper base BW ({}ms)", t1.elapsed().as_millis());
+            debug!("sleep: wallpaper base BW ({}ms)", t1.elapsed().as_millis());
 
             let t1 = Instant::now();
             // grayscale_pass writes LSB plane to BW RAM and MSB plane to
             // RED RAM, then triggers a single refresh with the grayscale LUT.
             self.epd.grayscale_pass(self.strip, &rs, &draw).await;
-            info!(
+            debug!(
                 "sleep: wallpaper grayscale overlay ({}ms)",
                 t1.elapsed().as_millis()
             );
@@ -764,7 +804,7 @@ impl super::Kernel {
                 })
                 .await;
         }
-        info!("sleep: screen rendered ({}ms)", t0.elapsed().as_millis());
+        debug!("sleep: screen rendered ({}ms)", t0.elapsed().as_millis());
 
         self.epd.enter_deep_sleep();
         info!(

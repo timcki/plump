@@ -218,7 +218,7 @@ pub fn save_to_sd(session: &RtcSession, sd: &crate::drivers::sdcard::SdStorage) 
         core::slice::from_raw_parts(session as *const RtcSession as *const u8, SESSION_SIZE)
     };
     match crate::drivers::storage::write_in_pulp(sd, SESSION_FILE, bytes) {
-        Ok(()) => log::info!("session: saved to SD ({} bytes)", SESSION_SIZE),
+        Ok(()) => log::debug!("session: saved to SD ({} bytes)", SESSION_SIZE),
         Err(e) => log::warn!("session: SD save failed: {}", e),
     }
 }
@@ -238,7 +238,7 @@ pub fn load_from_sd(sd: &crate::drivers::sdcard::SdStorage) -> Option<RtcSession
             let session: RtcSession =
                 unsafe { core::ptr::read(buf.0.as_ptr() as *const RtcSession) };
             if session.is_valid() {
-                log::info!(
+                log::debug!(
                     "session: loaded from SD (wake count {})",
                     session.wake_count()
                 );
@@ -262,7 +262,7 @@ pub fn load_from_sd(sd: &crate::drivers::sdcard::SdStorage) -> Option<RtcSession
             }
         }
         Ok(n) => {
-            log::info!("session: SD file too small ({} < {})", n, SESSION_SIZE);
+            log::debug!("session: SD file too small ({} < {})", n, SESSION_SIZE);
             None
         }
         Err(_) => None,

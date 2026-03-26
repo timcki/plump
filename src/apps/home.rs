@@ -196,7 +196,7 @@ impl HomeApp {
         if self.state == HomeState::ShowBookmarks {
             self.needs_load_bookmarks = true;
         }
-        log::info!(
+        log::debug!(
             "home: restore_state state={:?} selected={}",
             self.state,
             selected
@@ -227,7 +227,7 @@ impl HomeApp {
             let dir = smol_epub::cache::dir_name_str(&dir_buf);
             self.recent_cover = crate::apps::cover_cache::load_cover_thumb(k, dir);
             if self.recent_cover.is_some() {
-                log::info!("home: loaded cover thumbnail for recent book");
+                log::debug!("home: loaded cover thumbnail for recent book");
             }
         } else {
             self.recent_cover = None;

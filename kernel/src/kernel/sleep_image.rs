@@ -11,7 +11,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use log::info;
+use log::{debug, info};
 
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::sdcard::SdStorage;
@@ -168,7 +168,7 @@ fn alloc_read_batch(row_stride: usize) -> Option<Vec<u8>> {
             Ok(()) => {
                 buf.resize(len, 0);
                 if rows < target_rows {
-                    info!(
+                    debug!(
                         "sleep_image: using reduced read batch ({} rows, {} bytes)",
                         rows, len
                     );
@@ -177,7 +177,7 @@ fn alloc_read_batch(row_stride: usize) -> Option<Vec<u8>> {
             }
             Err(_) if rows > 1 => {
                 let next_rows = (rows / 2).max(1);
-                info!(
+                debug!(
                     "sleep_image: read batch alloc failed at {} bytes, retrying with {} rows",
                     len, next_rows
                 );
@@ -264,7 +264,7 @@ fn decode_row_lum(
 pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
     let (pixel_offset, bpp, palette_lum) = parse_header(sd)?;
     let row_stride = bmp_row_stride(bpp)?;
-    info!(
+    debug!(
         "sleep_image: {}x{} {}bpp, pixel data at offset {}",
         IMG_W, IMG_H, bpp, pixel_offset
     );
@@ -285,7 +285,7 @@ pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
     // batch buffer cannot fit we back off to smaller batches instead of OOMing.
     let mut read_batch = alloc_read_batch(row_stride)?;
     let batch_rows = read_batch.len() / row_stride;
-    info!(
+    debug!(
         "sleep_image: row_stride={} batch_rows={} batch_bytes={}",
         row_stride,
         batch_rows,
@@ -386,7 +386,7 @@ pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
         }
     }
 
-    info!(
+    debug!(
         "sleep_image: converted to 2bpp ({} chunks, {} bytes total)",
         CHUNK_COUNT,
         chunks.iter().map(|c| c.len()).sum::<usize>()

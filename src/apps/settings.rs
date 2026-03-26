@@ -115,10 +115,10 @@ impl SettingsApp {
             Ok((_size, n)) if n > 0 => {
                 parse_settings_txt(&buf[..n], &mut self.settings, &mut self.wifi);
                 self.settings.sanitize();
-                log::info!("settings: loaded from {}", config::SETTINGS_FILE);
+                log::debug!("settings: loaded from {}", config::SETTINGS_FILE);
             }
             _ => {
-                log::info!("settings: no file found, using defaults");
+                log::debug!("settings: no file found, using defaults");
             }
         }
 
