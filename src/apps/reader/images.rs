@@ -175,7 +175,7 @@ impl ReaderApp {
 
         let data_offset = {
             let mut hdr = [0u8; 30];
-            if k.read_chunk(epub_name, entry.local_offset, &mut hdr)
+            if k.sd().read_file_chunk(epub_name, entry.local_offset, &mut hdr)
                 .is_err()
             {
                 log::warn!("reader: failed to read ZIP local header");
@@ -201,7 +201,7 @@ impl ReaderApp {
         } else if entry.method == zip::METHOD_STORED {
             let mut magic = [0u8; 8];
             let n = k
-                .read_chunk(epub_name, data_offset, &mut magic)
+                .sd().read_file_chunk(epub_name, data_offset, &mut magic)
                 .unwrap_or(0);
             (
                 n >= 2 && magic[0] == 0xFF && magic[1] == 0xD8,
@@ -230,7 +230,7 @@ impl ReaderApp {
                     |off, buf| {
                         k_cell
                             .borrow_mut()
-                            .read_chunk(epub_name, off, buf)
+                            .sd().read_file_chunk(epub_name, off, buf)
                             .map_err(read_err)
                     },
                     data_offset,
@@ -243,7 +243,7 @@ impl ReaderApp {
                     |off, buf| {
                         k_cell
                             .borrow_mut()
-                            .read_chunk(epub_name, off, buf)
+                            .sd().read_file_chunk(epub_name, off, buf)
                             .map_err(read_err)
                     },
                     data_offset,
@@ -257,7 +257,7 @@ impl ReaderApp {
                     |off, buf| {
                         k_cell
                             .borrow_mut()
-                            .read_chunk(epub_name, off, buf)
+                            .sd().read_file_chunk(epub_name, off, buf)
                             .map_err(read_err)
                     },
                     data_offset,
@@ -270,7 +270,7 @@ impl ReaderApp {
                     |off, buf| {
                         k_cell
                             .borrow_mut()
-                            .read_chunk(epub_name, off, buf)
+                            .sd().read_file_chunk(epub_name, off, buf)
                             .map_err(read_err)
                     },
                     data_offset,
@@ -434,7 +434,7 @@ impl ReaderApp {
         let mut offset = start_offset;
         while offset < ch_size {
             let read_len = PAGE_BUF.min(ch_size - offset);
-            let n = k.read_cache_chunk(
+            let n = k.sd().read_chunk_in_pulp(
                 cf_str,
                 ch_base + offset as u32,
                 &mut self.pg.prefetch[..read_len],
@@ -788,7 +788,7 @@ pub(super) fn decode_image_streaming(
     max_h: u16,
 ) -> crate::error::Result<DecodedImage> {
     let mut hdr = [0u8; 30];
-    k.read_chunk(epub_name, entry.local_offset, &mut hdr)?;
+    k.sd().read_file_chunk(epub_name, entry.local_offset, &mut hdr)?;
     let skip = ZipIndex::local_header_data_skip(&hdr)
         .map_err(|_| Error::new(ErrorKind::ParseFailed, "decode_image: local header"))?;
     let data_offset = entry.local_offset + skip;
@@ -797,7 +797,7 @@ pub(super) fn decode_image_streaming(
 
     let result = if is_jpeg && entry.method == zip::METHOD_STORED {
         smol_epub::jpeg::decode_jpeg_sd(
-            |off, buf| k.read_chunk(epub_name, off, buf).map_err(read_err),
+            |off, buf| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err),
             data_offset,
             entry.uncomp_size,
             max_w,
@@ -805,7 +805,7 @@ pub(super) fn decode_image_streaming(
         )
     } else if is_jpeg {
         smol_epub::jpeg::decode_jpeg_deflate_sd(
-            |off, buf| k.read_chunk(epub_name, off, buf).map_err(read_err),
+            |off, buf| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err),
             data_offset,
             entry.comp_size,
             entry.uncomp_size,
@@ -814,7 +814,7 @@ pub(super) fn decode_image_streaming(
         )
     } else if entry.method == zip::METHOD_STORED {
         smol_epub::png::decode_png_sd(
-            |off, buf| k.read_chunk(epub_name, off, buf).map_err(read_err),
+            |off, buf| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err),
             data_offset,
             entry.uncomp_size,
             max_w,
@@ -822,7 +822,7 @@ pub(super) fn decode_image_streaming(
         )
     } else {
         smol_epub::png::decode_png_deflate_sd(
-            |off, buf| k.read_chunk(epub_name, off, buf).map_err(read_err),
+            |off, buf| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err),
             data_offset,
             entry.comp_size,
             max_w,
@@ -928,7 +928,7 @@ fn peek_source_dimensions(
     // read local header to find data offset
     let data_offset = {
         let mut hdr = [0u8; 30];
-        if k.read_chunk(epub_name, entry.local_offset, &mut hdr)
+        if k.sd().read_file_chunk(epub_name, entry.local_offset, &mut hdr)
             .is_err()
         {
             return DEFAULT_IMG_H;
@@ -948,7 +948,7 @@ fn peek_source_dimensions(
     } else {
         let mut magic = [0u8; 8];
         let n = k
-            .read_chunk(epub_name, data_offset, &mut magic)
+            .sd().read_file_chunk(epub_name, data_offset, &mut magic)
             .unwrap_or(0);
         (
             n >= 2 && magic[0] == 0xFF && magic[1] == 0xD8,
@@ -960,14 +960,14 @@ fn peek_source_dimensions(
 
     let dims = if is_png {
         smol_epub::png::peek_png_dimensions_streaming(
-            |off, buf| k.read_chunk(epub_name, off, buf).map_err(read_err),
+            |off, buf| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err),
             data_offset,
             entry.uncomp_size,
         )
         .map(|(w, h)| (w as u16, h as u16))
     } else if is_jpeg {
         smol_epub::jpeg::peek_jpeg_dimensions_streaming(
-            |off, buf| k.read_chunk(epub_name, off, buf).map_err(read_err),
+            |off, buf| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err),
             data_offset,
             entry.uncomp_size,
         )

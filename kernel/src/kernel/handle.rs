@@ -7,6 +7,7 @@
 // underlying caches directly via bookmark_cache() / dir_cache_mut()
 // rather than through dedicated handle methods
 
+use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage::{self, DirEntry, DirPage};
 use crate::error::{Error, Result};
 use crate::kernel::bookmarks::BookmarkCache;
@@ -26,6 +27,12 @@ impl<'k> KernelHandle<'k> {
         Self { kernel }
     }
 
+    /// Direct access to the SD storage for file I/O.
+    #[inline]
+    pub fn sd(&self) -> &SdStorage {
+        &self.kernel.sd
+    }
+
     // smol-epub sync reader bridge
     //
     // smol-epub performs I/O through closures that return
@@ -38,7 +45,7 @@ impl<'k> KernelHandle<'k> {
             &mut dyn FnMut(&str, u32, &mut [u8]) -> core::result::Result<usize, &'static str>,
         ) -> R,
     {
-        let sd = &self.kernel.sd;
+        let sd = self.sd();
         let mut reader = |name: &str, offset: u32, buf: &mut [u8]| {
             sd.read_file_chunk(name, offset, buf)
                 .map_err(|e: Error| -> &'static str { e.into() })
@@ -52,7 +59,7 @@ impl<'k> KernelHandle<'k> {
             &mut dyn FnMut(&str, u32, &mut [u8]) -> core::result::Result<usize, &'static str>,
         ) -> R,
     {
-        let sd = &self.kernel.sd;
+        let sd = self.sd();
         let mut reader = |name: &str, offset: u32, buf: &mut [u8]| {
             sd.read_chunk_in_pulp_subdir(dir, name, offset, buf)
                 .map_err(|e: Error| -> &'static str { e.into() })
@@ -64,26 +71,6 @@ impl<'k> KernelHandle<'k> {
     //
     // each calls a single storage::* function; return type is
     // Result<T> (unified Error) throughout
-
-    #[inline]
-    pub fn file_size(&mut self, name: &str) -> Result<u32> {
-        self.kernel.sd.file_size(name)
-    }
-
-    #[inline]
-    pub fn read_chunk(&mut self, name: &str, offset: u32, buf: &mut [u8]) -> Result<usize> {
-        self.kernel.sd.read_file_chunk(name, offset, buf)
-    }
-
-    #[inline]
-    pub fn read_file_start(&mut self, name: &str, buf: &mut [u8]) -> Result<(u32, usize)> {
-        self.kernel.sd.read_file_start(name, buf)
-    }
-
-    #[inline]
-    pub fn save_title(&mut self, filename: &str, title: &str) -> Result<()> {
-        self.kernel.sd.save_title(filename, title)
-    }
 
     #[inline]
     pub fn read_app_data_start(&mut self, name: &str, buf: &mut [u8]) -> Result<(u32, usize)> {
@@ -124,44 +111,6 @@ impl<'k> KernelHandle<'k> {
     #[inline]
     pub fn file_size_app_subdir(&mut self, dir: &str, name: &str) -> Result<u32> {
         self.kernel.sd.file_size_in_pulp_subdir(dir, name)
-    }
-
-    // _PULP/ direct file ops (v3 unified cache files)
-
-    #[inline]
-    pub fn read_cache_chunk(&mut self, name: &str, offset: u32, buf: &mut [u8]) -> Result<usize> {
-        self.kernel.sd.read_chunk_in_pulp(name, offset, buf)
-    }
-
-    #[inline]
-    pub fn write_cache(&mut self, name: &str, data: &[u8]) -> Result<()> {
-        self.kernel.sd.write_in_pulp(name, data)
-    }
-
-    #[inline]
-    pub fn append_cache(&mut self, name: &str, data: &[u8]) -> Result<()> {
-        self.kernel.sd.append_in_pulp(name, data)
-    }
-
-    #[inline]
-    pub fn write_cache_at(&mut self, name: &str, offset: u32, data: &[u8]) -> Result<()> {
-        self.kernel.sd.write_at_in_pulp(name, offset, data)
-    }
-
-    #[inline]
-    pub fn delete_cache(&mut self, name: &str) -> Result<()> {
-        self.kernel.sd.delete_in_pulp(name)
-    }
-
-    #[inline]
-    pub fn cache_file_size(&mut self, name: &str) -> Result<u32> {
-        self.kernel.sd.file_size_in_pulp(name)
-    }
-
-    // root directory file deletion
-    #[inline]
-    pub fn delete_file(&mut self, name: &str) -> Result<()> {
-        self.kernel.sd.delete_file(name)
     }
 
     pub fn dir_page(&mut self, offset: usize, buf: &mut [DirEntry]) -> Result<DirPage> {

@@ -215,7 +215,7 @@ impl ReaderApp {
             let cf_str = self.epub.cache_file_str();
             let ch = self.epub.chapter as usize;
             let ch_base = self.epub.chapter_table[ch].0;
-            let n = k.read_cache_chunk(
+            let n = k.sd().read_chunk_in_pulp(
                 cf_str,
                 ch_base + self.pg.offsets[self.pg.page],
                 &mut self.pg.buf,
@@ -223,7 +223,7 @@ impl ReaderApp {
             self.pg.buf_len = n;
         } else if self.file_size == 0 {
             _read_src = "first_read";
-            let (size, n) = k.read_file_start(name, &mut self.pg.buf)?;
+            let (size, n) = k.sd().read_file_start(name, &mut self.pg.buf)?;
             self.file_size = size;
             self.pg.buf_len = n;
             log::info!("reader: opened {} ({} bytes)", name, size);
@@ -234,7 +234,7 @@ impl ReaderApp {
                 return Ok(());
             }
         } else {
-            let n = k.read_chunk(name, self.pg.offsets[self.pg.page], &mut self.pg.buf)?;
+            let n = k.sd().read_file_chunk(name, self.pg.offsets[self.pg.page], &mut self.pg.buf)?;
             self.pg.buf_len = n;
         }
         pulp_kernel::perf_event!(
@@ -291,9 +291,9 @@ impl ReaderApp {
                 let cf_str = self.epub.cache_file_str();
                 let ch = self.epub.chapter as usize;
                 let ch_base = self.epub.chapter_table[ch].0;
-                k.read_cache_chunk(cf_str, ch_base + pf_offset, &mut self.pg.prefetch)
+                k.sd().read_chunk_in_pulp(cf_str, ch_base + pf_offset, &mut self.pg.prefetch)
             } else {
-                k.read_chunk(name, pf_offset, &mut self.pg.prefetch)
+                k.sd().read_file_chunk(name, pf_offset, &mut self.pg.prefetch)
             };
             match pf_result {
                 Ok(n) => {

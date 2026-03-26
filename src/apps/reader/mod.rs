@@ -817,7 +817,7 @@ impl ReaderApp {
         let (nb, nl) = self.name_copy();
         let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
         let title = core::str::from_utf8(&self.title[..self.title_len as usize]).unwrap_or("");
-        if let Err(e) = k.save_title(name, title) {
+        if let Err(e) = k.sd().save_title(name, title) {
             log::warn!("epub: failed to save title mapping: {}", e);
         }
     }
@@ -1475,7 +1475,7 @@ pub(super) fn read_full(
 ) -> crate::error::Result<()> {
     let mut total = 0usize;
     while total < buf.len() {
-        let n = k.read_chunk(name, offset + total as u32, &mut buf[total..])?;
+        let n = k.sd().read_file_chunk(name, offset + total as u32, &mut buf[total..])?;
         if n == 0 {
             return Err(Error::new(
                 ErrorKind::ReadFailed,
@@ -1499,7 +1499,7 @@ pub(super) fn extract_zip_entry(
     let k = RefCell::new(k);
     zip::extract_entry(entry, entry.local_offset, |offset, buf| {
         k.borrow_mut()
-            .read_chunk(name, offset, buf)
+            .sd().read_file_chunk(name, offset, buf)
             .map_err(|e: Error| -> &'static str { e.into() })
     })
 }

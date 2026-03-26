@@ -326,7 +326,7 @@ impl App<AppId> for FilesApp {
                     // also remove bookmark
                     k.bookmark_cache_mut().remove(&nb[..nl]);
 
-                    match k.delete_file(name) {
+                    match k.sd().delete_file(name) {
                         Ok(()) => {
                             log::info!("files: deleted {}", name);
                             k.invalidate_dir_cache();
@@ -358,7 +358,7 @@ impl App<AppId> for FilesApp {
                     log::debug!("files: deleting cache for {} ({})", name, cf_str);
 
                     // delete v3 flat cache file (best effort)
-                    match k.delete_cache(cf_str) {
+                    match k.sd().delete_in_pulp(cf_str) {
                         Ok(()) => log::debug!("files: cache deleted for {}", name),
                         Err(e) => log::warn!("files: cache delete failed: {}", e),
                     }
@@ -553,7 +553,7 @@ fn scan_one_epub_title(k: &mut KernelHandle<'_>, from: usize) -> Option<TitleSca
     log::debug!("titles: scanning {} (idx {})", name, idx);
 
     let result = (|| -> crate::error::Result<()> {
-        let file_size = k.file_size(name)?;
+        let file_size = k.sd().file_size(name)?;
         if file_size < 22 {
             return Err(Error::new(ErrorKind::InvalidData, "title_scan: too small"));
         }
@@ -561,7 +561,7 @@ fn scan_one_epub_title(k: &mut KernelHandle<'_>, from: usize) -> Option<TitleSca
         let tail_size = (file_size as usize).min(512);
         let tail_offset = file_size - tail_size as u32;
         let mut buf = [0u8; 512];
-        let n = k.read_chunk(name, tail_offset, &mut buf[..tail_size])?;
+        let n = k.sd().read_file_chunk(name, tail_offset, &mut buf[..tail_size])?;
 
         // ZipIndex::parse_eocd returns Result<_, &'static str>;
         // the From<&'static str> impl on Error converts automatically via ?
@@ -575,7 +575,7 @@ fn scan_one_epub_title(k: &mut KernelHandle<'_>, from: usize) -> Option<TitleSca
 
         let mut total = 0usize;
         while total < cd_buf.len() {
-            let rd = k.read_chunk(name, cd_offset + total as u32, &mut cd_buf[total..])?;
+            let rd = k.sd().read_file_chunk(name, cd_offset + total as u32, &mut cd_buf[total..])?;
             if rd == 0 {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
@@ -595,7 +595,7 @@ fn scan_one_epub_title(k: &mut KernelHandle<'_>, from: usize) -> Option<TitleSca
                 zip.entry(ci),
                 zip.entry(ci).local_offset,
                 |off, b| {
-                    k.read_chunk(name, off, b)
+                    k.sd().read_file_chunk(name, off, b)
                         .map_err(|e: Error| -> &'static str { e.into() })
                 },
             )?;
@@ -618,7 +618,7 @@ fn scan_one_epub_title(k: &mut KernelHandle<'_>, from: usize) -> Option<TitleSca
             zip.entry(opf_idx),
             zip.entry(opf_idx).local_offset,
             |off, b| {
-                k.read_chunk(name, off, b)
+                k.sd().read_file_chunk(name, off, b)
                     .map_err(|e: Error| -> &'static str { e.into() })
             },
         )?;
@@ -638,7 +638,7 @@ fn scan_one_epub_title(k: &mut KernelHandle<'_>, from: usize) -> Option<TitleSca
         }
 
         log::debug!("titles: {} -> \"{}\"", name, title);
-        let _ = k.save_title(name, title);
+        let _ = k.sd().save_title(name, title);
         k.dir_cache_mut().set_entry_title(idx, title.as_bytes());
 
         Ok(())
