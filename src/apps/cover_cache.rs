@@ -42,8 +42,8 @@ pub fn save_cover_thumb(
     let mut header = [0u8; 4];
     header[0..2].copy_from_slice(&img.width.to_le_bytes());
     header[2..4].copy_from_slice(&img.height.to_le_bytes());
-    k.write_app_subdir(dir, COVER_THUMB_FILE, &header)?;
-    k.append_app_subdir(dir, COVER_THUMB_FILE, &img.data)?;
+    k.sd().write_in_pulp_subdir(dir, COVER_THUMB_FILE, &header)?;
+    k.sd().append_in_pulp_subdir(dir, COVER_THUMB_FILE, &img.data)?;
     Ok(())
 }
 
@@ -51,12 +51,12 @@ pub fn save_cover_thumb(
 ///
 /// Returns `None` if the file doesn't exist or is invalid.
 pub fn load_cover_thumb(k: &mut KernelHandle<'_>, dir: &str) -> Option<DecodedImage> {
-    let size = k.file_size_app_subdir(dir, COVER_THUMB_FILE).ok()?;
+    let size = k.sd().file_size_in_pulp_subdir(dir, COVER_THUMB_FILE).ok()?;
     if size < 5 {
         return None;
     }
     let mut header = [0u8; 4];
-    k.read_app_subdir_chunk(dir, COVER_THUMB_FILE, 0, &mut header)
+    k.sd().read_chunk_in_pulp_subdir(dir, COVER_THUMB_FILE, 0, &mut header)
         .ok()?;
     let width = u16::from_le_bytes([header[0], header[1]]);
     let height = u16::from_le_bytes([header[2], header[3]]);
@@ -71,7 +71,7 @@ pub fn load_cover_thumb(k: &mut KernelHandle<'_>, dir: &str) -> Option<DecodedIm
     let mut data = Vec::new();
     data.try_reserve_exact(data_len).ok()?;
     data.resize(data_len, 0);
-    k.read_app_subdir_chunk(dir, COVER_THUMB_FILE, 4, &mut data)
+    k.sd().read_chunk_in_pulp_subdir(dir, COVER_THUMB_FILE, 4, &mut data)
         .ok()?;
     Some(DecodedImage {
         width,
@@ -83,7 +83,7 @@ pub fn load_cover_thumb(k: &mut KernelHandle<'_>, dir: &str) -> Option<DecodedIm
 
 /// Check whether a cover thumbnail already exists for the given cache dir.
 pub fn has_cover_thumb(k: &mut KernelHandle<'_>, dir: &str) -> bool {
-    k.file_size_app_subdir(dir, COVER_THUMB_FILE)
+    k.sd().file_size_in_pulp_subdir(dir, COVER_THUMB_FILE)
         .map(|s| s >= 5)
         .unwrap_or(false)
 }

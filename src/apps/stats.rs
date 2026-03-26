@@ -147,14 +147,14 @@ pub fn save_book_stats(
     let s = fmt.as_str().as_bytes();
     let len = s.len().min(buf.len());
     buf[..len].copy_from_slice(&s[..len]);
-    k.ensure_app_subdir(STATS_DIR)?;
-    k.write_app_subdir(STATS_DIR, filename, &buf[..len])
+    k.sd().ensure_pulp_subdir(STATS_DIR)?;
+    k.sd().write_in_pulp_subdir(STATS_DIR, filename, &buf[..len])
 }
 
 pub fn load_book_stats(k: &mut KernelHandle<'_>, filename: &str) -> Option<(u32, u32, u16)> {
     let mut buf = [0u8; 128];
     let n = k
-        .read_app_subdir_chunk(STATS_DIR, filename, 0, &mut buf)
+        .sd().read_chunk_in_pulp_subdir(STATS_DIR, filename, 0, &mut buf)
         .ok()?;
     if n == 0 {
         return None;
@@ -275,7 +275,7 @@ impl StatsApp {
             let fname = entry.name_str();
 
             // try to load stats for this file
-            let n = match k.read_app_subdir_chunk(STATS_DIR, fname, 0, &mut buf) {
+            let n = match k.sd().read_chunk_in_pulp_subdir(STATS_DIR, fname, 0, &mut buf) {
                 Ok(n) if n > 0 => n,
                 _ => continue,
             };

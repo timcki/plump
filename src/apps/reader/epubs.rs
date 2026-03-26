@@ -138,7 +138,7 @@ impl EpubState {
                                 // ensure image subdir exists for skip markers
                                 let dir_buf = self.cache_dir;
                                 let dir = cache::dir_name_str(&dir_buf);
-                                let _ = k.ensure_app_subdir(dir);
+                                let _ = k.sd().ensure_pulp_subdir(dir);
                                 log::info!("epub: v3 cache hit ({} chapters)", count);
                                 return Ok(true);
                             }
@@ -152,7 +152,7 @@ impl EpubState {
         // ensure image subdir exists (images stay in _PULP/_XXXXXXX/)
         let dir_buf = self.cache_dir;
         let dir = cache::dir_name_str(&dir_buf);
-        k.ensure_app_subdir(dir)?;
+        k.sd().ensure_pulp_subdir(dir)?;
         self.cache_chapter = 0;
         Ok(false)
     }
@@ -471,7 +471,7 @@ impl ReaderApp {
 
         // ensure the per-book cache directory exists (cover generation
         // runs before NeedCache which normally creates it)
-        if k.ensure_app_subdir(dir).is_err() {
+        if k.sd().ensure_pulp_subdir(dir).is_err() {
             log::warn!("epub: failed to create cache dir for cover thumb");
             return;
         }

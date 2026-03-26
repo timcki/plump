@@ -19,6 +19,7 @@ use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::Text;
 
 use crate::apps::{App, AppContext, AppId, DeferredPersistenceReason, RECENT_FILE, Transition};
+use crate::drivers::storage::PULP_DIR;
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::{GrayMode, StripBuffer};
@@ -1454,7 +1455,7 @@ impl ReaderApp {
         buf[pos] = self.progress_pct();
         pos += 1;
 
-        k.write_app_data(RECENT_FILE, &buf[..pos])?;
+        k.sd().write_file_in_dir(PULP_DIR, RECENT_FILE, &buf[..pos])?;
         self.recent_dirty = false;
         pulp_kernel::perf_event!(
             "reader",

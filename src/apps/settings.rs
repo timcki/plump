@@ -15,6 +15,7 @@ use core::fmt::Write as _;
 use crate::apps::{App, AppContext, AppId, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
+use crate::drivers::storage::PULP_DIR;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::fonts::max_size_idx;
@@ -111,7 +112,7 @@ impl SettingsApp {
         self.settings = SystemSettings::defaults();
         self.wifi = WifiConfig::empty();
 
-        match k.read_app_data_start(config::SETTINGS_FILE, &mut buf) {
+        match k.sd().read_file_start_in_dir(PULP_DIR, config::SETTINGS_FILE, &mut buf) {
             Ok((_size, n)) if n > 0 => {
                 parse_settings_txt(&buf[..n], &mut self.settings, &mut self.wifi);
                 self.settings.sanitize();
@@ -128,7 +129,7 @@ impl SettingsApp {
     fn save(&self, k: &mut KernelHandle<'_>) -> bool {
         let mut buf = [0u8; 512];
         let len = write_settings_txt(&self.settings, &self.wifi, &mut buf);
-        match k.write_app_data(config::SETTINGS_FILE, &buf[..len]) {
+        match k.sd().write_file_in_dir(PULP_DIR, config::SETTINGS_FILE, &buf[..len]) {
             Ok(_) => {
                 log::info!("settings: saved to {}", config::SETTINGS_FILE);
                 true
