@@ -9,7 +9,7 @@
 
 use core::ops::ControlFlow;
 
-use embedded_sdmmc::Mode;
+use embedded_sdmmc::{Mode, RawFile};
 
 use crate::drivers::sdcard::{SdStorage, SdStorageInner, poll_once};
 use crate::error::{Error, ErrorKind};
@@ -308,6 +308,166 @@ fn borrow(sd: &SdStorage) -> core::result::Result<core::cell::RefMut<'_, SdStora
         .ok_or(Error::new(ErrorKind::NoCard, "storage::borrow"))
 }
 
+// streaming file handle — keeps one file open across multiple writes
+//
+// must be closed via close(); dropping without closing leaks the
+// handle in the volume manager (it will refuse to open the file again).
+// debug builds panic on leak; release builds log an error.
+
+/// Handle to an open file on the SD card.
+///
+/// Created via [`SdStorage::create_file`]. Must be consumed via
+/// [`close()`](OpenFile::close) — dropping without closing leaks the
+/// handle inside the volume manager.
+pub struct OpenFile {
+    raw: Option<RawFile>,
+}
+
+impl OpenFile {
+    /// Write a chunk of data to the open file.
+    pub fn write(&self, sd: &SdStorage, data: &[u8]) -> crate::error::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let raw = self.raw.expect("OpenFile::write after close");
+        poll_once(async {
+            let mut guard = borrow(sd)?;
+            guard
+                .mgr
+                .write(raw, data)
+                .await
+                .map_err(|_| Error::new(ErrorKind::WriteFailed, "OpenFile::write"))?;
+            crate::perf::counters::inc_sd_writes();
+            crate::perf::counters::add_sd_bytes_written(data.len() as u32);
+            Ok(())
+        })
+    }
+
+    /// Close the file, flushing metadata to SD. Consumes self.
+    pub fn close(mut self, sd: &SdStorage) -> crate::error::Result<()> {
+        let raw = self.raw.take().expect("OpenFile::close called twice");
+        poll_once(async {
+            let mut guard = borrow(sd)?;
+            guard
+                .mgr
+                .close_file(raw)
+                .await
+                .map_err(|_| Error::new(ErrorKind::WriteFailed, "OpenFile::close"))
+        })
+    }
+}
+
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        if self.raw.is_some() {
+            // file handle leaked — volume manager still thinks it is open
+            log::error!("OpenFile dropped without close()! Handle leaked.");
+            debug_assert!(false, "OpenFile dropped without close()");
+        }
+    }
+}
+
+impl SdStorage {
+    /// Create (or truncate) a file in the root directory and return
+    /// an [`OpenFile`] handle for streaming writes.
+    pub fn create_file(&self, name: &str) -> crate::error::Result<OpenFile> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            let raw = inner
+                .mgr
+                .open_file_in_dir(inner.root, name, Mode::ReadWriteCreateOrTruncate)
+                .await
+                .map_err(|_| Error::new(ErrorKind::OpenFile, "SdStorage::create_file"))?;
+            Ok(OpenFile { raw: Some(raw) })
+        })
+    }
+
+    /// Write an entire file atomically (create/truncate + write + close).
+    pub fn write_file(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            op_write!(inner, inner.root, name, data)
+        })
+    }
+
+    /// Append data to an existing file (open + seek-to-end + write + close).
+    pub fn append_root_file(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            op_append!(inner, inner.root, name, data)
+        })
+    }
+
+    /// Delete a file from the root directory.
+    pub fn delete_file(&self, name: &str) -> crate::error::Result<()> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            op_delete!(inner, inner.root, name)
+        })
+    }
+
+    /// List supported files in the root directory.
+    pub fn list_root_files(&self, buf: &mut [DirEntry]) -> crate::error::Result<usize> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+
+            let mut count = 0usize;
+            let mut total = 0usize;
+
+            inner
+                .mgr
+                .iterate_dir(inner.root, |entry| {
+                    if entry.attributes.is_volume() || entry.attributes.is_directory() {
+                        return ControlFlow::Continue(());
+                    }
+
+                    let mut name_buf = [0u8; 13];
+                    let name_len = sfn_to_bytes(&entry.name, &mut name_buf);
+                    let sfn = &name_buf[..name_len as usize];
+
+                    if sfn.is_empty() || sfn[0] == b'.' || sfn[0] == b'_' {
+                        return ControlFlow::Continue(());
+                    }
+                    if !has_supported_ext(sfn) {
+                        return ControlFlow::Continue(());
+                    }
+
+                    total += 1;
+
+                    if count < buf.len() {
+                        buf[count] = DirEntry {
+                            name: name_buf,
+                            name_len,
+                            is_dir: false,
+                            size: entry.size,
+                            title: [0u8; TITLE_CAP],
+                            title_len: 0,
+                        };
+                        count += 1;
+                    }
+                    ControlFlow::Continue(())
+                })
+                .await
+                .map_err(|_| Error::new(ErrorKind::ReadFailed, "list_root_files"))?;
+
+            if total > count {
+                log::warn!(
+                    "dir: {} supported files on SD, only {} fit in buffer (max {})",
+                    total,
+                    count,
+                    buf.len(),
+                );
+            }
+            Ok(count)
+        })
+    }
+}
+
 // root file operations
 
 pub fn file_size(sd: &SdStorage, name: &str) -> crate::error::Result<u32> {
@@ -343,86 +503,24 @@ pub fn read_file_start(
     })
 }
 
+/// Thin wrapper — delegates to [`SdStorage::write_file`].
 pub fn write_file(sd: &SdStorage, name: &str, data: &[u8]) -> crate::error::Result<()> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        op_write!(inner, inner.root, name, data)
-    })
+    sd.write_file(name, data)
 }
 
+/// Thin wrapper — delegates to [`SdStorage::append_root_file`].
 pub fn append_root_file(sd: &SdStorage, name: &str, data: &[u8]) -> crate::error::Result<()> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        op_append!(inner, inner.root, name, data)
-    })
+    sd.append_root_file(name, data)
 }
 
+/// Thin wrapper — delegates to [`SdStorage::delete_file`].
 pub fn delete_file(sd: &SdStorage, name: &str) -> crate::error::Result<()> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        op_delete!(inner, inner.root, name)
-    })
+    sd.delete_file(name)
 }
 
-// directory listing
-
+/// Thin wrapper — delegates to [`SdStorage::list_root_files`].
 pub fn list_root_files(sd: &SdStorage, buf: &mut [DirEntry]) -> crate::error::Result<usize> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-
-        let mut count = 0usize;
-        let mut total = 0usize;
-
-        inner
-            .mgr
-            .iterate_dir(inner.root, |entry| {
-                if entry.attributes.is_volume() || entry.attributes.is_directory() {
-                    return ControlFlow::Continue(());
-                }
-
-                let mut name_buf = [0u8; 13];
-                let name_len = sfn_to_bytes(&entry.name, &mut name_buf);
-                let sfn = &name_buf[..name_len as usize];
-
-                if sfn.is_empty() || sfn[0] == b'.' || sfn[0] == b'_' {
-                    return ControlFlow::Continue(());
-                }
-                if !has_supported_ext(sfn) {
-                    return ControlFlow::Continue(());
-                }
-
-                total += 1;
-
-                if count < buf.len() {
-                    buf[count] = DirEntry {
-                        name: name_buf,
-                        name_len,
-                        is_dir: false,
-                        size: entry.size,
-                        title: [0u8; TITLE_CAP],
-                        title_len: 0,
-                    };
-                    count += 1;
-                }
-                ControlFlow::Continue(())
-            })
-            .await
-            .map_err(|_| Error::new(ErrorKind::ReadFailed, "list_root_files"))?;
-
-        if total > count {
-            log::warn!(
-                "dir: {} supported files on SD, only {} fit in buffer (max {})",
-                total,
-                count,
-                buf.len(),
-            );
-        }
-        Ok(count)
-    })
+    sd.list_root_files(buf)
 }
 
 // directory management

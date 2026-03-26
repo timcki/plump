@@ -58,12 +58,12 @@ const HOSTNAME_WIRE: [u8; 12] = [
 const MDNS_RESPONSE_LEN: usize = 38;
 
 const MAX_BOUNDARY_LEN: usize = 120;
-const WORK_BUF_SIZE: usize = 2048;
+const WORK_BUF_SIZE: usize = 4096;
 
 // TCP buffer sizes
 
-const TCP_RX_BUF_SIZE: usize = 2048;
-const TCP_TX_BUF_SIZE: usize = 1536;
+const TCP_RX_BUF_SIZE: usize = 4096;
+const TCP_TX_BUF_SIZE: usize = 2048;
 
 const HTTP_HEADER_BUF_SIZE: usize = 1024;
 
@@ -73,9 +73,22 @@ const DIR_LIST_MAX: usize = 64;
 const HTTP_TIMEOUT_SECS: u64 = 30;
 const ACCEPT_RETRY_MS: u64 = 200;
 
-const SOCKET_CLOSE_DELAY_MS: u64 = 50;
+const SOCKET_CLOSE_DELAY_MS: u64 = 10;
 
 const MDNS_BIND_RETRY_MS: u64 = 100;
+
+fn log_heap(label: &str) {
+    let stats = esp_alloc::HEAP.stats();
+    let free = stats.size - stats.current_usage;
+    info!(
+        "upload: heap [{}]: {}K used / {}K total ({}K free, {}K peak)",
+        label,
+        stats.current_usage / 1024,
+        stats.size / 1024,
+        free / 1024,
+        stats.max_usage / 1024,
+    );
+}
 
 enum ServerEvent {
     Nothing,
@@ -280,6 +293,7 @@ pub async fn run_upload_mode(
         "upload: serving at http://pulp.local/  ({})",
         core::str::from_utf8(&ip_buf[1..ip_len.saturating_sub(1)]).unwrap_or("?")
     );
+    log_heap("server ready");
 
     render_screen(
         epd,
@@ -428,7 +442,7 @@ where
         let _ = socket.write_all(HTTP_200_JSON).await;
 
         let mut entries = [storage::DirEntry::EMPTY; DIR_LIST_MAX];
-        let count = match storage::list_root_files(sd, &mut entries) {
+        let count = match sd.list_root_files(&mut entries) {
             Ok(n) => n,
             Err(_) => {
                 let _ = socket.write_all(b"[]").await;
@@ -534,7 +548,7 @@ where
         name_buf[..name_bytes.len()].copy_from_slice(name_bytes);
         let name_len = name_bytes.len() as u8;
 
-        match storage::delete_file(sd, name) {
+        match sd.delete_file(name) {
             Ok(()) => {
                 let _ = socket.write_all(HTTP_200_TEXT).await;
                 let _ = socket.write_all(b"OK").await;
@@ -632,27 +646,32 @@ where
         .map_err(|_| "filename encoding error")?;
 
     debug!("upload: receiving file '{}'", name_str);
+    log_heap("upload start");
 
-    storage::write_file(sd, name_str, &[]).map_err(|_| "write failed")?;
+    // open file once for the entire upload (create/truncate)
+    let file = sd.create_file(name_str).map_err(|_| "create failed")?;
 
     // holdback last end_marker.len() bytes to detect boundary spanning two reads
 
     let mut total_written: u32 = 0;
 
-    loop {
+    let result = loop {
         if let Some(pos) = find_subsequence(&work[..filled], end_marker) {
             if pos > 0 {
-                storage::append_root_file(sd, name_str, &work[..pos])
-                    .map_err(|_| "write failed")?;
+                if let Err(_) = file.write(sd, &work[..pos]) {
+                    break Err("write failed");
+                }
                 total_written += pos as u32;
             }
             debug!("upload: complete, {} bytes written", total_written);
-            return Ok((file_name_buf, file_name_len));
+            break Ok(());
         }
 
         if filled > end_marker.len() {
             let safe = filled - end_marker.len();
-            storage::append_root_file(sd, name_str, &work[..safe]).map_err(|_| "write failed")?;
+            if let Err(_) = file.write(sd, &work[..safe]) {
+                break Err("write failed");
+            }
             total_written += safe as u32;
 
             work.copy_within(safe..filled, 0);
@@ -665,12 +684,20 @@ where
             .map_err(|_| "read error during upload")?;
         if n == 0 {
             if filled > 0 {
-                let _ = storage::append_root_file(sd, name_str, &work[..filled]);
+                let _ = file.write(sd, &work[..filled]);
             }
+            // close before returning error so the handle is not leaked
+            let _ = file.close(sd);
             return Err("upload incomplete");
         }
         filled += n;
-    }
+    };
+
+    // always close — whether write loop succeeded or failed
+    let _ = file.close(sd);
+    log_heap("upload done");
+    result?;
+    Ok((file_name_buf, file_name_len))
 }
 
 fn extract_path(line: &[u8]) -> &[u8] {
@@ -838,7 +865,6 @@ fn extract_content_length(headers: &[u8]) -> Option<usize> {
 }
 
 async fn close_socket(socket: &mut TcpSocket<'_>) {
-    Timer::after(Duration::from_millis(SOCKET_CLOSE_DELAY_MS)).await;
     socket.close();
     Timer::after(Duration::from_millis(SOCKET_CLOSE_DELAY_MS)).await;
     socket.abort();

@@ -166,7 +166,7 @@ impl<'k> KernelHandle<'k> {
     // root directory file deletion
     #[inline]
     pub fn delete_file(&mut self, name: &str) -> Result<()> {
-        storage::delete_file(&self.kernel.sd, name)
+        self.kernel.sd.delete_file(name)
     }
 
     pub fn dir_page(&mut self, offset: usize, buf: &mut [DirEntry]) -> Result<DirPage> {
