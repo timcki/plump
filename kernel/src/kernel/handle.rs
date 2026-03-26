@@ -1,11 +1,7 @@
-// kernel handle: synchronous syscall boundary for apps
+// kernel handle: app-facing API surface
 //
-// every storage method calls a single storage::* function and returns
-// the unified Error result; apps call these directly
-//
-// app-specific logic (bookmarks, title scan, etc) accesses the
-// underlying caches directly via bookmark_cache() / dir_cache_mut()
-// rather than through dedicated handle methods
+// provides sd() for direct storage access, sync-reader bridges for
+// smol-epub, dir-cache coordination, system info, and cache accessors
 
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage::{DirEntry, DirPage};

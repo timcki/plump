@@ -7,7 +7,7 @@
 //   [16..48) filename [u8;32]
 
 use crate::drivers::sdcard::SdStorage;
-use crate::drivers::storage::{self, TITLE_CAP};
+use crate::drivers::storage::{PULP_DIR, TITLE_CAP};
 // FNV-1a hash with ASCII case folding, used for bookmark filename lookups.
 pub fn fnv1a_icase(data: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
@@ -189,7 +189,7 @@ impl BookmarkCache {
     pub fn force_load(&mut self, sd: &SdStorage) {
         let mut buf = [0u8; FILE_LEN];
         let slot_count =
-            match sd.read_file_start_in_dir(storage::PULP_DIR, BOOKMARK_FILE, &mut buf) {
+            match sd.read_file_start_in_dir(PULP_DIR, BOOKMARK_FILE, &mut buf) {
                 Ok((_, n)) => (n / RECORD_LEN).min(SLOTS),
                 Err(_) => 0,
             };
@@ -382,7 +382,7 @@ impl BookmarkCache {
             buf[base..base + RECORD_LEN].copy_from_slice(&rec);
         }
 
-        match sd.write_file_in_dir(storage::PULP_DIR, BOOKMARK_FILE, &buf[..file_len]) {
+        match sd.write_file_in_dir(PULP_DIR, BOOKMARK_FILE, &buf[..file_len]) {
             Ok(_) => {
                 self.dirty = false;
                 log::debug!("bookmarks: flushed {} slots to SD", self.count);
