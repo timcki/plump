@@ -9,7 +9,9 @@ use crate::apps::home::HomeApp;
 use crate::apps::reader::ReaderApp;
 use crate::apps::settings::SettingsApp;
 use crate::apps::stats::StatsApp;
-use crate::apps::{App, AppContext, AppId, Launcher, PendingSetting, Redraw, Transition};
+use crate::apps::{
+    App, AppContext, AppId, DeferredPersistenceReason, Launcher, PendingSetting, Redraw, Transition,
+};
 use esp_hal::delay::Delay;
 
 use crate::apps::widgets::quick_menu::{MAX_APP_ACTIONS, QuickMenuResult};
@@ -438,7 +440,7 @@ impl AppManager {
     pub fn flush_deferred_persistence(
         &mut self,
         k: &mut KernelHandle<'_>,
-        force: bool,
+        reason: DeferredPersistenceReason,
     ) -> crate::error::Result<()> {
         // today only ReaderApp does real work; others inherit the
         // default no-op. iterate all singletons for retry semantics.
@@ -450,7 +452,7 @@ impl AppManager {
             AppId::Settings,
             AppId::Stats,
         ] {
-            let result = with_app!(id, self, |app| app.flush_deferred_persistence(k, force));
+            let result = with_app!(id, self, |app| app.flush_deferred_persistence(k, reason));
             if let Err(e) = result {
                 log::warn!("flush_deferred_persistence({:?}): {}", id, e);
                 first_error.get_or_insert(e);
@@ -475,7 +477,9 @@ impl AppManager {
                 // before leaving the current app so inactive retries still
                 // run and reader dirty state gets one last chance before the
                 // singleton is potentially reused for another book.
-                if let Err(e) = self.flush_deferred_persistence(k, true) {
+                if let Err(e) =
+                    self.flush_deferred_persistence(k, DeferredPersistenceReason::Transition)
+                {
                     log::warn!("flush on leave {:?}: {}", nav.from, e);
                 }
 
@@ -720,9 +724,9 @@ impl AppLayer for AppManager {
     fn flush_deferred_persistence(
         &mut self,
         k: &mut KernelHandle<'_>,
-        force: bool,
+        reason: DeferredPersistenceReason,
     ) -> crate::error::Result<()> {
-        AppManager::flush_deferred_persistence(self, k, force)
+        AppManager::flush_deferred_persistence(self, k, reason)
     }
 
     fn collect_session(&self, session: &mut crate::kernel::rtc_session::RtcSession) {

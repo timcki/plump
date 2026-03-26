@@ -293,7 +293,10 @@ impl super::Kernel {
             // reading stats) in safe no-redraw windows. apps own their
             // debounce logic so most calls are cheap no-ops.
             if !app_mgr.has_redraw() {
-                if let Err(e) = app_mgr.flush_deferred_persistence(&mut self.handle(), false) {
+                if let Err(e) = app_mgr.flush_deferred_persistence(
+                    &mut self.handle(),
+                    super::app::DeferredPersistenceReason::Opportunistic,
+                ) {
                     debug!("scheduler: opportunistic flush error: {}", e);
                 }
             }
@@ -699,7 +702,10 @@ impl super::Kernel {
         // TODO: decide policy on force-flush failure here: keep the
         // current best-effort behavior, retry, or abort/defer sleep to
         // preserve durability guarantees more strictly.
-        if let Err(e) = app_mgr.flush_deferred_persistence(&mut self.handle(), true) {
+        if let Err(e) = app_mgr.flush_deferred_persistence(
+            &mut self.handle(),
+            super::app::DeferredPersistenceReason::Sleep,
+        ) {
             info!("sleep: flush_deferred_persistence error: {}", e);
         }
 

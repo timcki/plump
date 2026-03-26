@@ -18,7 +18,7 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::Text;
 
-use crate::apps::{App, AppContext, AppId, RECENT_FILE, Transition};
+use crate::apps::{App, AppContext, AppId, DeferredPersistenceReason, RECENT_FILE, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::{GrayMode, StripBuffer};
@@ -1658,7 +1658,7 @@ impl App<AppId> for ReaderApp {
         self.restore_offset = None;
         self.restore_page_hint = None;
         // NOTE: recent_dirty / stats_dirty intentionally NOT cleared here;
-        // flush_deferred_persistence(force=true) runs before on_exit and
+        // flush_deferred_persistence(Transition) runs before on_exit and
         // handles them. if it failed, dirty state is kept for retry.
         self.pending_position_change = None;
         self.defer_open_work_once = false;
@@ -2464,8 +2464,9 @@ impl App<AppId> for ReaderApp {
     fn flush_deferred_persistence(
         &mut self,
         k: &mut KernelHandle<'_>,
-        force: bool,
+        reason: DeferredPersistenceReason,
     ) -> crate::error::Result<()> {
+        let force = reason.is_forced();
         if force && self.stats_pause_clock() {
             self.stats_dirty = true;
         }
@@ -2475,7 +2476,7 @@ impl App<AppId> for ReaderApp {
             return Ok(());
         }
 
-        // non-forced: respect debounce deadline
+        // opportunistic flushes respect the debounce deadline
         if !force {
             match self.persist_next_flush_at {
                 Some(deadline) if crate::kernel::uptime_secs() < deadline => return Ok(()),
@@ -2483,6 +2484,10 @@ impl App<AppId> for ReaderApp {
                 _ => {}
             }
         }
+
+        let _attempted_recent = self.recent_dirty;
+        let _attempted_stats = self.stats_dirty;
+        pulp_kernel::perf_begin!(_fd_t0);
 
         let mut first_error = None;
 
@@ -2499,6 +2504,19 @@ impl App<AppId> for ReaderApp {
                 first_error.get_or_insert(e);
             }
         }
+
+        let _ok = first_error.is_none();
+        pulp_kernel::perf_event!(
+            "reader",
+            "flush_deferred reason={} force={} state={:?} recent={} stats={} ok={} elapsed_ms={}",
+            reason.as_str(),
+            force,
+            self.state,
+            _attempted_recent,
+            _attempted_stats,
+            _ok,
+            _fd_t0.elapsed().as_millis()
+        );
 
         if let Some(err) = first_error {
             // re-arm debounce for retry

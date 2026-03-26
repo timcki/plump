@@ -88,6 +88,29 @@ pub enum PendingSetting {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredPersistenceReason {
+    Opportunistic,
+    Transition,
+    Sleep,
+}
+
+impl DeferredPersistenceReason {
+    #[inline]
+    pub const fn is_forced(self) -> bool {
+        !matches!(self, Self::Opportunistic)
+    }
+
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Opportunistic => "opportunistic",
+            Self::Transition => "transition",
+            Self::Sleep => "sleep",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transition<Id> {
     None,
     Push(Id),
@@ -324,15 +347,15 @@ pub trait App<Id> {
 
     /// Flush deferred persistence (e.g. RECENT, reading stats).
     ///
-    /// Called periodically in safe no-redraw windows (`force=false`)
-    /// and on app transitions / before sleep (`force=true`).
+    /// Called periodically in safe no-redraw windows (`Opportunistic`)
+    /// and on app transitions / before sleep (`Transition` / `Sleep`).
     /// Implementations should return early when nothing is dirty or
-    /// when the debounce deadline hasn't passed (non-forced).
+    /// when the debounce deadline hasn't passed (non-forced reasons).
     /// Dirty flags must only be cleared on success so failures retry.
     fn flush_deferred_persistence(
         &mut self,
         _k: &mut KernelHandle<'_>,
-        _force: bool,
+        _reason: DeferredPersistenceReason,
     ) -> crate::error::Result<()> {
         Ok(())
     }
@@ -516,11 +539,12 @@ pub trait AppLayer {
     ///
     /// Dispatches to every app (not just the active one) so that
     /// failed flushes can retry even when the owning app is suspended.
-    /// `force=true` bypasses debounce (used on transitions / sleep).
+    /// The reason identifies whether this is an opportunistic,
+    /// transition-time, or sleep-time flush.
     fn flush_deferred_persistence(
         &mut self,
         k: &mut KernelHandle<'_>,
-        force: bool,
+        reason: DeferredPersistenceReason,
     ) -> crate::error::Result<()>;
 
     // session persistence: save/restore active app across sleep/wake

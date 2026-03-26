@@ -35,7 +35,9 @@ pub type Transition = crate::kernel::app::Transition<AppId>;
 pub type NavEvent = crate::kernel::app::NavEvent<AppId>;
 pub type Launcher = crate::kernel::app::Launcher<AppId>;
 
-pub use crate::kernel::app::{App, AppContext, PendingSetting, RECENT_FILE, Redraw};
+pub use crate::kernel::app::{
+    App, AppContext, DeferredPersistenceReason, PendingSetting, RECENT_FILE, Redraw,
+};
 
 // unified error types
 pub use crate::kernel::{Error, ErrorKind, Result, ResultExt};
