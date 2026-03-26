@@ -217,7 +217,7 @@ pub fn save_to_sd(session: &RtcSession, sd: &crate::drivers::sdcard::SdStorage) 
     let bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(session as *const RtcSession as *const u8, SESSION_SIZE)
     };
-    match crate::drivers::storage::write_in_pulp(sd, SESSION_FILE, bytes) {
+    match sd.write_in_pulp(SESSION_FILE, bytes) {
         Ok(()) => log::debug!("session: saved to SD ({} bytes)", SESSION_SIZE),
         Err(e) => log::warn!("session: SD save failed: {}", e),
     }
@@ -231,7 +231,7 @@ pub fn load_from_sd(sd: &crate::drivers::sdcard::SdStorage) -> Option<RtcSession
     struct AlignedBuf([u8; SESSION_SIZE]);
     let mut buf = AlignedBuf([0u8; SESSION_SIZE]);
 
-    match crate::drivers::storage::read_chunk_in_pulp(sd, SESSION_FILE, 0, &mut buf.0) {
+    match sd.read_chunk_in_pulp(SESSION_FILE, 0, &mut buf.0) {
         Ok(n) if n >= SESSION_SIZE => {
             // safety: buf is properly aligned (align 4) and contains
             // SESSION_SIZE bytes with the same layout as RtcSession
@@ -271,5 +271,5 @@ pub fn load_from_sd(sd: &crate::drivers::sdcard::SdStorage) -> Option<RtcSession
 
 // delete session file from SD (e.g. after successful cold boot)
 pub fn clear_sd(sd: &crate::drivers::sdcard::SdStorage) {
-    let _ = crate::drivers::storage::delete_in_pulp(sd, SESSION_FILE);
+    let _ = sd.delete_in_pulp(SESSION_FILE);
 }

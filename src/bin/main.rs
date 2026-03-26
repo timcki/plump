@@ -26,7 +26,6 @@ use pulp_os::board::{Board, speed_up_spi};
 use pulp_os::drivers::battery;
 use pulp_os::drivers::input::InputDriver;
 use pulp_os::drivers::sdcard::SdStorage;
-use pulp_os::drivers::storage;
 use pulp_os::drivers::strip::StripBuffer;
 use pulp_os::kernel::BookmarkCache;
 use pulp_os::kernel::BootConsole;
@@ -113,7 +112,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let sd_ok = sd.probe_ok();
     if sd_ok {
         console.push("sd: fat32 mounted");
-        if let Err(e) = storage::ensure_pulp_dir_async(&sd).await {
+        if let Err(e) = sd.ensure_pulp_dir_async().await {
             console.push("sd: pulp dir failed");
             log::warn!("ensure_pulp_dir: {:?}", e);
         }

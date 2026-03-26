@@ -466,304 +466,324 @@ impl SdStorage {
             Ok(count)
         })
     }
-}
 
-// root file operations
+    // root file reads
 
-pub fn file_size(sd: &SdStorage, name: &str) -> crate::error::Result<u32> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        op_file_size!(inner, inner.root, name)
-    })
-}
-
-pub fn read_file_chunk(
-    sd: &SdStorage,
-    name: &str,
-    offset: u32,
-    buf: &mut [u8],
-) -> crate::error::Result<usize> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        op_read_chunk!(inner, inner.root, name, offset, buf)
-    })
-}
-
-pub fn read_file_start(
-    sd: &SdStorage,
-    name: &str,
-    buf: &mut [u8],
-) -> crate::error::Result<(u32, usize)> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        op_read_start!(inner, inner.root, name, buf)
-    })
-}
-
-// single-directory file operations
-
-pub fn write_file_in_dir(
-    sd: &SdStorage,
-    dir: &str,
-    name: &str,
-    data: &[u8],
-) -> crate::error::Result<()> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_dir!(inner, dir, |dir_h| op_write!(inner, dir_h, name, data))
-    })
-}
-
-pub fn read_file_start_in_dir(
-    sd: &SdStorage,
-    dir: &str,
-    name: &str,
-    buf: &mut [u8],
-) -> crate::error::Result<(u32, usize)> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_dir!(inner, dir, |dir_h| op_read_start!(inner, dir_h, name, buf))
-    })
-}
-
-// async boot path (runs inside the real executor)
-
-pub async fn ensure_pulp_dir_async(sd: &SdStorage) -> crate::error::Result<()> {
-    let mut guard = borrow(sd)?;
-    let inner = &mut *guard;
-
-    if let Ok(dir) = inner.mgr.open_dir(inner.root, PULP_DIR).await {
-        let _ = inner.mgr.close_dir(dir);
-        return Ok(());
-    }
-    match inner.mgr.make_dir_in_dir(inner.root, PULP_DIR).await {
-        Ok(()) => Ok(()),
-        Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
-        Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_pulp_dir_async")),
-    }
-}
-
-// _PULP subdirectory operations
-
-pub fn ensure_pulp_subdir(sd: &SdStorage, name: &str) -> crate::error::Result<()> {
-    let exists = poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_dir!(inner, PULP_DIR, |pulp_h| {
-            match inner.mgr.open_dir(pulp_h, name).await {
-                Ok(sub) => {
-                    let _ = inner.mgr.close_dir(sub);
-                    Ok::<_, Error>(true)
-                }
-                Err(_) => Ok(false),
-            }
+    /// Get the size of a file in the root directory.
+    pub fn file_size(&self, name: &str) -> crate::error::Result<u32> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            op_file_size!(inner, inner.root, name)
         })
-    })?;
-
-    if exists {
-        return Ok(());
     }
 
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_dir!(inner, PULP_DIR, |pulp_h| {
-            match inner.mgr.make_dir_in_dir(pulp_h, name).await {
-                Ok(()) => Ok::<_, Error>(()),
-                Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
-                Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_pulp_subdir")),
-            }
+    /// Read a chunk from a file in the root directory at the given offset.
+    pub fn read_file_chunk(
+        &self,
+        name: &str,
+        offset: u32,
+        buf: &mut [u8],
+    ) -> crate::error::Result<usize> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            op_read_chunk!(inner, inner.root, name, offset, buf)
         })
-    })
-}
+    }
 
-pub fn write_in_pulp_subdir(
-    sd: &SdStorage,
-    dir: &str,
-    name: &str,
-    data: &[u8],
-) -> crate::error::Result<()> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
+    /// Read from the start of a file in the root directory.
+    /// Returns (file_size, bytes_read).
+    pub fn read_file_start(
+        &self,
+        name: &str,
+        buf: &mut [u8],
+    ) -> crate::error::Result<(u32, usize)> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            op_read_start!(inner, inner.root, name, buf)
+        })
+    }
+
+    // named-directory file operations
+
+    /// Write a file in a named subdirectory of root.
+    pub fn write_file_in_dir(
+        &self,
+        dir: &str,
+        name: &str,
+        data: &[u8],
+    ) -> crate::error::Result<()> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            in_dir!(inner, dir, |dir_h| op_write!(inner, dir_h, name, data))
+        })
+    }
+
+    /// Read from the start of a file in a named subdirectory of root.
+    /// Returns (file_size, bytes_read).
+    pub fn read_file_start_in_dir(
+        &self,
+        dir: &str,
+        name: &str,
+        buf: &mut [u8],
+    ) -> crate::error::Result<(u32, usize)> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            in_dir!(inner, dir, |dir_h| op_read_start!(inner, dir_h, name, buf))
+        })
+    }
+
+    // _PULP/ directory management
+
+    /// Ensure the _PULP directory exists (async, for boot path).
+    pub async fn ensure_pulp_dir_async(&self) -> crate::error::Result<()> {
+        let mut guard = borrow(self)?;
         let inner = &mut *guard;
-        in_subdir!(inner, PULP_DIR, dir, |sub_h| op_write!(
-            inner, sub_h, name, data
-        ))
-    })
-}
 
-pub fn append_in_pulp_subdir(
-    sd: &SdStorage,
-    dir: &str,
-    name: &str,
-    data: &[u8],
-) -> crate::error::Result<()> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_subdir!(inner, PULP_DIR, dir, |sub_h| op_append!(
-            inner, sub_h, name, data
-        ))
-    })
-}
+        if let Ok(dir) = inner.mgr.open_dir(inner.root, PULP_DIR).await {
+            let _ = inner.mgr.close_dir(dir);
+            return Ok(());
+        }
+        match inner.mgr.make_dir_in_dir(inner.root, PULP_DIR).await {
+            Ok(()) => Ok(()),
+            Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
+            Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_pulp_dir_async")),
+        }
+    }
 
-pub fn read_chunk_in_pulp_subdir(
-    sd: &SdStorage,
-    dir: &str,
-    name: &str,
-    offset: u32,
-    buf: &mut [u8],
-) -> crate::error::Result<usize> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_subdir!(inner, PULP_DIR, dir, |sub_h| op_read_chunk!(
-            inner, sub_h, name, offset, buf
-        ))
-    })
-}
-
-pub fn file_size_in_pulp_subdir(
-    sd: &SdStorage,
-    dir: &str,
-    name: &str,
-) -> crate::error::Result<u32> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_subdir!(inner, PULP_DIR, dir, |sub_h| op_file_size!(
-            inner, sub_h, name
-        ))
-    })
-}
-
-pub fn delete_in_pulp_subdir(sd: &SdStorage, dir: &str, name: &str) -> crate::error::Result<()> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_subdir!(inner, PULP_DIR, dir, |sub_h| op_delete!(inner, sub_h, name))
-    })
-}
-
-// _PULP/ direct file operations (cache files live directly in _PULP/)
-
-pub fn read_chunk_in_pulp(
-    sd: &SdStorage,
-    name: &str,
-    offset: u32,
-    buf: &mut [u8],
-) -> crate::error::Result<usize> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_dir!(inner, PULP_DIR, |dir_h| op_read_chunk!(
-            inner, dir_h, name, offset, buf
-        ))
-    })
-}
-
-pub fn write_in_pulp(sd: &SdStorage, name: &str, data: &[u8]) -> crate::error::Result<()> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_dir!(inner, PULP_DIR, |dir_h| op_write!(inner, dir_h, name, data))
-    })
-}
-
-pub fn append_in_pulp(sd: &SdStorage, name: &str, data: &[u8]) -> crate::error::Result<()> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_dir!(inner, PULP_DIR, |dir_h| op_append!(
-            inner, dir_h, name, data
-        ))
-    })
-}
-
-pub fn file_size_in_pulp(sd: &SdStorage, name: &str) -> crate::error::Result<u32> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_dir!(inner, PULP_DIR, |dir_h| op_file_size!(inner, dir_h, name))
-    })
-}
-
-pub fn delete_in_pulp(sd: &SdStorage, name: &str) -> crate::error::Result<()> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_dir!(inner, PULP_DIR, |dir_h| op_delete!(inner, dir_h, name))
-    })
-}
-
-// seek+write: open existing file, seek to offset, write data, close
-// used to update the chapter offset table after all chapters are appended
-pub fn write_at_in_pulp(
-    sd: &SdStorage,
-    name: &str,
-    offset: u32,
-    data: &[u8],
-) -> crate::error::Result<()> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_dir!(inner, PULP_DIR, |dir_h| {
-            match inner
-                .mgr
-                .open_file_in_dir(dir_h, name, Mode::ReadWriteCreateOrAppend)
-                .await
-            {
-                Err(_) => Err(Error::new(ErrorKind::OpenFile, "write_at")),
-                Ok(file) => {
-                    let result = match inner.mgr.file_seek_from_start(file, offset) {
-                        Ok(()) => inner
-                            .mgr
-                            .write(file, data)
-                            .await
-                            .map_err(|_| Error::new(ErrorKind::WriteFailed, "write_at")),
-                        Err(_) => Err(Error::new(ErrorKind::SeekFailed, "write_at")),
-                    };
-                    let _ = inner.mgr.close_file(file).await;
-                    if result.is_ok() {
-                        crate::perf::counters::inc_sd_writes();
-                        crate::perf::counters::add_sd_bytes_written(data.len() as u32);
+    /// Ensure a subdirectory exists under _PULP/.
+    pub fn ensure_pulp_subdir(&self, name: &str) -> crate::error::Result<()> {
+        let exists = poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            in_dir!(inner, PULP_DIR, |pulp_h| {
+                match inner.mgr.open_dir(pulp_h, name).await {
+                    Ok(sub) => {
+                        let _ = inner.mgr.close_dir(sub);
+                        Ok::<_, Error>(true)
                     }
-                    result
+                    Err(_) => Ok(false),
                 }
-            }
+            })
+        })?;
+
+        if exists {
+            return Ok(());
+        }
+
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            in_dir!(inner, PULP_DIR, |pulp_h| {
+                match inner.mgr.make_dir_in_dir(pulp_h, name).await {
+                    Ok(()) => Ok::<_, Error>(()),
+                    Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
+                    Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_pulp_subdir")),
+                }
+            })
         })
-    })
-}
-
-// title mapping
-
-// append a title line to _PULP/TITLES.BIN
-pub fn save_title(sd: &SdStorage, filename: &str, title: &str) -> crate::error::Result<()> {
-    let name_bytes = filename.as_bytes();
-    let title_bytes = title.as_bytes();
-    let title_len = title_bytes.len().min(TITLE_CAP);
-    let line_len = name_bytes.len() + 1 + title_len + 1; // name + \t + title + \n
-    if line_len > 128 {
-        return Err(Error::new(
-            ErrorKind::WriteFailed,
-            "save_title: line too long",
-        ));
     }
-    let mut line = [0u8; 128];
-    line[..name_bytes.len()].copy_from_slice(name_bytes);
-    line[name_bytes.len()] = b'\t';
-    line[name_bytes.len() + 1..name_bytes.len() + 1 + title_len]
-        .copy_from_slice(&title_bytes[..title_len]);
-    line[name_bytes.len() + 1 + title_len] = b'\n';
 
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_dir!(inner, PULP_DIR, |dir_h| op_append!(inner, dir_h, TITLES_FILE, &line[..line_len]))
-    })
+    // _PULP/ direct file operations (cache files live directly in _PULP/)
+
+    /// Read a chunk from a file in _PULP/.
+    pub fn read_chunk_in_pulp(
+        &self,
+        name: &str,
+        offset: u32,
+        buf: &mut [u8],
+    ) -> crate::error::Result<usize> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            in_dir!(inner, PULP_DIR, |dir_h| op_read_chunk!(
+                inner, dir_h, name, offset, buf
+            ))
+        })
+    }
+
+    /// Write (create/truncate) a file in _PULP/.
+    pub fn write_in_pulp(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            in_dir!(inner, PULP_DIR, |dir_h| op_write!(inner, dir_h, name, data))
+        })
+    }
+
+    /// Append data to a file in _PULP/.
+    pub fn append_in_pulp(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            in_dir!(inner, PULP_DIR, |dir_h| op_append!(
+                inner, dir_h, name, data
+            ))
+        })
+    }
+
+    /// Get the size of a file in _PULP/.
+    pub fn file_size_in_pulp(&self, name: &str) -> crate::error::Result<u32> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            in_dir!(inner, PULP_DIR, |dir_h| op_file_size!(inner, dir_h, name))
+        })
+    }
+
+    /// Delete a file in _PULP/.
+    pub fn delete_in_pulp(&self, name: &str) -> crate::error::Result<()> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            in_dir!(inner, PULP_DIR, |dir_h| op_delete!(inner, dir_h, name))
+        })
+    }
+
+    /// Seek to offset and write data in a file in _PULP/.
+    /// Used to update the chapter offset table after all chapters are appended.
+    pub fn write_at_in_pulp(
+        &self,
+        name: &str,
+        offset: u32,
+        data: &[u8],
+    ) -> crate::error::Result<()> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            in_dir!(inner, PULP_DIR, |dir_h| {
+                match inner
+                    .mgr
+                    .open_file_in_dir(dir_h, name, Mode::ReadWriteCreateOrAppend)
+                    .await
+                {
+                    Err(_) => Err(Error::new(ErrorKind::OpenFile, "write_at")),
+                    Ok(file) => {
+                        let result = match inner.mgr.file_seek_from_start(file, offset) {
+                            Ok(()) => inner
+                                .mgr
+                                .write(file, data)
+                                .await
+                                .map_err(|_| Error::new(ErrorKind::WriteFailed, "write_at")),
+                            Err(_) => Err(Error::new(ErrorKind::SeekFailed, "write_at")),
+                        };
+                        let _ = inner.mgr.close_file(file).await;
+                        if result.is_ok() {
+                            crate::perf::counters::inc_sd_writes();
+                            crate::perf::counters::add_sd_bytes_written(data.len() as u32);
+                        }
+                        result
+                    }
+                }
+            })
+        })
+    }
+
+    // _PULP subdirectory file operations
+
+    /// Write (create/truncate) a file in _PULP/<dir>/.
+    pub fn write_in_pulp_subdir(
+        &self,
+        dir: &str,
+        name: &str,
+        data: &[u8],
+    ) -> crate::error::Result<()> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            in_subdir!(inner, PULP_DIR, dir, |sub_h| op_write!(
+                inner, sub_h, name, data
+            ))
+        })
+    }
+
+    /// Append data to a file in _PULP/<dir>/.
+    pub fn append_in_pulp_subdir(
+        &self,
+        dir: &str,
+        name: &str,
+        data: &[u8],
+    ) -> crate::error::Result<()> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            in_subdir!(inner, PULP_DIR, dir, |sub_h| op_append!(
+                inner, sub_h, name, data
+            ))
+        })
+    }
+
+    /// Read a chunk from a file in _PULP/<dir>/.
+    pub fn read_chunk_in_pulp_subdir(
+        &self,
+        dir: &str,
+        name: &str,
+        offset: u32,
+        buf: &mut [u8],
+    ) -> crate::error::Result<usize> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            in_subdir!(inner, PULP_DIR, dir, |sub_h| op_read_chunk!(
+                inner, sub_h, name, offset, buf
+            ))
+        })
+    }
+
+    /// Get the size of a file in _PULP/<dir>/.
+    pub fn file_size_in_pulp_subdir(
+        &self,
+        dir: &str,
+        name: &str,
+    ) -> crate::error::Result<u32> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            in_subdir!(inner, PULP_DIR, dir, |sub_h| op_file_size!(
+                inner, sub_h, name
+            ))
+        })
+    }
+
+    /// Delete a file in _PULP/<dir>/.
+    pub fn delete_in_pulp_subdir(
+        &self,
+        dir: &str,
+        name: &str,
+    ) -> crate::error::Result<()> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let inner = &mut *guard;
+            in_subdir!(inner, PULP_DIR, dir, |sub_h| op_delete!(inner, sub_h, name))
+        })
+    }
+
+    // title mapping
+
+    /// Append a title line to _PULP/TITLES.BIN.
+    pub fn save_title(&self, filename: &str, title: &str) -> crate::error::Result<()> {
+        let name_bytes = filename.as_bytes();
+        let title_bytes = title.as_bytes();
+        let title_len = title_bytes.len().min(TITLE_CAP);
+        let line_len = name_bytes.len() + 1 + title_len + 1;
+        if line_len > 128 {
+            return Err(Error::new(
+                ErrorKind::WriteFailed,
+                "save_title: line too long",
+            ));
+        }
+        let mut line = [0u8; 128];
+        line[..name_bytes.len()].copy_from_slice(name_bytes);
+        line[name_bytes.len()] = b'\t';
+        line[name_bytes.len() + 1..name_bytes.len() + 1 + title_len]
+            .copy_from_slice(&title_bytes[..title_len]);
+        line[name_bytes.len() + 1 + title_len] = b'\n';
+
+        self.append_in_pulp(TITLES_FILE, &line[..line_len])
+    }
 }
+

@@ -189,7 +189,7 @@ impl BookmarkCache {
     pub fn force_load(&mut self, sd: &SdStorage) {
         let mut buf = [0u8; FILE_LEN];
         let slot_count =
-            match storage::read_file_start_in_dir(sd, storage::PULP_DIR, BOOKMARK_FILE, &mut buf) {
+            match sd.read_file_start_in_dir(storage::PULP_DIR, BOOKMARK_FILE, &mut buf) {
                 Ok((_, n)) => (n / RECORD_LEN).min(SLOTS),
                 Err(_) => 0,
             };
@@ -382,7 +382,7 @@ impl BookmarkCache {
             buf[base..base + RECORD_LEN].copy_from_slice(&rec);
         }
 
-        match storage::write_file_in_dir(sd, storage::PULP_DIR, BOOKMARK_FILE, &buf[..file_len]) {
+        match sd.write_file_in_dir(storage::PULP_DIR, BOOKMARK_FILE, &buf[..file_len]) {
             Ok(_) => {
                 self.dirty = false;
                 log::debug!("bookmarks: flushed {} slots to SD", self.count);

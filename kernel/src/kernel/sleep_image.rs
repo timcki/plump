@@ -15,7 +15,6 @@ use log::{debug, info};
 
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::sdcard::SdStorage;
-use crate::drivers::storage;
 
 const IMG_W: usize = SCREEN_W as usize; // 480
 const IMG_H: usize = SCREEN_H as usize; // 800
@@ -75,7 +74,7 @@ const MAX_PALETTE: usize = 256;
 fn parse_header(sd: &SdStorage) -> Option<(u32, u16, [u8; MAX_PALETTE])> {
     // read header + full palette in one chunk (54 + 256*4 = 1078 bytes)
     let mut buf = [0u8; BMP_HEADER_SIZE + MAX_PALETTE * 4];
-    let n = storage::read_file_chunk(sd, FILENAME, 0, &mut buf).ok()?;
+    let n = sd.read_file_chunk(FILENAME, 0, &mut buf).ok()?;
     if n < BMP_HEADER_SIZE {
         info!("sleep_image: file too small for BMP header");
         return None;
@@ -305,7 +304,7 @@ pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
         let batch_len = rows * row_stride;
         let offset = pixel_offset + (first_bmp_row * row_stride) as u32;
 
-        match storage::read_file_chunk(sd, FILENAME, offset, &mut read_batch[..batch_len]) {
+        match sd.read_file_chunk(FILENAME, offset, &mut read_batch[..batch_len]) {
             Ok(n) if n == batch_len => {}
             Ok(n) => {
                 info!(
