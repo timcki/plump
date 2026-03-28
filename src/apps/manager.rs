@@ -328,6 +328,13 @@ impl AppManager {
                 session.reader_byte_offset,
                 session.reader_font_size,
             );
+
+            // Wake-to-reader should use the rich cover loading screen on
+            // the very first frame instead of flashing a generic resume
+            // screen before background restore reloads cached assets.
+            if self.launcher.active() == AppId::Reader {
+                self.reader.prepare_restore_loading_screen(k);
+            }
         }
 
         // propagate fonts (uses settings already loaded)

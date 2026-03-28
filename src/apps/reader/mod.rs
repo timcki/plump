@@ -1385,6 +1385,10 @@ impl ReaderApp {
         }
     }
 
+    pub(crate) fn prepare_restore_loading_screen(&mut self, k: &mut KernelHandle<'_>) {
+        let _ = self.try_load_cached_cover_thumb(k);
+    }
+
     fn progress_pct(&self) -> u8 {
         if self.is_epub && !self.epub.spine.is_empty() {
             let spine_len = self.epub.spine.len() as u64;
