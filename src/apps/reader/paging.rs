@@ -60,6 +60,7 @@ impl ReaderApp {
         self.pg.line_count = 0;
         let mut col: usize = 0;
         let mut line_start: usize = 0;
+        let mut skipped_leading_blank = false;
 
         for i in 0..n {
             let b = self.pg.buf[i];
@@ -67,6 +68,12 @@ impl ReaderApp {
                 b'\r' => {}
                 b'\n' => {
                     let end = trim_trailing_cr(&self.pg.buf, line_start, i);
+                    if self.pg.line_count == 0 && end == line_start && !skipped_leading_blank {
+                        skipped_leading_blank = true;
+                        line_start = i + 1;
+                        col = 0;
+                        continue;
+                    }
                     self.push_line(line_start, end);
                     line_start = i + 1;
                     col = 0;
@@ -714,6 +721,7 @@ pub(super) fn wrap_proportional(
     let mut indent: u8 = 0;
     let mut max_w = base_max_w;
     let mut img_idx: usize = 0;
+    let mut skipped_leading_blank = false;
 
     #[inline]
     fn current_style(bold: bool, italic: bool, heading: bool) -> fonts::Style {
@@ -832,6 +840,17 @@ pub(super) fn wrap_proportional(
         }
 
         if b == b'\n' {
+            let end = trim_trailing_cr(buf, line_start, i);
+            if line_count == 0 && end == line_start && !skipped_leading_blank {
+                skipped_leading_blank = true;
+                line_start = i + 1;
+                cursor_x = 0;
+                last_space = line_start;
+                cursor_at_space = 0;
+                i += 1;
+                continue;
+            }
+
             emit!(line_start, i, LineSpan::END_HARD);
             line_start = i + 1;
             cursor_x = 0;
