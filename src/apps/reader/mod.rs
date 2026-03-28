@@ -2018,7 +2018,7 @@ impl App<AppId> for ReaderApp {
                     self.epub_index_chapter();
 
                     if self.is_epub && self.epub.try_cache_chapter(k) {
-                        self.preindex_all_pages();
+                        self.preindex_all_pages(k);
                     }
 
                     if want_last {

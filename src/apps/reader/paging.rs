@@ -117,6 +117,7 @@ impl ReaderApp {
         self.pg.line_count = 0;
         self.pg.prefetch_page = NO_PREFETCH;
         self.pg.prefetch_len = 0;
+        self.img_height_count = 0;
         self.page_img = None;
         self.fullscreen_img = false;
     }
@@ -356,7 +357,7 @@ impl ReaderApp {
         Ok(())
     }
 
-    pub(super) fn preindex_all_pages(&mut self) {
+    pub(super) fn preindex_all_pages(&mut self, k: &mut KernelHandle<'_>) {
         if self.epub.ch_cache.is_empty() {
             return;
         }
@@ -372,6 +373,7 @@ impl ReaderApp {
             let n = end - offset;
             self.pg.buf[..n].copy_from_slice(&self.epub.ch_cache[offset..end]);
             self.pg.buf_len = n;
+            self.prescan_image_heights(k, n);
 
             let consumed = self.wrap_lines_counted(n);
             let next_offset = offset + consumed;
