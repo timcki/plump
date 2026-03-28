@@ -590,6 +590,16 @@ impl ReaderApp {
         !matches!(self.state, State::Ready | State::ShowToc | State::Error)
     }
 
+    fn shows_rich_loading_screen(&self) -> bool {
+        self.shows_loading_screen()
+            && matches!(
+                self.pending_position_change,
+                Some(
+                    PendingPositionChange::OpenReady | PendingPositionChange::RestoreReady
+                )
+            )
+    }
+
     fn loading_visual_region(&self) -> Region {
         Region::new(
             self.text_margin,
@@ -2622,12 +2632,14 @@ impl App<AppId> for ReaderApp {
             return;
         }
 
-        // loading states: draw a centered loading screen and hide the
-        // normal reader chrome so the page feels intentional instead
-        // of showing duplicated filename/progress UI.
-        if self.state != State::Ready && self.state != State::Error && self.state != State::ShowToc
-        {
-            self.draw_loading_screen(strip);
+        // loading states: fresh opens/restores get the centered
+        // cover/title loading screen, while in-reader page turns and
+        // chapter jumps stay intentionally blank so they don't flash
+        // book metadata between chapters.
+        if self.shows_loading_screen() {
+            if self.shows_rich_loading_screen() {
+                self.draw_loading_screen(strip);
+            }
             return;
         }
 
