@@ -639,6 +639,29 @@ impl super::Kernel {
                 self.partial_refreshes = 0;
                 self.red_stale = false;
 
+                // After a full GC refresh the panel is left in plain BW.
+                // Re-apply grayscale AA for reader text, then restore BW
+                // content to both RAM planes for subsequent partial DU updates.
+                if app_mgr.system_settings().text_aa
+                    && app_mgr.wants_grayscale()
+                    && !app_mgr.has_redraw()
+                    && deferred.is_none()
+                {
+                    let rs = crate::drivers::ssd1677::RenderState {
+                        px: 0,
+                        py: 0,
+                        pw: crate::drivers::ssd1677::WIDTH,
+                        ph: crate::drivers::ssd1677::HEIGHT,
+                        left_mask: 0,
+                        right_mask: 0,
+                    };
+                    let draw = |s: &mut StripBuffer| app_mgr.draw(s);
+                    self.epd.grayscale_pass(self.strip, &rs, &draw).await;
+
+                    let draw = |s: &mut StripBuffer| app_mgr.draw(s);
+                    self.epd.partial_phase3_sync(self.strip, &rs, &draw);
+                }
+
                 if let Some(action) = deferred {
                     self.apply_deferred_action(action, app_mgr);
                 }
