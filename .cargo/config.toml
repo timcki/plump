@@ -6,7 +6,8 @@ runner = "espflash flash --monitor --chip esp32c3"
 # Changing this requires a rebuild.
 #
 # Common profiles:
-#   ESP_LOG="debug,esp_hal=info"     — default dev logging with HAL noise reduced
+#   ESP_LOG="warn"                   — quiet default
+#   ESP_LOG="debug,esp_hal=info"     — debug app logging with HAL noise reduced
 #   ESP_LOG="info"                   — normal info-level logging
 #   ESP_LOG="warn,perf=info"         — quiet: suppress normal info/debug, show perf only
 #   ESP_LOG="info,perf=off"          — hide perf output, keep normal logging
@@ -19,7 +20,7 @@ runner = "espflash flash --monitor --chip esp32c3"
 #
 # Note: `ESP_LOG=...,perf=off` hides perf output but does not remove
 # instrumentation cost. Build without `--features perf` for zero-overhead.
-ESP_LOG="debug,esp_hal=info"
+ESP_LOG="warn"
 
 [build]
 rustflags = [
