@@ -47,13 +47,17 @@ pub const ROW2_THRESHOLDS: &[(u16, u16, Button)] = &[
     (1659, DEFAULT_TOLERANCE, Button::VolUp),
 ];
 
-pub fn decode_ladder(mv: u16, thresholds: &[(u16, u16, Button)]) -> Option<Button> {
-    for &(center, tolerance, button) in thresholds {
-        let low = center.saturating_sub(tolerance);
-        let high = center.saturating_add(tolerance);
-        if mv >= low && mv <= high {
-            return Some(button);
+impl Button {
+    /// Decode a button from an ADC millivolt reading using a resistance
+    /// ladder threshold table. Returns `None` if no threshold matches.
+    pub fn from_ladder(mv: u16, thresholds: &[(u16, u16, Button)]) -> Option<Button> {
+        for &(center, tolerance, button) in thresholds {
+            let low = center.saturating_sub(tolerance);
+            let high = center.saturating_add(tolerance);
+            if mv >= low && mv <= high {
+                return Some(button);
+            }
         }
+        None
     }
-    None
 }

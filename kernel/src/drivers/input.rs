@@ -5,7 +5,7 @@
 use esp_hal::time::{Duration, Instant};
 
 use crate::board::InputHw;
-use crate::board::button::{Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS, decode_ladder};
+use crate::board::button::{Button, ROW1_THRESHOLDS, ROW2_THRESHOLDS};
 use crate::kernel::timing;
 
 macro_rules! read_averaged {
@@ -164,7 +164,8 @@ impl InputDriver {
         let mv1 = self.read_averaged_row1();
         let mv2 = self.read_averaged_row2();
 
-        decode_ladder(mv1, ROW1_THRESHOLDS).or_else(|| decode_ladder(mv2, ROW2_THRESHOLDS))
+        Button::from_ladder(mv1, ROW1_THRESHOLDS)
+            .or_else(|| Button::from_ladder(mv2, ROW2_THRESHOLDS))
     }
 
     fn read_averaged_row1(&mut self) -> u16 {
