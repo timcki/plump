@@ -108,6 +108,142 @@ impl RtcSession {
     pub fn wake_count(&self) -> u32 {
         self.wake_count
     }
+
+    // ── RTC FAST memory operations ──────────────────────────────
+
+    /// Peek at RTC session validity without consuming it.
+    /// Safe to call multiple times (e.g. from main before boot console,
+    /// then again during boot()). Does NOT prevent subsequent restore.
+    pub fn rtc_peek_valid() -> bool {
+        // Safety: single-threaded boot context, volatile read via raw pointer
+        let magic = unsafe {
+            let ptr = core::ptr::addr_of!(RTC_SESSION);
+            core::ptr::read_volatile(core::ptr::addr_of!((*ptr).magic))
+        };
+        magic == RTC_SESSION_MAGIC
+    }
+
+    /// Check if RTC session data is valid and available for restore.
+    /// Returns true only once per boot (subsequent calls return false).
+    /// Must be called from main thread during boot, before async tasks.
+    pub fn rtc_consume() -> bool {
+        // Only allow one restore per boot
+        if SESSION_CONSUMED.load(Ordering::Relaxed) != 0 {
+            return false;
+        }
+
+        // Safety: single-threaded boot context, volatile read via raw pointer
+        let valid = unsafe {
+            let ptr = core::ptr::addr_of!(RTC_SESSION);
+            core::ptr::read_volatile(core::ptr::addr_of!((*ptr).magic))
+        } == RTC_SESSION_MAGIC;
+
+        if valid {
+            SESSION_CONSUMED.store(1, Ordering::Relaxed);
+        }
+
+        valid
+    }
+
+    /// Load session data from RTC FAST memory.
+    /// Caller should check `rtc_consume()` first.
+    pub fn rtc_load() -> Self {
+        // Safety: single-threaded context, volatile read via raw pointer
+        unsafe {
+            let ptr = core::ptr::addr_of!(RTC_SESSION);
+            core::ptr::read_volatile(ptr)
+        }
+    }
+
+    /// Save session data to RTC FAST memory before entering deep sleep.
+    /// Must be called from main thread before sleep, after tasks stopped.
+    pub fn rtc_save(&self) {
+        unsafe {
+            let ptr = core::ptr::addr_of_mut!(RTC_SESSION);
+            core::ptr::write_volatile(ptr, *self);
+            // Ensure magic is set (caller may have forgotten)
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*ptr).magic),
+                RTC_SESSION_MAGIC,
+            );
+        }
+    }
+
+    /// Clear RTC session data.
+    pub fn rtc_clear() {
+        unsafe {
+            let ptr = core::ptr::addr_of_mut!(RTC_SESSION);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).magic), 0);
+        }
+    }
+
+    /// Get wake count from RTC for debugging (doesn't consume session).
+    pub fn rtc_wake_count() -> u32 {
+        unsafe {
+            let ptr = core::ptr::addr_of!(RTC_SESSION);
+            core::ptr::read_volatile(core::ptr::addr_of!((*ptr).wake_count))
+        }
+    }
+
+    // ── SD-based session persistence ────────────────────────────
+
+    /// Save session to SD card as raw bytes.
+    pub fn save_to_sd(&self, sd: &crate::drivers::sdcard::SdStorage) {
+        // safety: RtcSession is #[repr(C)] with only primitive types;
+        // reinterpreting as bytes is well-defined
+        let bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(self as *const RtcSession as *const u8, SESSION_SIZE)
+        };
+        match sd.write_in_pulp(SESSION_FILE, bytes) {
+            Ok(()) => log::debug!("session: saved to SD ({} bytes)", SESSION_SIZE),
+            Err(e) => log::warn!("session: SD save failed: {}", e),
+        }
+    }
+
+    /// Load session from SD card; returns Some if valid.
+    pub fn load_from_sd(sd: &crate::drivers::sdcard::SdStorage) -> Option<Self> {
+        // align the read buffer to match RtcSession's align(4) requirement;
+        // a plain [u8] has align 1 which causes UB with ptr::read on RISC-V
+        #[repr(C, align(4))]
+        struct AlignedBuf([u8; SESSION_SIZE]);
+        let mut buf = AlignedBuf([0u8; SESSION_SIZE]);
+
+        match sd.read_chunk_in_pulp(SESSION_FILE, 0, &mut buf.0) {
+            Ok(n) if n >= SESSION_SIZE => {
+                // safety: buf is properly aligned (align 4) and contains
+                // SESSION_SIZE bytes with the same layout as RtcSession
+                let session: RtcSession =
+                    unsafe { core::ptr::read(buf.0.as_ptr() as *const RtcSession) };
+                if session.is_valid() {
+                    log::debug!(
+                        "session: loaded from SD (wake count {})",
+                        session.wake_count()
+                    );
+                    Some(session)
+                } else {
+                    log::warn!(
+                        "session: SD file magic {:08x} != {:08x} (read {} bytes, first 8: {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x})",
+                        session.magic,
+                        RTC_SESSION_MAGIC,
+                        n,
+                        buf.0[0], buf.0[1], buf.0[2], buf.0[3],
+                        buf.0[4], buf.0[5], buf.0[6], buf.0[7],
+                    );
+                    None
+                }
+            }
+            Ok(n) => {
+                log::debug!("session: SD file too small ({} < {})", n, SESSION_SIZE);
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Delete session file from SD (e.g. after successful cold boot).
+    pub fn clear_sd(sd: &crate::drivers::sdcard::SdStorage) {
+        let _ = sd.delete_in_pulp(SESSION_FILE);
+    }
 }
 
 // RTC FAST persistent storage
@@ -126,150 +262,6 @@ static mut RTC_SESSION: RtcSession = RtcSession::zeroed();
 // (prevents re-reading stale data after initial restore)
 static SESSION_CONSUMED: AtomicU32 = AtomicU32::new(0);
 
-// peek at RTC session validity without consuming it.
-// safe to call multiple times (e.g. from main before boot console,
-// then again during boot()). does NOT prevent subsequent restore.
-pub fn peek_valid() -> bool {
-    // Safety: single-threaded boot context, volatile read via raw pointer
-    let magic = unsafe {
-        let ptr = core::ptr::addr_of!(RTC_SESSION);
-        core::ptr::read_volatile(core::ptr::addr_of!((*ptr).magic))
-    };
-    magic == RTC_SESSION_MAGIC
-}
-
-// check if RTC session data is valid and available for restore
-// returns true only once per boot (subsequent calls return false)
-// must be called from main thread during boot, before async tasks
-pub fn is_valid_session() -> bool {
-    // Only allow one restore per boot
-    if SESSION_CONSUMED.load(Ordering::Relaxed) != 0 {
-        return false;
-    }
-
-    // Safety: single-threaded boot context, volatile read via raw pointer
-    let valid = unsafe {
-        let ptr = core::ptr::addr_of!(RTC_SESSION);
-        core::ptr::read_volatile(core::ptr::addr_of!((*ptr).magic))
-    } == RTC_SESSION_MAGIC;
-
-    if valid {
-        SESSION_CONSUMED.store(1, Ordering::Relaxed);
-    }
-
-    valid
-}
-
-// load session data (caller should check is_valid_session() first)
-// must be called from main thread during boot
-pub fn load() -> RtcSession {
-    // Safety: single-threaded context, volatile read via raw pointer
-    unsafe {
-        let ptr = core::ptr::addr_of!(RTC_SESSION);
-        core::ptr::read_volatile(ptr)
-    }
-}
-
-// save session data before entering deep sleep
-// must be called from main thread before sleep, after tasks stopped
-pub fn save(session: &RtcSession) {
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(RTC_SESSION);
-        // Copy all fields
-        core::ptr::write_volatile(ptr, *session);
-        // Ensure magic is set (caller may have forgotten)
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).magic), RTC_SESSION_MAGIC);
-    }
-}
-
-// clear RTC session data
-pub fn clear() {
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(RTC_SESSION);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).magic), 0);
-    }
-}
-
-// get wake count for debugging (doesn't consume session)
-pub fn wake_count() -> u32 {
-    unsafe {
-        let ptr = core::ptr::addr_of!(RTC_SESSION);
-        core::ptr::read_volatile(core::ptr::addr_of!((*ptr).wake_count))
-    }
-}
-
-// --- SD-based session persistence (fallback for battery wake) ---
-//
-// on battery, the brownout detector fires during the deep sleep wake
-// voltage sag, causing a full system reset that wipes RTC FAST memory.
-// we save the session to SD as a fallback so it can be restored even
-// when RTC data is lost.
-
-pub const SESSION_FILE: &str = "SESSION.BIN";
-
-// size of the raw session data on SD (must match struct size)
+// SD session file name and size
+const SESSION_FILE: &str = "SESSION.BIN";
 const SESSION_SIZE: usize = core::mem::size_of::<RtcSession>();
-
-// save session to SD card as raw bytes
-pub fn save_to_sd(session: &RtcSession, sd: &crate::drivers::sdcard::SdStorage) {
-    // safety: RtcSession is #[repr(C)] with only primitive types;
-    // reinterpreting as bytes is well-defined
-    let bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(session as *const RtcSession as *const u8, SESSION_SIZE)
-    };
-    match sd.write_in_pulp(SESSION_FILE, bytes) {
-        Ok(()) => log::debug!("session: saved to SD ({} bytes)", SESSION_SIZE),
-        Err(e) => log::warn!("session: SD save failed: {}", e),
-    }
-}
-
-// load session from SD card; returns Some if valid
-pub fn load_from_sd(sd: &crate::drivers::sdcard::SdStorage) -> Option<RtcSession> {
-    // align the read buffer to match RtcSession's align(4) requirement;
-    // a plain [u8] has align 1 which causes UB with ptr::read on RISC-V
-    #[repr(C, align(4))]
-    struct AlignedBuf([u8; SESSION_SIZE]);
-    let mut buf = AlignedBuf([0u8; SESSION_SIZE]);
-
-    match sd.read_chunk_in_pulp(SESSION_FILE, 0, &mut buf.0) {
-        Ok(n) if n >= SESSION_SIZE => {
-            // safety: buf is properly aligned (align 4) and contains
-            // SESSION_SIZE bytes with the same layout as RtcSession
-            let session: RtcSession =
-                unsafe { core::ptr::read(buf.0.as_ptr() as *const RtcSession) };
-            if session.is_valid() {
-                log::debug!(
-                    "session: loaded from SD (wake count {})",
-                    session.wake_count()
-                );
-                Some(session)
-            } else {
-                log::warn!(
-                    "session: SD file magic {:08x} != {:08x} (read {} bytes, first 8: {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x})",
-                    session.magic,
-                    RTC_SESSION_MAGIC,
-                    n,
-                    buf.0[0],
-                    buf.0[1],
-                    buf.0[2],
-                    buf.0[3],
-                    buf.0[4],
-                    buf.0[5],
-                    buf.0[6],
-                    buf.0[7],
-                );
-                None
-            }
-        }
-        Ok(n) => {
-            log::debug!("session: SD file too small ({} < {})", n, SESSION_SIZE);
-            None
-        }
-        Err(_) => None,
-    }
-}
-
-// delete session file from SD (e.g. after successful cold boot)
-pub fn clear_sd(sd: &crate::drivers::sdcard::SdStorage) {
-    let _ = sd.delete_in_pulp(SESSION_FILE);
-}

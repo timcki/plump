@@ -63,21 +63,21 @@ impl super::Kernel {
     // skip the console render on fast wake. checks RTC first (free),
     // then SD fallback (one file read).
     pub fn has_valid_session(&self) -> bool {
-        use super::rtc_session;
+        use super::rtc_session::RtcSession;
         // RTC check is a single volatile read — essentially free
-        if rtc_session::peek_valid() {
+        if RtcSession::rtc_peek_valid() {
             return true;
         }
         // SD fallback: check if session file exists and is valid.
         // this costs one SD read (~20ms) but saves ~1.6s of EPD refresh
         // when the session is valid.
-        rtc_session::load_from_sd(&self.sd).is_some()
+        RtcSession::load_from_sd(&self.sd).is_some()
     }
 
     // one-time boot: load caches, settings, render the home screen
     // if waking from deep sleep with valid RTC session, restore it
     pub async fn boot<A: AppLayer>(&mut self, app_mgr: &mut A) {
-        use super::rtc_session;
+        use super::rtc_session::RtcSession;
         use embassy_time::Instant;
 
         let boot_start = Instant::now();
@@ -107,9 +107,9 @@ impl super::Kernel {
         // sag, causing a full system reset that wipes RTC FAST memory.
         // the SD-backed session survives this and provides reliable resume.
         let t0 = Instant::now();
-        let has_rtc_session = rtc_session::is_valid_session();
+        let has_rtc_session = RtcSession::rtc_consume();
         let rtc_session_data = if has_rtc_session {
-            let session = rtc_session::load();
+            let session = RtcSession::rtc_load();
             info!(
                 "boot: RTC session valid (wake count {}) ({}ms)",
                 session.wake_count(),
@@ -119,7 +119,7 @@ impl super::Kernel {
         } else {
             // RTC invalid — try SD fallback (typical on battery wake)
             let t1 = Instant::now();
-            match rtc_session::load_from_sd(&self.sd) {
+            match RtcSession::load_from_sd(&self.sd) {
                 Some(session) => {
                     info!(
                         "boot: SD session valid (wake count {}) ({}ms)",
@@ -774,7 +774,7 @@ impl super::Kernel {
     // due to brownout resets (voltage sag wipes the RTC power domain).
     // the SD copy is the reliable fallback (~20ms extra).
     async fn sleep_with_session<A: AppLayer>(&mut self, app_mgr: &mut A, reason: &str) {
-        use super::rtc_session;
+        use super::rtc_session::RtcSession;
         use embassy_time::Instant;
 
         let sleep_start = Instant::now();
@@ -797,7 +797,7 @@ impl super::Kernel {
 
         // collect session state from app layer
         let t0 = Instant::now();
-        let mut session = rtc_session::RtcSession::zeroed();
+        let mut session = RtcSession::zeroed();
         app_mgr.collect_session(&mut session);
 
         // increment wake count for debugging
@@ -807,10 +807,10 @@ impl super::Kernel {
         session.mark_valid();
 
         // save to RTC memory (fast path, works on USB / stable power)
-        rtc_session::save(&session);
+        session.rtc_save();
 
         // save to SD card (reliable fallback for battery wake)
-        rtc_session::save_to_sd(&session, &self.sd);
+        session.save_to_sd(&self.sd);
         debug!(
             "sleep: session saved to RTC + SD ({}ms)",
             t0.elapsed().as_millis()
