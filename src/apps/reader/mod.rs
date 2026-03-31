@@ -30,7 +30,7 @@ use crate::kernel::QuickAction;
 use crate::kernel::bookmarks;
 use crate::kernel::work_queue;
 use crate::kernel::work_queue::DecodedImage;
-use crate::ui::{Alignment, HEADER_W, Region, StackFmt, draw_progress_bar};
+use crate::ui::{Alignment, HEADER_W, ProgressBar, Region, StackFmt};
 use smol_epub::cache;
 use smol_epub::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
 use smol_epub::html_strip::{
@@ -735,7 +735,7 @@ impl ReaderApp {
                 Alignment::Center,
                 BinaryColor::On,
             );
-            draw_progress_bar(strip, bar_region, pct);
+            ProgressBar::new(bar_region, pct).draw(strip);
             return;
         }
 
@@ -776,7 +776,7 @@ impl ReaderApp {
                 Alignment::Center,
                 BinaryColor::On,
             );
-            draw_progress_bar(strip, bar_region, pct);
+            ProgressBar::new(bar_region, pct).draw(strip);
         } else {
             let heading_font = fonts::heading_font(2);
             let stage_y = content.y + content.h / 3 + 6;
@@ -796,7 +796,7 @@ impl ReaderApp {
                 Alignment::Center,
                 BinaryColor::On,
             );
-            draw_progress_bar(strip, bar_region, pct);
+            ProgressBar::new(bar_region, pct).draw(strip);
         }
     }
 

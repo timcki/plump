@@ -585,12 +585,12 @@ impl AppManager {
         if self.launcher.ctx.loading_active() && !suppress_loading {
             let region = self.launcher.ctx.loading_region();
             if region.intersects(strip.logical_window()) {
-                crate::ui::draw_loading_indicator(
-                    strip,
+                crate::ui::LoadingIndicator::new(
                     region,
                     self.launcher.ctx.loading_msg(),
                     self.launcher.ctx.loading_pct(),
-                );
+                )
+                .draw(strip);
             }
         }
 

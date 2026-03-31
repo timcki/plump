@@ -117,70 +117,96 @@ pub fn wrap_prev(current: usize, count: usize) -> usize {
     if current == 0 { count - 1 } else { current - 1 }
 }
 
-// horizontal progress bar for 1-bit e-paper
-// draws a 1px black border around the full track and fills
-// proportionally from the left; pct is clamped to 0..=100
-// region should be at least 4px wide and 4px tall
-pub fn draw_progress_bar(strip: &mut StripBuffer, region: Region, pct: u8) {
-    let pct = pct.min(100) as u32;
+/// Horizontal progress bar for 1-bit e-paper.
+///
+/// Draws a 1px black border around the full track and fills
+/// proportionally from the left; `pct` is clamped to 0..=100.
+/// Region should be at least 4px wide and 4px tall.
+pub struct ProgressBar {
+    pub region: Region,
+    pub pct: u8,
+}
 
-    // clear region
-    region
-        .to_rect()
-        .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
-        .draw(strip)
-        .unwrap();
+impl ProgressBar {
+    pub const fn new(region: Region, pct: u8) -> Self {
+        Self { region, pct }
+    }
 
-    // 1px border shows full extent even at 0%
-    region
-        .to_rect()
-        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
-        .draw(strip)
-        .unwrap();
+    pub fn draw(&self, strip: &mut StripBuffer) {
+        let pct = self.pct.min(100) as u32;
 
-    // filled portion inside the border
-    if pct > 0 && region.w > 2 && region.h > 2 {
-        let inner_w = (region.w - 2) as u32;
-        let fill_w = (inner_w * pct / 100).max(1);
-        Rectangle::new(
-            Point::new((region.x + 1) as i32, (region.y + 1) as i32),
-            Size::new(fill_w, (region.h - 2) as u32),
-        )
-        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-        .draw(strip)
-        .unwrap();
+        // clear region
+        self.region
+            .to_rect()
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+            .draw(strip)
+            .unwrap();
+
+        // 1px border shows full extent even at 0%
+        self.region
+            .to_rect()
+            .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+            .draw(strip)
+            .unwrap();
+
+        // filled portion inside the border
+        if pct > 0 && self.region.w > 2 && self.region.h > 2 {
+            let inner_w = (self.region.w - 2) as u32;
+            let fill_w = (inner_w * pct / 100).max(1);
+            Rectangle::new(
+                Point::new((self.region.x + 1) as i32, (self.region.y + 1) as i32),
+                Size::new(fill_w, (self.region.h - 2) as u32),
+            )
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(strip)
+            .unwrap();
+        }
     }
 }
 
-// loading indicator for 1-bit e-paper
-// draws "msg...pct%" centered vertically in the region using the
-// built-in FONT_9X18 mono font; works without any custom bitmap
-// fonts loaded, usable from any app or the kernel itself
-//
-// typical usage:
-//   draw_loading_indicator(strip, region, "Loading", 25)  => "Loading...25%"
-//   draw_loading_indicator(strip, region, "Caching 3/15", 20)  => "Caching 3/15...20%"
-pub fn draw_loading_indicator(strip: &mut StripBuffer, region: Region, msg: &str, pct: u8) {
-    use core::fmt::Write;
+/// Loading indicator for 1-bit e-paper.
+///
+/// Draws `"msg...pct%"` centered vertically in the region using the
+/// built-in FONT_9X18 mono font; works without any custom bitmap
+/// fonts loaded, usable from any app or the kernel itself.
+///
+/// ```text
+/// LoadingIndicator::new(region, "Loading", 25)       => "Loading...25%"
+/// LoadingIndicator::new(region, "Caching 3/15", 20)  => "Caching 3/15...20%"
+/// ```
+pub struct LoadingIndicator<'a> {
+    pub region: Region,
+    pub msg: &'a str,
+    pub pct: u8,
+}
 
-    // clear region
-    region
-        .to_rect()
-        .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
-        .draw(strip)
-        .unwrap();
+impl<'a> LoadingIndicator<'a> {
+    pub const fn new(region: Region, msg: &'a str, pct: u8) -> Self {
+        Self { region, msg, pct }
+    }
 
-    // format "msg...pct%"
-    let mut buf = [0u8; 48];
-    let mut fmt = BorrowedFmt::new(&mut buf);
-    let _ = write!(fmt, "{}...{}%", msg, pct.min(100));
-    let text = fmt.as_str();
+    pub fn draw(&self, strip: &mut StripBuffer) {
+        use core::fmt::Write;
 
-    // FONT_9X18: 9px wide, 18px tall, ~14px ascent
-    // center vertically; baseline = region.y + (h + 9) / 2
-    let style = MonoTextStyle::new(&FONT_9X18, BinaryColor::On);
-    let baseline_y = region.y as i32 + (region.h as i32 + 9) / 2;
-    Text::new(text, Point::new(region.x as i32 + 2, baseline_y), style)
-        .draw(strip)
-        .unwrap();
+        // clear region
+        self.region
+            .to_rect()
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+            .draw(strip)
+            .unwrap();
+
+        // format "msg...pct%"
+        let mut buf = [0u8; 48];
+        let mut fmt = BorrowedFmt::new(&mut buf);
+        let _ = write!(fmt, "{}...{}%", self.msg, self.pct.min(100));
+        let text = fmt.as_str();
+
+        // FONT_9X18: 9px wide, 18px tall, ~14px ascent
+        // center vertically; baseline = region.y + (h + 9) / 2
+        let style = MonoTextStyle::new(&FONT_9X18, BinaryColor::On);
+        let baseline_y = self.region.y as i32 + (self.region.h as i32 + 9) / 2;
+        Text::new(text, Point::new(self.region.x as i32 + 2, baseline_y), style)
+            .draw(strip)
+            .unwrap();
+    }
 }
