@@ -1350,10 +1350,8 @@ impl ReaderApp {
             return false;
         }
 
-        let dir_buf =
-            crate::apps::cover_cache::cache_dir_for_filename(&self.filename[..self.filename_len]);
-        let dir = cache::dir_name_str(&dir_buf);
-        self.loading_cover = crate::apps::cover_cache::load_cover_thumb(k, dir);
+        self.loading_cover =
+            crate::apps::cover_cache::load_cover_for(k, &self.filename[..self.filename_len]);
 
         if let Some(ref img) = self.loading_cover {
             log::debug!(

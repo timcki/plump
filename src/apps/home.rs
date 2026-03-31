@@ -222,11 +222,10 @@ impl HomeApp {
                 self.recent_stats_time = 0;
             }
             // try to load cached cover thumbnail
-            let dir_buf = crate::apps::cover_cache::cache_dir_for_filename(
+            self.recent_cover = crate::apps::cover_cache::load_cover_for(
+                k,
                 &self.recent_book[..self.recent_book_len],
             );
-            let dir = smol_epub::cache::dir_name_str(&dir_buf);
-            self.recent_cover = crate::apps::cover_cache::load_cover_thumb(k, dir);
             if self.recent_cover.is_some() {
                 log::debug!("home: loaded cover thumbnail for recent book");
             }
@@ -429,11 +428,10 @@ impl App<AppId> for HomeApp {
                     self.recent_stats_time = 0;
                 }
                 // load cached cover thumbnail
-                let dir_buf = crate::apps::cover_cache::cache_dir_for_filename(
+                self.recent_cover = crate::apps::cover_cache::load_cover_for(
+                    k,
                     &self.recent_book[..self.recent_book_len],
                 );
-                let dir = smol_epub::cache::dir_name_str(&dir_buf);
-                self.recent_cover = crate::apps::cover_cache::load_cover_thumb(k, dir);
             } else {
                 self.recent_cover = None;
             }

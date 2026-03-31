@@ -28,7 +28,7 @@ pub const COVER_THUMB_MAX_H: u16 = 240;
 ///
 /// Returns the 8-byte directory name buffer (e.g. `_1A2B3C4D`) that
 /// can be passed to `cache::dir_name_str()`.
-pub fn cache_dir_for_filename(filename: &[u8]) -> [u8; 8] {
+fn cache_dir_for_filename(filename: &[u8]) -> [u8; 8] {
     let hash = cache::fnv1a(filename);
     cache::dir_name_for_hash(hash)
 }
@@ -86,4 +86,20 @@ pub fn has_cover_thumb(k: &mut KernelHandle<'_>, dir: &str) -> bool {
     k.sd().file_size_in_pulp_subdir(dir, COVER_THUMB_FILE)
         .map(|s| s >= 5)
         .unwrap_or(false)
+}
+
+// ── convenience helpers (filename → hash → dir → operation) ─────────
+
+/// Load a cover thumbnail by book filename (internalizes hash→dir).
+pub fn load_cover_for(k: &mut KernelHandle<'_>, filename: &[u8]) -> Option<DecodedImage> {
+    let dir_buf = cache_dir_for_filename(filename);
+    let dir = cache::dir_name_str(&dir_buf);
+    load_cover_thumb(k, dir)
+}
+
+/// Check whether a cover thumbnail exists by book filename.
+pub fn has_cover_for(k: &mut KernelHandle<'_>, filename: &[u8]) -> bool {
+    let dir_buf = cache_dir_for_filename(filename);
+    let dir = cache::dir_name_str(&dir_buf);
+    has_cover_thumb(k, dir)
 }
