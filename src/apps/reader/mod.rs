@@ -461,9 +461,7 @@ pub struct ReaderApp {
     pub(super) qa_count: u8,
 
     // reading statistics (accumulated per book, flushed to SD)
-    pub(super) stats_pages: u32,
-    pub(super) stats_time_secs: u32,
-    pub(super) stats_sessions: u16,
+    pub(super) stats: crate::apps::stats::ReadingStats,
     pub(super) stats_last_uptime: u32, // uptime_secs at last page turn / enter
     pub(super) stats_dirty: bool,
     pub(super) stats_clock_running: bool, // false when suspended/exited
@@ -529,9 +527,7 @@ impl ReaderApp {
             qa_buf: [QuickAction::trigger(0, "", ""); QA_MAX],
             qa_count: 0,
 
-            stats_pages: 0,
-            stats_time_secs: 0,
-            stats_sessions: 0,
+            stats: crate::apps::stats::ReadingStats::EMPTY,
             stats_last_uptime: 0,
             stats_dirty: false,
             stats_clock_running: false,
@@ -988,7 +984,7 @@ impl ReaderApp {
             let now = crate::kernel::uptime_secs();
             let delta = now.saturating_sub(self.stats_last_uptime);
             if delta > 0 && delta < 600 {
-                self.stats_time_secs = self.stats_time_secs.saturating_add(delta);
+                self.stats.time_secs = self.stats.time_secs.saturating_add(delta);
                 added_elapsed = true;
             }
             self.stats_clock_running = false;
@@ -1010,26 +1006,19 @@ impl ReaderApp {
         let delta = now.saturating_sub(self.stats_last_uptime);
         // ignore deltas > 10 min (user was idle / fell asleep)
         if delta < 600 {
-            self.stats_time_secs = self.stats_time_secs.saturating_add(delta);
+            self.stats.time_secs = self.stats.time_secs.saturating_add(delta);
         }
         self.stats_last_uptime = now;
-        self.stats_pages = self.stats_pages.saturating_add(1);
+        self.stats.pages = self.stats.pages.saturating_add(1);
         self.stats_dirty = true;
     }
 
     // load stats from SD for the current book
     fn stats_load(&mut self, k: &mut KernelHandle<'_>) {
-        if let Some((pages, time, sessions)) = crate::apps::stats::load_book_stats(k, self.name()) {
-            self.stats_pages = pages;
-            self.stats_time_secs = time;
-            self.stats_sessions = sessions;
-        } else {
-            self.stats_pages = 0;
-            self.stats_time_secs = 0;
-            self.stats_sessions = 0;
-        }
+        self.stats = crate::apps::stats::ReadingStats::load(k, self.name())
+            .unwrap_or(crate::apps::stats::ReadingStats::EMPTY);
         // new session
-        self.stats_sessions = self.stats_sessions.saturating_add(1);
+        self.stats.sessions = self.stats.sessions.saturating_add(1);
         self.stats_dirty = true;
     }
 
@@ -1044,32 +1033,26 @@ impl ReaderApp {
             let now = crate::kernel::uptime_secs();
             let delta = now.saturating_sub(self.stats_last_uptime);
             if delta < 600 {
-                self.stats_time_secs = self.stats_time_secs.saturating_add(delta);
+                self.stats.time_secs = self.stats.time_secs.saturating_add(delta);
             }
             self.stats_last_uptime = now;
         }
 
-        crate::apps::stats::save_book_stats(
-            k,
-            self.name(),
-            self.stats_pages,
-            self.stats_time_secs,
-            self.stats_sessions,
-        )?;
+        self.stats.save(k, self.name())?;
         self.stats_dirty = false;
         pulp_kernel::perf_event!(
             "reader",
             "stats_flush pages={} time_s={} elapsed_ms={}",
-            self.stats_pages,
-            self.stats_time_secs,
+            self.stats.pages,
+            self.stats.time_secs,
             _sf_t0.elapsed().as_millis()
         );
         Ok(())
     }
 
     // public accessors for home screen display
-    pub fn reading_stats(&self) -> (u32, u32) {
-        (self.stats_pages, self.stats_time_secs)
+    pub fn reading_stats(&self) -> &crate::apps::stats::ReadingStats {
+        &self.stats
     }
 
     // transition to error state with consistent handling

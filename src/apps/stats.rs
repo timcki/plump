@@ -34,15 +34,75 @@ const STATS_DIR: &str = "STATS";
 
 // ── BookStats ────────────────────────────────────────────────────────
 
+/// Per-book reading statistics (pages turned, time spent, sessions).
+///
+/// Stored as key=value text files in `_PULP/STATS/<filename>`.
+#[derive(Clone, Copy, Default)]
+pub struct ReadingStats {
+    pub pages: u32,
+    pub time_secs: u32,
+    pub sessions: u16,
+}
+
+impl ReadingStats {
+    pub const EMPTY: Self = Self {
+        pages: 0,
+        time_secs: 0,
+        sessions: 0,
+    };
+
+    /// Load stats for a book from SD.
+    pub fn load(k: &mut KernelHandle<'_>, filename: &str) -> Option<Self> {
+        let mut buf = [0u8; 128];
+        let n = k
+            .sd()
+            .read_chunk_in_pulp_subdir(STATS_DIR, filename, 0, &mut buf)
+            .ok()?;
+        if n == 0 {
+            return None;
+        }
+        let mut stats = Self::EMPTY;
+        parse_stats(&buf[..n], &mut stats);
+        if stats.pages == 0 && stats.time_secs == 0 && stats.sessions == 0 {
+            return None;
+        }
+        Some(stats)
+    }
+
+    /// Save stats for a book to SD.
+    pub fn save(
+        &self,
+        k: &mut KernelHandle<'_>,
+        filename: &str,
+    ) -> crate::error::Result<()> {
+        let mut buf = [0u8; 64];
+        let mut fmt = StackFmt::<64>::new();
+        let _ = write!(
+            fmt,
+            "pages={}\ntime={}\nsessions={}\n",
+            self.pages, self.time_secs, self.sessions
+        );
+        let s = fmt.as_str().as_bytes();
+        let len = s.len().min(buf.len());
+        buf[..len].copy_from_slice(&s[..len]);
+        k.sd().ensure_pulp_subdir(STATS_DIR)?;
+        k.sd()
+            .write_in_pulp_subdir(STATS_DIR, filename, &buf[..len])
+    }
+
+    /// Returns true if all fields are zero.
+    pub fn is_empty(self) -> bool {
+        self.pages == 0 && self.time_secs == 0 && self.sessions == 0
+    }
+}
+
 #[derive(Clone, Copy)]
 struct BookStats {
     filename: [u8; 32],
     filename_len: u8,
     title: [u8; 64],
     title_len: u8,
-    pages: u32,
-    time_secs: u32,
-    sessions: u16,
+    stats: ReadingStats,
 }
 
 impl BookStats {
@@ -51,9 +111,7 @@ impl BookStats {
         filename_len: 0,
         title: [0u8; 64],
         title_len: 0,
-        pages: 0,
-        time_secs: 0,
-        sessions: 0,
+        stats: ReadingStats::EMPTY,
     };
 
     fn display_name(&self) -> &str {
@@ -84,7 +142,7 @@ fn fmt_compact_duration<const N: usize>(secs: u32, buf: &mut BitmapDynLabel<N>) 
 
 // ── parsing ──────────────────────────────────────────────────────────
 
-fn parse_stats(data: &[u8], stats: &mut BookStats) {
+fn parse_stats(data: &[u8], stats: &mut ReadingStats) {
     for line in data.split(|&b| b == b'\n') {
         let line = trim_bytes(line);
         if line.is_empty() || line[0] == b'#' {
@@ -128,44 +186,7 @@ fn trim_bytes(s: &[u8]) -> &[u8] {
     &s[start..end]
 }
 
-// ── public helpers for reader to save/load stats ─────────────────────
 
-pub fn save_book_stats(
-    k: &mut KernelHandle<'_>,
-    filename: &str,
-    pages: u32,
-    time_secs: u32,
-    sessions: u16,
-) -> crate::error::Result<()> {
-    let mut buf = [0u8; 64];
-    let mut fmt = StackFmt::<64>::new();
-    let _ = write!(
-        fmt,
-        "pages={}\ntime={}\nsessions={}\n",
-        pages, time_secs, sessions
-    );
-    let s = fmt.as_str().as_bytes();
-    let len = s.len().min(buf.len());
-    buf[..len].copy_from_slice(&s[..len]);
-    k.sd().ensure_pulp_subdir(STATS_DIR)?;
-    k.sd().write_in_pulp_subdir(STATS_DIR, filename, &buf[..len])
-}
-
-pub fn load_book_stats(k: &mut KernelHandle<'_>, filename: &str) -> Option<(u32, u32, u16)> {
-    let mut buf = [0u8; 128];
-    let n = k
-        .sd().read_chunk_in_pulp_subdir(STATS_DIR, filename, 0, &mut buf)
-        .ok()?;
-    if n == 0 {
-        return None;
-    }
-    let mut bs = BookStats::EMPTY;
-    parse_stats(&buf[..n], &mut bs);
-    if bs.pages == 0 && bs.time_secs == 0 && bs.sessions == 0 {
-        return None;
-    }
-    Some((bs.pages, bs.time_secs, bs.sessions))
-}
 
 // ── StatsApp ─────────────────────────────────────────────────────────
 
@@ -295,18 +316,15 @@ impl StatsApp {
             self.books[idx].title[..dlen].copy_from_slice(&display.as_bytes()[..dlen]);
             self.books[idx].title_len = dlen as u8;
 
-            parse_stats(&buf[..n], &mut self.books[idx]);
+            parse_stats(&buf[..n], &mut self.books[idx].stats);
 
             // skip entries with zero stats
-            if self.books[idx].pages == 0
-                && self.books[idx].time_secs == 0
-                && self.books[idx].sessions == 0
-            {
+            if self.books[idx].stats.is_empty() {
                 continue;
             }
 
-            self.total_pages += self.books[idx].pages;
-            self.total_time += self.books[idx].time_secs;
+            self.total_pages += self.books[idx].stats.pages;
+            self.total_time += self.books[idx].stats.time_secs;
             self.total_books += 1;
             self.book_count += 1;
         }
@@ -472,8 +490,8 @@ impl App<AppId> for StatsApp {
                 let mut stat_label = BitmapDynLabel::<24>::new(stat_region, self.ui_fonts.body)
                     .alignment(Alignment::CenterRight)
                     .inverted(selected);
-                let _ = write!(stat_label, "{}p \u{b7} ", book.pages);
-                fmt_compact_duration(book.time_secs, &mut stat_label);
+                let _ = write!(stat_label, "{}p \u{b7} ", book.stats.pages);
+                fmt_compact_duration(book.stats.time_secs, &mut stat_label);
                 stat_label.draw(strip).unwrap();
             } else {
                 // clear empty rows

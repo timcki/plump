@@ -216,8 +216,8 @@ impl HomeApp {
         if self.recent_book_len > 0 {
             let fname =
                 core::str::from_utf8(&self.recent_book[..self.recent_book_len]).unwrap_or("");
-            if let Some((_pages, time, _sessions)) = crate::apps::stats::load_book_stats(k, fname) {
-                self.recent_stats_time = time;
+            if let Some(s) = crate::apps::stats::ReadingStats::load(k, fname) {
+                self.recent_stats_time = s.time_secs;
             } else {
                 self.recent_stats_time = 0;
             }
@@ -423,10 +423,8 @@ impl App<AppId> for HomeApp {
             if self.recent_book_len > 0 {
                 let fname =
                     core::str::from_utf8(&self.recent_book[..self.recent_book_len]).unwrap_or("");
-                if let Some((_pages, time, _sessions)) =
-                    crate::apps::stats::load_book_stats(k, fname)
-                {
-                    self.recent_stats_time = time;
+                if let Some(s) = crate::apps::stats::ReadingStats::load(k, fname) {
+                    self.recent_stats_time = s.time_secs;
                 } else {
                     self.recent_stats_time = 0;
                 }
