@@ -562,7 +562,7 @@ impl ReaderApp {
     }
 
     fn apply_theme_layout(&mut self) {
-        let theme = crate::kernel::config::reading_theme(self.reading_theme_idx);
+        let theme = crate::kernel::config::ReadingTheme::from_idx(self.reading_theme_idx);
         self.text_margin = theme.margin_h;
         self.text_y = TEXT_Y + theme.margin_v;
         self.text_w = (SCREEN_W - 2 * self.text_margin) as u32;
@@ -1137,7 +1137,7 @@ impl ReaderApp {
         self.font_ascent = LINE_H;
         self.max_lines = LINES_PER_PAGE as u8;
 
-        let theme = crate::kernel::config::reading_theme(self.reading_theme_idx);
+        let theme = crate::kernel::config::ReadingTheme::from_idx(self.reading_theme_idx);
         let spacing_pct = theme.line_spacing_pct;
 
         if fonts::font_data::HAS_REGULAR {

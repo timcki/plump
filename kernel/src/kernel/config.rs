@@ -50,6 +50,14 @@ pub struct ReadingTheme {
     pub line_spacing_pct: u16, // line spacing as percentage (100 = font native)
 }
 
+impl ReadingTheme {
+    /// Look up a theme by index; falls back to the last theme.
+    pub fn from_idx(idx: u8) -> &'static ReadingTheme {
+        let i = (idx as usize).min(READING_THEMES.len() - 1);
+        &READING_THEMES[i]
+    }
+}
+
 pub const READING_THEMES: [ReadingTheme; NUM_READING_THEMES as usize] = [
     ReadingTheme {
         name: "Compact",
@@ -77,22 +85,11 @@ pub const READING_THEMES: [ReadingTheme; NUM_READING_THEMES as usize] = [
     },
 ];
 
-// look up the active reading theme by index; falls back to Default
-pub fn reading_theme(idx: u8) -> &'static ReadingTheme {
-    let i = (idx as usize).min(READING_THEMES.len() - 1);
-    &READING_THEMES[i]
-}
-
 // text alignment for the reader (0 = Left, 1 = Justify)
 pub const NUM_TEXT_ALIGNMENTS: u8 = 2;
 pub const DEFAULT_TEXT_ALIGNMENT: u8 = 0;
 
-pub const TEXT_ALIGNMENT_NAMES: &[&str] = &["Left", "Justify"];
-
-pub fn text_alignment_name(idx: u8) -> &'static str {
-    let i = (idx as usize).min(TEXT_ALIGNMENT_NAMES.len() - 1);
-    TEXT_ALIGNMENT_NAMES[i]
-}
+const TEXT_ALIGNMENT_NAMES: &[&str] = &["Left", "Justify"];
 
 #[derive(Clone, Copy)]
 pub struct SystemSettings {
@@ -139,6 +136,17 @@ impl SystemSettings {
             reader_status: true,
             text_alignment: DEFAULT_TEXT_ALIGNMENT,
         }
+    }
+
+    /// Look up the active reading theme.
+    pub fn reading_theme(&self) -> &'static ReadingTheme {
+        ReadingTheme::from_idx(self.reading_theme)
+    }
+
+    /// Return the display name for the current text alignment.
+    pub fn text_alignment_name(&self) -> &'static str {
+        let i = (self.text_alignment as usize).min(TEXT_ALIGNMENT_NAMES.len() - 1);
+        TEXT_ALIGNMENT_NAMES[i]
     }
 
     pub fn sanitize(&mut self) {
@@ -281,16 +289,19 @@ fn apply_setting(key: &[u8], val: &[u8], s: &mut SystemSettings, w: &mut WifiCon
     }
 }
 
-pub fn parse_settings_txt(data: &[u8], settings: &mut SystemSettings, wifi: &mut WifiConfig) {
-    for line in data.split(|&b| b == b'\n') {
-        let line = trim(line);
-        if line.is_empty() || line[0] == b'#' {
-            continue;
-        }
-        if let Some(eq) = line.iter().position(|&b| b == b'=') {
-            let key = trim(&line[..eq]);
-            let val = trim(&line[eq + 1..]);
-            apply_setting(key, val, settings, wifi);
+impl SystemSettings {
+    /// Parse a SETTINGS.TXT blob into self + wifi config.
+    pub fn parse_txt(&mut self, data: &[u8], wifi: &mut WifiConfig) {
+        for line in data.split(|&b| b == b'\n') {
+            let line = trim(line);
+            if line.is_empty() || line[0] == b'#' {
+                continue;
+            }
+            if let Some(eq) = line.iter().position(|&b| b == b'=') {
+                let key = trim(&line[..eq]);
+                let val = trim(&line[eq + 1..]);
+                apply_setting(key, val, self, wifi);
+            }
         }
     }
 }
@@ -342,36 +353,39 @@ impl<'a> TxtWriter<'a> {
     }
 }
 
-pub fn write_settings_txt(s: &SystemSettings, w: &WifiConfig, buf: &mut [u8]) -> usize {
+impl SystemSettings {
+    /// Serialize self + wifi config to SETTINGS.TXT format.
+    pub fn write_txt(&self, w: &WifiConfig, buf: &mut [u8]) -> usize {
     let mut wr = TxtWriter::new(buf);
     wr.put(b"# pulp-os settings\n");
     wr.put(b"# lines starting with # are ignored\n\n");
 
     wr.put(b"# power settings\n");
-    wr.kv_num(b"sleep_timeout", s.sleep_timeout);
-    wr.kv_num(b"ghost_clear", s.ghost_clear_every as u16);
+    wr.kv_num(b"sleep_timeout", self.sleep_timeout);
+    wr.kv_num(b"ghost_clear", self.ghost_clear_every as u16);
 
     wr.put(b"\n# font settings\n");
-    wr.kv_num(b"book_font", s.book_font_size_idx as u16);
-    wr.kv_num(b"ui_font", s.ui_font_size_idx as u16);
+    wr.kv_num(b"book_font", self.book_font_size_idx as u16);
+    wr.kv_num(b"ui_font", self.ui_font_size_idx as u16);
 
     wr.put(b"\n# reading settings (0=Compact, 1=Default, 2=Relaxed, 3=Spacious)\n");
-    wr.kv_num(b"reading_theme", s.reading_theme as u16);
+    wr.kv_num(b"reading_theme", self.reading_theme as u16);
 
     wr.put(b"\n# display settings\n");
-    wr.kv_num(b"sunlight_fix", if s.sunlight_fix { 1 } else { 0 });
-    wr.kv_num(b"text_aa", if s.text_aa { 1 } else { 0 });
+    wr.kv_num(b"sunlight_fix", if self.sunlight_fix { 1 } else { 0 });
+    wr.kv_num(b"text_aa", if self.text_aa { 1 } else { 0 });
 
     wr.put(b"\n# reader settings\n");
-    wr.kv_num(b"reader_status", if s.reader_status { 1 } else { 0 });
+    wr.kv_num(b"reader_status", if self.reader_status { 1 } else { 0 });
     wr.put(b"# text alignment (0=Left, 1=Justify)\n");
-    wr.kv_num(b"text_alignment", s.text_alignment as u16);
+    wr.kv_num(b"text_alignment", self.text_alignment as u16);
 
     wr.put(b"\n# control settings\n");
-    wr.kv_num(b"swap_buttons", if s.swap_buttons { 1 } else { 0 });
+    wr.kv_num(b"swap_buttons", if self.swap_buttons { 1 } else { 0 });
 
     wr.put(b"\n# wifi credentials for upload mode\n");
     wr.kv_str(b"wifi_ssid", &w.ssid[..w.ssid_len as usize]);
     wr.kv_str(b"wifi_pass", &w.pass[..w.pass_len as usize]);
     wr.pos
+    }
 }

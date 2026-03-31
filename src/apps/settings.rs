@@ -23,7 +23,6 @@ use crate::kernel::KernelHandle;
 use crate::kernel::config::{
     self, GHOST_CLEAR_STEP, MAX_GHOST_CLEAR, MAX_SLEEP_TIMEOUT, MIN_GHOST_CLEAR,
     NUM_READING_THEMES, NUM_TEXT_ALIGNMENTS, SLEEP_TIMEOUT_STEP, SystemSettings, WifiConfig,
-    parse_settings_txt, reading_theme, text_alignment_name, write_settings_txt,
 };
 use crate::ui::{
     Alignment, BUTTON_BAR_H, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, LARGE_MARGIN, Region,
@@ -114,7 +113,7 @@ impl SettingsApp {
 
         match k.sd().read_file_start_in_dir(PULP_DIR, config::SETTINGS_FILE, &mut buf) {
             Ok((_size, n)) if n > 0 => {
-                parse_settings_txt(&buf[..n], &mut self.settings, &mut self.wifi);
+                self.settings.parse_txt(&buf[..n], &mut self.wifi);
                 self.settings.sanitize();
                 log::debug!("settings: loaded from {}", config::SETTINGS_FILE);
             }
@@ -128,7 +127,7 @@ impl SettingsApp {
 
     fn save(&self, k: &mut KernelHandle<'_>) -> bool {
         let mut buf = [0u8; 512];
-        let len = write_settings_txt(&self.settings, &self.wifi, &mut buf);
+        let len = self.settings.write_txt(&self.wifi, &mut buf);
         match k.sd().write_file_in_dir(PULP_DIR, config::SETTINGS_FILE, &buf[..len]) {
             Ok(_) => {
                 log::info!("settings: saved to {}", config::SETTINGS_FILE);
@@ -194,7 +193,7 @@ impl SettingsApp {
                 );
             }
             4 => {
-                let theme = reading_theme(self.settings.reading_theme);
+                let theme = self.settings.reading_theme();
                 let _ = write!(buf, "{}", theme.name);
             }
             5 => {
@@ -234,7 +233,7 @@ impl SettingsApp {
                 );
             }
             9 => {
-                let _ = write!(buf, "{}", text_alignment_name(self.settings.text_alignment));
+                let _ = write!(buf, "{}", self.settings.text_alignment_name());
             }
             _ => {}
         }
