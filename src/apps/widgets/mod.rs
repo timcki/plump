@@ -16,4 +16,4 @@ pub use button_feedback::{BUTTON_BAR_H, ButtonFeedback};
 pub use format::{draw_position_indicator, fmt_percent, fmt_position};
 pub use list::ListSelection;
 pub use quick_menu::QuickMenu;
-pub use selectable_row::{draw_selection, draw_selection_if_visible, selection_fg};
+pub use selectable_row::SelectableRow;

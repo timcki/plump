@@ -9,7 +9,7 @@ pub use crate::kernel::app::{MAX_APP_ACTIONS, QuickAction, QuickActionKind};
 use crate::ui::stack_fmt::StackFmt;
 use crate::ui::{Alignment, Region, wrap_next, wrap_prev};
 
-use super::selectable_row::draw_selection_if_visible;
+use super::selectable_row::SelectableRow;
 
 const OVERLAY_W: u16 = 400;
 const OVERLAY_X: u16 = (SCREEN_W - OVERLAY_W) / 2;
@@ -311,7 +311,7 @@ impl QuickMenu {
         for i in 0..self.count {
             let selected = i == self.selected;
             let row_region = Region::new(OVERLAY_X, self.item_y(i), OVERLAY_W, ITEM_H);
-            let fg = draw_selection_if_visible(strip, row_region, selected);
+            let fg = SelectableRow::new(row_region, selected).draw_if_visible(strip);
 
             let label_region = self.item_label_region(i);
             let value_region = self.item_value_region(i);

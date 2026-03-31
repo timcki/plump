@@ -13,45 +13,61 @@ use embedded_graphics::primitives::PrimitiveStyle;
 use crate::drivers::strip::StripBuffer;
 use crate::ui::Region;
 
-#[inline]
-pub fn draw_selection(strip: &mut StripBuffer, region: Region, selected: bool) -> BinaryColor {
-    if selected {
-        region
-            .to_rect()
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-            .draw(strip)
-            .unwrap();
-        BinaryColor::Off
-    } else {
-        BinaryColor::On
-    }
+/// A row that renders with inverted colors when selected.
+///
+/// Construct with region + selected state, then call `draw()` to fill
+/// the background and get the foreground color for text.
+pub struct SelectableRow {
+    pub region: Region,
+    pub selected: bool,
 }
 
-#[inline]
-pub fn draw_selection_if_visible(
-    strip: &mut StripBuffer,
-    region: Region,
-    selected: bool,
-) -> BinaryColor {
-    if selected && region.intersects(strip.logical_window()) {
-        region
-            .to_rect()
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-            .draw(strip)
-            .unwrap();
-        BinaryColor::Off
-    } else if selected {
-        BinaryColor::Off
-    } else {
-        BinaryColor::On
+impl SelectableRow {
+    #[inline]
+    pub const fn new(region: Region, selected: bool) -> Self {
+        Self { region, selected }
     }
-}
 
-#[inline]
-pub const fn selection_fg(selected: bool) -> BinaryColor {
-    if selected {
-        BinaryColor::Off
-    } else {
-        BinaryColor::On
+    /// Returns the foreground color without drawing anything.
+    #[inline]
+    pub const fn fg(&self) -> BinaryColor {
+        if self.selected {
+            BinaryColor::Off
+        } else {
+            BinaryColor::On
+        }
+    }
+
+    /// Fill the background if selected, return foreground color for text.
+    #[inline]
+    pub fn draw(&self, strip: &mut StripBuffer) -> BinaryColor {
+        if self.selected {
+            self.region
+                .to_rect()
+                .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                .draw(strip)
+                .unwrap();
+            BinaryColor::Off
+        } else {
+            BinaryColor::On
+        }
+    }
+
+    /// Same as `draw()` but skips the fill if the region doesn't
+    /// intersect the current strip window (avoids wasted draw calls).
+    #[inline]
+    pub fn draw_if_visible(&self, strip: &mut StripBuffer) -> BinaryColor {
+        if self.selected && self.region.intersects(strip.logical_window()) {
+            self.region
+                .to_rect()
+                .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                .draw(strip)
+                .unwrap();
+            BinaryColor::Off
+        } else if self.selected {
+            BinaryColor::Off
+        } else {
+            BinaryColor::On
+        }
     }
 }
