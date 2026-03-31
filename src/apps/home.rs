@@ -88,7 +88,6 @@ pub struct HomeApp {
     recent_author: [u8; 64],
     recent_author_len: u8,
     recent_progress: u8,
-    recent_stats_pages: u32,
     recent_stats_time: u32,
     recent_cover: Option<crate::kernel::work_queue::DecodedImage>,
     needs_load_recent: bool,
@@ -124,7 +123,6 @@ impl HomeApp {
             recent_author: [0u8; 64],
             recent_author_len: 0,
             recent_progress: 0,
-            recent_stats_pages: 0,
             recent_stats_time: 0,
             recent_cover: None,
             needs_load_recent: false,
@@ -218,11 +216,9 @@ impl HomeApp {
         if self.recent_book_len > 0 {
             let fname =
                 core::str::from_utf8(&self.recent_book[..self.recent_book_len]).unwrap_or("");
-            if let Some((pages, time, _sessions)) = crate::apps::stats::load_book_stats(k, fname) {
-                self.recent_stats_pages = pages;
+            if let Some((_pages, time, _sessions)) = crate::apps::stats::load_book_stats(k, fname) {
                 self.recent_stats_time = time;
             } else {
-                self.recent_stats_pages = 0;
                 self.recent_stats_time = 0;
             }
             // try to load cached cover thumbnail
@@ -427,13 +423,11 @@ impl App<AppId> for HomeApp {
             if self.recent_book_len > 0 {
                 let fname =
                     core::str::from_utf8(&self.recent_book[..self.recent_book_len]).unwrap_or("");
-                if let Some((pages, time, _sessions)) =
+                if let Some((_pages, time, _sessions)) =
                     crate::apps::stats::load_book_stats(k, fname)
                 {
-                    self.recent_stats_pages = pages;
                     self.recent_stats_time = time;
                 } else {
-                    self.recent_stats_pages = 0;
                     self.recent_stats_time = 0;
                 }
                 // load cached cover thumbnail
@@ -780,22 +774,19 @@ impl HomeApp {
                     .unwrap();
                 }
 
-                // stats text: "342 pages · 5h 23m" or "X% read" if no stats
+                // stats text: "5h 23m" or "X% read" if no time stats
                 let pct_y = bar_y + CARD_PROGRESS_H + 4;
                 let pct_region = Region::new(text_x, pct_y, text_w, line_h);
                 let mut pct_buf = BitmapDynLabel::<28>::new(pct_region, self.ui_fonts.body)
                     .alignment(text_align)
                     .inverted(selected);
-                if self.recent_stats_pages > 0 || self.recent_stats_time > 0 {
-                    let _ = write!(pct_buf, "{} pages", self.recent_stats_pages);
-                    if self.recent_stats_time > 0 {
-                        let hours = self.recent_stats_time / 3600;
-                        let mins = (self.recent_stats_time % 3600) / 60;
-                        if hours > 0 {
-                            let _ = write!(pct_buf, " \u{b7} {}h {}m", hours, mins);
-                        } else {
-                            let _ = write!(pct_buf, " \u{b7} {}m", mins);
-                        }
+                if self.recent_stats_time > 0 {
+                    let hours = self.recent_stats_time / 3600;
+                    let mins = (self.recent_stats_time % 3600) / 60;
+                    if hours > 0 {
+                        let _ = write!(pct_buf, "{}h {}m", hours, mins);
+                    } else {
+                        let _ = write!(pct_buf, "{}m", mins);
                     }
                 } else {
                     let _ = write!(pct_buf, "{}% read", self.recent_progress);
