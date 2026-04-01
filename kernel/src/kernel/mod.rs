@@ -47,6 +47,86 @@ use crate::kernel::dir_cache::DirCache;
 // default ghost-clear interval (overridden by settings once loaded)
 pub const DEFAULT_GHOST_CLEAR_EVERY: u32 = 10;
 
+/// Tracks the last settings values pushed to hardware so the
+/// scheduler only re-applies when something actually changed.
+///
+/// Inspired by the SdCard pattern: encapsulate mutable state behind
+/// a struct with explicit methods instead of scattering raw Signal
+/// calls and ad-hoc comparisons across the scheduler.
+pub(crate) struct AppliedSettings {
+    pub generation: u32,
+    pub sleep_timeout: u16,
+    pub sunlight_fix: bool,
+    pub swap_buttons: bool,
+}
+
+impl AppliedSettings {
+    pub const fn new() -> Self {
+        Self {
+            generation: 0,
+            sleep_timeout: 0,
+            sunlight_fix: false,
+            swap_buttons: false,
+        }
+    }
+
+    /// Compare against current settings and apply only changed fields
+    /// to hardware.  Updates self and returns whether `swap_buttons`
+    /// changed (the caller must propagate that to the app layer since
+    /// `ButtonMapper` lives in the distro, not the kernel).
+    pub fn sync(
+        &mut self,
+        generation: u32,
+        ss: &config::SystemSettings,
+        epd: &mut crate::board::Epd,
+    ) -> bool {
+        let mut swap_changed = false;
+
+        if self.sleep_timeout != ss.sleep_timeout {
+            log::info!(
+                "settings: sleep_timeout {} -> {}",
+                self.sleep_timeout,
+                ss.sleep_timeout
+            );
+            tasks::set_idle_timeout(ss.sleep_timeout);
+            self.sleep_timeout = ss.sleep_timeout;
+        }
+
+        if self.sunlight_fix != ss.sunlight_fix {
+            log::info!(
+                "settings: sunlight_fix {} -> {}",
+                self.sunlight_fix,
+                ss.sunlight_fix
+            );
+            epd.set_sunlight_mode(ss.sunlight_fix);
+            self.sunlight_fix = ss.sunlight_fix;
+        }
+
+        if self.swap_buttons != ss.swap_buttons {
+            log::info!(
+                "settings: swap_buttons {} -> {}",
+                self.swap_buttons,
+                ss.swap_buttons
+            );
+            self.swap_buttons = ss.swap_buttons;
+            swap_changed = true;
+        }
+
+        self.generation = generation;
+        swap_changed
+    }
+
+    /// Snapshot current settings without diffing; used at boot when
+    /// the initial `set_idle_timeout` / `set_sunlight_mode` have
+    /// already been called and we just need to record what was applied.
+    pub fn init_from(&mut self, generation: u32, ss: &config::SystemSettings) {
+        self.generation = generation;
+        self.sleep_timeout = ss.sleep_timeout;
+        self.sunlight_fix = ss.sunlight_fix;
+        self.swap_buttons = ss.swap_buttons;
+    }
+}
+
 pub struct Kernel {
     pub(crate) sd: SdStorage,
     pub(crate) dir_cache: &'static mut DirCache,
@@ -65,6 +145,10 @@ pub struct Kernel {
     // power-button policy state machine; resolves raw power events
     // into semantic inputs (MenuTap) or sleep requests
     pub(crate) input_policy: input_policy::InputPolicyState,
+
+    // last settings values pushed to hardware; used for
+    // generation-based diffing in the scheduler main loop
+    pub(crate) applied: AppliedSettings,
 }
 
 impl Kernel {
@@ -91,6 +175,7 @@ impl Kernel {
             partial_refreshes: 0,
             red_stale: false,
             input_policy: input_policy::InputPolicyState::new(),
+            applied: AppliedSettings::new(),
         }
     }
 

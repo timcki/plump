@@ -161,9 +161,13 @@ impl super::Kernel {
             info!("boot: skipped home recent load (not waking to home)");
         }
 
+        // apply initial settings to hardware and record them so the
+        // generation-based check in run() starts from a known baseline
         tasks::set_idle_timeout(app_mgr.system_settings().sleep_timeout);
         self.epd
             .set_sunlight_mode(app_mgr.system_settings().sunlight_fix);
+        self.applied
+            .init_from(app_mgr.settings_generation(), app_mgr.system_settings());
         self.log_stats();
 
         // try to restore session from RTC memory
@@ -296,9 +300,21 @@ impl super::Kernel {
                 }
             }
 
-            if self.poll_housekeeping(app_mgr) {
+            if self.poll_housekeeping() {
                 self.sleep_with_session(app_mgr, "idle timeout").await;
                 continue;
+            }
+
+            // generation-based settings propagation: only re-apply
+            // hardware state when the app layer signals a change
+            let settings_gen = app_mgr.settings_generation();
+            if settings_gen != self.applied.generation {
+                let swap_changed =
+                    self.applied
+                        .sync(settings_gen, app_mgr.system_settings(), &mut self.epd);
+                if swap_changed {
+                    app_mgr.on_swap_buttons_changed(self.applied.swap_buttons);
+                }
             }
 
             // opportunistic flush of deferred app persistence (RECENT,
@@ -419,7 +435,7 @@ impl super::Kernel {
     }
 
     // shared housekeeping body: battery, sd probe, bookmark flush, stats
-    fn poll_housekeeping_inner<A: AppLayer>(&mut self, app_mgr: &A) {
+    fn poll_housekeeping_inner(&mut self) {
         if let Some(mv) = tasks::BATTERY_MV.try_take() {
             self.cached_battery_mv = mv;
         }
@@ -434,23 +450,18 @@ impl super::Kernel {
 
         if tasks::STATUS_DUE.try_take().is_some() {
             self.log_stats();
-            if app_mgr.settings_loaded() {
-                tasks::set_idle_timeout(app_mgr.system_settings().sleep_timeout);
-                self.epd
-                    .set_sunlight_mode(app_mgr.system_settings().sunlight_fix);
-            }
         }
     }
 
     // returns true if idle sleep is due
-    fn poll_housekeeping<A: AppLayer>(&mut self, app_mgr: &A) -> bool {
-        self.poll_housekeeping_inner(app_mgr);
+    fn poll_housekeeping(&mut self) -> bool {
+        self.poll_housekeeping_inner();
         tasks::IDLE_SLEEP_DUE.try_take().is_some()
     }
 
     // housekeeping without idle-sleep check; never sleep mid-refresh
-    fn poll_housekeeping_waveform<A: AppLayer>(&mut self, app_mgr: &A) {
-        self.poll_housekeeping_inner(app_mgr);
+    fn poll_housekeeping_waveform(&mut self) {
+        self.poll_housekeeping_inner();
     }
 
     // partial refreshes use DU waveform (~400 ms); after ghost_clear_every
@@ -762,7 +773,7 @@ impl super::Kernel {
                 }
             }
 
-            self.poll_housekeeping_waveform(app_mgr);
+            self.poll_housekeeping_waveform();
         }
 
         (deferred, sleep_requested)

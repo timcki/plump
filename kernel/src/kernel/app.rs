@@ -537,6 +537,12 @@ pub trait AppLayer {
     /// changes.  The kernel compares this against its last-seen value
     /// to decide whether hardware state needs updating.
     fn settings_generation(&self) -> u32;
+
+    /// Called by the kernel when `swap_buttons` changes.  The app
+    /// layer owns `ButtonMapper` and button-feedback labels, so it
+    /// must propagate the new value itself.
+    fn on_swap_buttons_changed(&mut self, swap: bool);
+
     fn ghost_clear_every(&self) -> u32;
     fn wants_grayscale(&self) -> bool;
     fn wifi_config(&self) -> &WifiConfig;
