@@ -6,7 +6,7 @@ use crate::apps::{App, AppContext, AppId, RECENT_FILE, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::battery;
-use crate::drivers::storage::PLUMP_DIR;
+
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::kernel::KernelHandle;
@@ -208,7 +208,7 @@ impl HomeApp {
     // This is intentional for now — see TODO-960fb375 for context.
     pub fn load_recent(&mut self, k: &mut KernelHandle<'_>) {
         let mut buf = [0u8; 196];
-        match k.sd().read_file_start_in_dir(PLUMP_DIR, RECENT_FILE, &mut buf) {
+        match k.sd().read_file_start_in_dir(k.sd().data_dir(), RECENT_FILE, &mut buf) {
             Ok((_, n)) if n > 0 => self.parse_recent(&buf[..n]),
             _ => self.recent_book_len = 0,
         }
@@ -414,7 +414,7 @@ impl App<AppId> for HomeApp {
         if self.needs_load_recent {
             let old_count = self.item_count;
             let mut buf = [0u8; 196];
-            match k.sd().read_file_start_in_dir(PLUMP_DIR, RECENT_FILE, &mut buf) {
+            match k.sd().read_file_start_in_dir(k.sd().data_dir(), RECENT_FILE, &mut buf) {
                 Ok((_, n)) if n > 0 => self.parse_recent(&buf[..n]),
                 _ => self.recent_book_len = 0,
             }

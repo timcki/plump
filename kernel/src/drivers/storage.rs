@@ -14,7 +14,9 @@ use embedded_sdmmc::{Mode, RawFile};
 use crate::drivers::sdcard::{SdStorage, SdStorageInner, poll_once};
 use crate::error::{Error, ErrorKind};
 
+// TODO: rename _PULP to _PLUMP on-disk and drop legacy fallback
 pub const PLUMP_DIR: &str = "_PLUMP";
+pub const LEGACY_DIR: &str = "_PULP";
 pub const TITLES_FILE: &str = "TITLES.BIN";
 pub const TITLE_CAP: usize = 64;
 
@@ -539,15 +541,33 @@ impl SdStorage {
 
     // _PLUMP/ directory management
 
-    /// Ensure the _PLUMP directory exists (async, for boot path).
+    /// Ensure the data directory exists (async, for boot path).
+    ///
+    /// Probes for `_PLUMP` first; if absent, falls back to legacy `_PULP`
+    /// so existing SD cards keep working. Creates `_PLUMP` only when
+    /// neither directory is found.
+    // TODO: rename _PULP to _PLUMP on-disk and drop legacy fallback
     pub async fn ensure_plump_dir_async(&self) -> crate::error::Result<()> {
         let mut guard = borrow(self)?;
         let inner = &mut *guard;
 
+        // Try the current name first.
         if let Ok(dir) = inner.mgr.open_dir(inner.root, PLUMP_DIR).await {
             let _ = inner.mgr.close_dir(dir);
+            inner.data_dir = PLUMP_DIR;
             return Ok(());
         }
+
+        // Fall back to the legacy directory if it exists.
+        if let Ok(dir) = inner.mgr.open_dir(inner.root, LEGACY_DIR).await {
+            let _ = inner.mgr.close_dir(dir);
+            inner.data_dir = LEGACY_DIR;
+            log::info!("data dir: using legacy {}", LEGACY_DIR);
+            return Ok(());
+        }
+
+        // Neither exists — create the new one.
+        inner.data_dir = PLUMP_DIR;
         match inner.mgr.make_dir_in_dir(inner.root, PLUMP_DIR).await {
             Ok(()) => Ok(()),
             Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
@@ -555,12 +575,13 @@ impl SdStorage {
         }
     }
 
-    /// Ensure a subdirectory exists under _PLUMP/.
+    /// Ensure a subdirectory exists under the data directory.
     pub fn ensure_plump_subdir(&self, name: &str) -> crate::error::Result<()> {
         let exists = poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_dir!(inner, PLUMP_DIR, |plump_h| {
+            let dir = inner.data_dir;
+            in_dir!(inner, dir, |plump_h| {
                 match inner.mgr.open_dir(plump_h, name).await {
                     Ok(sub) => {
                         let _ = inner.mgr.close_dir(sub);
@@ -578,7 +599,8 @@ impl SdStorage {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_dir!(inner, PLUMP_DIR, |plump_h| {
+            let dir = inner.data_dir;
+            in_dir!(inner, dir, |plump_h| {
                 match inner.mgr.make_dir_in_dir(plump_h, name).await {
                     Ok(()) => Ok::<_, Error>(()),
                     Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
@@ -588,9 +610,9 @@ impl SdStorage {
         })
     }
 
-    // _PLUMP/ direct file operations (cache files live directly in _PLUMP/)
+    // data dir direct file operations (cache files live directly in the data dir)
 
-    /// Read a chunk from a file in _PLUMP/.
+    /// Read a chunk from a file in the data directory.
     pub fn read_chunk_in_plump(
         &self,
         name: &str,
@@ -600,51 +622,56 @@ impl SdStorage {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_dir!(inner, PLUMP_DIR, |dir_h| op_read_chunk!(
+            let dir = inner.data_dir;
+            in_dir!(inner, dir, |dir_h| op_read_chunk!(
                 inner, dir_h, name, offset, buf
             ))
         })
     }
 
-    /// Write (create/truncate) a file in _PLUMP/.
+    /// Write (create/truncate) a file in the data directory.
     pub fn write_in_plump(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_dir!(inner, PLUMP_DIR, |dir_h| op_write!(inner, dir_h, name, data))
+            let dir = inner.data_dir;
+            in_dir!(inner, dir, |dir_h| op_write!(inner, dir_h, name, data))
         })
     }
 
-    /// Append data to a file in _PLUMP/.
+    /// Append data to a file in the data directory.
     pub fn append_in_plump(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_dir!(inner, PLUMP_DIR, |dir_h| op_append!(
+            let dir = inner.data_dir;
+            in_dir!(inner, dir, |dir_h| op_append!(
                 inner, dir_h, name, data
             ))
         })
     }
 
-    /// Get the size of a file in _PLUMP/.
+    /// Get the size of a file in the data directory.
     pub fn file_size_in_plump(&self, name: &str) -> crate::error::Result<u32> {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_dir!(inner, PLUMP_DIR, |dir_h| op_file_size!(inner, dir_h, name))
+            let dir = inner.data_dir;
+            in_dir!(inner, dir, |dir_h| op_file_size!(inner, dir_h, name))
         })
     }
 
-    /// Delete a file in _PLUMP/.
+    /// Delete a file in the data directory.
     pub fn delete_in_plump(&self, name: &str) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_dir!(inner, PLUMP_DIR, |dir_h| op_delete!(inner, dir_h, name))
+            let dir = inner.data_dir;
+            in_dir!(inner, dir, |dir_h| op_delete!(inner, dir_h, name))
         })
     }
 
-    /// Seek to offset and write data in a file in _PLUMP/.
+    /// Seek to offset and write data in a file in the data directory.
     /// Used to update the chapter offset table after all chapters are appended.
     pub fn write_at_in_plump(
         &self,
@@ -655,7 +682,8 @@ impl SdStorage {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_dir!(inner, PLUMP_DIR, |dir_h| {
+            let dir = inner.data_dir;
+            in_dir!(inner, dir, |dir_h| {
                 match inner
                     .mgr
                     .open_file_in_dir(dir_h, name, Mode::ReadWriteCreateOrAppend)
@@ -683,9 +711,9 @@ impl SdStorage {
         })
     }
 
-    // _PLUMP subdirectory file operations
+    // data dir subdirectory file operations
 
-    /// Write (create/truncate) a file in _PLUMP/<dir>/.
+    /// Write (create/truncate) a file in <data_dir>/<dir>/.
     pub fn write_in_plump_subdir(
         &self,
         dir: &str,
@@ -695,13 +723,14 @@ impl SdStorage {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_subdir!(inner, PLUMP_DIR, dir, |sub_h| op_write!(
+            let dd = inner.data_dir;
+            in_subdir!(inner, dd, dir, |sub_h| op_write!(
                 inner, sub_h, name, data
             ))
         })
     }
 
-    /// Append data to a file in _PLUMP/<dir>/.
+    /// Append data to a file in <data_dir>/<dir>/.
     pub fn append_in_plump_subdir(
         &self,
         dir: &str,
@@ -711,13 +740,14 @@ impl SdStorage {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_subdir!(inner, PLUMP_DIR, dir, |sub_h| op_append!(
+            let dd = inner.data_dir;
+            in_subdir!(inner, dd, dir, |sub_h| op_append!(
                 inner, sub_h, name, data
             ))
         })
     }
 
-    /// Read a chunk from a file in _PLUMP/<dir>/.
+    /// Read a chunk from a file in <data_dir>/<dir>/.
     pub fn read_chunk_in_plump_subdir(
         &self,
         dir: &str,
@@ -728,13 +758,14 @@ impl SdStorage {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_subdir!(inner, PLUMP_DIR, dir, |sub_h| op_read_chunk!(
+            let dd = inner.data_dir;
+            in_subdir!(inner, dd, dir, |sub_h| op_read_chunk!(
                 inner, sub_h, name, offset, buf
             ))
         })
     }
 
-    /// Get the size of a file in _PLUMP/<dir>/.
+    /// Get the size of a file in <data_dir>/<dir>/.
     pub fn file_size_in_plump_subdir(
         &self,
         dir: &str,
@@ -743,13 +774,14 @@ impl SdStorage {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_subdir!(inner, PLUMP_DIR, dir, |sub_h| op_file_size!(
+            let dd = inner.data_dir;
+            in_subdir!(inner, dd, dir, |sub_h| op_file_size!(
                 inner, sub_h, name
             ))
         })
     }
 
-    /// Delete a file in _PLUMP/<dir>/.
+    /// Delete a file in <data_dir>/<dir>/.
     pub fn delete_in_plump_subdir(
         &self,
         dir: &str,
@@ -758,13 +790,14 @@ impl SdStorage {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_subdir!(inner, PLUMP_DIR, dir, |sub_h| op_delete!(inner, sub_h, name))
+            let dd = inner.data_dir;
+            in_subdir!(inner, dd, dir, |sub_h| op_delete!(inner, sub_h, name))
         })
     }
 
     // title mapping
 
-    /// Append a title line to _PLUMP/TITLES.BIN.
+    /// Append a title line to TITLES.BIN in the data directory.
     pub fn save_title(&self, filename: &str, title: &str) -> crate::error::Result<()> {
         let name_bytes = filename.as_bytes();
         let title_bytes = title.as_bytes();

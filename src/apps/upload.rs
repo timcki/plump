@@ -200,6 +200,7 @@ pub async fn run_upload_mode(
             &[
                 "No WiFi credentials!",
                 "Set wifi_ssid in",
+                // TODO: show actual data_dir name (_PLUMP or legacy _PULP)
                 "_PLUMP/SETTINGS.TXT",
             ],
             Some("Press BACK to exit"),

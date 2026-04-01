@@ -86,6 +86,8 @@ pub(crate) struct SdStorageInner {
     #[allow(dead_code)]
     pub(crate) vol: RawVolume,
     pub(crate) root: RawDirectory,
+    /// Resolved data directory name ("_PLUMP" or legacy "_PULP").
+    pub(crate) data_dir: &'static str,
 }
 
 // holds a persistently-mounted AsyncVolumeManager with volume 0 and
@@ -157,13 +159,27 @@ impl SdStorage {
 
         info!("SD card: filesystem mounted");
         Self {
-            inner: Some(RefCell::new(SdStorageInner { mgr, vol, root })),
+            inner: Some(RefCell::new(SdStorageInner {
+                mgr,
+                vol,
+                root,
+                data_dir: crate::drivers::storage::PLUMP_DIR,
+            })),
         }
     }
 
     #[inline]
     pub fn probe_ok(&self) -> bool {
         self.inner.is_some()
+    }
+
+    /// Return the resolved data directory name (`"_PLUMP"` or legacy `"_PULP"`).
+    #[inline]
+    pub fn data_dir(&self) -> &'static str {
+        match &self.inner {
+            Some(cell) => cell.borrow().data_dir,
+            None => crate::drivers::storage::PLUMP_DIR,
+        }
     }
 
     #[inline]

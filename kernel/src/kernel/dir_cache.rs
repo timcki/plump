@@ -2,7 +2,7 @@
 // loaded lazily from SD, held in RAM, invalidated on demand
 
 use crate::drivers::sdcard::SdStorage;
-use crate::drivers::storage::{DirEntry, DirPage, PLUMP_DIR, TITLES_FILE};
+use crate::drivers::storage::{DirEntry, DirPage, TITLES_FILE};
 use crate::error::Result;
 
 const MAX_DIR_ENTRIES: usize = 128;
@@ -46,7 +46,7 @@ impl DirCache {
 
     fn load_titles(&mut self, sd: &SdStorage) {
         let mut buf = [0u8; 4096];
-        let n = match sd.read_file_start_in_dir(PLUMP_DIR, TITLES_FILE, &mut buf) {
+        let n = match sd.read_file_start_in_dir(sd.data_dir(), TITLES_FILE, &mut buf) {
             Ok((_, n)) => n,
             Err(_) => return,
         };
