@@ -3,8 +3,9 @@
 use alloc::string::String;
 use core::fmt::Write as FmtWrite;
 
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_net::IpListenEndpoint;
+use embassy_net::Ipv4Address;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_time::{Duration, Timer};
@@ -55,7 +56,7 @@ const HOSTNAME_WIRE: [u8; 13] = [
     0,
 ];
 
-const MDNS_RESPONSE_LEN: usize = 39;
+const MDNS_MULTICAST: [u8; 4] = [224, 0, 0, 251];
 
 const MAX_BOUNDARY_LEN: usize = 120;
 const WORK_BUF_SIZE: usize = 4096;
@@ -75,7 +76,91 @@ const ACCEPT_RETRY_MS: u64 = 200;
 
 const SOCKET_CLOSE_DELAY_MS: u64 = 10;
 
-const MDNS_BIND_RETRY_MS: u64 = 100;
+/// Cursor-based DNS packet writer.  Appends bytes, u16, u32 without
+/// hardcoded offsets — if the hostname length changes, all downstream
+/// fields shift automatically.
+struct DnsBuf<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> DnsBuf<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn put(&mut self, data: &[u8]) {
+        let n = data.len().min(self.buf.len() - self.pos);
+        self.buf[self.pos..self.pos + n].copy_from_slice(&data[..n]);
+        self.pos += n;
+    }
+
+    fn put_u16(&mut self, v: u16) {
+        self.put(&v.to_be_bytes());
+    }
+
+    fn put_u32(&mut self, v: u32) {
+        self.put(&v.to_be_bytes());
+    }
+
+    fn len(&self) -> usize {
+        self.pos
+    }
+}
+
+/// Bundles rendering resources so screen helpers don't need 6+ parameters.
+struct UploadScreen<'a> {
+    epd: &'a mut Epd,
+    strip: &'a mut StripBuffer,
+    delay: &'a mut Delay,
+    heading: &'static BitmapFont,
+    body: &'static BitmapFont,
+    bumps: &'a ButtonFeedback,
+}
+
+impl<'a> UploadScreen<'a> {
+    fn new(
+        epd: &'a mut Epd,
+        strip: &'a mut StripBuffer,
+        delay: &'a mut Delay,
+        ui_font_size_idx: u8,
+        bumps: &'a ButtonFeedback,
+    ) -> Self {
+        Self {
+            epd,
+            strip,
+            delay,
+            heading: fonts::heading_font(ui_font_size_idx),
+            body: fonts::chrome_font(),
+            bumps,
+        }
+    }
+
+    /// Render lines with optional footer (partial refresh).
+    async fn show(&mut self, lines: &[&str], footer: Option<&str>) {
+        render_screen(
+            self.epd, self.strip, self.delay,
+            self.heading, self.body, lines, footer, self.bumps, false,
+        ).await;
+    }
+
+    /// Render lines with optional footer (full refresh).
+    async fn show_full(&mut self, lines: &[&str], footer: Option<&str>) {
+        render_screen(
+            self.epd, self.strip, self.delay,
+            self.heading, self.body, lines, footer, self.bumps, true,
+        ).await;
+    }
+
+    /// Show error message and wait for BACK button.
+    async fn show_error(&mut self, msg: &str) {
+        render_screen(
+            self.epd, self.strip, self.delay,
+            self.heading, self.body, &[msg], Some("Press BACK to exit"), self.bumps, false,
+        ).await;
+        drain_until_back().await;
+    }
+}
 
 fn log_heap(label: &str) {
     let stats = esp_alloc::HEAP.stats();
@@ -108,26 +193,17 @@ pub async fn run_upload_mode(
     bumps: &ButtonFeedback,
     wifi_cfg: &WifiConfig,
 ) {
-    let heading = fonts::heading_font(ui_font_size_idx);
-    let body = fonts::chrome_font();
+    let mut screen = UploadScreen::new(epd, strip, delay, ui_font_size_idx, bumps);
 
     if !wifi_cfg.has_credentials() {
-        render_screen(
-            epd,
-            strip,
-            delay,
-            heading,
-            body,
+        screen.show(
             &[
                 "No WiFi credentials!",
                 "Set wifi_ssid in",
                 "_PULP/SETTINGS.TXT",
             ],
             Some("Press BACK to exit"),
-            bumps,
-            false,
-        )
-        .await;
+        ).await;
         drain_until_back().await;
         return;
     }
@@ -141,26 +217,14 @@ pub async fn run_upload_mode(
             let _ = write!(w, "Connecting to '{}'...", ssid);
         });
         let msg = core::str::from_utf8(&msg_buf[..msg_len]).unwrap_or("Connecting...");
-        render_screen(epd, strip, delay, heading, body, &[msg], None, bumps, true).await;
+        screen.show_full(&[msg], None).await;
     }
 
     let radio = match esp_radio::init() {
         Ok(r) => r,
         Err(e) => {
             info!("upload: radio init failed: {:?}", e);
-            render_screen(
-                epd,
-                strip,
-                delay,
-                heading,
-                body,
-                &["Radio init failed!"],
-                Some("Press BACK to exit"),
-                bumps,
-                false,
-            )
-            .await;
-            drain_until_back().await;
+            screen.show_error("Radio init failed!").await;
             return;
         }
     };
@@ -169,19 +233,7 @@ pub async fn run_upload_mode(
         Ok(pair) => pair,
         Err(e) => {
             info!("upload: wifi::new failed: {:?}", e);
-            render_screen(
-                epd,
-                strip,
-                delay,
-                heading,
-                body,
-                &["WiFi init failed!"],
-                Some("Press BACK to exit"),
-                bumps,
-                false,
-            )
-            .await;
-            drain_until_back().await;
+            screen.show_error("WiFi init failed!").await;
             return;
         }
     };
@@ -192,37 +244,13 @@ pub async fn run_upload_mode(
 
     if let Err(e) = wifi_ctrl.set_config(&ModeConfig::Client(client_cfg)) {
         info!("upload: set_config failed: {:?}", e);
-        render_screen(
-            epd,
-            strip,
-            delay,
-            heading,
-            body,
-            &["WiFi config error!"],
-            Some("Press BACK to exit"),
-            bumps,
-            false,
-        )
-        .await;
-        drain_until_back().await;
+        screen.show_error("WiFi config error!").await;
         return;
     }
 
     if let Err(e) = wifi_ctrl.start_async().await {
         info!("upload: start failed: {:?}", e);
-        render_screen(
-            epd,
-            strip,
-            delay,
-            heading,
-            body,
-            &["WiFi start failed!"],
-            Some("Press BACK to exit"),
-            bumps,
-            false,
-        )
-        .await;
-        drain_until_back().await;
+        screen.show_error("WiFi start failed!").await;
         return;
     }
 
@@ -230,19 +258,7 @@ pub async fn run_upload_mode(
 
     if let Err(e) = wifi_ctrl.connect_async().await {
         info!("upload: connect failed: {:?}", e);
-        render_screen(
-            epd,
-            strip,
-            delay,
-            heading,
-            body,
-            &["Connection failed!"],
-            Some("Press BACK to exit"),
-            bumps,
-            false,
-        )
-        .await;
-        drain_until_back().await;
+        screen.show_error("Connection failed!").await;
         return;
     }
 
@@ -295,61 +311,65 @@ pub async fn run_upload_mode(
     );
     log_heap("server ready");
 
-    render_screen(
-        epd,
-        strip,
-        delay,
-        heading,
-        body,
+    screen.show(
         &["http://plump.local/", ip_str],
         Some("Press BACK to exit"),
-        bumps,
-        false,
-    )
-    .await;
+    ).await;
+
+    let _ = stack.join_multicast_group(Ipv4Address::new(224, 0, 0, 251));
 
     let mut rx_buf = [0u8; TCP_RX_BUF_SIZE];
     let mut tx_buf = [0u8; TCP_TX_BUF_SIZE];
 
+    // Persistent mDNS UDP socket — created once before the loop
+    let mut mdns_rx_meta = [PacketMetadata::EMPTY; 2];
+    let mut mdns_rx_buf = [0u8; 512];
+    let mut mdns_tx_meta = [PacketMetadata::EMPTY; 2];
+    let mut mdns_tx_buf = [0u8; 512];
+    let mut mdns_socket = UdpSocket::new(
+        stack,
+        &mut mdns_rx_meta,
+        &mut mdns_rx_buf,
+        &mut mdns_tx_meta,
+        &mut mdns_tx_buf,
+    );
+    let _ = mdns_socket.bind(MDNS_PORT);
+
     loop {
-        let inner_result = match select(
+        match select(
             runner.run(),
-            select(
-                select(
-                    serve_one_request(stack, &mut rx_buf, &mut tx_buf, sd),
-                    mdns_respond_once(stack, ip_octets),
-                ),
+            select3(
+                serve_one_request(stack, &mut rx_buf, &mut tx_buf, sd),
+                mdns_handle_one(&mut mdns_socket, ip_octets),
                 drain_until_back(),
             ),
         )
         .await
         {
-            Either::Second(Either::First(inner)) => inner,
-            Either::Second(Either::Second(_)) => break, // back pressed
+            Either::Second(Either3::First(event)) => {
+                match event {
+                    ServerEvent::Uploaded { name, name_len } => {
+                        let fname =
+                            core::str::from_utf8(&name[..name_len as usize]).unwrap_or("???");
+                        info!("upload: file saved as '{}'", fname);
+                    }
+                    ServerEvent::UploadFailed => {
+                        warn!("upload: file upload failed");
+                    }
+                    ServerEvent::Deleted { name, name_len } => {
+                        let fname =
+                            core::str::from_utf8(&name[..name_len as usize]).unwrap_or("???");
+                        info!("upload: deleted '{}'", fname);
+                    }
+                    ServerEvent::DeleteFailed => {
+                        warn!("upload: file delete failed");
+                    }
+                    ServerEvent::Nothing => {}
+                }
+            }
+            Either::Second(Either3::Second(())) => continue,
+            Either::Second(Either3::Third(())) => break,
             _ => unreachable!(),
-        };
-
-        let event = match inner_result {
-            Either::First(ev) => ev,
-            Either::Second(()) => ServerEvent::Nothing,
-        };
-
-        match event {
-            ServerEvent::Uploaded { name, name_len } => {
-                let fname = core::str::from_utf8(&name[..name_len as usize]).unwrap_or("???");
-                info!("upload: file saved as '{}'", fname);
-            }
-            ServerEvent::UploadFailed => {
-                warn!("upload: file upload failed");
-            }
-            ServerEvent::Deleted { name, name_len } => {
-                let fname = core::str::from_utf8(&name[..name_len as usize]).unwrap_or("???");
-                info!("upload: deleted '{}'", fname);
-            }
-            ServerEvent::DeleteFailed => {
-                warn!("upload: file delete failed");
-            }
-            ServerEvent::Nothing => {}
         }
     }
 
@@ -879,19 +899,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-async fn mdns_respond_once(stack: embassy_net::Stack<'_>, ip_octets: [u8; 4]) {
-    let mut rx_meta = [PacketMetadata::EMPTY; 2];
-    let mut rx_buf = [0u8; 512];
-    let mut tx_meta = [PacketMetadata::EMPTY; 2];
-    let mut tx_buf = [0u8; 512];
-
-    let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
-
-    if socket.bind(MDNS_PORT).is_err() {
-        Timer::after(Duration::from_millis(MDNS_BIND_RETRY_MS)).await;
-        return;
-    }
-
+async fn mdns_handle_one(socket: &mut UdpSocket<'_>, ip_octets: [u8; 4]) {
     let mut pkt = [0u8; 256];
     let (n, _remote) = match socket.recv_from(&mut pkt).await {
         Ok(r) => r,
@@ -904,24 +912,26 @@ async fn mdns_respond_once(stack: embassy_net::Stack<'_>, ip_octets: [u8; 4]) {
 
     debug!("upload: mDNS query for plump.local -- responding");
 
-    let mut resp = [0u8; MDNS_RESPONSE_LEN];
+    let mut resp = [0u8; 64];
     let len = build_mdns_response(&mut resp, ip_octets);
 
     let mdns_dest = embassy_net::IpEndpoint::new(
-        embassy_net::IpAddress::Ipv4(embassy_net::Ipv4Address::new(224, 0, 0, 251)),
+        embassy_net::IpAddress::Ipv4(Ipv4Address::from(MDNS_MULTICAST)),
         MDNS_PORT,
     );
     let _ = socket.send_to(&resp[..len], mdns_dest).await;
 }
 
 fn is_mdns_query_for_plump(pkt: &[u8]) -> bool {
-    if pkt.len() < 29 {
+    // DNS header (12) + qname + qtype (2) + qclass (2)
+    let min_len = 12 + HOSTNAME_WIRE.len() + 4;
+    if pkt.len() < min_len {
         return false;
     }
 
     let flags = u16::from_be_bytes([pkt[2], pkt[3]]);
     if flags & 0x8000 != 0 {
-        return false;
+        return false; // response, not query
     }
 
     let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]);
@@ -929,41 +939,55 @@ fn is_mdns_query_for_plump(pkt: &[u8]) -> bool {
         return false;
     }
 
-    let qname = &pkt[12..25];
-    if qname[0] != 5 || qname[6] != 5 || qname[12] != 0 {
+    // compare qname against HOSTNAME_WIRE (case-insensitive for labels)
+    let qname_end = 12 + HOSTNAME_WIRE.len();
+    let qname = &pkt[12..qname_end];
+
+    // verify label structure: first label length, second label length, NUL
+    if qname[0] != HOSTNAME_WIRE[0] {
         return false;
     }
-    if !qname[1..6].eq_ignore_ascii_case(b"plump") {
+    let label1_len = qname[0] as usize;
+    if qname[1 + label1_len] != HOSTNAME_WIRE[1 + label1_len] {
         return false;
     }
-    if !qname[7..12].eq_ignore_ascii_case(b"local") {
+    let label2_len = qname[1 + label1_len] as usize;
+    if qname[1 + label1_len + 1 + label2_len] != 0 {
         return false;
     }
 
-    let qtype = u16::from_be_bytes([pkt[25], pkt[26]]);
-    let qclass = u16::from_be_bytes([pkt[27], pkt[28]]) & 0x7FFF;
+    // case-insensitive label comparison
+    if !qname[1..1 + label1_len].eq_ignore_ascii_case(&HOSTNAME_WIRE[1..1 + label1_len]) {
+        return false;
+    }
+    let l2_start = 1 + label1_len + 1;
+    if !qname[l2_start..l2_start + label2_len]
+        .eq_ignore_ascii_case(&HOSTNAME_WIRE[l2_start..l2_start + label2_len])
+    {
+        return false;
+    }
+
+    let qtype = u16::from_be_bytes([pkt[qname_end], pkt[qname_end + 1]]);
+    let qclass = u16::from_be_bytes([pkt[qname_end + 2], pkt[qname_end + 3]]) & 0x7FFF;
 
     (qtype == 1 || qtype == 255) && qclass == 1
 }
 
 fn build_mdns_response(buf: &mut [u8], ip: [u8; 4]) -> usize {
-    let r = &mut buf[..MDNS_RESPONSE_LEN];
-
-    r[0..2].copy_from_slice(&[0x00, 0x00]);
-    r[2..4].copy_from_slice(&[0x84, 0x00]);
-    r[4..6].copy_from_slice(&[0x00, 0x00]);
-    r[6..8].copy_from_slice(&[0x00, 0x01]);
-    r[8..10].copy_from_slice(&[0x00, 0x00]);
-    r[10..12].copy_from_slice(&[0x00, 0x00]);
-
-    r[12..25].copy_from_slice(&HOSTNAME_WIRE);
-    r[25..27].copy_from_slice(&[0x00, 0x01]);
-    r[27..29].copy_from_slice(&[0x80, 0x01]);
-    r[29..33].copy_from_slice(&[0x00, 0x00, 0x00, 0x78]);
-    r[33..35].copy_from_slice(&[0x00, 0x04]);
-    r[35..39].copy_from_slice(&ip);
-
-    MDNS_RESPONSE_LEN
+    let mut w = DnsBuf::new(buf);
+    w.put_u16(0x0000);       // transaction ID
+    w.put_u16(0x8400);       // flags: response, authoritative
+    w.put_u16(0x0000);       // QDCOUNT
+    w.put_u16(0x0001);       // ANCOUNT
+    w.put_u16(0x0000);       // NSCOUNT
+    w.put_u16(0x0000);       // ARCOUNT
+    w.put(&HOSTNAME_WIRE);   // name
+    w.put_u16(0x0001);       // TYPE A
+    w.put_u16(0x8001);       // CLASS IN, cache-flush
+    w.put_u32(120);          // TTL 120s
+    w.put_u16(0x0004);       // RDLENGTH
+    w.put(&ip);              // RDATA (IPv4 address)
+    w.len()
 }
 
 async fn drain_until_back() {
