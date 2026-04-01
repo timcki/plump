@@ -56,6 +56,7 @@ pub struct SettingsApp {
     scroll: usize,
     loaded: bool,
     save_needed: bool,
+    generation: u32,
     ui_fonts: fonts::UiFonts,
     items_top: u16,
 }
@@ -70,6 +71,7 @@ impl SettingsApp {
             scroll: 0,
             loaded: false,
             save_needed: false,
+            generation: 0,
             ui_fonts: uf,
             items_top: TITLE_Y + uf.heading.line_height + HEADING_ITEMS_GAP,
         }
@@ -94,6 +96,12 @@ impl SettingsApp {
 
     pub fn mark_save_needed(&mut self) {
         self.save_needed = true;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    #[inline]
+    pub fn generation(&self) -> u32 {
+        self.generation
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -123,6 +131,7 @@ impl SettingsApp {
         }
 
         self.loaded = true;
+        self.generation = self.generation.wrapping_add(1);
     }
 
     fn save(&self, k: &mut KernelHandle<'_>) -> bool {
@@ -291,7 +300,7 @@ impl SettingsApp {
             }
             _ => return,
         }
-        self.save_needed = true;
+        self.mark_save_needed();
     }
 
     fn decrement(&mut self) {
@@ -343,7 +352,7 @@ impl SettingsApp {
             }
             _ => return,
         }
-        self.save_needed = true;
+        self.mark_save_needed();
     }
 
     // scroll management:

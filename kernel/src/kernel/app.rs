@@ -532,6 +532,11 @@ pub trait AppLayer {
     // system configuration
     fn system_settings(&self) -> &SystemSettings;
     fn settings_loaded(&self) -> bool;
+
+    /// Generation counter bumped whenever any `SystemSettings` field
+    /// changes.  The kernel compares this against its last-seen value
+    /// to decide whether hardware state needs updating.
+    fn settings_generation(&self) -> u32;
     fn ghost_clear_every(&self) -> u32;
     fn wants_grayscale(&self) -> bool;
     fn wifi_config(&self) -> &WifiConfig;

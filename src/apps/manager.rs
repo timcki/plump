@@ -663,6 +663,11 @@ impl AppManager {
     }
 
     #[inline]
+    pub fn settings_generation(&self) -> u32 {
+        self.settings.generation()
+    }
+
+    #[inline]
     pub fn wifi_config(&self) -> &crate::kernel::config::WifiConfig {
         self.settings.wifi_config()
     }
@@ -730,6 +735,10 @@ impl AppLayer for AppManager {
 
     fn settings_loaded(&self) -> bool {
         self.settings.is_loaded()
+    }
+
+    fn settings_generation(&self) -> u32 {
+        self.settings.generation()
     }
 
     fn ghost_clear_every(&self) -> u32 {
