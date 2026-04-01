@@ -575,30 +575,23 @@ impl super::Kernel {
                             self.red_stale = true;
                             self.partial_refreshes += 1;
                         } else {
-                            self.red_stale = false;
-                            {
-                                let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                                self.epd.partial_phase3_sync(self.strip, &rs, &draw);
-                            }
                             self.partial_refreshes += 1;
-                            self.epd.power_off_async().await;
 
-                            // grayscale antialiasing pass: re-render into
-                            // LSB + MSB planes and refresh with gray LUT.
-                            // only for reader pages (not quick menu, settings, etc.)
                             if app_mgr.system_settings().text_aa
                                 && app_mgr.wants_grayscale()
                                 && !app_mgr.has_redraw()
                             {
+                                // grayscale AA: skip phase3_sync (gray overwrites
+                                // both RAMs) and skip post-gray restore (next page
+                                // turn uses inv_red to resync)
                                 let draw = |s: &mut StripBuffer| app_mgr.draw(s);
                                 self.epd.grayscale_pass(self.strip, &rs, &draw).await;
-
-                                // restore BW content to both RAM planes so
-                                // subsequent DU refreshes compute correct
-                                // pixel deltas (physical display keeps gray)
+                                self.red_stale = true;
+                            } else {
                                 let draw = |s: &mut StripBuffer| app_mgr.draw(s);
                                 self.epd.partial_phase3_sync(self.strip, &rs, &draw);
-                                // red_stale stays false — both planes are in sync
+                                self.red_stale = false;
+                                self.epd.power_off_async().await;
                             }
                         }
 
@@ -654,8 +647,8 @@ impl super::Kernel {
                 self.red_stale = false;
 
                 // After a full GC refresh the panel is left in plain BW.
-                // Re-apply grayscale AA for reader text, then restore BW
-                // content to both RAM planes for subsequent partial DU updates.
+                // re-apply grayscale AA for reader text; next partial
+                // will use inv_red to resync both RAM planes
                 if app_mgr.system_settings().text_aa
                     && app_mgr.wants_grayscale()
                     && !app_mgr.has_redraw()
@@ -671,9 +664,7 @@ impl super::Kernel {
                     };
                     let draw = |s: &mut StripBuffer| app_mgr.draw(s);
                     self.epd.grayscale_pass(self.strip, &rs, &draw).await;
-
-                    let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                    self.epd.partial_phase3_sync(self.strip, &rs, &draw);
+                    self.red_stale = true;
                 }
 
                 if let Some(action) = deferred {

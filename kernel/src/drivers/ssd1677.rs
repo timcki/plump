@@ -275,6 +275,56 @@ where
         }
     }
 
+    // draw once per strip in GrayDual mode, send LSB → BW RAM and MSB → RED RAM
+    #[allow(clippy::too_many_arguments)]
+    fn write_region_strips_gray_dual<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        px: u16,
+        py: u16,
+        pw: u16,
+        ph: u16,
+        draw: &F,
+        left_mask: u8,
+        right_mask: u8,
+    ) where
+        F: Fn(&mut StripBuffer),
+    {
+        let max_rows = StripBuffer::max_rows_for_width(pw);
+        let row_bytes = (pw / 8) as usize;
+        let needs_mask = left_mask != 0 || right_mask != 0;
+
+        let mut y = py;
+        while y < py + ph {
+            let rows = max_rows.min(py + ph - y);
+            strip.begin_window(self.rotation, px, y, pw, rows);
+            draw(strip);
+
+            if needs_mask && row_bytes > 0 {
+                for row in strip.data_mut().chunks_mut(row_bytes) {
+                    row[0] |= left_mask;
+                    row[row.len() - 1] |= right_mask;
+                }
+                for row in strip.gray_data_mut().chunks_mut(row_bytes) {
+                    row[0] |= left_mask;
+                    row[row.len() - 1] |= right_mask;
+                }
+            }
+
+            // LSB plane → BW RAM
+            self.set_partial_ram_area(px, y, pw, rows);
+            self.send_command(cmd::WRITE_RAM_BW);
+            self.send_data(strip.data());
+
+            // MSB plane → RED RAM
+            self.set_partial_ram_area(px, y, pw, rows);
+            self.send_command(cmd::WRITE_RAM_RED);
+            self.send_data(strip.gray_data());
+
+            y += rows;
+        }
+    }
+
     fn init_display(&mut self, delay: &mut Delay) {
         self.send_command(cmd::SW_RESET);
         delay.delay_millis(10);
@@ -759,49 +809,28 @@ where
 
     /// Perform a grayscale antialiasing pass.
     ///
-    /// Renders content twice (LSB + MSB planes) via strip streaming,
-    /// then loads the custom grayscale LUT and triggers a single refresh.
-    /// The draw closure is called in GrayLsb and GrayMsb modes —
-    /// the StripBuffer's gray_mode controls which pixels are drawn.
-    ///
-    /// After this, BW and RED RAM contain gray plane data (not BW content),
-    /// so the caller should mark red_stale = true.
+    /// Renders content once per strip in GrayDual mode, writing LSB plane
+    /// to BW RAM and MSB plane to RED RAM, then triggers a grayscale LUT
+    /// refresh. After this, both RAMs contain gray plane data (not BW
+    /// content), so the caller should mark red_stale = true.
     pub async fn grayscale_pass<F>(&mut self, strip: &mut StripBuffer, rs: &RenderState, draw: &F)
     where
         F: Fn(&mut StripBuffer),
     {
-        // LSB pass → BW RAM
-        strip.set_gray_mode(GrayMode::GrayLsb);
-        self.write_region_strips(
+        // single draw pass fills both LSB (buf) and MSB (gray_buf) planes
+        strip.set_gray_mode(GrayMode::GrayDual);
+        self.write_region_strips_gray_dual(
             strip,
             rs.px,
             rs.py,
             rs.pw,
             rs.ph,
-            cmd::WRITE_RAM_BW,
             draw,
             rs.left_mask,
             rs.right_mask,
         );
-
-        // MSB pass → RED RAM
-        strip.set_gray_mode(GrayMode::GrayMsb);
-        self.write_region_strips(
-            strip,
-            rs.px,
-            rs.py,
-            rs.pw,
-            rs.ph,
-            cmd::WRITE_RAM_RED,
-            draw,
-            rs.left_mask,
-            rs.right_mask,
-        );
-
-        // Restore BW mode
         strip.set_gray_mode(GrayMode::Bw);
 
-        // Trigger grayscale refresh and wait
         self.start_grayscale_refresh(rs);
         self.wait_busy_async().await;
     }

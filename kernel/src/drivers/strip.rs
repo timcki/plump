@@ -26,6 +26,9 @@ pub enum GrayMode {
     /// MSB plane (→ RED RAM): coverage values 1 and 2 set bit.
     /// Buffer starts 0x00.
     GrayMsb,
+    /// Dual-plane: writes LSB to `buf` and MSB to `gray_buf` in one pass.
+    /// Both buffers start 0x00.
+    GrayDual,
 }
 
 pub const STRIP_ROWS: u16 = 40;
@@ -34,8 +37,16 @@ pub const PHYS_BYTES_PER_ROW: usize = (WIDTH as usize) / 8;
 pub const STRIP_BUF_SIZE: usize = PHYS_BYTES_PER_ROW * STRIP_ROWS as usize;
 pub const STRIP_COUNT: u16 = HEIGHT / STRIP_ROWS;
 
+/// byte offset and bit mask for a pixel at the given x position in a strip row
+#[inline(always)]
+fn bit_pos(buf_x: usize) -> (usize, u8) {
+    (buf_x / 8, 1u8 << (7 - (buf_x & 7)))
+}
+
 pub struct StripBuffer {
     buf: [u8; STRIP_BUF_SIZE],
+    // secondary buffer for GrayDual mode (MSB plane)
+    gray_buf: [u8; STRIP_BUF_SIZE],
     rotation: Rotation,
     gray_mode: GrayMode,
     win_x: u16,
@@ -49,6 +60,7 @@ impl StripBuffer {
     pub const fn new() -> Self {
         Self {
             buf: [0xFF; STRIP_BUF_SIZE],
+            gray_buf: [0u8; STRIP_BUF_SIZE],
             rotation: Rotation::Deg270,
             gray_mode: GrayMode::Bw,
             win_x: 0,
@@ -81,6 +93,9 @@ impl StripBuffer {
             0x00
         };
         self.buf[..STRIP_BUF_SIZE].fill(fill);
+        if self.gray_mode == GrayMode::GrayDual {
+            self.gray_buf[..STRIP_BUF_SIZE].fill(0x00);
+        }
     }
 
     pub fn begin_window(&mut self, rotation: Rotation, x: u16, y: u16, w: u16, mut h: u16) {
@@ -116,6 +131,9 @@ impl StripBuffer {
             0x00
         };
         self.buf[..total].fill(fill);
+        if self.gray_mode == GrayMode::GrayDual {
+            self.gray_buf[..total].fill(0x00);
+        }
     }
 
     pub fn data(&self) -> &[u8] {
@@ -126,6 +144,17 @@ impl StripBuffer {
     pub fn data_mut(&mut self) -> &mut [u8] {
         let total = self.row_bytes as usize * self.win_h as usize;
         &mut self.buf[..total]
+    }
+
+    /// Secondary buffer data (MSB plane) for GrayDual mode.
+    pub fn gray_data(&self) -> &[u8] {
+        let total = self.row_bytes as usize * self.win_h as usize;
+        &self.gray_buf[..total]
+    }
+
+    pub fn gray_data_mut(&mut self) -> &mut [u8] {
+        let total = self.row_bytes as usize * self.win_h as usize;
+        &mut self.gray_buf[..total]
     }
 
     pub fn window(&self) -> (u16, u16, u16, u16) {
@@ -195,6 +224,21 @@ impl StripBuffer {
         } else {
             self.buf[idx] |= 1 << bit;
         }
+    }
+
+    /// Set a bit in the secondary gray buffer (for GrayDual generic fallback).
+    fn set_gray_pixel_physical(&mut self, px: u16, py: u16) {
+        if px < self.win_x || px >= self.win_x + self.win_w {
+            return;
+        }
+        if py < self.win_y || py >= self.win_y + self.win_h {
+            return;
+        }
+
+        let local_x = (px - self.win_x) as usize;
+        let local_y = (py - self.win_y) as usize;
+        let idx = (local_x / 8) + (local_y * self.row_bytes as usize);
+        self.gray_buf[idx] |= 1 << (7 - (local_x % 8));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -333,9 +377,11 @@ impl StripBuffer {
     /// In gray modes, `black` is ignored — gray planes always set bits.
     ///
     /// Behaviour depends on `self.gray_mode`:
-    ///   Bw:      any non-zero → set/clear bit per `black` (buffer starts 0xFF)
-    ///   GrayLsb: val >= 2     → set bit   (buffer starts 0x00)
-    ///   GrayMsb: val 1 or 2   → set bit   (buffer starts 0x00)
+    ///   Bw:       any non-zero → set/clear bit per `black` (buffer starts 0xFF)
+    ///   GrayLsb:  val >= 2     → set bit in buf   (buffer starts 0x00)
+    ///   GrayMsb:  val 1 or 2   → set bit in buf   (buffer starts 0x00)
+    ///   GrayDual: val >= 2     → set bit in buf (LSB plane)
+    ///             val 1 or 2   → set bit in gray_buf (MSB plane)
     #[allow(clippy::too_many_arguments)]
     pub fn blit_2bpp(
         &mut self,
@@ -410,51 +456,56 @@ impl StripBuffer {
             match gray_mode {
                 GrayMode::Bw => {
                     if black {
-                        // any non-zero → clear bit (black pixel)
                         for y in y0..y1 {
                             let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
                             if val != 0 {
-                                let buf_x = (gy + y as i32 - wx) as usize;
-                                let byte_col = buf_x / 8;
-                                let inv_mask = !(1u8 << (7 - (buf_x & 7)));
-                                self.buf[dst_row_base + byte_col] &= inv_mask;
+                                let (col, mask) = bit_pos((gy + y as i32 - wx) as usize);
+                                self.buf[dst_row_base + col] &= !mask;
                             }
                         }
                     } else {
-                        // any non-zero → set bit (white pixel, for inverted text)
                         for y in y0..y1 {
                             let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
                             if val != 0 {
-                                let buf_x = (gy + y as i32 - wx) as usize;
-                                let byte_col = buf_x / 8;
-                                let mask = 1u8 << (7 - (buf_x & 7));
-                                self.buf[dst_row_base + byte_col] |= mask;
+                                let (col, mask) = bit_pos((gy + y as i32 - wx) as usize);
+                                self.buf[dst_row_base + col] |= mask;
                             }
                         }
                     }
                 }
                 GrayMode::GrayLsb => {
-                    // val >= 2 (dark gray + black) → set bit
                     for y in y0..y1 {
                         let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
                         if val >= 2 {
-                            let buf_x = (gy + y as i32 - wx) as usize;
-                            let byte_col = buf_x / 8;
-                            let mask = 1u8 << (7 - (buf_x & 7));
-                            self.buf[dst_row_base + byte_col] |= mask;
+                            let (col, mask) = bit_pos((gy + y as i32 - wx) as usize);
+                            self.buf[dst_row_base + col] |= mask;
                         }
                     }
                 }
                 GrayMode::GrayMsb => {
-                    // val 1 or 2 (light gray + dark gray) → set bit
-                    // val 3 (black) and val 0 (white) are NOT set
                     for y in y0..y1 {
                         let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
                         if val == 1 || val == 2 {
-                            let buf_x = (gy + y as i32 - wx) as usize;
-                            let byte_col = buf_x / 8;
-                            let mask = 1u8 << (7 - (buf_x & 7));
-                            self.buf[dst_row_base + byte_col] |= mask;
+                            let (col, mask) = bit_pos((gy + y as i32 - wx) as usize);
+                            self.buf[dst_row_base + col] |= mask;
+                        }
+                    }
+                }
+                GrayMode::GrayDual => {
+                    for y in y0..y1 {
+                        let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
+                        if val == 0 {
+                            continue;
+                        }
+                        let (col, mask) = bit_pos((gy + y as i32 - wx) as usize);
+                        let idx = dst_row_base + col;
+                        // LSB plane (buf → BW RAM): dark gray + black
+                        if val >= 2 {
+                            self.buf[idx] |= mask;
+                        }
+                        // MSB plane (gray_buf → RED RAM): light + dark gray
+                        if val <= 2 {
+                            self.gray_buf[idx] |= mask;
                         }
                     }
                 }
@@ -491,16 +542,29 @@ impl StripBuffer {
                     continue;
                 }
                 let val = (bitmaps[row + x / 4] >> (6 - (x & 3) * 2)) & 0x03;
-                let should_draw = match self.gray_mode {
-                    GrayMode::Bw => val != 0,
-                    GrayMode::GrayLsb => val >= 2,
-                    GrayMode::GrayMsb => val == 1 || val == 2,
-                };
-                if should_draw {
+                if self.gray_mode == GrayMode::GrayDual {
+                    if val == 0 {
+                        continue;
+                    }
                     let (px, py) = self.to_physical(lx as u16, ly as u16);
-                    // Bw: respect black param. Gray: always set bit.
-                    let set_black = black && self.gray_mode == GrayMode::Bw;
-                    self.set_pixel_physical(px, py, set_black);
+                    if val >= 2 {
+                        self.set_pixel_physical(px, py, false);
+                    }
+                    if val <= 2 {
+                        self.set_gray_pixel_physical(px, py);
+                    }
+                } else {
+                    let should_draw = match self.gray_mode {
+                        GrayMode::Bw => val != 0,
+                        GrayMode::GrayLsb => val >= 2,
+                        GrayMode::GrayMsb => val == 1 || val == 2,
+                        GrayMode::GrayDual => unreachable!(),
+                    };
+                    if should_draw {
+                        let (px, py) = self.to_physical(lx as u16, ly as u16);
+                        let set_black = black && self.gray_mode == GrayMode::Bw;
+                        self.set_pixel_physical(px, py, set_black);
+                    }
                 }
             }
         }
