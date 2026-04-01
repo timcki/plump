@@ -1,12 +1,12 @@
 [package]
-name         = "pulp-kernel"
+name         = "plump-kernel"
 edition      = "2024"
 rust-version = "1.88"
 version      = "0.1.0"
 authors      = ["Hans Martin <hansmrtn@users.noreply.github.com>"]
-description  = "no_std async kernel for pulp-os (scheduling, drivers, storage, EPD rendering)"
+description  = "no_std async kernel for plump (scheduling, drivers, storage, EPD rendering)"
 license      = "MIT"
-repository   = "https://github.com/hansmrtn/pulp-os"
+repository   = "https://github.com/hansmrtn/plump"
 
 [features]
 default = []

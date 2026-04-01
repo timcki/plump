@@ -358,7 +358,7 @@ impl App<AppId> for FilesApp {
                     log::debug!("files: deleting cache for {} ({})", name, cf_str);
 
                     // delete v3 flat cache file (best effort)
-                    match k.sd().delete_in_pulp(cf_str) {
+                    match k.sd().delete_in_plump(cf_str) {
                         Ok(()) => log::debug!("files: cache deleted for {}", name),
                         Err(e) => log::warn!("files: cache delete failed: {}", e),
                     }

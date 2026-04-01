@@ -14,7 +14,7 @@ use embedded_sdmmc::{Mode, RawFile};
 use crate::drivers::sdcard::{SdStorage, SdStorageInner, poll_once};
 use crate::error::{Error, ErrorKind};
 
-pub const PULP_DIR: &str = "_PULP";
+pub const PLUMP_DIR: &str = "_PLUMP";
 pub const TITLES_FILE: &str = "TITLES.BIN";
 pub const TITLE_CAP: usize = 64;
 
@@ -537,31 +537,31 @@ impl SdStorage {
         })
     }
 
-    // _PULP/ directory management
+    // _PLUMP/ directory management
 
-    /// Ensure the _PULP directory exists (async, for boot path).
-    pub async fn ensure_pulp_dir_async(&self) -> crate::error::Result<()> {
+    /// Ensure the _PLUMP directory exists (async, for boot path).
+    pub async fn ensure_plump_dir_async(&self) -> crate::error::Result<()> {
         let mut guard = borrow(self)?;
         let inner = &mut *guard;
 
-        if let Ok(dir) = inner.mgr.open_dir(inner.root, PULP_DIR).await {
+        if let Ok(dir) = inner.mgr.open_dir(inner.root, PLUMP_DIR).await {
             let _ = inner.mgr.close_dir(dir);
             return Ok(());
         }
-        match inner.mgr.make_dir_in_dir(inner.root, PULP_DIR).await {
+        match inner.mgr.make_dir_in_dir(inner.root, PLUMP_DIR).await {
             Ok(()) => Ok(()),
             Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
-            Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_pulp_dir_async")),
+            Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_plump_dir_async")),
         }
     }
 
-    /// Ensure a subdirectory exists under _PULP/.
-    pub fn ensure_pulp_subdir(&self, name: &str) -> crate::error::Result<()> {
+    /// Ensure a subdirectory exists under _PLUMP/.
+    pub fn ensure_plump_subdir(&self, name: &str) -> crate::error::Result<()> {
         let exists = poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_dir!(inner, PULP_DIR, |pulp_h| {
-                match inner.mgr.open_dir(pulp_h, name).await {
+            in_dir!(inner, PLUMP_DIR, |plump_h| {
+                match inner.mgr.open_dir(plump_h, name).await {
                     Ok(sub) => {
                         let _ = inner.mgr.close_dir(sub);
                         Ok::<_, Error>(true)
@@ -578,20 +578,20 @@ impl SdStorage {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_dir!(inner, PULP_DIR, |pulp_h| {
-                match inner.mgr.make_dir_in_dir(pulp_h, name).await {
+            in_dir!(inner, PLUMP_DIR, |plump_h| {
+                match inner.mgr.make_dir_in_dir(plump_h, name).await {
                     Ok(()) => Ok::<_, Error>(()),
                     Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
-                    Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_pulp_subdir")),
+                    Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_plump_subdir")),
                 }
             })
         })
     }
 
-    // _PULP/ direct file operations (cache files live directly in _PULP/)
+    // _PLUMP/ direct file operations (cache files live directly in _PLUMP/)
 
-    /// Read a chunk from a file in _PULP/.
-    pub fn read_chunk_in_pulp(
+    /// Read a chunk from a file in _PLUMP/.
+    pub fn read_chunk_in_plump(
         &self,
         name: &str,
         offset: u32,
@@ -600,53 +600,53 @@ impl SdStorage {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_dir!(inner, PULP_DIR, |dir_h| op_read_chunk!(
+            in_dir!(inner, PLUMP_DIR, |dir_h| op_read_chunk!(
                 inner, dir_h, name, offset, buf
             ))
         })
     }
 
-    /// Write (create/truncate) a file in _PULP/.
-    pub fn write_in_pulp(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
+    /// Write (create/truncate) a file in _PLUMP/.
+    pub fn write_in_plump(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_dir!(inner, PULP_DIR, |dir_h| op_write!(inner, dir_h, name, data))
+            in_dir!(inner, PLUMP_DIR, |dir_h| op_write!(inner, dir_h, name, data))
         })
     }
 
-    /// Append data to a file in _PULP/.
-    pub fn append_in_pulp(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
+    /// Append data to a file in _PLUMP/.
+    pub fn append_in_plump(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_dir!(inner, PULP_DIR, |dir_h| op_append!(
+            in_dir!(inner, PLUMP_DIR, |dir_h| op_append!(
                 inner, dir_h, name, data
             ))
         })
     }
 
-    /// Get the size of a file in _PULP/.
-    pub fn file_size_in_pulp(&self, name: &str) -> crate::error::Result<u32> {
+    /// Get the size of a file in _PLUMP/.
+    pub fn file_size_in_plump(&self, name: &str) -> crate::error::Result<u32> {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_dir!(inner, PULP_DIR, |dir_h| op_file_size!(inner, dir_h, name))
+            in_dir!(inner, PLUMP_DIR, |dir_h| op_file_size!(inner, dir_h, name))
         })
     }
 
-    /// Delete a file in _PULP/.
-    pub fn delete_in_pulp(&self, name: &str) -> crate::error::Result<()> {
+    /// Delete a file in _PLUMP/.
+    pub fn delete_in_plump(&self, name: &str) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_dir!(inner, PULP_DIR, |dir_h| op_delete!(inner, dir_h, name))
+            in_dir!(inner, PLUMP_DIR, |dir_h| op_delete!(inner, dir_h, name))
         })
     }
 
-    /// Seek to offset and write data in a file in _PULP/.
+    /// Seek to offset and write data in a file in _PLUMP/.
     /// Used to update the chapter offset table after all chapters are appended.
-    pub fn write_at_in_pulp(
+    pub fn write_at_in_plump(
         &self,
         name: &str,
         offset: u32,
@@ -655,7 +655,7 @@ impl SdStorage {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_dir!(inner, PULP_DIR, |dir_h| {
+            in_dir!(inner, PLUMP_DIR, |dir_h| {
                 match inner
                     .mgr
                     .open_file_in_dir(dir_h, name, Mode::ReadWriteCreateOrAppend)
@@ -683,10 +683,10 @@ impl SdStorage {
         })
     }
 
-    // _PULP subdirectory file operations
+    // _PLUMP subdirectory file operations
 
-    /// Write (create/truncate) a file in _PULP/<dir>/.
-    pub fn write_in_pulp_subdir(
+    /// Write (create/truncate) a file in _PLUMP/<dir>/.
+    pub fn write_in_plump_subdir(
         &self,
         dir: &str,
         name: &str,
@@ -695,14 +695,14 @@ impl SdStorage {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_subdir!(inner, PULP_DIR, dir, |sub_h| op_write!(
+            in_subdir!(inner, PLUMP_DIR, dir, |sub_h| op_write!(
                 inner, sub_h, name, data
             ))
         })
     }
 
-    /// Append data to a file in _PULP/<dir>/.
-    pub fn append_in_pulp_subdir(
+    /// Append data to a file in _PLUMP/<dir>/.
+    pub fn append_in_plump_subdir(
         &self,
         dir: &str,
         name: &str,
@@ -711,14 +711,14 @@ impl SdStorage {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_subdir!(inner, PULP_DIR, dir, |sub_h| op_append!(
+            in_subdir!(inner, PLUMP_DIR, dir, |sub_h| op_append!(
                 inner, sub_h, name, data
             ))
         })
     }
 
-    /// Read a chunk from a file in _PULP/<dir>/.
-    pub fn read_chunk_in_pulp_subdir(
+    /// Read a chunk from a file in _PLUMP/<dir>/.
+    pub fn read_chunk_in_plump_subdir(
         &self,
         dir: &str,
         name: &str,
@@ -728,14 +728,14 @@ impl SdStorage {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_subdir!(inner, PULP_DIR, dir, |sub_h| op_read_chunk!(
+            in_subdir!(inner, PLUMP_DIR, dir, |sub_h| op_read_chunk!(
                 inner, sub_h, name, offset, buf
             ))
         })
     }
 
-    /// Get the size of a file in _PULP/<dir>/.
-    pub fn file_size_in_pulp_subdir(
+    /// Get the size of a file in _PLUMP/<dir>/.
+    pub fn file_size_in_plump_subdir(
         &self,
         dir: &str,
         name: &str,
@@ -743,14 +743,14 @@ impl SdStorage {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_subdir!(inner, PULP_DIR, dir, |sub_h| op_file_size!(
+            in_subdir!(inner, PLUMP_DIR, dir, |sub_h| op_file_size!(
                 inner, sub_h, name
             ))
         })
     }
 
-    /// Delete a file in _PULP/<dir>/.
-    pub fn delete_in_pulp_subdir(
+    /// Delete a file in _PLUMP/<dir>/.
+    pub fn delete_in_plump_subdir(
         &self,
         dir: &str,
         name: &str,
@@ -758,13 +758,13 @@ impl SdStorage {
         poll_once(async {
             let mut guard = borrow(self)?;
             let inner = &mut *guard;
-            in_subdir!(inner, PULP_DIR, dir, |sub_h| op_delete!(inner, sub_h, name))
+            in_subdir!(inner, PLUMP_DIR, dir, |sub_h| op_delete!(inner, sub_h, name))
         })
     }
 
     // title mapping
 
-    /// Append a title line to _PULP/TITLES.BIN.
+    /// Append a title line to _PLUMP/TITLES.BIN.
     pub fn save_title(&self, filename: &str, title: &str) -> crate::error::Result<()> {
         let name_bytes = filename.as_bytes();
         let title_bytes = title.as_bytes();
@@ -783,7 +783,7 @@ impl SdStorage {
             .copy_from_slice(&title_bytes[..title_len]);
         line[name_bytes.len() + 1 + title_len] = b'\n';
 
-        self.append_in_pulp(TITLES_FILE, &line[..line_len])
+        self.append_in_plump(TITLES_FILE, &line[..line_len])
     }
 }
 

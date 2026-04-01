@@ -1,12 +1,12 @@
 // ui re-exports: kernel primitives + app-side font-dependent widgets
 //
 // kernel ui (Region, Alignment, StackFmt, statusbar constants) is
-// re-exported from pulp-kernel; font-dependent widgets (BitmapLabel,
+// re-exported from plump-kernel; font-dependent widgets (BitmapLabel,
 // QuickMenu, ButtonFeedback) come from apps::widgets
 
 // kernel-side primitives
-pub use pulp_kernel::ui::stack_fmt;
-pub use pulp_kernel::ui::*;
+pub use plump_kernel::ui::stack_fmt;
+pub use plump_kernel::ui::*;
 
 // app-side font-dependent widgets
 pub use crate::apps::widgets::QuickMenu;

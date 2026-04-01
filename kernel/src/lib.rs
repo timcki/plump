@@ -1,4 +1,4 @@
-// pulp-kernel -- hardware drivers, scheduling, and system core
+// plump-kernel -- hardware drivers, scheduling, and system core
 //
 // generic over AppLayer; never imports concrete apps or fonts
 // ships a built-in mono font (FONT_9X18) for boot console and

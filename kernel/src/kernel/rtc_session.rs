@@ -10,7 +10,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-// magic value to validate RTC session data: "PLPS" (PuLP Session)
+// magic value to validate RTC session data: "PLPS" (PLuMP Session)
 const RTC_SESSION_MAGIC: u32 = 0x504C5053;
 
 // max navigation stack depth (must match app::MAX_STACK_DEPTH)
@@ -194,7 +194,7 @@ impl RtcSession {
         let bytes: &[u8] = unsafe {
             core::slice::from_raw_parts(self as *const RtcSession as *const u8, SESSION_SIZE)
         };
-        match sd.write_in_pulp(SESSION_FILE, bytes) {
+        match sd.write_in_plump(SESSION_FILE, bytes) {
             Ok(()) => log::debug!("session: saved to SD ({} bytes)", SESSION_SIZE),
             Err(e) => log::warn!("session: SD save failed: {}", e),
         }
@@ -208,7 +208,7 @@ impl RtcSession {
         struct AlignedBuf([u8; SESSION_SIZE]);
         let mut buf = AlignedBuf([0u8; SESSION_SIZE]);
 
-        match sd.read_chunk_in_pulp(SESSION_FILE, 0, &mut buf.0) {
+        match sd.read_chunk_in_plump(SESSION_FILE, 0, &mut buf.0) {
             Ok(n) if n >= SESSION_SIZE => {
                 // safety: buf is properly aligned (align 4) and contains
                 // SESSION_SIZE bytes with the same layout as RtcSession
@@ -242,7 +242,7 @@ impl RtcSession {
 
     /// Delete session file from SD (e.g. after successful cold boot).
     pub fn clear_sd(sd: &crate::drivers::sdcard::SdStorage) {
-        let _ = sd.delete_in_pulp(SESSION_FILE);
+        let _ = sd.delete_in_plump(SESSION_FILE);
     }
 }
 

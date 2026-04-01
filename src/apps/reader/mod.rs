@@ -2,7 +2,7 @@ mod epubs;
 mod images;
 mod paging;
 
-pub use pulp_kernel::util::decode_utf8_char;
+pub use plump_kernel::util::decode_utf8_char;
 
 use crate::apps::PendingSetting;
 use crate::fonts::bitmap::{self, BitmapFont};
@@ -19,7 +19,7 @@ use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::Text;
 
 use crate::apps::{App, AppContext, AppId, DeferredPersistenceReason, RECENT_FILE, Transition};
-use crate::drivers::storage::PULP_DIR;
+use crate::drivers::storage::PLUMP_DIR;
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::{GrayMode, StripBuffer};
@@ -1027,7 +1027,7 @@ impl ReaderApp {
         if !self.stats_dirty || self.filename_len == 0 {
             return Ok(());
         }
-        pulp_kernel::perf_begin!(_sf_t0);
+        plump_kernel::perf_begin!(_sf_t0);
         // accumulate any unrecorded time only if the clock is running
         if self.stats_clock_running {
             let now = crate::kernel::uptime_secs();
@@ -1040,7 +1040,7 @@ impl ReaderApp {
 
         self.stats.save(k, self.name())?;
         self.stats_dirty = false;
-        pulp_kernel::perf_event!(
+        plump_kernel::perf_event!(
             "reader",
             "stats_flush pages={} time_s={} elapsed_ms={}",
             self.stats.pages,
@@ -1420,7 +1420,7 @@ impl ReaderApp {
     // write extended RECENT file: filename\0title\0author\0progress
     // returns Err on write failure (dirty state kept for retry)
     fn write_recent(&mut self, k: &mut KernelHandle<'_>) -> crate::error::Result<()> {
-        pulp_kernel::perf_begin!(_wr_t0);
+        plump_kernel::perf_begin!(_wr_t0);
         let mut buf = [0u8; 196];
         let mut pos = 0usize;
 
@@ -1455,9 +1455,9 @@ impl ReaderApp {
         buf[pos] = self.progress_pct();
         pos += 1;
 
-        k.sd().write_file_in_dir(PULP_DIR, RECENT_FILE, &buf[..pos])?;
+        k.sd().write_file_in_dir(PLUMP_DIR, RECENT_FILE, &buf[..pos])?;
         self.recent_dirty = false;
-        pulp_kernel::perf_event!(
+        plump_kernel::perf_event!(
             "reader",
             "write_recent bytes={} elapsed_ms={}",
             pos,
@@ -1718,7 +1718,7 @@ impl App<AppId> for ReaderApp {
         use embassy_time::Instant;
 
         // perf: snapshot SD counters at start of background pass
-        let _sd_snap = pulp_kernel::perf::counters::snapshot();
+        let _sd_snap = plump_kernel::perf::counters::snapshot();
 
         loop {
             match self.state {
@@ -1749,7 +1749,7 @@ impl App<AppId> for ReaderApp {
                         ctx.loading_pct(),
                         t0.elapsed().as_millis()
                     );
-                    pulp_kernel::perf_event!(
+                    plump_kernel::perf_event!(
                         "reader",
                         "NeedBookmark to={:?} elapsed_ms={}",
                         self.state,
@@ -1774,7 +1774,7 @@ impl App<AppId> for ReaderApp {
                                 ctx.loading_pct(),
                                 t0.elapsed().as_millis()
                             );
-                            pulp_kernel::perf_event!(
+                            plump_kernel::perf_event!(
                                 "reader",
                                 "NeedInit ok to=NeedOpf elapsed_ms={}",
                                 t0.elapsed().as_millis()
@@ -1786,7 +1786,7 @@ impl App<AppId> for ReaderApp {
                                 t0.elapsed().as_millis(),
                                 e
                             );
-                            pulp_kernel::perf_event!(
+                            plump_kernel::perf_event!(
                                 "reader",
                                 "NeedInit err_kind={:?} err_src={} elapsed_ms={}",
                                 e.kind(),
@@ -1822,7 +1822,7 @@ impl App<AppId> for ReaderApp {
                                 ctx.loading_pct(),
                                 t0.elapsed().as_millis()
                             );
-                            pulp_kernel::perf_event!(
+                            plump_kernel::perf_event!(
                                 "reader",
                                 "NeedOpf ok to=NeedToc spine_len={} elapsed_ms={}",
                                 spine_len,
@@ -1835,7 +1835,7 @@ impl App<AppId> for ReaderApp {
                                 t0.elapsed().as_millis(),
                                 e
                             );
-                            pulp_kernel::perf_event!(
+                            plump_kernel::perf_event!(
                                 "reader",
                                 "NeedOpf err_kind={:?} err_src={} elapsed_ms={}",
                                 e.kind(),
@@ -1860,7 +1860,7 @@ impl App<AppId> for ReaderApp {
                         ctx.loading_pct(),
                         t0.elapsed().as_millis()
                     );
-                    pulp_kernel::perf_event!(
+                    plump_kernel::perf_event!(
                         "reader",
                         "NeedToc to=NeedCache elapsed_ms={}",
                         t0.elapsed().as_millis()
@@ -1880,7 +1880,7 @@ impl App<AppId> for ReaderApp {
                                 ctx.loading_pct(),
                                 t0.elapsed().as_millis()
                             );
-                            pulp_kernel::perf_event!(
+                            plump_kernel::perf_event!(
                                 "reader",
                                 "NeedCache hit=true to=NeedIndex elapsed_ms={}",
                                 t0.elapsed().as_millis()
@@ -1916,7 +1916,7 @@ impl App<AppId> for ReaderApp {
                                         ctx.loading_pct(),
                                         t0.elapsed().as_millis()
                                     );
-                                    pulp_kernel::perf_event!(
+                                    plump_kernel::perf_event!(
                                         "reader",
                                         "NeedCache hit=false ch={} to=NeedIndex elapsed_ms={}",
                                         ch,
@@ -1929,7 +1929,7 @@ impl App<AppId> for ReaderApp {
                                         t0.elapsed().as_millis(),
                                         e
                                     );
-                                    pulp_kernel::perf_event!(
+                                    plump_kernel::perf_event!(
                                         "reader",
                                         "NeedCache err_kind={:?} err_src={} ch={} elapsed_ms={}",
                                         e.kind(),
@@ -1948,7 +1948,7 @@ impl App<AppId> for ReaderApp {
                                 t0.elapsed().as_millis(),
                                 e
                             );
-                            pulp_kernel::perf_event!(
+                            plump_kernel::perf_event!(
                                 "reader",
                                 "NeedCache err_kind={:?} err_src={} elapsed_ms={}",
                                 e.kind(),
@@ -1981,7 +1981,7 @@ impl App<AppId> for ReaderApp {
                                 t0.elapsed().as_millis(),
                                 e
                             );
-                            pulp_kernel::perf_event!(
+                            plump_kernel::perf_event!(
                                 "reader",
                                 "NeedIndex stage=cache_prereq err_kind={:?} err_src={} elapsed_ms={}",
                                 e.kind(),
@@ -2012,7 +2012,7 @@ impl App<AppId> for ReaderApp {
                                     ctx.loading_active(),
                                     t0.elapsed().as_millis()
                                 );
-                                pulp_kernel::perf_event!(
+                                plump_kernel::perf_event!(
                                     "reader",
                                     "NeedIndex mode=last_page to=Ready pages={} elapsed_ms={}",
                                     self.pg.total_pages,
@@ -2025,7 +2025,7 @@ impl App<AppId> for ReaderApp {
                                     t0.elapsed().as_millis(),
                                     e
                                 );
-                                pulp_kernel::perf_event!(
+                                plump_kernel::perf_event!(
                                     "reader",
                                     "NeedIndex mode=last_page err_kind={:?} err_src={} elapsed_ms={}",
                                     e.kind(),
@@ -2045,7 +2045,7 @@ impl App<AppId> for ReaderApp {
                             ctx.loading_pct(),
                             t0.elapsed().as_millis()
                         );
-                        pulp_kernel::perf_event!(
+                        plump_kernel::perf_event!(
                             "reader",
                             "NeedIndex to=NeedPage pages={} fully_indexed={} elapsed_ms={}",
                             self.pg.total_pages,
@@ -2067,7 +2067,7 @@ impl App<AppId> for ReaderApp {
                                     t0.elapsed().as_millis(),
                                     e
                                 );
-                                pulp_kernel::perf_event!(
+                                plump_kernel::perf_event!(
                                     "reader",
                                     "NeedPage mode=restore_indexed err_kind={:?} err_src={} elapsed_ms={}",
                                     e.kind(),
@@ -2087,7 +2087,7 @@ impl App<AppId> for ReaderApp {
                                             t0.elapsed().as_millis(),
                                             e
                                         );
-                                        pulp_kernel::perf_event!(
+                                        plump_kernel::perf_event!(
                                             "reader",
                                             "NeedPage mode=restore_scan err_kind={:?} err_src={} elapsed_ms={}",
                                             e.kind(),
@@ -2117,8 +2117,8 @@ impl App<AppId> for ReaderApp {
                                 t0.elapsed().as_millis()
                             );
                             {
-                                let _d = pulp_kernel::perf::counters::delta(&_sd_snap);
-                                pulp_kernel::perf_event!(
+                                let _d = plump_kernel::perf::counters::delta(&_sd_snap);
+                                plump_kernel::perf_event!(
                                     "reader",
                                     "NeedPage mode=restore to=Ready page={} sd_reads={} sd_bytes_r={} elapsed_ms={}",
                                     self.pg.page,
@@ -2140,8 +2140,8 @@ impl App<AppId> for ReaderApp {
                                     t0.elapsed().as_millis()
                                 );
                                 {
-                                    let _d = pulp_kernel::perf::counters::delta(&_sd_snap);
-                                    pulp_kernel::perf_event!(
+                                    let _d = plump_kernel::perf::counters::delta(&_sd_snap);
+                                    plump_kernel::perf_event!(
                                         "reader",
                                         "NeedPage mode=open to=Ready page={} sd_reads={} sd_bytes_r={} elapsed_ms={}",
                                         self.pg.page,
@@ -2157,7 +2157,7 @@ impl App<AppId> for ReaderApp {
                                     t0.elapsed().as_millis(),
                                     e
                                 );
-                                pulp_kernel::perf_event!(
+                                plump_kernel::perf_event!(
                                     "reader",
                                     "NeedPage mode=open err_kind={:?} err_src={} elapsed_ms={}",
                                     e.kind(),
@@ -2488,7 +2488,7 @@ impl App<AppId> for ReaderApp {
 
         let _attempted_recent = self.recent_dirty;
         let _attempted_stats = self.stats_dirty;
-        pulp_kernel::perf_begin!(_fd_t0);
+        plump_kernel::perf_begin!(_fd_t0);
 
         let mut first_error = None;
 
@@ -2507,7 +2507,7 @@ impl App<AppId> for ReaderApp {
         }
 
         let _ok = first_error.is_none();
-        pulp_kernel::perf_event!(
+        plump_kernel::perf_event!(
             "reader",
             "flush_deferred reason={} force={} state={:?} recent={} stats={} ok={} elapsed_ms={}",
             reason.as_str(),

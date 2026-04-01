@@ -1,4 +1,4 @@
-// system configuration: key=value text in _PULP/SETTINGS.TXT
+// system configuration: key=value text in _PLUMP/SETTINGS.TXT
 //
 // SystemSettings and WifiConfig are kernel-owned configuration;
 // the SettingsApp in apps/ provides the UI for editing them
@@ -357,7 +357,7 @@ impl SystemSettings {
     /// Serialize self + wifi config to SETTINGS.TXT format.
     pub fn write_txt(&self, w: &WifiConfig, buf: &mut [u8]) -> usize {
     let mut wr = TxtWriter::new(buf);
-    wr.put(b"# pulp-os settings\n");
+    wr.put(b"# plump settings\n");
     wr.put(b"# lines starting with # are ignored\n\n");
 
     wr.put(b"# power settings\n");

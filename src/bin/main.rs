@@ -13,27 +13,27 @@ use esp_hal::ram;
 use esp_hal::timer::timg::TimerGroup;
 use log::info;
 
-use pulp_os::apps::Launcher;
-use pulp_os::apps::files::FilesApp;
-use pulp_os::apps::home::HomeApp;
-use pulp_os::apps::manager::AppManager;
-use pulp_os::apps::reader::ReaderApp;
-use pulp_os::apps::settings::SettingsApp;
-use pulp_os::apps::stats::StatsApp;
-use pulp_os::apps::widgets::{ButtonFeedback, QuickMenu};
-use pulp_os::board::action::ButtonMapper;
-use pulp_os::board::{Board, speed_up_spi};
-use pulp_os::drivers::battery;
-use pulp_os::drivers::input::InputDriver;
-use pulp_os::drivers::sdcard::SdStorage;
-use pulp_os::drivers::strip::StripBuffer;
-use pulp_os::kernel::BookmarkCache;
-use pulp_os::kernel::BootConsole;
-use pulp_os::kernel::Kernel;
-use pulp_os::kernel::dir_cache::DirCache;
-use pulp_os::kernel::tasks;
-use pulp_os::kernel::work_queue;
-use pulp_os::ui::paint_stack;
+use plump::apps::Launcher;
+use plump::apps::files::FilesApp;
+use plump::apps::home::HomeApp;
+use plump::apps::manager::AppManager;
+use plump::apps::reader::ReaderApp;
+use plump::apps::settings::SettingsApp;
+use plump::apps::stats::StatsApp;
+use plump::apps::widgets::{ButtonFeedback, QuickMenu};
+use plump::board::action::ButtonMapper;
+use plump::board::{Board, speed_up_spi};
+use plump::drivers::battery;
+use plump::drivers::input::InputDriver;
+use plump::drivers::sdcard::SdStorage;
+use plump::drivers::strip::StripBuffer;
+use plump::kernel::BookmarkCache;
+use plump::kernel::BootConsole;
+use plump::kernel::Kernel;
+use plump::kernel::dir_cache::DirCache;
+use plump::kernel::tasks;
+use plump::kernel::work_queue;
+use plump::ui::paint_stack;
 use static_cell::{ConstStaticCell, StaticCell};
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -67,7 +67,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64_000);
 
     let mut console = alloc::boxed::Box::new(BootConsole::new());
-    console.push("pulp-os 0.1.0");
+    console.push("plump 0.1.0");
     console.push("esp32c3 rv32imc 160mhz");
     console.push("heap: 172K (108K + 64K reclaimed)");
 
@@ -112,9 +112,9 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let sd_ok = sd.probe_ok();
     if sd_ok {
         console.push("sd: fat32 mounted");
-        if let Err(e) = sd.ensure_pulp_dir_async().await {
-            console.push("sd: pulp dir failed");
-            log::warn!("ensure_pulp_dir: {:?}", e);
+        if let Err(e) = sd.ensure_plump_dir_async().await {
+            console.push("sd: plump dir failed");
+            log::warn!("ensure_plump_dir: {:?}", e);
         }
     }
 

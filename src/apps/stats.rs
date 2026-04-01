@@ -56,7 +56,7 @@ impl ReadingStats {
         let mut buf = [0u8; 128];
         let n = k
             .sd()
-            .read_chunk_in_pulp_subdir(STATS_DIR, filename, 0, &mut buf)
+            .read_chunk_in_plump_subdir(STATS_DIR, filename, 0, &mut buf)
             .ok()?;
         if n == 0 {
             return None;
@@ -85,9 +85,9 @@ impl ReadingStats {
         let s = fmt.as_str().as_bytes();
         let len = s.len().min(buf.len());
         buf[..len].copy_from_slice(&s[..len]);
-        k.sd().ensure_pulp_subdir(STATS_DIR)?;
+        k.sd().ensure_plump_subdir(STATS_DIR)?;
         k.sd()
-            .write_in_pulp_subdir(STATS_DIR, filename, &buf[..len])
+            .write_in_plump_subdir(STATS_DIR, filename, &buf[..len])
     }
 
     /// Returns true if all fields are zero.
@@ -296,7 +296,7 @@ impl StatsApp {
             let fname = entry.name_str();
 
             // try to load stats for this file
-            let n = match k.sd().read_chunk_in_pulp_subdir(STATS_DIR, fname, 0, &mut buf) {
+            let n = match k.sd().read_chunk_in_plump_subdir(STATS_DIR, fname, 0, &mut buf) {
                 Ok(n) if n > 0 => n,
                 _ => continue,
             };

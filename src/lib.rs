@@ -1,13 +1,13 @@
-// pulp-os - e-reader firmware for the XTEink X4
+// plump - e-reader firmware for the XTEink X4
 
 #![no_std]
 
 extern crate alloc;
 
-pub use pulp_kernel::board;
-pub use pulp_kernel::drivers;
-pub use pulp_kernel::error;
-pub use pulp_kernel::kernel;
+pub use plump_kernel::board;
+pub use plump_kernel::drivers;
+pub use plump_kernel::error;
+pub use plump_kernel::kernel;
 
 pub mod apps;
 pub mod fonts;

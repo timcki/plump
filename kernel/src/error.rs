@@ -1,4 +1,4 @@
-// unified error type for pulp-os
+// unified error type for plump
 //
 // single Copy type carrying ErrorKind (what) and a &'static str
 // source tag (where); smol-epub boundary converts via From impls

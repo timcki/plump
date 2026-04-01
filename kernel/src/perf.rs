@@ -1,4 +1,4 @@
-//! Feature-gated performance instrumentation for pulp-os.
+//! Feature-gated performance instrumentation for plump.
 //!
 //! All macros compile to nothing when the `perf` cargo feature is disabled.
 //! When enabled, they emit structured `key=value` logs via `log::info!`
@@ -64,9 +64,9 @@
 //! per-scope summaries inside `perf_event!`:
 //!
 //! ```ignore
-//! let snap = pulp_kernel::perf::counters::snapshot();
+//! let snap = plump_kernel::perf::counters::snapshot();
 //! // ... work ...
-//! let d = pulp_kernel::perf::counters::delta(&snap);
+//! let d = plump_kernel::perf::counters::delta(&snap);
 //! perf_event!("storage", "page_load reads={} bytes_r={}", d.sd_reads, d.sd_bytes_read);
 //! ```
 

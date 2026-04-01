@@ -1,4 +1,4 @@
-// wifi upload server: HTTP file upload + mDNS (pulp.local)
+// wifi upload server: HTTP file upload + mDNS (plump.local)
 
 use alloc::string::String;
 use core::fmt::Write as FmtWrite;
@@ -48,14 +48,14 @@ const UPLOAD_PAGE: &[u8] = include_bytes!("../../assets/upload.html");
 
 const MDNS_PORT: u16 = 5353;
 
-// "pulp.local" in DNS wire format: length-prefixed labels + NUL
-const HOSTNAME_WIRE: [u8; 12] = [
-    4, b'p', b'u', b'l', b'p', //
+// "plump.local" in DNS wire format: length-prefixed labels + NUL
+const HOSTNAME_WIRE: [u8; 13] = [
+    5, b'p', b'l', b'u', b'm', b'p', //
     5, b'l', b'o', b'c', b'a', b'l', //
     0,
 ];
 
-const MDNS_RESPONSE_LEN: usize = 38;
+const MDNS_RESPONSE_LEN: usize = 39;
 
 const MAX_BOUNDARY_LEN: usize = 120;
 const WORK_BUF_SIZE: usize = 4096;
@@ -290,7 +290,7 @@ pub async fn run_upload_mode(
     let ip_str = core::str::from_utf8(&ip_buf[..ip_len]).unwrap_or("???");
 
     info!(
-        "upload: serving at http://pulp.local/  ({})",
+        "upload: serving at http://plump.local/  ({})",
         core::str::from_utf8(&ip_buf[1..ip_len.saturating_sub(1)]).unwrap_or("?")
     );
     log_heap("server ready");
@@ -301,7 +301,7 @@ pub async fn run_upload_mode(
         delay,
         heading,
         body,
-        &["http://pulp.local/", ip_str],
+        &["http://plump.local/", ip_str],
         Some("Press BACK to exit"),
         bumps,
         false,
@@ -898,11 +898,11 @@ async fn mdns_respond_once(stack: embassy_net::Stack<'_>, ip_octets: [u8; 4]) {
         Err(_) => return,
     };
 
-    if !is_mdns_query_for_pulp(&pkt[..n]) {
+    if !is_mdns_query_for_plump(&pkt[..n]) {
         return;
     }
 
-    debug!("upload: mDNS query for pulp.local -- responding");
+    debug!("upload: mDNS query for plump.local -- responding");
 
     let mut resp = [0u8; MDNS_RESPONSE_LEN];
     let len = build_mdns_response(&mut resp, ip_octets);
@@ -914,8 +914,8 @@ async fn mdns_respond_once(stack: embassy_net::Stack<'_>, ip_octets: [u8; 4]) {
     let _ = socket.send_to(&resp[..len], mdns_dest).await;
 }
 
-fn is_mdns_query_for_pulp(pkt: &[u8]) -> bool {
-    if pkt.len() < 28 {
+fn is_mdns_query_for_plump(pkt: &[u8]) -> bool {
+    if pkt.len() < 29 {
         return false;
     }
 
@@ -929,19 +929,19 @@ fn is_mdns_query_for_pulp(pkt: &[u8]) -> bool {
         return false;
     }
 
-    let qname = &pkt[12..24];
-    if qname[0] != 4 || qname[5] != 5 || qname[11] != 0 {
+    let qname = &pkt[12..25];
+    if qname[0] != 5 || qname[6] != 5 || qname[12] != 0 {
         return false;
     }
-    if !qname[1..5].eq_ignore_ascii_case(b"pulp") {
+    if !qname[1..6].eq_ignore_ascii_case(b"plump") {
         return false;
     }
-    if !qname[6..11].eq_ignore_ascii_case(b"local") {
+    if !qname[7..12].eq_ignore_ascii_case(b"local") {
         return false;
     }
 
-    let qtype = u16::from_be_bytes([pkt[24], pkt[25]]);
-    let qclass = u16::from_be_bytes([pkt[26], pkt[27]]) & 0x7FFF;
+    let qtype = u16::from_be_bytes([pkt[25], pkt[26]]);
+    let qclass = u16::from_be_bytes([pkt[27], pkt[28]]) & 0x7FFF;
 
     (qtype == 1 || qtype == 255) && qclass == 1
 }
@@ -956,12 +956,12 @@ fn build_mdns_response(buf: &mut [u8], ip: [u8; 4]) -> usize {
     r[8..10].copy_from_slice(&[0x00, 0x00]);
     r[10..12].copy_from_slice(&[0x00, 0x00]);
 
-    r[12..24].copy_from_slice(&HOSTNAME_WIRE);
-    r[24..26].copy_from_slice(&[0x00, 0x01]);
-    r[26..28].copy_from_slice(&[0x80, 0x01]);
-    r[28..32].copy_from_slice(&[0x00, 0x00, 0x00, 0x78]);
-    r[32..34].copy_from_slice(&[0x00, 0x04]);
-    r[34..38].copy_from_slice(&ip);
+    r[12..25].copy_from_slice(&HOSTNAME_WIRE);
+    r[25..27].copy_from_slice(&[0x00, 0x01]);
+    r[27..29].copy_from_slice(&[0x80, 0x01]);
+    r[29..33].copy_from_slice(&[0x00, 0x00, 0x00, 0x78]);
+    r[33..35].copy_from_slice(&[0x00, 0x04]);
+    r[35..39].copy_from_slice(&ip);
 
     MDNS_RESPONSE_LEN
 }

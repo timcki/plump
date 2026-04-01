@@ -1,4 +1,4 @@
-pulp-os -- e-reader firmware for the XTEink X4
+plump -- e-reader firmware for the XTEink X4
 
 bare-metal e-reader operating system for the XTEink X4 board
 (ESP32-C3 + SSD1677 e-paper). written in Rust. no std, no
@@ -49,7 +49,7 @@ features
                     scanner (resolves titles from OPF metadata)
     bookmarks       16-slot LRU in RAM, flushed to SD every 30 s;
                     home screen bookmarks browser sorted by recency
-    wifi upload     HTTP file upload + mDNS (pulp.local);
+    wifi upload     HTTP file upload + mDNS (plump.local);
                     drag-and-drop web UI with delete support
     fonts           regular/bold/italic TTFs rasterised at build time
                     via fontdue; five sizes, book and UI independently
@@ -83,7 +83,7 @@ runtime
     CPU sleeps (WFI) whenever all tasks are waiting.
 
 directory layout
-    kernel/                 pulp-kernel workspace crate (zero app imports)
+    kernel/                 plump-kernel workspace crate (zero app imports)
       src/
         lib.rs              crate root, re-exports
         kernel/
@@ -227,7 +227,7 @@ design notes
     saved on change. font size changes propagate to all apps.
 
     wifi upload. bypasses normal dispatch. HTTP server on port 80,
-    mDNS on 5353 (pulp.local). multipart upload with 8.3 filename
+    mDNS on 5353 (plump.local). multipart upload with 8.3 filename
     sanitisation. radio torn down before returning to app loop.
 
     memory budget. ~172 KB heap for epub text and image decode

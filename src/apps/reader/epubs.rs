@@ -36,7 +36,7 @@ impl smol_epub::async_io::AsyncWriteChunk for CellWriter<'_, '_> {
     async fn write_chunk(&mut self, data: &[u8]) -> Result<(), &'static str> {
         self.0
             .borrow_mut()
-            .sd().append_in_pulp(self.1, data)
+            .sd().append_in_plump(self.1, data)
             .map_err(|e: Error| -> &'static str { e.into() })
     }
 }
@@ -100,7 +100,7 @@ impl EpubState {
 
         // try reading v3 header
         let hdr_cap = cache::HEADER_SIZE.min(scratch.len());
-        if let Ok(n) = k.sd().read_chunk_in_pulp(cf_str, 0, &mut scratch[..hdr_cap])
+        if let Ok(n) = k.sd().read_chunk_in_plump(cf_str, 0, &mut scratch[..hdr_cap])
             && n >= cache::HEADER_SIZE
         {
             let hdr_buf: &[u8; cache::HEADER_SIZE] =
@@ -121,7 +121,7 @@ impl EpubState {
                     let tbl_offset = hdr.table_offset();
                     if tbl_bytes <= scratch.len() {
                         if let Ok(tn) =
-                            k.sd().read_chunk_in_pulp(cf_str, tbl_offset, &mut scratch[..tbl_bytes])
+                            k.sd().read_chunk_in_plump(cf_str, tbl_offset, &mut scratch[..tbl_bytes])
                             && tn >= tbl_bytes
                         {
                             if cache::parse_chapter_table(
@@ -138,7 +138,7 @@ impl EpubState {
                                 // ensure image subdir exists for skip markers
                                 let dir_buf = self.cache_dir;
                                 let dir = cache::dir_name_str(&dir_buf);
-                                let _ = k.sd().ensure_pulp_subdir(dir);
+                                let _ = k.sd().ensure_plump_subdir(dir);
                                 log::info!("epub: v3 cache hit ({} chapters)", count);
                                 return Ok(true);
                             }
@@ -152,7 +152,7 @@ impl EpubState {
         // ensure image subdir exists (images stay in _PULP/_XXXXXXX/)
         let dir_buf = self.cache_dir;
         let dir = cache::dir_name_str(&dir_buf);
-        k.sd().ensure_pulp_subdir(dir)?;
+        k.sd().ensure_plump_subdir(dir)?;
         self.cache_chapter = 0;
         Ok(false)
     }
@@ -184,7 +184,7 @@ impl EpubState {
 
         let mut hdr_buf = [0u8; cache::HEADER_SIZE];
         cache::encode_v3_header(&hdr, &mut hdr_buf);
-        k.sd().write_at_in_pulp(cf_str, 0, &hdr_buf)?;
+        k.sd().write_at_in_plump(cf_str, 0, &hdr_buf)?;
 
         // write chapter table
         let tbl_size = spine_len * cache::CHAPTER_ENTRY_SIZE;
@@ -193,7 +193,7 @@ impl EpubState {
         for i in 0..spine_len {
             cache::encode_chapter_table(&self.chapter_table[i..i + 1], &mut tbl_buf);
             let offset = cache::HEADER_SIZE as u32 + (i * cache::CHAPTER_ENTRY_SIZE) as u32;
-            k.sd().write_at_in_pulp(cf_str, offset, &tbl_buf[..cache::CHAPTER_ENTRY_SIZE])?;
+            k.sd().write_at_in_plump(cf_str, offset, &tbl_buf[..cache::CHAPTER_ENTRY_SIZE])?;
         }
         let _ = tbl_size; // used for clarity above
 
@@ -223,7 +223,7 @@ impl EpubState {
         // with a placeholder header + empty chapter table so appends
         // start at the correct data offset.  ch may not be 0 when a
         // bookmark restores the reader to a later chapter.
-        if !self.chapters_cached && k.sd().file_size_in_pulp(cf_str).is_err() {
+        if !self.chapters_cached && k.sd().file_size_in_plump(cf_str).is_err() {
             let spine_len = self.spine.len();
             let mut init_buf = [0u8; cache::HEADER_SIZE];
             // write a minimal header (will be overwritten by finish_cache)
@@ -233,20 +233,20 @@ impl EpubState {
             hdr.epub_size = self.archive_size;
             hdr.name_hash = self.name_hash;
             cache::encode_v3_header(&hdr, &mut init_buf);
-            k.sd().write_in_pulp(cf_str, &init_buf)?;
+            k.sd().write_in_plump(cf_str, &init_buf)?;
             // pad with zeroes for the chapter table
             let tbl_size = spine_len * cache::CHAPTER_ENTRY_SIZE;
             let zeros = [0u8; 64];
             let mut remaining = tbl_size;
             while remaining > 0 {
                 let chunk = remaining.min(zeros.len());
-                k.sd().append_in_pulp(cf_str, &zeros[..chunk])?;
+                k.sd().append_in_plump(cf_str, &zeros[..chunk])?;
                 remaining -= chunk;
             }
         }
 
         // record the offset where this chapter's data starts
-        let ch_offset = k.sd().file_size_in_pulp(cf_str)?;
+        let ch_offset = k.sd().file_size_in_plump(cf_str)?;
         self.chapter_table[ch].0 = ch_offset;
 
         let k_cell = RefCell::new(&mut *k);
@@ -312,7 +312,7 @@ impl EpubState {
         let mut pos = 0usize;
         while pos < ch_size {
             let chunk = (ch_size - pos).min(PAGE_BUF);
-            match k.sd().read_chunk_in_pulp(
+            match k.sd().read_chunk_in_plump(
                 cf_str,
                 ch_off + pos as u32,
                 &mut self.ch_cache[pos..pos + chunk],
@@ -347,7 +347,7 @@ impl ReaderApp {
         let cf_str = cache::cache_filename_str(&cf);
         let mut hdr_buf = [0u8; cache::HEADER_SIZE];
 
-        let Ok(n) = k.sd().read_chunk_in_pulp(cf_str, 0, &mut hdr_buf) else {
+        let Ok(n) = k.sd().read_chunk_in_plump(cf_str, 0, &mut hdr_buf) else {
             return false;
         };
         if n < cache::HEADER_SIZE {
@@ -471,7 +471,7 @@ impl ReaderApp {
 
         // ensure the per-book cache directory exists (cover generation
         // runs before NeedCache which normally creates it)
-        if k.sd().ensure_pulp_subdir(dir).is_err() {
+        if k.sd().ensure_plump_subdir(dir).is_err() {
             log::warn!("epub: failed to create cache dir for cover thumb");
             return;
         }

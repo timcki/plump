@@ -165,10 +165,10 @@ impl ReaderApp {
         &mut self,
         k: &mut KernelHandle<'_>,
     ) -> crate::error::Result<()> {
-        pulp_kernel::perf_begin!(_lp_t0);
+        plump_kernel::perf_begin!(_lp_t0);
 
         if !self.epub.ch_cache.is_empty() {
-            pulp_kernel::perf_begin!(_t_read);
+            plump_kernel::perf_begin!(_t_read);
             let start = (self.pg.offsets[self.pg.page] as usize).min(self.epub.ch_cache.len());
             let end = (start + PAGE_BUF).min(self.epub.ch_cache.len());
             let n = end - start;
@@ -178,41 +178,41 @@ impl ReaderApp {
             self.pg.buf_len = n;
             self.pg.prefetch_page = NO_PREFETCH;
             self.pg.prefetch_len = 0;
-            pulp_kernel::perf_event!(
+            plump_kernel::perf_event!(
                 "reader",
                 "load_prefetch.read src=ch_cache bytes={} elapsed_ms={}",
                 n,
                 _t_read.elapsed().as_millis()
             );
 
-            pulp_kernel::perf_begin!(_t_prescan);
+            plump_kernel::perf_begin!(_t_prescan);
             self.prescan_image_heights(k, n);
-            pulp_kernel::perf_event!(
+            plump_kernel::perf_event!(
                 "reader",
                 "load_prefetch.prescan bytes={} elapsed_ms={}",
                 n,
                 _t_prescan.elapsed().as_millis()
             );
 
-            pulp_kernel::perf_begin!(_t_wrap);
+            plump_kernel::perf_begin!(_t_wrap);
             self.wrap_lines_counted(n);
             self.precompute_line_metrics();
-            pulp_kernel::perf_event!(
+            plump_kernel::perf_event!(
                 "reader",
                 "load_prefetch.wrap+metrics lines={} elapsed_ms={}",
                 self.pg.line_count,
                 _t_wrap.elapsed().as_millis()
             );
 
-            pulp_kernel::perf_begin!(_t_decode);
+            plump_kernel::perf_begin!(_t_decode);
             self.decode_page_images(k);
-            pulp_kernel::perf_event!(
+            plump_kernel::perf_event!(
                 "reader",
                 "load_prefetch.decode elapsed_ms={}",
                 _t_decode.elapsed().as_millis()
             );
 
-            pulp_kernel::perf_event!(
+            plump_kernel::perf_event!(
                 "reader",
                 "load_prefetch page={} src=ch_cache bytes={} lines={} elapsed_ms={}",
                 self.pg.page,
@@ -227,7 +227,7 @@ impl ReaderApp {
         let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
 
         // -- read stage --
-        pulp_kernel::perf_begin!(_t_read);
+        plump_kernel::perf_begin!(_t_read);
         let mut _read_src = "sd";
         if self.pg.prefetch_page == self.pg.page {
             _read_src = "prefetch";
@@ -241,7 +241,7 @@ impl ReaderApp {
             let cf_str = self.epub.cache_file_str();
             let ch = self.epub.chapter as usize;
             let ch_base = self.epub.chapter_table[ch].0;
-            let n = k.sd().read_chunk_in_pulp(
+            let n = k.sd().read_chunk_in_plump(
                 cf_str,
                 ch_base + self.pg.offsets[self.pg.page],
                 &mut self.pg.buf,
@@ -263,7 +263,7 @@ impl ReaderApp {
             let n = k.sd().read_file_chunk(name, self.pg.offsets[self.pg.page], &mut self.pg.buf)?;
             self.pg.buf_len = n;
         }
-        pulp_kernel::perf_event!(
+        plump_kernel::perf_event!(
             "reader",
             "load_prefetch.read src={} bytes={} elapsed_ms={}",
             _read_src,
@@ -272,19 +272,19 @@ impl ReaderApp {
         );
 
         // -- prescan + wrap stages --
-        pulp_kernel::perf_begin!(_t_prescan);
+        plump_kernel::perf_begin!(_t_prescan);
         self.prescan_image_heights(k, self.pg.buf_len);
-        pulp_kernel::perf_event!(
+        plump_kernel::perf_event!(
             "reader",
             "load_prefetch.prescan bytes={} elapsed_ms={}",
             self.pg.buf_len,
             _t_prescan.elapsed().as_millis()
         );
 
-        pulp_kernel::perf_begin!(_t_wrap);
+        plump_kernel::perf_begin!(_t_wrap);
         let consumed = self.wrap_lines_counted(self.pg.buf_len);
         self.precompute_line_metrics();
-        pulp_kernel::perf_event!(
+        plump_kernel::perf_event!(
             "reader",
             "load_prefetch.wrap+metrics lines={} consumed={} elapsed_ms={}",
             self.pg.line_count,
@@ -308,7 +308,7 @@ impl ReaderApp {
         }
 
         // -- prefetch stage --
-        pulp_kernel::perf_begin!(_t_pf);
+        plump_kernel::perf_begin!(_t_pf);
         if self.pg.page + 1 < self.pg.total_pages {
             if self.pg.prefetch.len() < PAGE_BUF {
                 self.pg.prefetch.resize(PAGE_BUF, 0);
@@ -318,7 +318,7 @@ impl ReaderApp {
                 let cf_str = self.epub.cache_file_str();
                 let ch = self.epub.chapter as usize;
                 let ch_base = self.epub.chapter_table[ch].0;
-                k.sd().read_chunk_in_pulp(cf_str, ch_base + pf_offset, &mut self.pg.prefetch)
+                k.sd().read_chunk_in_plump(cf_str, ch_base + pf_offset, &mut self.pg.prefetch)
             } else {
                 k.sd().read_file_chunk(name, pf_offset, &mut self.pg.prefetch)
             };
@@ -336,7 +336,7 @@ impl ReaderApp {
             self.pg.prefetch_page = NO_PREFETCH;
             self.pg.prefetch_len = 0;
         }
-        pulp_kernel::perf_event!(
+        plump_kernel::perf_event!(
             "reader",
             "load_prefetch.prefetch did_prefetch={} elapsed_ms={}",
             self.pg.prefetch_page != NO_PREFETCH,
@@ -344,15 +344,15 @@ impl ReaderApp {
         );
 
         // -- decode stage --
-        pulp_kernel::perf_begin!(_t_decode);
+        plump_kernel::perf_begin!(_t_decode);
         self.decode_page_images(k);
-        pulp_kernel::perf_event!(
+        plump_kernel::perf_event!(
             "reader",
             "load_prefetch.decode elapsed_ms={}",
             _t_decode.elapsed().as_millis()
         );
 
-        pulp_kernel::perf_event!(
+        plump_kernel::perf_event!(
             "reader",
             "load_prefetch page={} src={} bytes={} lines={} elapsed_ms={}",
             self.pg.page,
@@ -369,7 +369,7 @@ impl ReaderApp {
             return;
         }
 
-        pulp_kernel::perf_begin!(_pi_t0);
+        plump_kernel::perf_begin!(_pi_t0);
         let total = self.epub.ch_cache.len();
         self.pg.offsets[0] = 0;
         self.pg.total_pages = 1;
@@ -396,7 +396,7 @@ impl ReaderApp {
 
         self.pg.fully_indexed = true;
         log::debug!("chapter pre-indexed: {} pages", self.pg.total_pages);
-        pulp_kernel::perf_event!(
+        plump_kernel::perf_event!(
             "reader",
             "preindex_all_pages pages={} ch_bytes={} elapsed_ms={}",
             self.pg.total_pages,
@@ -681,7 +681,7 @@ pub(super) fn measure_line(
     LineMeasure { width, gaps }
 }
 
-// UTF-8 decoding is provided by pulp_kernel::util::decode_utf8_char
+// UTF-8 decoding is provided by plump_kernel::util::decode_utf8_char
 // (re-exported via super::decode_utf8_char)
 
 pub(super) fn trim_trailing_cr(buf: &[u8], start: usize, end: usize) -> usize {

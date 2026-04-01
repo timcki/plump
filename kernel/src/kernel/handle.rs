@@ -57,7 +57,7 @@ impl<'k> KernelHandle<'k> {
     {
         let sd = self.sd();
         let mut reader = |name: &str, offset: u32, buf: &mut [u8]| {
-            sd.read_chunk_in_pulp_subdir(dir, name, offset, buf)
+            sd.read_chunk_in_plump_subdir(dir, name, offset, buf)
                 .map_err(|e: Error| -> &'static str { e.into() })
         };
         f(&mut reader)

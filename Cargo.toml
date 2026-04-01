@@ -22,23 +22,23 @@ esp-alloc = { version = "0.9.0", features = ["internal-heap-stats"] }
 
 [package]
 edition      = "2024"
-name         = "pulp-os"
+name         = "plump"
 rust-version = "1.88"
 version      = "0.1.0"
 authors      = ["Hans Martin <https://github.com/hansmrtn>"]
-repository   = "https://github.com/hansmrtn/pulp-os"
+repository   = "https://github.com/hansmrtn/plump"
 license      = "MIT"
 
 [features]
 default = []
-perf = ["pulp-kernel/perf"]
+perf = ["plump-kernel/perf"]
 
 [[bin]]
-name = "pulp-os"
+name = "plump"
 path = "./src/bin/main.rs"
 
 [dependencies]
-pulp-kernel = { path = "kernel" }
+plump-kernel = { path = "kernel" }
 
 esp-hal.workspace              = true
 embassy-executor.workspace     = true

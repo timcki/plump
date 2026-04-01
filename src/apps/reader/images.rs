@@ -434,7 +434,7 @@ impl ReaderApp {
         let mut offset = start_offset;
         while offset < ch_size {
             let read_len = PAGE_BUF.min(ch_size - offset);
-            let n = k.sd().read_chunk_in_pulp(
+            let n = k.sd().read_chunk_in_plump(
                 cf_str,
                 ch_base + offset as u32,
                 &mut self.pg.prefetch[..read_len],
@@ -489,7 +489,7 @@ impl ReaderApp {
                 let resume = (offset + path_start + path_len) as u32;
 
                 // already cached or skip-marked
-                if k.sd().file_size_in_pulp_subdir(dir, img_file).is_ok() {
+                if k.sd().file_size_in_plump_subdir(dir, img_file).is_ok() {
                     self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
                     self.epub.img_cached_count = self.epub.img_cached_count.saturating_add(1);
                     i = path_start + path_len;
@@ -501,7 +501,7 @@ impl ReaderApp {
 
                 if !is_jpeg && !is_png {
                     log::info!("precache: skip unsupported: {}", full_path);
-                    let _ = k.sd().write_in_pulp_subdir(dir, img_file, &[]);
+                    let _ = k.sd().write_in_plump_subdir(dir, img_file, &[]);
                     self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
                     self.epub.img_cached_count = self.epub.img_cached_count.saturating_add(1);
                     i = path_start + path_len;
@@ -531,7 +531,7 @@ impl ReaderApp {
                 // remaining large images so the device stays responsive
                 if entry.uncomp_size > PRECACHE_IMG_MAX {
                     if self.epub.skip_large_img {
-                        let _ = k.sd().write_in_pulp_subdir(dir, img_file, &[]);
+                        let _ = k.sd().write_in_plump_subdir(dir, img_file, &[]);
                         self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
                         self.epub.img_cached_count = self.epub.img_cached_count.saturating_add(1);
                         i = path_start + path_len;
@@ -561,7 +561,7 @@ impl ReaderApp {
                         }
                         Err(e) => {
                             log::warn!("precache: streaming failed: {}", e);
-                            let _ = k.sd().write_in_pulp_subdir(dir, img_file, &[]);
+                            let _ = k.sd().write_in_plump_subdir(dir, img_file, &[]);
                             // stop trying large images this session
                             self.epub.skip_large_img = true;
                         }
@@ -588,7 +588,7 @@ impl ReaderApp {
                     Ok(d) => d,
                     Err(e) => {
                         log::warn!("precache: extract failed: {}", e);
-                        let _ = k.sd().write_in_pulp_subdir(dir, img_file, &[]);
+                        let _ = k.sd().write_in_plump_subdir(dir, img_file, &[]);
                         self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
                         self.epub.img_cached_count = self.epub.img_cached_count.saturating_add(1);
                         i = path_start + path_len;
@@ -840,7 +840,7 @@ pub(super) fn load_cached_image(
     dir: &str,
     name: &str,
 ) -> crate::error::Result<DecodedImage> {
-    let size = k.sd().file_size_in_pulp_subdir(dir, name)?;
+    let size = k.sd().file_size_in_plump_subdir(dir, name)?;
     if size < 5 {
         return Err(Error::new(
             ErrorKind::InvalidData,
@@ -848,7 +848,7 @@ pub(super) fn load_cached_image(
         ));
     }
     let mut header = [0u8; 4];
-    k.sd().read_chunk_in_pulp_subdir(dir, name, 0, &mut header)?;
+    k.sd().read_chunk_in_plump_subdir(dir, name, 0, &mut header)?;
     let width = u16::from_le_bytes([header[0], header[1]]);
     let height = u16::from_le_bytes([header[2], header[3]]);
     if width == 0 || height == 0 {
@@ -869,7 +869,7 @@ pub(super) fn load_cached_image(
     data.try_reserve_exact(data_len)
         .map_err(|_| Error::new(ErrorKind::OutOfMemory, "load_cached_image"))?;
     data.resize(data_len, 0);
-    k.sd().read_chunk_in_pulp_subdir(dir, name, 4, &mut data)?;
+    k.sd().read_chunk_in_plump_subdir(dir, name, 4, &mut data)?;
     Ok(DecodedImage {
         width,
         height,
@@ -883,12 +883,12 @@ pub(super) fn load_cached_image(
 // returns None if the file doesn't exist, is too small, or has
 // zero dimensions.
 fn peek_cached_image_size(k: &mut KernelHandle<'_>, dir: &str, name: &str) -> Option<(u16, u16)> {
-    let size = k.sd().file_size_in_pulp_subdir(dir, name).ok()?;
+    let size = k.sd().file_size_in_plump_subdir(dir, name).ok()?;
     if size < 5 {
         return None;
     }
     let mut hdr = [0u8; 4];
-    k.sd().read_chunk_in_pulp_subdir(dir, name, 0, &mut hdr).ok()?;
+    k.sd().read_chunk_in_plump_subdir(dir, name, 0, &mut hdr).ok()?;
     let w = u16::from_le_bytes([hdr[0], hdr[1]]);
     let h = u16::from_le_bytes([hdr[2], hdr[3]]);
     if w == 0 || h == 0 {
@@ -999,7 +999,7 @@ pub(super) fn save_cached_image(
     let mut header = [0u8; 4];
     header[0..2].copy_from_slice(&img.width.to_le_bytes());
     header[2..4].copy_from_slice(&img.height.to_le_bytes());
-    k.sd().write_in_pulp_subdir(dir, name, &header)?;
-    k.sd().append_in_pulp_subdir(dir, name, &img.data)?;
+    k.sd().write_in_plump_subdir(dir, name, &header)?;
+    k.sd().append_in_plump_subdir(dir, name, &img.data)?;
     Ok(())
 }

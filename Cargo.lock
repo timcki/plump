@@ -1233,6 +1233,53 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b3cff922bd51709b605d9ead9aa71031d81447142d828eb4a6eba76fe619f9b"
 
 [[package]]
+name = "plump"
+version = "0.1.0"
+dependencies = [
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-net",
+ "embassy-time",
+ "embedded-graphics",
+ "embedded-graphics-core",
+ "embedded-io-async 0.7.0",
+ "esp-alloc",
+ "esp-backtrace",
+ "esp-bootloader-esp-idf",
+ "esp-hal",
+ "esp-println",
+ "esp-radio",
+ "esp-rtos",
+ "fontdue",
+ "log",
+ "plump-kernel",
+ "smol-epub",
+ "static_cell",
+]
+
+[[package]]
+name = "plump-kernel"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-sync 0.7.2",
+ "embassy-time",
+ "embedded-graphics",
+ "embedded-graphics-core",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "embedded-hal-bus",
+ "embedded-sdmmc",
+ "esp-alloc",
+ "esp-hal",
+ "log",
+ "nb 1.1.0",
+ "static_cell",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1284,53 +1331,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "pulp-kernel"
-version = "0.1.0"
-dependencies = [
- "critical-section",
- "embassy-executor",
- "embassy-futures",
- "embassy-sync 0.7.2",
- "embassy-time",
- "embedded-graphics",
- "embedded-graphics-core",
- "embedded-hal 1.0.0",
- "embedded-hal-async",
- "embedded-hal-bus",
- "embedded-sdmmc",
- "esp-alloc",
- "esp-hal",
- "log",
- "nb 1.1.0",
- "static_cell",
-]
-
-[[package]]
-name = "pulp-os"
-version = "0.1.0"
-dependencies = [
- "embassy-executor",
- "embassy-futures",
- "embassy-net",
- "embassy-time",
- "embedded-graphics",
- "embedded-graphics-core",
- "embedded-io-async 0.7.0",
- "esp-alloc",
- "esp-backtrace",
- "esp-bootloader-esp-idf",
- "esp-hal",
- "esp-println",
- "esp-radio",
- "esp-rtos",
- "fontdue",
- "log",
- "pulp-kernel",
- "smol-epub",
- "static_cell",
 ]
 
 [[package]]
