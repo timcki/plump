@@ -36,7 +36,8 @@ pub type NavEvent = crate::kernel::app::NavEvent<AppId>;
 pub type Launcher = crate::kernel::app::Launcher<AppId>;
 
 pub use crate::kernel::app::{
-    App, AppContext, DeferredPersistenceReason, PendingSetting, RECENT_FILE, Redraw,
+    App, AppContext, BgBudget, BgOutcome, DeferredPersistenceReason, PendingSetting, RECENT_FILE,
+    Redraw,
 };
 
 // unified error types

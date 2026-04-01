@@ -8,7 +8,7 @@ use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::PrimitiveStyle;
 
-use crate::apps::{App, AppContext, AppId, Transition};
+use crate::apps::{App, AppContext, AppId, BgBudget, BgOutcome, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::storage::DirEntry;
@@ -312,7 +312,12 @@ impl App<AppId> for FilesApp {
         ));
     }
 
-    async fn background(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
+    fn background_step(
+        &mut self,
+        ctx: &mut AppContext,
+        k: &mut KernelHandle<'_>,
+        _budget: BgBudget,
+    ) -> BgOutcome {
         if self.pending_delete_file {
             self.pending_delete_file = false;
             if let Some(entry) = self.selected_entry() {
@@ -343,7 +348,9 @@ impl App<AppId> for FilesApp {
             }
             ctx.mark_dirty(self.list_region());
             ctx.mark_dirty(STATUS_REGION);
-            return;
+            return BgOutcome::Progress {
+                more: self.needs_load,
+            };
         }
 
         if self.pending_delete_cache {
@@ -364,7 +371,7 @@ impl App<AppId> for FilesApp {
                     }
                 }
             }
-            return;
+            return BgOutcome::Progress { more: false };
         }
 
         if self.needs_load {
@@ -392,7 +399,9 @@ impl App<AppId> for FilesApp {
                 ctx.mark_dirty(self.list_region());
                 ctx.mark_dirty(STATUS_REGION);
             }
-            return;
+            return BgOutcome::Progress {
+                more: self.title_scanning,
+            };
         }
 
         if self.title_scanning {
@@ -406,7 +415,12 @@ impl App<AppId> for FilesApp {
                 self.title_scanning = false;
                 log::debug!("titles: scan complete");
             }
+            return BgOutcome::Progress {
+                more: self.title_scanning || self.needs_load,
+            };
         }
+
+        BgOutcome::Idle
     }
 
     fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {

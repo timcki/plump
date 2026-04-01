@@ -1,12 +1,11 @@
 // epub init, chapter cache pipeline, and background cache state machine
 //
 // pure epub-state methods live on impl EpubState (init_zip,
-// check_cache, finish_cache, cache_chapter_async, try_cache_chapter).
+// check_cache, finish_cache, cache_chapter_begin/step, try_cache_chapter).
 // methods that also touch PageState or ReaderApp fields stay on
-// impl ReaderApp (epub_init_opf, epub_index_chapter, bg_cache_step).
+// impl ReaderApp (epub_init_opf, epub_index_chapter, bg_cache_step_sync).
 
 use alloc::vec::Vec;
-use core::cell::RefCell;
 
 use smol_epub::cache;
 use smol_epub::epub;
@@ -15,31 +14,8 @@ use crate::error::{Error, ErrorKind};
 use crate::kernel::KernelHandle;
 use crate::kernel::work_queue;
 
+use crate::apps::BgOutcome;
 use super::{BgCacheState, CHAPTER_CACHE_MAX, EOCD_TAIL, EpubState, PAGE_BUF, ReaderApp, ZipIndex};
-
-// one cell shared between reader and writer; safe because
-// stream_strip_entry_async never borrows both simultaneously
-struct CellReader<'a, 'k>(&'a RefCell<&'a mut KernelHandle<'k>>, &'a str);
-// CellWriter appends to a flat cache file in _PLUMP/ (v3 format)
-struct CellWriter<'a, 'k>(&'a RefCell<&'a mut KernelHandle<'k>>, &'a str);
-
-impl smol_epub::async_io::AsyncReadAt for CellReader<'_, '_> {
-    async fn read_at(&mut self, offset: u32, buf: &mut [u8]) -> Result<usize, &'static str> {
-        self.0
-            .borrow_mut()
-            .sd().read_file_chunk(self.1, offset, buf)
-            .map_err(|e: Error| -> &'static str { e.into() })
-    }
-}
-
-impl smol_epub::async_io::AsyncWriteChunk for CellWriter<'_, '_> {
-    async fn write_chunk(&mut self, data: &[u8]) -> Result<(), &'static str> {
-        self.0
-            .borrow_mut()
-            .sd().append_in_plump(self.1, data)
-            .map_err(|e: Error| -> &'static str { e.into() })
-    }
-}
 
 impl EpubState {
     pub(super) fn init_zip(
@@ -202,9 +178,8 @@ impl EpubState {
         Ok(false)
     }
 
-    // async streaming chapter cache: decompress, strip HTML, append to v3 flat file.
-    // tracks offset/size in chapter_table for random access reads.
-    pub(super) async fn cache_chapter_async(
+    /// Start caching chapter `ch`. Creates a StreamStripStep.
+    pub(super) fn cache_chapter_begin(
         &mut self,
         k: &mut KernelHandle<'_>,
         ch: usize,
@@ -226,7 +201,6 @@ impl EpubState {
         if !self.chapters_cached && k.sd().file_size_in_plump(cf_str).is_err() {
             let spine_len = self.spine.len();
             let mut init_buf = [0u8; cache::HEADER_SIZE];
-            // write a minimal header (will be overwritten by finish_cache)
             let mut hdr = cache::CacheHeader::empty();
             hdr.version = cache::CACHE_V3;
             hdr.chapter_count = spine_len as u16;
@@ -234,7 +208,6 @@ impl EpubState {
             hdr.name_hash = self.name_hash;
             cache::encode_v3_header(&hdr, &mut init_buf);
             k.sd().write_in_plump(cf_str, &init_buf)?;
-            // pad with zeroes for the chapter table
             let tbl_size = spine_len * cache::CHAPTER_ENTRY_SIZE;
             let zeros = [0u8; 64];
             let mut remaining = tbl_size;
@@ -249,31 +222,65 @@ impl EpubState {
         let ch_offset = k.sd().file_size_in_plump(cf_str)?;
         self.chapter_table[ch].0 = ch_offset;
 
-        let k_cell = RefCell::new(&mut *k);
-
-        let mut reader = CellReader(&k_cell, epub_name);
-        let mut writer = CellWriter(&k_cell, cf_str);
-
-        let text_size = smol_epub::async_io::stream_strip_entry_async(
-            &entry,
-            entry.local_offset,
-            &mut reader,
-            &mut writer,
-        )
-        .await
-        .map_err(|msg| Error::from(msg).with_source("cache_chapter_async: stream"))?;
-
-        self.chapter_table[ch] = (ch_offset, text_size);
-        self.ch_cached[ch] = true;
-
-        log::info!(
-            "epub: cached ch{}/{} = {} bytes at offset {}",
-            ch,
-            self.spine.len(),
-            text_size,
-            ch_offset,
-        );
+        // create the step state machine
+        let mut read_fn = |offset: u32, buf: &mut [u8]| -> Result<usize, &'static str> {
+            k.sd()
+                .read_file_chunk(epub_name, offset, buf)
+                .map_err(|e: Error| -> &'static str { e.into() })
+        };
+        let step = cache::StreamStripStep::new(&entry, entry.local_offset, &mut read_fn)
+            .map_err(|msg| Error::from(msg).with_source("cache_chapter_begin: new"))?;
+        self.cache_step = Some(step);
         Ok(())
+    }
+
+    /// Advance one step of in-progress chapter caching.
+    /// Returns Ok(true) when the chapter is done, Ok(false) when more work remains.
+    pub(super) fn cache_chapter_step(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+        ch: usize,
+        epub_name: &str,
+    ) -> crate::error::Result<bool> {
+        let cf = self.cache_file;
+        let cf_str = cache::cache_filename_str(&cf);
+
+        let step = self
+            .cache_step
+            .as_mut()
+            .expect("cache_chapter_step called without active cache_step");
+
+        let mut read_fn = |offset: u32, buf: &mut [u8]| -> Result<usize, &'static str> {
+            k.sd()
+                .read_file_chunk(epub_name, offset, buf)
+                .map_err(|e: Error| -> &'static str { e.into() })
+        };
+        let mut write_fn = |data: &[u8]| -> Result<(), &'static str> {
+            k.sd()
+                .append_in_plump(cf_str, data)
+                .map_err(|e: Error| -> &'static str { e.into() })
+        };
+
+        match step
+            .step(&mut read_fn, &mut write_fn)
+            .map_err(|msg| Error::from(msg).with_source("cache_chapter_step: step"))?
+        {
+            cache::StripStepResult::Continue => Ok(false),
+            cache::StripStepResult::Done(text_size) => {
+                let ch_offset = self.chapter_table[ch].0;
+                self.chapter_table[ch] = (ch_offset, text_size);
+                self.ch_cached[ch] = true;
+                self.cache_step = None;
+                log::info!(
+                    "epub: cached ch{}/{} = {} bytes at offset {}",
+                    ch,
+                    self.spine.len(),
+                    text_size,
+                    ch_offset,
+                );
+                Ok(true)
+            }
+        }
     }
 
     pub(super) fn try_cache_chapter(&mut self, k: &mut KernelHandle<'_>) -> bool {
@@ -559,12 +566,44 @@ impl ReaderApp {
         );
     }
 
-    // run one step of background caching; async because CacheChapter
-    // awaits cache_chapter_async which yields during deflate
-    pub(super) async fn bg_cache_step(&mut self, k: &mut KernelHandle<'_>) {
+    /// Sync step-based background caching. Returns a BgOutcome.
+    pub(super) fn bg_cache_step_sync(&mut self, k: &mut KernelHandle<'_>) -> BgOutcome {
         match self.epub.bg_cache {
             BgCacheState::CacheChapter => {
                 let spine_len = self.epub.spine.len();
+
+                // If a step is already in progress, advance it
+                if self.epub.cache_step.is_some() {
+                    // figure out which chapter we're actively caching:
+                    // could be a priority adjacent chapter or the sequential one
+                    let ch = self.find_active_cache_chapter();
+                    let (nb, nl) = self.name_copy();
+                    let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+                    match self.epub.cache_chapter_step(k, ch, &name) {
+                        Ok(false) => return BgOutcome::Progress { more: true },
+                        Ok(true) => {
+                            // chapter done — check if it was sequential
+                            if ch == self.epub.cache_chapter as usize {
+                                self.epub.cache_chapter += 1;
+                            }
+                            // try nearby image dispatch
+                            if self.try_dispatch_nearby_image(k) {
+                                self.epub.bg_cache = BgCacheState::WaitNearbyImage;
+                            }
+                            return BgOutcome::Progress { more: true };
+                        }
+                        Err(e) => {
+                            log::warn!("bg: cache step ch{} failed: {}, skipping", ch, e);
+                            self.epub.cache_step = None;
+                            if ch == self.epub.cache_chapter as usize {
+                                self.epub.cache_chapter += 1;
+                            }
+                            return BgOutcome::Progress { more: true };
+                        }
+                    }
+                }
+
+                // No step in progress — pick the next chapter to cache
 
                 // skip chapters already cached
                 while (self.epub.cache_chapter as usize) < spine_len
@@ -573,12 +612,11 @@ impl ReaderApp {
                     self.epub.cache_chapter += 1;
                 }
 
-                // priority: cache chapters adjacent to reading position
-                // before continuing the sequential scan; forward/backward
-                // nav stays instant
+                // priority: cache chapters adjacent to reading position first
                 let reading_ch = self.epub.chapter as usize;
                 let (nb, nl) = self.name_copy();
                 let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+
                 for &adj in &[reading_ch + 1, reading_ch.saturating_sub(1)] {
                     if adj < spine_len && adj != reading_ch && !self.epub.ch_cached[adj] {
                         log::info!(
@@ -586,9 +624,11 @@ impl ReaderApp {
                             adj,
                             reading_ch,
                         );
-                        if let Err(e) = self.epub.cache_chapter_async(k, adj, &name).await {
-                            log::warn!("epub: priority ch{} failed: {}", adj, e);
+                        if let Err(e) = self.epub.cache_chapter_begin(k, adj, &name) {
+                            log::warn!("epub: priority ch{} begin failed: {}", adj, e);
+                            continue;
                         }
+                        return BgOutcome::Progress { more: true };
                     }
                 }
 
@@ -606,21 +646,16 @@ impl ReaderApp {
                     self.epub.img_found_count = 0;
                     self.epub.img_cached_count = 0;
                     self.epub.bg_cache = BgCacheState::CacheImage;
-                    return;
+                    return BgOutcome::Progress { more: true };
                 }
 
-                match self.epub.cache_chapter_async(k, ch, &name).await {
-                    Ok(()) => {
-                        self.epub.cache_chapter += 1;
-                        // try nearby image dispatch before next chapter
-                        if self.try_dispatch_nearby_image(k) {
-                            self.epub.bg_cache = BgCacheState::WaitNearbyImage;
-                        }
-                        // else stay in CacheChapter
-                    }
+                // start caching the next sequential chapter
+                match self.epub.cache_chapter_begin(k, ch, &name) {
+                    Ok(()) => BgOutcome::Progress { more: true },
                     Err(e) => {
-                        log::warn!("bg: ch{} failed: {}, skipping", ch, e);
+                        log::warn!("bg: ch{} begin failed: {}, skipping", ch, e);
                         self.epub.cache_chapter += 1;
+                        BgOutcome::Progress { more: true }
                     }
                 }
             }
@@ -629,51 +664,81 @@ impl ReaderApp {
                 match self.epub_recv_image_result(k) {
                     Ok(Some(_)) => {
                         if self.try_dispatch_nearby_image(k) {
-                            // stay in WaitNearbyImage
+                            BgOutcome::WaitingExternal
                         } else {
                             self.epub.bg_cache = BgCacheState::CacheChapter;
+                            BgOutcome::Progress { more: true }
                         }
                     }
                     Ok(None) if work_queue::is_idle() => {
                         log::warn!("bg: worker idle with no result, recovering");
                         self.epub.bg_cache = BgCacheState::CacheChapter;
+                        BgOutcome::Progress { more: true }
                     }
-                    Ok(None) => {}
+                    Ok(None) => BgOutcome::WaitingExternal,
                     Err(e) => {
                         log::warn!("bg: nearby image error: {}, continuing", e);
                         self.epub.bg_cache = BgCacheState::CacheChapter;
+                        BgOutcome::Progress { more: true }
                     }
                 }
             }
+
             BgCacheState::CacheImage => {
                 match self.epub_find_and_dispatch_image(k) {
                     Ok(true) => {
-                        // worker busy: dispatched a small image, wait
-                        // worker idle: decoded inline, scan next tick
                         if !work_queue::is_idle() {
                             self.epub.bg_cache = BgCacheState::WaitImage;
+                            BgOutcome::WaitingExternal
+                        } else {
+                            BgOutcome::Progress { more: true }
                         }
                     }
-                    Ok(false) => self.epub.bg_cache = BgCacheState::Idle,
+                    Ok(false) => {
+                        self.epub.bg_cache = BgCacheState::Idle;
+                        BgOutcome::Idle
+                    }
                     Err(e) => {
                         log::warn!("bg: image error: {}, continuing", e);
-                        // stay in CacheImage; next tick scans for the next one
+                        BgOutcome::Progress { more: true }
                     }
                 }
             }
+
             BgCacheState::WaitImage => match self.epub_recv_image_result(k) {
-                Ok(Some(_)) => self.epub.bg_cache = BgCacheState::CacheImage,
+                Ok(Some(_)) => {
+                    self.epub.bg_cache = BgCacheState::CacheImage;
+                    BgOutcome::Progress { more: true }
+                }
                 Ok(None) if work_queue::is_idle() => {
                     log::warn!("bg: worker idle with no result, recovering");
                     self.epub.bg_cache = BgCacheState::CacheImage;
+                    BgOutcome::Progress { more: true }
                 }
-                Ok(None) => {}
+                Ok(None) => BgOutcome::WaitingExternal,
                 Err(e) => {
                     log::warn!("bg: image recv error: {}", e);
                     self.epub.bg_cache = BgCacheState::CacheImage;
+                    BgOutcome::Progress { more: true }
                 }
             },
-            BgCacheState::Idle => {}
+
+            BgCacheState::Idle => BgOutcome::Idle,
         }
     }
+
+    /// Helper: determine which chapter the active cache_step is working on.
+    /// Checks priority adjacent chapters first, then falls back to sequential.
+    fn find_active_cache_chapter(&self) -> usize {
+        let reading_ch = self.epub.chapter as usize;
+        let spine_len = self.epub.spine.len();
+        // check priority chapters
+        for &adj in &[reading_ch + 1, reading_ch.saturating_sub(1)] {
+            if adj < spine_len && adj != reading_ch && !self.epub.ch_cached[adj] {
+                return adj;
+            }
+        }
+        self.epub.cache_chapter as usize
+    }
+
 }

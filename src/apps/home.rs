@@ -2,7 +2,7 @@
 
 use core::fmt::Write as _;
 
-use crate::apps::{App, AppContext, AppId, RECENT_FILE, Transition};
+use crate::apps::{App, AppContext, AppId, BgBudget, BgOutcome, RECENT_FILE, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::battery;
@@ -410,7 +410,12 @@ impl App<AppId> for HomeApp {
         ctx.mark_dirty(CONTENT_REGION);
     }
 
-    async fn background(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
+    fn background_step(
+        &mut self,
+        ctx: &mut AppContext,
+        k: &mut KernelHandle<'_>,
+        _budget: BgBudget,
+    ) -> BgOutcome {
         if self.needs_load_recent {
             let old_count = self.item_count;
             let mut buf = [0u8; 196];
@@ -440,6 +445,9 @@ impl App<AppId> for HomeApp {
             if self.item_count != old_count {
                 ctx.request_full_redraw();
             }
+            return BgOutcome::Progress {
+                more: self.needs_load_bookmarks,
+            };
         }
 
         if self.needs_load_bookmarks {
@@ -463,7 +471,10 @@ impl App<AppId> for HomeApp {
             if self.state == HomeState::ShowBookmarks {
                 ctx.mark_dirty(self.bm_list_region());
             }
+            return BgOutcome::Progress { more: false };
         }
+
+        BgOutcome::Idle
     }
 
     fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {

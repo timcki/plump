@@ -28,8 +28,8 @@ pub use crate::error::{Error, ErrorKind, Result, ResultExt};
 pub use crate::drivers::storage::StorageError;
 
 pub use app::{
-    App, AppContext, AppIdType, AppLayer, Launcher, NavEvent, PendingSetting, QuickAction,
-    QuickActionKind, RECENT_FILE, Redraw, Transition,
+    App, AppContext, AppIdType, AppLayer, BgBudget, BgOutcome, Launcher, NavEvent, PendingSetting,
+    QuickAction, QuickActionKind, RECENT_FILE, Redraw, Transition,
 };
 pub use bookmarks::BookmarkCache;
 pub use console::BootConsole;

@@ -10,7 +10,8 @@ use crate::apps::reader::ReaderApp;
 use crate::apps::settings::SettingsApp;
 use crate::apps::stats::StatsApp;
 use crate::apps::{
-    App, AppContext, AppId, DeferredPersistenceReason, Launcher, PendingSetting, Redraw, Transition,
+    App, AppContext, AppId, BgBudget, BgOutcome, DeferredPersistenceReason, Launcher,
+    PendingSetting, Redraw, Transition,
 };
 use esp_hal::delay::Delay;
 
@@ -554,21 +555,34 @@ impl AppManager {
         }
     }
 
-    pub async fn run_background(&mut self, k: &mut KernelHandle<'_>) {
+    pub fn run_background_step(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+        budget: BgBudget,
+    ) -> BgOutcome {
         let active = self.launcher.active();
-        with_app!(active, self, |app| {
-            app.background(&mut self.launcher.ctx, k).await
+        let active_outcome = with_app!(active, self, |app| {
+            app.background_step(&mut self.launcher.ctx, k, budget)
         });
 
-        for &id in &[AppId::Home, AppId::Files, AppId::Reader, AppId::Settings] {
+        let mut combined = active_outcome;
+        for &id in &[
+            AppId::Home,
+            AppId::Files,
+            AppId::Reader,
+            AppId::Settings,
+            AppId::Stats,
+        ] {
             if id != active {
-                with_app!(id, self, |app| {
-                    if app.has_background_when_suspended() {
-                        app.background_suspended(k);
-                    }
+                let outcome = with_app!(id, self, |app| {
+                    app.background_suspended_step(k, budget)
                 });
+                combined = combined.merge(outcome);
             }
         }
+
+        self.sync_button_config();
+        combined
     }
 
     pub fn draw(&self, strip: &mut StripBuffer) {
@@ -698,8 +712,12 @@ impl AppLayer for AppManager {
         AppManager::apply_transition(self, t, k);
     }
 
-    async fn run_background(&mut self, k: &mut KernelHandle<'_>) {
-        AppManager::run_background(self, k).await;
+    fn run_background_step(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+        budget: BgBudget,
+    ) -> BgOutcome {
+        AppManager::run_background_step(self, k, budget)
     }
 
     fn draw(&self, strip: &mut StripBuffer) {

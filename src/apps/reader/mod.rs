@@ -18,7 +18,7 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::Text;
 
-use crate::apps::{App, AppContext, AppId, DeferredPersistenceReason, RECENT_FILE, Transition};
+use crate::apps::{App, AppContext, AppId, BgBudget, BgOutcome, DeferredPersistenceReason, RECENT_FILE, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::{GrayMode, StripBuffer};
@@ -295,6 +295,8 @@ pub(super) struct EpubState {
     pub(super) img_found_count: u16,
     pub(super) img_cached_count: u16,
 
+    pub(super) cache_step: Option<smol_epub::cache::StreamStripStep>,
+
     pub(super) toc: Option<Box<EpubToc>>,
     pub(super) toc_source: Option<TocSource>,
     pub(super) toc_selected: usize,
@@ -329,6 +331,7 @@ impl EpubState {
             skip_large_img: false,
             img_found_count: 0,
             img_cached_count: 0,
+            cache_step: None,
             toc: None,
             toc_source: None,
             toc_selected: 0,
@@ -1713,495 +1716,419 @@ impl App<AppId> for ReaderApp {
         ctx.mark_dirty(PAGE_REGION);
     }
 
-    async fn background(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
-        use embassy_time::Instant;
-
-        // perf: snapshot SD counters at start of background pass
-        let _sd_snap = plump_kernel::perf::counters::snapshot();
-
-        loop {
-            match self.state {
-                State::NeedBookmark => {
-                    let t0 = Instant::now();
-                    self.bookmark_load(k.bookmark_cache());
-                    self.stats_load(k);
-                    if self.try_load_cached_cover_thumb(k) {
-                        ctx.mark_dirty(self.loading_visual_region());
-                    }
-
-                    if self.is_epub {
-                        self.epub.zip.clear();
-                        self.epub.meta = EpubMeta::new();
-                        self.epub.spine = EpubSpine::new();
-                        self.epub.chapters_cached = false;
-                        self.goto_last_page = false;
-                        self.state = State::NeedInit;
-                        self.set_loading_ui(ctx, "Loading", 10);
-                    } else {
-                        self.state = State::NeedPage;
-                        self.set_loading_ui(ctx, "Loading", 50);
-                    }
-                    log::debug!(
-                        "reader:bg NeedBookmark -> {:?} loading='{}' pct={} ({}ms)",
-                        self.state,
-                        ctx.loading_msg(),
-                        ctx.loading_pct(),
-                        t0.elapsed().as_millis()
-                    );
-                    plump_kernel::perf_event!(
-                        "reader",
-                        "NeedBookmark to={:?} elapsed_ms={}",
-                        self.state,
-                        t0.elapsed().as_millis()
-                    );
-                    continue;
+    fn background_step(
+        &mut self,
+        ctx: &mut AppContext,
+        k: &mut KernelHandle<'_>,
+        _budget: BgBudget,
+    ) -> BgOutcome {
+        // Phase 1: Open pipeline (NeedBookmark..NeedPage)
+        // Each state does ONE step and returns Progress { more: true }
+        match self.state {
+            State::NeedBookmark => {
+                plump_kernel::perf_begin!(_t0);
+                self.bookmark_load(k.bookmark_cache());
+                self.stats_load(k);
+                if self.try_load_cached_cover_thumb(k) {
+                    ctx.mark_dirty(self.loading_visual_region());
                 }
 
-                State::NeedInit => {
-                    let t0 = Instant::now();
-                    let (nb, nl) = self.name_copy();
-                    let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
-                    match self.epub.init_zip(k, name, &mut self.pg.buf) {
-                        Ok(()) => {
-                            self.try_prefill_title_from_cache_header(k);
-                            self.state = State::NeedOpf;
-                            self.set_loading_ui(ctx, "Loading", 25);
-                            log::debug!(
-                                "reader:bg NeedInit -> {:?} loading='{}' pct={} ({}ms)",
-                                self.state,
-                                ctx.loading_msg(),
-                                ctx.loading_pct(),
-                                t0.elapsed().as_millis()
-                            );
-                            plump_kernel::perf_event!(
-                                "reader",
-                                "NeedInit ok to=NeedOpf elapsed_ms={}",
-                                t0.elapsed().as_millis()
-                            );
-                        }
-                        Err(e) => {
-                            log::debug!(
-                                "reader:bg NeedInit failed after {}ms: {}",
-                                t0.elapsed().as_millis(),
-                                e
-                            );
-                            plump_kernel::perf_event!(
-                                "reader",
-                                "NeedInit err_kind={:?} err_src={} elapsed_ms={}",
-                                e.kind(),
-                                e.source_tag(),
-                                t0.elapsed().as_millis()
-                            );
-                            log::info!("reader: epub init (zip) failed: {}", e);
-                            self.enter_error(ctx, e);
-                        }
+                if self.is_epub {
+                    self.epub.zip.clear();
+                    self.epub.meta = EpubMeta::new();
+                    self.epub.spine = EpubSpine::new();
+                    self.epub.chapters_cached = false;
+                    self.goto_last_page = false;
+                    self.state = State::NeedInit;
+                    self.set_loading_ui(ctx, "Loading", 10);
+                } else {
+                    self.state = State::NeedPage;
+                    self.set_loading_ui(ctx, "Loading", 50);
+                }
+                plump_kernel::perf_event!(
+                    "reader",
+                    "NeedBookmark to={:?} elapsed_ms={}",
+                    self.state,
+                    _t0.elapsed().as_millis()
+                );
+                return BgOutcome::Progress { more: true };
+            }
+
+            State::NeedInit => {
+                plump_kernel::perf_begin!(_t0);
+                let (nb, nl) = self.name_copy();
+                let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+                match self.epub.init_zip(k, name, &mut self.pg.buf) {
+                    Ok(()) => {
+                        self.try_prefill_title_from_cache_header(k);
+                        self.state = State::NeedOpf;
+                        self.set_loading_ui(ctx, "Loading", 25);
+                        plump_kernel::perf_event!(
+                            "reader",
+                            "NeedInit ok to=NeedOpf elapsed_ms={}",
+                            _t0.elapsed().as_millis()
+                        );
+                    }
+                    Err(e) => {
+                        plump_kernel::perf_event!(
+                            "reader",
+                            "NeedInit err_kind={:?} err_src={} elapsed_ms={}",
+                            e.kind(),
+                            e.source_tag(),
+                            _t0.elapsed().as_millis()
+                        );
+                        log::info!("reader: epub init (zip) failed: {}", e);
+                        self.epub.cache_step = None;
+                        self.enter_error(ctx, e);
                     }
                 }
+                return BgOutcome::Progress { more: true };
+            }
 
-                State::NeedOpf => {
-                    let t0 = Instant::now();
-                    match self.epub_init_opf(k) {
-                        Ok(()) => {
-                            // clamp restored chapter to valid spine range
-                            let spine_len = self.epub.spine.len();
-                            if spine_len > 0 && self.epub.chapter as usize >= spine_len {
-                                self.epub.chapter = (spine_len - 1) as u16;
-                            }
-                            // defer title/TOC/cover work until after
-                            // the first page is visible. RECENT is now
-                            // handled by the deferred persistence system.
-                            self.pending_title_save = self.title_is_real;
-                            self.pending_cover_thumb = self.epub.meta.has_cover();
-                            self.state = State::NeedToc;
-                            self.set_loading_ui(ctx, "Loading", 40);
-                            log::debug!(
-                                "reader:bg NeedOpf -> {:?} loading='{}' pct={} ({}ms)",
-                                self.state,
-                                ctx.loading_msg(),
-                                ctx.loading_pct(),
-                                t0.elapsed().as_millis()
-                            );
-                            plump_kernel::perf_event!(
-                                "reader",
-                                "NeedOpf ok to=NeedToc spine_len={} elapsed_ms={}",
-                                spine_len,
-                                t0.elapsed().as_millis()
-                            );
+            State::NeedOpf => {
+                plump_kernel::perf_begin!(_t0);
+                match self.epub_init_opf(k) {
+                    Ok(()) => {
+                        let spine_len = self.epub.spine.len();
+                        if spine_len > 0 && self.epub.chapter as usize >= spine_len {
+                            self.epub.chapter = (spine_len - 1) as u16;
                         }
-                        Err(e) => {
-                            log::debug!(
-                                "reader:bg NeedOpf failed after {}ms: {}",
-                                t0.elapsed().as_millis(),
-                                e
-                            );
-                            plump_kernel::perf_event!(
-                                "reader",
-                                "NeedOpf err_kind={:?} err_src={} elapsed_ms={}",
-                                e.kind(),
-                                e.source_tag(),
-                                t0.elapsed().as_millis()
-                            );
-                            log::info!("reader: epub init (opf) failed: {}", e);
-                            self.enter_error(ctx, e);
-                        }
+                        self.pending_title_save = self.title_is_real;
+                        self.pending_cover_thumb = self.epub.meta.has_cover();
+                        self.state = State::NeedToc;
+                        self.set_loading_ui(ctx, "Loading", 40);
+                        plump_kernel::perf_event!(
+                            "reader",
+                            "NeedOpf ok to=NeedToc spine_len={} elapsed_ms={}",
+                            spine_len,
+                            _t0.elapsed().as_millis()
+                        );
+                    }
+                    Err(e) => {
+                        plump_kernel::perf_event!(
+                            "reader",
+                            "NeedOpf err_kind={:?} err_src={} elapsed_ms={}",
+                            e.kind(),
+                            e.source_tag(),
+                            _t0.elapsed().as_millis()
+                        );
+                        log::info!("reader: epub init (opf) failed: {}", e);
+                        self.epub.cache_step = None;
+                        self.enter_error(ctx, e);
                     }
                 }
+                return BgOutcome::Progress { more: true };
+            }
 
-                State::NeedToc => {
-                    let t0 = Instant::now();
-                    self.pending_toc_parse = self.epub.toc_source.is_some();
-                    self.state = State::NeedCache;
-                    self.set_loading_ui(ctx, "Caching", 55);
-                    log::debug!(
-                        "reader:bg NeedToc -> {:?} loading='{}' pct={} ({}ms)",
-                        self.state,
-                        ctx.loading_msg(),
-                        ctx.loading_pct(),
-                        t0.elapsed().as_millis()
-                    );
-                    plump_kernel::perf_event!(
-                        "reader",
-                        "NeedToc to=NeedCache elapsed_ms={}",
-                        t0.elapsed().as_millis()
-                    );
-                }
+            State::NeedToc => {
+                plump_kernel::perf_begin!(_t0);
+                self.pending_toc_parse = self.epub.toc_source.is_some();
+                self.state = State::NeedCache;
+                self.set_loading_ui(ctx, "Caching", 55);
+                plump_kernel::perf_event!(
+                    "reader",
+                    "NeedToc to=NeedCache elapsed_ms={}",
+                    _t0.elapsed().as_millis()
+                );
+                return BgOutcome::Progress { more: true };
+            }
 
-                State::NeedCache => {
-                    let t0 = Instant::now();
-                    match self.epub.check_cache(k, &mut self.pg.buf) {
-                        Ok(true) => {
-                            self.state = State::NeedIndex;
-                            self.set_loading_ui(ctx, "Indexing", 75);
-                            log::debug!(
-                                "reader:bg NeedCache(cache-hit) -> {:?} loading='{}' pct={} ({}ms)",
-                                self.state,
-                                ctx.loading_msg(),
-                                ctx.loading_pct(),
-                                t0.elapsed().as_millis()
-                            );
-                            plump_kernel::perf_event!(
-                                "reader",
-                                "NeedCache hit=true to=NeedIndex elapsed_ms={}",
-                                t0.elapsed().as_millis()
-                            );
-                        }
-                        Ok(false) => {
-                            // cache the current chapter; async version yields
-                            // during deflate so the scheduler's select can
-                            // interrupt if the user presses back
-                            let ch = self.epub.chapter as usize;
-                            let (nb, nl) = self.name_copy();
-                            let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
-                            match self.epub.cache_chapter_async(k, ch, epub_name).await {
-                                Ok(()) => {
-                                    self.epub.chapters_cached = true;
-                                    self.epub.cache_chapter = 0;
-
-                                    // eagerly dispatch nearby images to
-                                    // the worker so they decode while the
-                                    // user reads the first page
-                                    if self.try_dispatch_nearby_image(k) {
-                                        self.epub.bg_cache = BgCacheState::WaitNearbyImage;
-                                    } else {
-                                        self.epub.bg_cache = BgCacheState::CacheChapter;
-                                    }
-
-                                    self.state = State::NeedIndex;
-                                    self.set_loading_ui(ctx, "Indexing", 75);
-                                    log::debug!(
-                                        "reader:bg NeedCache(cache-build) -> {:?} loading='{}' pct={} ({}ms)",
-                                        self.state,
-                                        ctx.loading_msg(),
-                                        ctx.loading_pct(),
-                                        t0.elapsed().as_millis()
-                                    );
-                                    plump_kernel::perf_event!(
-                                        "reader",
-                                        "NeedCache hit=false ch={} to=NeedIndex elapsed_ms={}",
-                                        ch,
-                                        t0.elapsed().as_millis()
-                                    );
-                                }
-                                Err(e) => {
-                                    log::debug!(
-                                        "reader:bg NeedCache(cache-build) failed after {}ms: {}",
-                                        t0.elapsed().as_millis(),
-                                        e
-                                    );
-                                    plump_kernel::perf_event!(
-                                        "reader",
-                                        "NeedCache err_kind={:?} err_src={} ch={} elapsed_ms={}",
-                                        e.kind(),
-                                        e.source_tag(),
-                                        ch,
-                                        t0.elapsed().as_millis()
-                                    );
-                                    log::info!("reader: cache ch{} failed: {}", ch, e);
-                                    self.enter_error(ctx, e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::debug!(
-                                "reader:bg NeedCache failed after {}ms: {}",
-                                t0.elapsed().as_millis(),
-                                e
-                            );
-                            plump_kernel::perf_event!(
-                                "reader",
-                                "NeedCache err_kind={:?} err_src={} elapsed_ms={}",
-                                e.kind(),
-                                e.source_tag(),
-                                t0.elapsed().as_millis()
-                            );
-                            log::info!("reader: cache check failed: {}", e);
-                            self.enter_error(ctx, e);
-                        }
+            State::NeedCache => {
+                plump_kernel::perf_begin!(_t0);
+                match self.epub.check_cache(k, &mut self.pg.buf) {
+                    Ok(true) => {
+                        // cache hit
+                        self.state = State::NeedIndex;
+                        self.set_loading_ui(ctx, "Indexing", 75);
+                        plump_kernel::perf_event!(
+                            "reader",
+                            "NeedCache hit=true to=NeedIndex elapsed_ms={}",
+                            _t0.elapsed().as_millis()
+                        );
+                        return BgOutcome::Progress { more: true };
                     }
-                }
-
-                State::NeedIndex => {
-                    let t0 = Instant::now();
-                    // ensure the target chapter is cached before
-                    // indexing (it may not be if background caching
-                    // hasn't reached it yet)
-                    if self.is_epub
-                        && self.epub.chapters_cached
-                        && !self.epub.ch_cached[self.epub.chapter as usize]
-                    {
-                        // async version yields during deflate so the
-                        // scheduler's select can interrupt on input
+                    Ok(false) => {
+                        // cache miss: start/continue caching the current chapter
                         let ch = self.epub.chapter as usize;
                         let (nb, nl) = self.name_copy();
                         let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
-                        if let Err(e) = self.epub.cache_chapter_async(k, ch, epub_name).await {
-                            log::debug!(
-                                "reader:bg NeedIndex cache prerequisite failed after {}ms: {}",
-                                t0.elapsed().as_millis(),
-                                e
-                            );
+
+                        if self.epub.cache_step.is_none() {
+                            // begin caching
+                            if let Err(e) = self.epub.cache_chapter_begin(k, ch, &epub_name) {
+                                plump_kernel::perf_event!(
+                                    "reader",
+                                    "NeedCache err_kind={:?} err_src={} ch={} elapsed_ms={}",
+                                    e.kind(),
+                                    e.source_tag(),
+                                    ch,
+                                    _t0.elapsed().as_millis()
+                                );
+                                log::info!("reader: cache ch{} begin failed: {}", ch, e);
+                                self.epub.cache_step = None;
+                                self.enter_error(ctx, e);
+                                return BgOutcome::Progress { more: true };
+                            }
+                        }
+
+                        // advance one step
+                        match self.epub.cache_chapter_step(k, ch, &epub_name) {
+                            Ok(false) => {
+                                // more work remains
+                                return BgOutcome::Progress { more: true };
+                            }
+                            Ok(true) => {
+                                // chapter done
+                                self.epub.chapters_cached = true;
+                                self.epub.cache_chapter = 0;
+
+                                if self.try_dispatch_nearby_image(k) {
+                                    self.epub.bg_cache = BgCacheState::WaitNearbyImage;
+                                } else {
+                                    self.epub.bg_cache = BgCacheState::CacheChapter;
+                                }
+
+                                self.state = State::NeedIndex;
+                                self.set_loading_ui(ctx, "Indexing", 75);
+                                plump_kernel::perf_event!(
+                                    "reader",
+                                    "NeedCache hit=false ch={} to=NeedIndex elapsed_ms={}",
+                                    ch,
+                                    _t0.elapsed().as_millis()
+                                );
+                                return BgOutcome::Progress { more: true };
+                            }
+                            Err(e) => {
+                                plump_kernel::perf_event!(
+                                    "reader",
+                                    "NeedCache err_kind={:?} err_src={} ch={} elapsed_ms={}",
+                                    e.kind(),
+                                    e.source_tag(),
+                                    ch,
+                                    _t0.elapsed().as_millis()
+                                );
+                                log::info!("reader: cache ch{} failed: {}", ch, e);
+                                self.epub.cache_step = None;
+                                self.enter_error(ctx, e);
+                                return BgOutcome::Progress { more: true };
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        plump_kernel::perf_event!(
+                            "reader",
+                            "NeedCache err_kind={:?} err_src={} elapsed_ms={}",
+                            e.kind(),
+                            e.source_tag(),
+                            _t0.elapsed().as_millis()
+                        );
+                        log::info!("reader: cache check failed: {}", e);
+                        self.epub.cache_step = None;
+                        self.enter_error(ctx, e);
+                        return BgOutcome::Progress { more: true };
+                    }
+                }
+            }
+
+            State::NeedIndex => {
+                plump_kernel::perf_begin!(_t0);
+                // ensure the target chapter is cached before indexing
+                if self.is_epub
+                    && self.epub.chapters_cached
+                    && !self.epub.ch_cached[self.epub.chapter as usize]
+                {
+                    let ch = self.epub.chapter as usize;
+                    let (nb, nl) = self.name_copy();
+                    let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+
+                    if self.epub.cache_step.is_none() {
+                        if let Err(e) = self.epub.cache_chapter_begin(k, ch, &epub_name) {
                             plump_kernel::perf_event!(
                                 "reader",
                                 "NeedIndex stage=cache_prereq err_kind={:?} err_src={} elapsed_ms={}",
                                 e.kind(),
                                 e.source_tag(),
-                                t0.elapsed().as_millis()
+                                _t0.elapsed().as_millis()
                             );
+                            self.epub.cache_step = None;
                             self.enter_error(ctx, e);
-                            break;
+                            return BgOutcome::Progress { more: true };
                         }
                     }
 
-                    let want_last = self.goto_last_page;
-                    self.goto_last_page = false;
-
-                    self.epub_index_chapter();
-
-                    if self.is_epub && self.epub.try_cache_chapter(k) {
-                        self.preindex_all_pages(k);
-                    }
-
-                    if want_last {
-                        match self.scan_to_last_page(k) {
-                            Ok(()) => {
-                                self.finish_ready_transition(ctx);
-                                log::debug!(
-                                    "reader:bg NeedIndex(last-page) -> {:?} loading_active={} ({}ms)",
-                                    self.state,
-                                    ctx.loading_active(),
-                                    t0.elapsed().as_millis()
-                                );
-                                plump_kernel::perf_event!(
-                                    "reader",
-                                    "NeedIndex mode=last_page to=Ready pages={} elapsed_ms={}",
-                                    self.pg.total_pages,
-                                    t0.elapsed().as_millis()
-                                );
-                            }
-                            Err(e) => {
-                                log::debug!(
-                                    "reader:bg NeedIndex(last-page) failed after {}ms: {}",
-                                    t0.elapsed().as_millis(),
-                                    e
-                                );
-                                plump_kernel::perf_event!(
-                                    "reader",
-                                    "NeedIndex mode=last_page err_kind={:?} err_src={} elapsed_ms={}",
-                                    e.kind(),
-                                    e.source_tag(),
-                                    t0.elapsed().as_millis()
-                                );
-                                self.enter_error(ctx, e)
-                            }
+                    match self.epub.cache_chapter_step(k, ch, &epub_name) {
+                        Ok(false) => {
+                            // prereq not done yet
+                            return BgOutcome::Progress { more: true };
                         }
-                    } else {
-                        self.state = State::NeedPage;
-                        self.set_loading_ui(ctx, "Loading page", 90);
-                        log::debug!(
-                            "reader:bg NeedIndex -> {:?} loading='{}' pct={} ({}ms)",
-                            self.state,
-                            ctx.loading_msg(),
-                            ctx.loading_pct(),
-                            t0.elapsed().as_millis()
-                        );
-                        plump_kernel::perf_event!(
-                            "reader",
-                            "NeedIndex to=NeedPage pages={} fully_indexed={} elapsed_ms={}",
-                            self.pg.total_pages,
-                            self.pg.fully_indexed,
-                            t0.elapsed().as_millis()
-                        );
+                        Ok(true) => {
+                            // prereq done, fall through to indexing below
+                        }
+                        Err(e) => {
+                            plump_kernel::perf_event!(
+                                "reader",
+                                "NeedIndex stage=cache_prereq err_kind={:?} err_src={} elapsed_ms={}",
+                                e.kind(),
+                                e.source_tag(),
+                                _t0.elapsed().as_millis()
+                            );
+                            self.epub.cache_step = None;
+                            self.enter_error(ctx, e);
+                            return BgOutcome::Progress { more: true };
+                        }
                     }
                 }
 
-                State::NeedPage => {
-                    let t0 = Instant::now();
-                    let page_hint = self.restore_page_hint.take();
-                    if let Some(target_off) = self.restore_offset.take() {
-                        if self.pg.fully_indexed && self.pg.total_pages > 0 {
-                            self.pg.page = self.locate_page_for_offset(target_off, page_hint);
-                            if let Err(e) = self.load_and_prefetch(k) {
-                                log::debug!(
-                                    "reader:bg NeedPage(restore-indexed) failed after {}ms: {}",
-                                    t0.elapsed().as_millis(),
-                                    e
-                                );
-                                plump_kernel::perf_event!(
-                                    "reader",
-                                    "NeedPage mode=restore_indexed err_kind={:?} err_src={} elapsed_ms={}",
-                                    e.kind(),
-                                    e.source_tag(),
-                                    t0.elapsed().as_millis()
-                                );
-                                self.enter_error(ctx, e);
-                            }
-                        } else {
-                            self.pg.page = 0;
-                            loop {
-                                match self.load_and_prefetch(k) {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        log::debug!(
-                                            "reader:bg NeedPage(restore-scan) failed after {}ms: {}",
-                                            t0.elapsed().as_millis(),
-                                            e
-                                        );
-                                        plump_kernel::perf_event!(
-                                            "reader",
-                                            "NeedPage mode=restore_scan err_kind={:?} err_src={} elapsed_ms={}",
-                                            e.kind(),
-                                            e.source_tag(),
-                                            t0.elapsed().as_millis()
-                                        );
-                                        self.enter_error(ctx, e);
-                                        break;
-                                    }
-                                }
-                                if self.pg.page + 1 >= self.pg.total_pages {
-                                    break;
-                                }
-                                if self.pg.offsets[self.pg.page + 1] > target_off {
-                                    break;
-                                }
-                                self.pg.page += 1;
-                            }
-                        }
-                        if self.state != State::Error {
+                let want_last = self.goto_last_page;
+                self.goto_last_page = false;
+
+                self.epub_index_chapter();
+
+                if self.is_epub && self.epub.try_cache_chapter(k) {
+                    self.preindex_all_pages(k);
+                }
+
+                if want_last {
+                    match self.scan_to_last_page(k) {
+                        Ok(()) => {
                             self.finish_ready_transition(ctx);
-                            log::debug!(
-                                "reader:bg NeedPage(restore) -> {:?} page={} loading_active={} ({}ms)",
-                                self.state,
-                                self.pg.page,
-                                ctx.loading_active(),
-                                t0.elapsed().as_millis()
+                            plump_kernel::perf_event!(
+                                "reader",
+                                "NeedIndex mode=last_page to=Ready pages={} elapsed_ms={}",
+                                self.pg.total_pages,
+                                _t0.elapsed().as_millis()
                             );
-                            {
-                                let _d = plump_kernel::perf::counters::delta(&_sd_snap);
-                                plump_kernel::perf_event!(
-                                    "reader",
-                                    "NeedPage mode=restore to=Ready page={} sd_reads={} sd_bytes_r={} elapsed_ms={}",
-                                    self.pg.page,
-                                    _d.sd_reads,
-                                    _d.sd_bytes_read,
-                                    t0.elapsed().as_millis()
-                                );
-                            }
+                        }
+                        Err(e) => {
+                            plump_kernel::perf_event!(
+                                "reader",
+                                "NeedIndex mode=last_page err_kind={:?} err_src={} elapsed_ms={}",
+                                e.kind(),
+                                e.source_tag(),
+                                _t0.elapsed().as_millis()
+                            );
+                            self.epub.cache_step = None;
+                            self.enter_error(ctx, e);
+                        }
+                    }
+                } else {
+                    self.state = State::NeedPage;
+                    self.set_loading_ui(ctx, "Loading page", 90);
+                    plump_kernel::perf_event!(
+                        "reader",
+                        "NeedIndex to=NeedPage pages={} fully_indexed={} elapsed_ms={}",
+                        self.pg.total_pages,
+                        self.pg.fully_indexed,
+                        _t0.elapsed().as_millis()
+                    );
+                }
+                return BgOutcome::Progress { more: true };
+            }
+
+            State::NeedPage => {
+                plump_kernel::perf_begin!(_t0);
+                let page_hint = self.restore_page_hint.take();
+                if let Some(target_off) = self.restore_offset.take() {
+                    if self.pg.fully_indexed && self.pg.total_pages > 0 {
+                        self.pg.page = self.locate_page_for_offset(target_off, page_hint);
+                        if let Err(e) = self.load_and_prefetch(k) {
+                            plump_kernel::perf_event!(
+                                "reader",
+                                "NeedPage mode=restore_indexed err_kind={:?} err_src={} elapsed_ms={}",
+                                e.kind(),
+                                e.source_tag(),
+                                _t0.elapsed().as_millis()
+                            );
+                            self.epub.cache_step = None;
+                            self.enter_error(ctx, e);
                         }
                     } else {
-                        match self.load_and_prefetch(k) {
-                            Ok(()) => {
-                                self.finish_ready_transition(ctx);
-                                log::debug!(
-                                    "reader:bg NeedPage(open) -> {:?} page={} loading_active={} ({}ms)",
-                                    self.state,
-                                    self.pg.page,
-                                    ctx.loading_active(),
-                                    t0.elapsed().as_millis()
-                                );
-                                {
-                                    let _d = plump_kernel::perf::counters::delta(&_sd_snap);
+                        self.pg.page = 0;
+                        loop {
+                            match self.load_and_prefetch(k) {
+                                Ok(()) => {}
+                                Err(e) => {
                                     plump_kernel::perf_event!(
                                         "reader",
-                                        "NeedPage mode=open to=Ready page={} sd_reads={} sd_bytes_r={} elapsed_ms={}",
-                                        self.pg.page,
-                                        _d.sd_reads,
-                                        _d.sd_bytes_read,
-                                        t0.elapsed().as_millis()
+                                        "NeedPage mode=restore_scan err_kind={:?} err_src={} elapsed_ms={}",
+                                        e.kind(),
+                                        e.source_tag(),
+                                        _t0.elapsed().as_millis()
                                     );
+                                    self.epub.cache_step = None;
+                                    self.enter_error(ctx, e);
+                                    break;
                                 }
                             }
-                            Err(e) => {
-                                log::debug!(
-                                    "reader:bg NeedPage(open) failed after {}ms: {}",
-                                    t0.elapsed().as_millis(),
-                                    e
-                                );
-                                plump_kernel::perf_event!(
-                                    "reader",
-                                    "NeedPage mode=open err_kind={:?} err_src={} elapsed_ms={}",
-                                    e.kind(),
-                                    e.source_tag(),
-                                    t0.elapsed().as_millis()
-                                );
-                                log::info!("reader: load failed: {}", e);
-                                self.enter_error(ctx, e);
+                            if self.pg.page + 1 >= self.pg.total_pages {
+                                break;
                             }
+                            if self.pg.offsets[self.pg.page + 1] > target_off {
+                                break;
+                            }
+                            self.pg.page += 1;
+                        }
+                    }
+                    if self.state != State::Error {
+                        self.finish_ready_transition(ctx);
+                        plump_kernel::perf_event!(
+                            "reader",
+                            "NeedPage mode=restore to=Ready page={} elapsed_ms={}",
+                            self.pg.page,
+                            _t0.elapsed().as_millis()
+                        );
+                    }
+                } else {
+                    match self.load_and_prefetch(k) {
+                        Ok(()) => {
+                            self.finish_ready_transition(ctx);
+                            plump_kernel::perf_event!(
+                                "reader",
+                                "NeedPage mode=open to=Ready page={} elapsed_ms={}",
+                                self.pg.page,
+                                _t0.elapsed().as_millis()
+                            );
+                        }
+                        Err(e) => {
+                            plump_kernel::perf_event!(
+                                "reader",
+                                "NeedPage mode=open err_kind={:?} err_src={} elapsed_ms={}",
+                                e.kind(),
+                                e.source_tag(),
+                                _t0.elapsed().as_millis()
+                            );
+                            log::info!("reader: load failed: {}", e);
+                            self.epub.cache_step = None;
+                            self.enter_error(ctx, e);
                         }
                     }
                 }
-
-                _ => {}
+                return BgOutcome::Progress { more: true };
             }
-            break;
+
+            State::Error => return BgOutcome::Idle,
+
+            // Ready / ShowToc: handled below
+            _ => {}
         }
 
+        // Phase 2: Deferred open work (Ready/ShowToc state)
         if matches!(self.state, State::Ready | State::ShowToc) {
             if self.defer_open_work_once {
                 self.defer_open_work_once = false;
-                return;
+                return BgOutcome::Progress { more: self.has_pending_open_work() || self.has_bg_work() };
             }
             if self.run_deferred_open_work(k) {
-                return;
+                return BgOutcome::Progress { more: self.has_pending_open_work() || self.has_bg_work() };
             }
         }
 
-        // RECENT and stats writes are now deferred — flushed via
-        // flush_deferred_persistence() in safe no-redraw windows,
-        // on app transitions, and before sleep.
-
-        // background caching; runs whenever the page content is
-        // settled and there is work to do. NeedIndex is included so
-        // adjacent-chapter caching can overlap with page indexing
-        // after a chapter jump. the scheduler wraps run_background
-        // in select(run_background, input) so every .await inside
-        // bg_cache_step is interruptible by user input.
+        // Phase 3: Background caching
         if matches!(
             self.state,
             State::Ready | State::ShowToc | State::NeedIndex | State::NeedPage
         ) && self.epub.bg_cache != BgCacheState::Idle
         {
-            // ensure caching indicator is visible (covers resume
-            // and the transition from initial load to bg caching)
             if !ctx.loading_active() {
                 self.set_cache_loading(ctx);
             }
@@ -2209,7 +2136,7 @@ impl App<AppId> for ReaderApp {
             let prev_bg = self.epub.bg_cache;
             let prev_img_found = self.epub.img_found_count;
             let prev_img_cached = self.epub.img_cached_count;
-            self.bg_cache_step(k).await;
+            let outcome = self.bg_cache_step_sync(k);
             if self.epub.bg_cache == BgCacheState::Idle {
                 ctx.clear_loading();
             } else if self.cached_chapter_count() != prev_count
@@ -2219,7 +2146,10 @@ impl App<AppId> for ReaderApp {
             {
                 self.set_cache_loading(ctx);
             }
+            return outcome;
         }
+
+        BgOutcome::Idle
     }
 
     fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {
@@ -2528,12 +2458,21 @@ impl App<AppId> for ReaderApp {
         }
     }
 
-    fn has_background_when_suspended(&self) -> bool {
-        self.has_bg_work()
-    }
-
-    fn background_suspended(&mut self, k: &mut KernelHandle<'_>) {
-        self.bg_work_tick(k);
+    fn background_suspended_step(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+        _budget: BgBudget,
+    ) -> BgOutcome {
+        if self.has_bg_work() {
+            self.bg_work_tick(k);
+            if self.has_bg_work() {
+                BgOutcome::WaitingExternal
+            } else {
+                BgOutcome::Progress { more: false }
+            }
+        } else {
+            BgOutcome::Idle
+        }
     }
 
     fn draw(&self, strip: &mut StripBuffer) {

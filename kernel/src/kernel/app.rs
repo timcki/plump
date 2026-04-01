@@ -31,6 +31,56 @@ use super::config::{SystemSettings, WifiConfig};
 
 pub const MAX_APP_ACTIONS: usize = 6;
 
+// ── background-step contract ────────────────────────────────────────
+
+/// Scheduler-owned budget for a single background step.
+///
+/// The exact field layout is intentionally minimal for now.
+/// The scheduler may use different budgets in normal vs waveform
+/// windows; apps should not inspect the budget to determine which
+/// window they are running in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BgBudget {
+    _private: (),
+}
+
+impl BgBudget {
+    /// Create a new budget (scheduler-side only).
+    pub const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Outcome of a single background step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BgOutcome {
+    /// No useful work to do right now.
+    Idle,
+    /// Did useful work this call; `more: true` means "call me again soon".
+    Progress { more: bool },
+    /// Background work exists conceptually but cannot advance locally
+    /// (e.g. waiting on a worker task to finish image decoding).
+    WaitingExternal,
+}
+
+impl BgOutcome {
+    /// Merge two outcomes — "most active" wins.
+    ///
+    /// Used by `AppManager` to combine active + suspended app outcomes.
+    pub fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Progress { more: true }, _) | (_, Self::Progress { more: true }) => {
+                Self::Progress { more: true }
+            }
+            (Self::Progress { more: false }, _) | (_, Self::Progress { more: false }) => {
+                Self::Progress { more: false }
+            }
+            (Self::WaitingExternal, _) | (_, Self::WaitingExternal) => Self::WaitingExternal,
+            _ => Self::Idle,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum QuickActionKind {
     Cycle {
@@ -310,9 +360,6 @@ impl AppContext {
     }
 }
 
-// background is async for epub streaming (stream_strip_entry_async);
-// other app impls compile to immediately-ready futures
-#[allow(async_fn_in_trait)]
 pub trait App<Id> {
     fn on_enter(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>);
 
@@ -338,7 +385,33 @@ pub trait App<Id> {
 
     fn draw(&self, strip: &mut StripBuffer);
 
-    async fn background(&mut self, _ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {}
+    /// Run one bounded step of background work for the active app.
+    ///
+    /// Called by the scheduler once per main-loop iteration and
+    /// repeatedly during EPD waveform waits. Each call should do
+    /// a bounded amount of work and return promptly (target: well
+    /// under 200 ms).
+    fn background_step(
+        &mut self,
+        _ctx: &mut AppContext,
+        _k: &mut KernelHandle<'_>,
+        _budget: BgBudget,
+    ) -> BgOutcome {
+        BgOutcome::Idle
+    }
+
+    /// Run one bounded step of background work while suspended.
+    ///
+    /// Called for apps that are in the navigation stack but not
+    /// currently active. No `AppContext` is provided since suspended
+    /// apps should not affect the UI.
+    fn background_suspended_step(
+        &mut self,
+        _k: &mut KernelHandle<'_>,
+        _budget: BgBudget,
+    ) -> BgOutcome {
+        BgOutcome::Idle
+    }
 
     fn pending_setting(&self) -> Option<PendingSetting> {
         None
@@ -364,12 +437,6 @@ pub trait App<Id> {
     fn hide_button_bar(&self) -> bool {
         false
     }
-
-    fn has_background_when_suspended(&self) -> bool {
-        false
-    }
-
-    fn background_suspended(&mut self, _k: &mut KernelHandle<'_>) {}
 }
 
 const MAX_STACK_DEPTH: usize = 4;
@@ -519,8 +586,16 @@ pub trait AppLayer {
 
     fn apply_transition(&mut self, t: Transition<Self::Id>, k: &mut KernelHandle<'_>);
 
-    // background work (SD I/O, caching); async for epub streaming
-    async fn run_background(&mut self, k: &mut KernelHandle<'_>);
+    /// Run one round of sync background steps for all apps.
+    ///
+    /// Dispatches `background_step` to the active app and
+    /// `background_suspended_step` to suspended apps, returning the
+    /// merged outcome.
+    fn run_background_step(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+        budget: BgBudget,
+    ) -> BgOutcome;
 
     // rendering
     fn draw(&self, strip: &mut StripBuffer);

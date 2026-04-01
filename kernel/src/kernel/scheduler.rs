@@ -265,39 +265,42 @@ impl super::Kernel {
             //
             //   1. background SD I/O runs here, before EPD access;
             //      interruptible by input so the user can navigate
-            //      away during long-running caching operations
+            //      away during long-running operations
             //   2. poll_housekeeping may do SD I/O, also before render
             //   3. render() touches the EPD; during the waveform window
             //      busy_wait_with_background runs SD I/O because the
             //      EPD charge pump is driving pixels with no SPI commands
             //   4. no SD I/O outside these three sites
             //
-            // when input arrives during run_background, the background
-            // future is dropped. this is safe: partial chapter cache
-            // writes leave ch_cached=false so the chapter is recached
-            // on the next attempt
-            let bg_input = {
-                let mut handle = self.handle();
-                match select(
-                    app_mgr.run_background(&mut handle),
-                    tasks::INPUT_EVENTS.receive(),
-                )
-                .await
-                {
-                    Either::First(()) => None,
-                    Either::Second(ev) => Some(ev),
-                }
-            };
+            // background steps are bounded and sync; between steps we
+            // poll for input so the user can interrupt long-running
+            // multi-step operations (e.g. chapter caching)
+            'bg: loop {
+                let outcome = {
+                    let mut handle = self.handle();
+                    app_mgr.run_background_step(&mut handle, super::app::BgBudget::new())
+                };
 
-            if let Some(ev) = bg_input {
-                if self.handle_input(ev, app_mgr) {
-                    self.sleep_with_session(app_mgr, "power held").await;
-                    continue;
+                // check for pending input between steps
+                if let Ok(ev) = tasks::INPUT_EVENTS.try_receive() {
+                    if self.handle_input(ev, app_mgr) {
+                        self.sleep_with_session(app_mgr, "power held").await;
+                        // sleep returns; restart main loop
+                        break 'bg;
+                    }
+                    if app_mgr.needs_special_mode() {
+                        break 'bg;
+                    }
                 }
 
-                if app_mgr.needs_special_mode() {
-                    continue;
+                match outcome {
+                    super::app::BgOutcome::Progress { more: true } => continue 'bg,
+                    _ => break 'bg,
                 }
+            }
+
+            if app_mgr.needs_special_mode() {
+                continue;
             }
 
             if self.poll_housekeeping() {
@@ -703,12 +706,10 @@ impl super::Kernel {
     // is_busy() is a sync GPIO read; no epd borrow is held across
     // any .await point, so self is fully available for handle() etc.
     //
-    // run_background is wrapped in select so input interrupts long
-    // background work (e.g. chapter caching). when the background
-    // future is dropped mid-stream, partial cache writes are safe
-    // because ch_cached stays false until the full write completes.
-    // the TICK_MS timeout ensures is_busy is re-checked regularly
-    // even during long background operations.
+    // background work runs as bounded sync steps via
+    // run_background_step; between steps we poll for input via
+    // with_timeout. the TICK_MS timeout ensures is_busy is
+    // re-checked regularly even when no input arrives.
     //
     // first deferred action wins; hold reset prevents the held
     // button from re-firing LongPress/Repeat for the waveform
@@ -728,22 +729,22 @@ impl super::Kernel {
                 break;
             }
 
-            // run background, interruptible by input or tick timeout
-            let ev = {
+            // run one bounded background step, then poll for input
+            {
                 let mut handle = self.handle();
-                match select(
-                    app_mgr.run_background(&mut handle),
-                    with_timeout(
-                        Duration::from_millis(timing::TICK_MS),
-                        tasks::INPUT_EVENTS.receive(),
-                    ),
-                )
-                .await
-                {
-                    Either::First(()) => None,
-                    Either::Second(Ok(ev)) => Some(ev),
-                    Either::Second(Err(_)) => None,
-                }
+                app_mgr.run_background_step(&mut handle, super::app::BgBudget::new());
+            }
+
+            // check for input; tick timeout ensures busy loop doesn't spin
+            // too tightly when no input and no background work remain
+            let ev = match with_timeout(
+                Duration::from_millis(timing::TICK_MS),
+                tasks::INPUT_EVENTS.receive(),
+            )
+            .await
+            {
+                Ok(ev) => Some(ev),
+                Err(_) => None,
             };
 
             if let Some(hw_event) = ev {

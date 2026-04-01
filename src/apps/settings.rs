@@ -487,16 +487,26 @@ impl App<AppId> for SettingsApp {
         }
     }
 
-    async fn background(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
+    fn background_step(
+        &mut self,
+        ctx: &mut AppContext,
+        k: &mut KernelHandle<'_>,
+        _budget: crate::apps::BgBudget,
+    ) -> crate::apps::BgOutcome {
         if !self.loaded {
             self.load(k);
             ctx.request_full_redraw();
-            return;
+            return crate::apps::BgOutcome::Progress {
+                more: self.save_needed,
+            };
         }
 
         if self.save_needed && self.save(k) {
             self.save_needed = false;
+            return crate::apps::BgOutcome::Progress { more: false };
         }
+
+        crate::apps::BgOutcome::Idle
     }
 
     fn draw(&self, strip: &mut StripBuffer) {

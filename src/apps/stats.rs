@@ -405,11 +405,18 @@ impl App<AppId> for StatsApp {
         }
     }
 
-    async fn background(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
+    fn background_step(
+        &mut self,
+        ctx: &mut AppContext,
+        k: &mut KernelHandle<'_>,
+        _budget: crate::apps::BgBudget,
+    ) -> crate::apps::BgOutcome {
         if !self.loaded {
             self.load_stats(k);
             ctx.request_full_redraw();
+            return crate::apps::BgOutcome::Progress { more: false };
         }
+        crate::apps::BgOutcome::Idle
     }
 
     fn draw(&self, strip: &mut StripBuffer) {
