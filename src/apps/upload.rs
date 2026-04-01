@@ -200,7 +200,7 @@ pub async fn run_upload_mode(
             &[
                 "No WiFi credentials!",
                 "Set wifi_ssid in",
-                "_PULP/SETTINGS.TXT",
+                "_PLUMP/SETTINGS.TXT",
             ],
             Some("Press BACK to exit"),
         ).await;

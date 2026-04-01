@@ -5,7 +5,7 @@
 //   4-byte header: u16 width (LE), u16 height (LE)
 //   packed 1-bit pixel payload (stride = ceil(width/8))
 //
-// Thumbnails live in the per-book `_PULP/_XXXXXXX/` directory
+// Thumbnails live in the per-book `_PLUMP/_XXXXXXX/` directory
 // alongside chapter/image caches, under a fixed filename.
 
 use alloc::vec::Vec;

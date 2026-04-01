@@ -223,7 +223,7 @@ design notes
     flushed every 30 s if dirty, plus on sleep. lookup by fnv1a
     hash + case-insensitive name comparison.
 
-    settings. key=value text in _PULP/SETTINGS.TXT. parsed at boot,
+    settings. key=value text in _PLUMP/SETTINGS.TXT. parsed at boot,
     saved on change. font size changes propagate to all apps.
 
     wifi upload. bypasses normal dispatch. HTTP server on port 80,

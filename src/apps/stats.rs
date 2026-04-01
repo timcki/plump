@@ -1,6 +1,6 @@
 // per-book reading statistics screen
 //
-// stats are stored as individual key=value files in _PULP/STATS/<filename>
+// stats are stored as individual key=value files in _PLUMP/STATS/<filename>
 // the screen shows global totals and a scrollable per-book list
 
 use core::fmt::Write as _;
@@ -36,7 +36,7 @@ const STATS_DIR: &str = "STATS";
 
 /// Per-book reading statistics (pages turned, time spent, sessions).
 ///
-/// Stored as key=value text files in `_PULP/STATS/<filename>`.
+/// Stored as key=value text files in `_PLUMP/STATS/<filename>`.
 #[derive(Clone, Copy, Default)]
 pub struct ReadingStats {
     pub pages: u32,

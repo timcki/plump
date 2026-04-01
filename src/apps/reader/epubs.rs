@@ -20,7 +20,7 @@ use super::{BgCacheState, CHAPTER_CACHE_MAX, EOCD_TAIL, EpubState, PAGE_BUF, Rea
 // one cell shared between reader and writer; safe because
 // stream_strip_entry_async never borrows both simultaneously
 struct CellReader<'a, 'k>(&'a RefCell<&'a mut KernelHandle<'k>>, &'a str);
-// CellWriter appends to a flat cache file in _PULP/ (v3 format)
+// CellWriter appends to a flat cache file in _PLUMP/ (v3 format)
 struct CellWriter<'a, 'k>(&'a RefCell<&'a mut KernelHandle<'k>>, &'a str);
 
 impl smol_epub::async_io::AsyncReadAt for CellReader<'_, '_> {
@@ -149,7 +149,7 @@ impl EpubState {
         }
 
         log::info!("epub: building v3 cache for {} chapters", self.spine.len());
-        // ensure image subdir exists (images stay in _PULP/_XXXXXXX/)
+        // ensure image subdir exists (images stay in _PLUMP/_XXXXXXX/)
         let dir_buf = self.cache_dir;
         let dir = cache::dir_name_str(&dir_buf);
         k.sd().ensure_plump_subdir(dir)?;
