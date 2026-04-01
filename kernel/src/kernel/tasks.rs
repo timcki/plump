@@ -128,6 +128,10 @@ pub async fn idle_timeout_task() -> ! {
                     continue;
                 }
                 Either3::Second(new_mins) => {
+                    if new_mins == timeout_mins {
+                        // same value — don't restart the timer
+                        continue;
+                    }
                     timeout_mins = new_mins;
                     break;
                 }
