@@ -183,3 +183,14 @@ impl ListSelection {
         }
     }
 }
+
+/// ensure `selected` is visible in a scrolling window of `visible` rows.
+/// adjusts `scroll` in place. use this when ListSelection is too
+/// heavyweight (e.g. when visible count is dynamic).
+pub fn ensure_visible(selected: usize, scroll: &mut usize, visible: usize) {
+    if selected < *scroll {
+        *scroll = selected;
+    } else if selected >= *scroll + visible {
+        *scroll = selected + 1 - visible;
+    }
+}

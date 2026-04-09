@@ -359,11 +359,7 @@ impl SettingsApp {
 
     fn scroll_into_view(&mut self) {
         let vis = self.visible_items();
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + vis {
-            self.scroll = self.selected + 1 - vis;
-        }
+        crate::apps::widgets::list::ensure_visible(self.selected, &mut self.scroll, vis);
     }
 
     // row region helpers (visible_idx = position on screen, 0 = first visible):

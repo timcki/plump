@@ -239,11 +239,7 @@ impl StatsApp {
 
     fn scroll_into_view(&mut self) {
         let vis = self.visible_rows();
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + vis {
-            self.scroll = self.selected + 1 - vis;
-        }
+        crate::apps::widgets::list::ensure_visible(self.selected, &mut self.scroll, vis);
     }
 
     fn row_region(&self, vis_index: usize) -> Region {
