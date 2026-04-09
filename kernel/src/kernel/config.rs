@@ -172,44 +172,36 @@ pub const WIFI_SSID_CAP: usize = 32;
 pub const WIFI_PASS_CAP: usize = 63;
 
 pub struct WifiConfig {
-    ssid: [u8; WIFI_SSID_CAP],
-    ssid_len: u8,
-    pass: [u8; WIFI_PASS_CAP],
-    pass_len: u8,
+    ssid: crate::util::FixedStr<WIFI_SSID_CAP>,
+    pass: crate::util::FixedStr<WIFI_PASS_CAP>,
 }
 
 impl WifiConfig {
     pub const fn empty() -> Self {
         Self {
-            ssid: [0u8; WIFI_SSID_CAP],
-            ssid_len: 0,
-            pass: [0u8; WIFI_PASS_CAP],
-            pass_len: 0,
+            ssid: crate::util::FixedStr::EMPTY,
+            pass: crate::util::FixedStr::EMPTY,
         }
     }
 
     pub fn ssid(&self) -> &str {
-        core::str::from_utf8(&self.ssid[..self.ssid_len as usize]).unwrap_or("")
+        self.ssid.as_str()
     }
 
     pub fn password(&self) -> &str {
-        core::str::from_utf8(&self.pass[..self.pass_len as usize]).unwrap_or("")
+        self.pass.as_str()
     }
 
     pub fn has_credentials(&self) -> bool {
-        self.ssid_len > 0
+        !self.ssid.is_empty()
     }
 
     fn set_ssid(&mut self, val: &[u8]) {
-        let n = val.len().min(WIFI_SSID_CAP);
-        self.ssid[..n].copy_from_slice(&val[..n]);
-        self.ssid_len = n as u8;
+        self.ssid.set(val);
     }
 
     fn set_pass(&mut self, val: &[u8]) {
-        let n = val.len().min(WIFI_PASS_CAP);
-        self.pass[..n].copy_from_slice(&val[..n]);
-        self.pass_len = n as u8;
+        self.pass.set(val);
     }
 }
 
@@ -384,8 +376,8 @@ impl SystemSettings {
     wr.kv_num(b"swap_buttons", if self.swap_buttons { 1 } else { 0 });
 
     wr.put(b"\n# wifi credentials for upload mode\n");
-    wr.kv_str(b"wifi_ssid", &w.ssid[..w.ssid_len as usize]);
-    wr.kv_str(b"wifi_pass", &w.pass[..w.pass_len as usize]);
+    wr.kv_str(b"wifi_ssid", w.ssid.as_bytes());
+    wr.kv_str(b"wifi_pass", w.pass.as_bytes());
     wr.pos
     }
 }

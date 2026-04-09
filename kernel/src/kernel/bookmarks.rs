@@ -8,6 +8,7 @@
 
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage::TITLE_CAP;
+use crate::util::FixedStr;
 // FNV-1a hash with ASCII case folding, used for bookmark filename lookups.
 pub fn fnv1a_icase(data: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
@@ -52,8 +53,7 @@ pub struct BookmarkSlot {
     pub chapter: u16,
     pub valid: bool,
     pub generation: u16,
-    pub name_len: u8,
-    pub filename: [u8; FILENAME_CAP],
+    pub filename: FixedStr<FILENAME_CAP>,
 }
 
 impl BookmarkSlot {
@@ -63,12 +63,11 @@ impl BookmarkSlot {
         chapter: 0,
         valid: false,
         generation: 0,
-        name_len: 0,
-        filename: [0u8; FILENAME_CAP],
+        filename: FixedStr::EMPTY,
     };
 
     pub fn filename_str(&self) -> &str {
-        core::str::from_utf8(&self.filename[..self.name_len as usize]).unwrap_or("?")
+        self.filename.as_str()
     }
 
     fn decode(rec: &[u8]) -> Self {
@@ -85,8 +84,7 @@ impl BookmarkSlot {
             chapter: read_u16_le(rec, 8),
             valid: read_u16_le(rec, 10) & 1 != 0,
             generation: read_u16_le(rec, 12),
-            name_len,
-            filename,
+            filename: FixedStr::from_raw(filename, name_len),
         }
     }
 
@@ -97,53 +95,45 @@ impl BookmarkSlot {
         write_u16_le(&mut rec, 8, self.chapter);
         write_u16_le(&mut rec, 10, if self.valid { 1 } else { 0 });
         write_u16_le(&mut rec, 12, self.generation);
-        rec[14] = self.name_len;
-        rec[16..16 + self.name_len as usize]
-            .copy_from_slice(&self.filename[..self.name_len as usize]);
+        rec[14] = self.filename.raw_len();
+        let n = self.filename.len();
+        rec[16..16 + n].copy_from_slice(&self.filename.raw_buf()[..n]);
         rec
     }
 
     fn matches_name(&self, name: &[u8]) -> bool {
-        self.name_len as usize == name.len()
-            && self.filename[..self.name_len as usize].eq_ignore_ascii_case(name)
+        self.filename.eq_ignore_ascii_case(name)
     }
 }
 
 #[derive(Clone, Copy)]
 pub struct BmListEntry {
-    pub filename: [u8; FILENAME_CAP],
-    pub name_len: u8,
+    pub filename: FixedStr<FILENAME_CAP>,
     pub chapter: u16,
-    pub title: [u8; TITLE_CAP],
-    pub title_len: u8,
+    pub title: FixedStr<TITLE_CAP>,
 }
 
 impl BmListEntry {
     pub const EMPTY: Self = Self {
-        filename: [0u8; FILENAME_CAP],
-        name_len: 0,
+        filename: FixedStr::EMPTY,
         chapter: 0,
-        title: [0u8; TITLE_CAP],
-        title_len: 0,
+        title: FixedStr::EMPTY,
     };
 
     pub fn filename_str(&self) -> &str {
-        core::str::from_utf8(&self.filename[..self.name_len as usize]).unwrap_or("?")
+        self.filename.as_str()
     }
 
     pub fn display_name(&self) -> &str {
-        if self.title_len > 0 {
-            core::str::from_utf8(&self.title[..self.title_len as usize])
-                .unwrap_or(self.filename_str())
+        if !self.title.is_empty() {
+            self.title.as_str()
         } else {
-            self.filename_str()
+            self.filename.as_str()
         }
     }
 
     pub fn set_title(&mut self, s: &[u8]) {
-        let n = s.len().min(TITLE_CAP);
-        self.title[..n].copy_from_slice(&s[..n]);
-        self.title_len = n as u8;
+        self.title.set(s);
     }
 }
 
@@ -237,14 +227,12 @@ impl BookmarkCache {
                 break;
             }
             let slot = &self.slots[i];
-            if slot.valid && slot.name_len > 0 {
+            if slot.valid && !slot.filename.is_empty() {
                 gens[count] = slot.generation;
                 out[count] = BmListEntry {
                     filename: slot.filename,
-                    name_len: slot.name_len,
                     chapter: slot.chapter,
-                    title: [0u8; TITLE_CAP],
-                    title_len: 0,
+                    title: FixedStr::EMPTY,
                 };
                 count += 1;
             }
@@ -318,18 +306,15 @@ impl BookmarkCache {
         });
 
         let generation = max_gen.wrapping_add(1);
-        let name_len = filename.len().min(FILENAME_CAP);
 
-        let mut new_slot = BookmarkSlot {
+        let new_slot = BookmarkSlot {
             name_hash: key,
             byte_offset,
             chapter,
             valid: true,
             generation,
-            name_len: name_len as u8,
-            filename: [0u8; FILENAME_CAP],
+            filename: FixedStr::from_bytes(filename),
         };
-        new_slot.filename[..name_len].copy_from_slice(&filename[..name_len]);
 
         self.slots[write_slot] = new_slot;
 

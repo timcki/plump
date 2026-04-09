@@ -456,7 +456,7 @@ impl App<AppId> for HomeApp {
             let _ = k.ensure_dir_cache_loaded();
             for i in 0..self.bm_count {
                 let entry = &self.bm_entries[i];
-                let fname = &entry.filename[..entry.name_len as usize];
+                let fname = entry.filename.as_bytes();
                 if let Some((title, len)) = k.dir_cache_mut().find_title(fname) {
                     let mut tbuf = [0u8; 96];
                     let n = (len as usize).min(96);
@@ -607,7 +607,7 @@ impl HomeApp {
             ActionEvent::Press(Action::Select) => {
                 if self.bm_count > 0 && self.bm_selected < self.bm_count {
                     let slot = &self.bm_entries[self.bm_selected];
-                    ctx.set_message(&slot.filename[..slot.name_len as usize]);
+                    ctx.set_message(slot.filename.as_bytes());
                     self.state = HomeState::Menu;
                     Transition::Push(AppId::Reader)
                 } else {
@@ -887,19 +887,19 @@ impl HomeApp {
 
 // humanize an all-uppercase SFN bookmark filename into the title field
 fn humanize_bm_entry(entry: &mut BmListEntry) {
-    let nlen = entry.name_len as usize;
-    if nlen == 0 || entry.title_len > 0 {
+    if entry.filename.is_empty() || !entry.title.is_empty() {
         return;
     }
-    let src = &entry.filename[..nlen];
+    let src = entry.filename.as_bytes();
     let all_upper = src.iter().all(|&b| !b.is_ascii_lowercase());
     if !all_upper {
         return;
     }
-    let n = nlen.min(entry.title.len());
+    let n = src.len().min(plump_kernel::drivers::storage::TITLE_CAP);
     let dot_pos = src.iter().position(|&b| b == b'.').unwrap_or(n);
+    let buf = entry.title.buf_mut();
     for i in 0..n {
-        entry.title[i] = if i == 0 {
+        buf[i] = if i == 0 {
             src[i]
         } else if i > dot_pos {
             src[i].to_ascii_lowercase()
@@ -907,5 +907,5 @@ fn humanize_bm_entry(entry: &mut BmListEntry) {
             src[i].to_ascii_lowercase()
         };
     }
-    entry.title_len = n as u8;
+    entry.title.set_len(n as u8);
 }
