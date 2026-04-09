@@ -98,33 +98,24 @@ impl ReadingStats {
 
 #[derive(Clone, Copy)]
 struct BookStats {
-    filename: [u8; 32],
-    filename_len: u8,
-    title: [u8; 64],
-    title_len: u8,
+    filename: plump_kernel::util::FixedStr<32>,
+    title: plump_kernel::util::FixedStr<64>,
     stats: ReadingStats,
 }
 
 impl BookStats {
     const EMPTY: Self = Self {
-        filename: [0u8; 32],
-        filename_len: 0,
-        title: [0u8; 64],
-        title_len: 0,
+        filename: plump_kernel::util::FixedStr::EMPTY,
+        title: plump_kernel::util::FixedStr::EMPTY,
         stats: ReadingStats::EMPTY,
     };
 
     fn display_name(&self) -> &str {
-        let tlen = self.title_len as usize;
-        if tlen > 0 {
-            core::str::from_utf8(&self.title[..tlen]).unwrap_or(self.filename_str())
+        if !self.title.is_empty() {
+            self.title.as_str()
         } else {
-            self.filename_str()
+            self.filename.as_str()
         }
-    }
-
-    fn filename_str(&self) -> &str {
-        core::str::from_utf8(&self.filename[..self.filename_len as usize]).unwrap_or("?")
     }
 }
 
@@ -304,17 +295,9 @@ impl StatsApp {
             let idx = self.book_count;
             self.books[idx] = BookStats::EMPTY;
 
-            // copy filename
-            let fname_bytes = fname.as_bytes();
-            let flen = fname_bytes.len().min(32);
-            self.books[idx].filename[..flen].copy_from_slice(&fname_bytes[..flen]);
-            self.books[idx].filename_len = flen as u8;
-
-            // copy display title
-            let display = entry.display_name();
-            let dlen = display.len().min(64);
-            self.books[idx].title[..dlen].copy_from_slice(&display.as_bytes()[..dlen]);
-            self.books[idx].title_len = dlen as u8;
+            // copy filename and display title
+            self.books[idx].filename.set(fname.as_bytes());
+            self.books[idx].title.set(entry.display_name().as_bytes());
 
             parse_stats(&buf[..n], &mut self.books[idx].stats);
 

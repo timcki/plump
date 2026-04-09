@@ -104,26 +104,25 @@ impl DirCache {
         self.valid = false;
     }
 
-    pub fn next_untitled_epub(&self, from: usize) -> Option<(usize, [u8; 13], u8)> {
+    pub fn next_untitled_epub(&self, from: usize) -> Option<(usize, crate::util::FixedStr<13>)> {
         for i in from..self.count {
             let e = &self.entries[i];
             if e.has_real_title() || e.is_dir {
                 continue;
             }
-            let name = e.name_str().as_bytes();
+            let name = e.name.as_bytes();
             if name.len() >= 5
-                && name[name.len() - 5..name.len() - 4] == [b'.']
+                && name[name.len() - 5] == b'.'
                 && name[name.len() - 4..].eq_ignore_ascii_case(b"EPUB")
             {
-                return Some((i, e.name, e.name_len));
+                return Some((i, e.name));
             }
         }
         None
     }
 
-    // look up the display title for a filename (case-insensitive);
-    // returns (title_bytes, title_len) including humanized SFN
-    pub fn find_title(&self, filename: &[u8]) -> Option<(&[u8], u8)> {
+    // look up the display title for a filename (case-insensitive)
+    pub fn find_title(&self, filename: &[u8]) -> Option<&[u8]> {
         let name = match core::str::from_utf8(filename) {
             Ok(s) => s,
             Err(_) => return None,
@@ -131,9 +130,8 @@ impl DirCache {
         for i in 0..self.count {
             let e = &self.entries[i];
             if e.name_str().eq_ignore_ascii_case(name) {
-                let len = (e.title_len & 0x7F) as usize;
-                if len > 0 {
-                    return Some((&e.title[..len], len as u8));
+                if !e.title.is_empty() {
+                    return Some(e.title.as_bytes());
                 }
                 return None;
             }
@@ -166,8 +164,8 @@ fn entry_gt(a: &DirEntry, b: &DirEntry) -> bool {
     if a.is_dir != b.is_dir {
         return !a.is_dir;
     }
-    let an = a.name_str().as_bytes();
-    let bn = b.name_str().as_bytes();
+    let an = a.name.as_bytes();
+    let bn = b.name.as_bytes();
     for (ab, bb) in an.iter().zip(bn.iter()) {
         let ac = ab.to_ascii_lowercase();
         let bc = bb.to_ascii_lowercase();

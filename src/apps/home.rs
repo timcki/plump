@@ -457,11 +457,8 @@ impl App<AppId> for HomeApp {
             for i in 0..self.bm_count {
                 let entry = &self.bm_entries[i];
                 let fname = entry.filename.as_bytes();
-                if let Some((title, len)) = k.dir_cache_mut().find_title(fname) {
-                    let mut tbuf = [0u8; 96];
-                    let n = (len as usize).min(96);
-                    tbuf[..n].copy_from_slice(&title[..n]);
-                    self.bm_entries[i].set_title(&tbuf[..n]);
+                if let Some(title) = k.dir_cache_mut().find_title(fname) {
+                    self.bm_entries[i].set_title(title);
                 } else {
                     // inline humanize: lowercase all-upper SFN filenames
                     humanize_bm_entry(&mut self.bm_entries[i]);

@@ -175,11 +175,13 @@ fn log_heap(label: &str) {
     );
 }
 
+type FileName = plump_kernel::util::FixedStr<13>;
+
 enum ServerEvent {
     Nothing,
-    Uploaded { name: [u8; 13], name_len: u8 },
+    Uploaded { name: FileName },
     UploadFailed,
-    Deleted { name: [u8; 13], name_len: u8 },
+    Deleted { name: FileName },
     DeleteFailed,
 }
 
@@ -349,18 +351,14 @@ pub async fn run_upload_mode(
         {
             Either::Second(Either3::First(event)) => {
                 match event {
-                    ServerEvent::Uploaded { name, name_len } => {
-                        let fname =
-                            core::str::from_utf8(&name[..name_len as usize]).unwrap_or("???");
-                        info!("upload: file saved as '{}'", fname);
+                    ServerEvent::Uploaded { name } => {
+                        info!("upload: file saved as '{}'", name);
                     }
                     ServerEvent::UploadFailed => {
                         warn!("upload: file upload failed");
                     }
-                    ServerEvent::Deleted { name, name_len } => {
-                        let fname =
-                            core::str::from_utf8(&name[..name_len as usize]).unwrap_or("???");
-                        info!("upload: deleted '{}'", fname);
+                    ServerEvent::Deleted { name } => {
+                        info!("upload: deleted '{}'", name);
                     }
                     ServerEvent::DeleteFailed => {
                         warn!("upload: file delete failed");
@@ -514,15 +512,12 @@ where
         };
 
         match handle_upload(&mut socket, sd, boundary, initial_body).await {
-            Ok((name_buf, name_len)) => {
+            Ok(name) => {
                 let _ = socket.write_all(HTTP_200_TEXT).await;
                 let _ = socket.write_all(b"OK").await;
                 let _ = socket.flush().await;
                 close_socket(&mut socket).await;
-                return ServerEvent::Uploaded {
-                    name: name_buf,
-                    name_len,
-                };
+                return ServerEvent::Uploaded { name };
             }
             Err(e) => {
                 debug!("upload: handle_upload error: {}", e);
@@ -564,11 +559,6 @@ where
             return ServerEvent::DeleteFailed;
         }
 
-        let mut name_buf = [0u8; 13];
-        let name_bytes = name.as_bytes();
-        name_buf[..name_bytes.len()].copy_from_slice(name_bytes);
-        let name_len = name_bytes.len() as u8;
-
         match sd.delete_file(name) {
             Ok(()) => {
                 let _ = socket.write_all(HTTP_200_TEXT).await;
@@ -576,8 +566,7 @@ where
                 let _ = socket.flush().await;
                 close_socket(&mut socket).await;
                 return ServerEvent::Deleted {
-                    name: name_buf,
-                    name_len,
+                    name: FileName::from_bytes(name.as_bytes()),
                 };
             }
             Err(e) => {
@@ -600,7 +589,7 @@ async fn handle_upload(
     sd: &SdStorage,
     boundary: &[u8],
     initial_body: &[u8],
-) -> Result<([u8; 13], u8), &'static str>
+) -> Result<FileName, &'static str>
 where
 {
     if boundary.len() > MAX_BOUNDARY_LEN {
@@ -621,24 +610,24 @@ where
     work[..init_len].copy_from_slice(&initial_body[..init_len]);
     let mut filled = init_len;
 
-    let (file_name_buf, file_name_len) = loop {
+    let file_name = loop {
         if let Some(pos) = find_subsequence(&work[..filled], b"\r\n\r\n") {
             let part_headers = &work[..pos];
 
             let raw_name = extract_filename(part_headers).ok_or("no filename in upload")?;
-            let (name_buf, name_len) = sanitize_83(raw_name);
-            if name_len == 0 {
+            let name = sanitize_83(raw_name);
+            if name.is_empty() {
                 return Err("invalid filename");
             }
 
             // warn if sanitisation changed the name, two different
             // original names can map to the same 8.3 name, causing
             // the second upload to silently overwrite the first.
-            if raw_name != &name_buf[..name_len as usize] {
+            if raw_name != name.as_bytes() {
                 log::warn!(
                     "upload: sanitised '{}' -> '{}' (may overwrite existing file)",
                     core::str::from_utf8(raw_name).unwrap_or("?"),
-                    core::str::from_utf8(&name_buf[..name_len as usize]).unwrap_or("?"),
+                    name,
                 );
             }
 
@@ -646,7 +635,7 @@ where
             work.copy_within(file_start..filled, 0);
             filled -= file_start;
 
-            break (name_buf, name_len);
+            break name;
         }
 
         if filled >= work.len() {
@@ -663,8 +652,7 @@ where
         filled += n;
     };
 
-    let name_str = core::str::from_utf8(&file_name_buf[..file_name_len as usize])
-        .map_err(|_| "filename encoding error")?;
+    let name_str = file_name.as_str();
 
     debug!("upload: receiving file '{}'", name_str);
     log_heap("upload start");
@@ -718,7 +706,7 @@ where
     let _ = file.close(sd);
     log_heap("upload done");
     result?;
-    Ok((file_name_buf, file_name_len))
+    Ok(file_name)
 }
 
 fn extract_path(line: &[u8]) -> &[u8] {
@@ -780,7 +768,7 @@ fn extract_filename(headers: &[u8]) -> Option<&[u8]> {
     Some(&rest[..end])
 }
 
-fn sanitize_83(raw: &[u8]) -> ([u8; 13], u8) {
+fn sanitize_83(raw: &[u8]) -> FileName {
     let name = match raw.iter().rposition(|&b| b == b'/' || b == b'\\') {
         Some(p) => &raw[p + 1..],
         None => raw,
@@ -828,7 +816,7 @@ fn sanitize_83(raw: &[u8]) -> ([u8; 13], u8) {
         }
     }
 
-    (out, pos as u8)
+    FileName::from_raw(out, pos as u8)
 }
 
 fn is_valid_83_char(b: u8) -> bool {

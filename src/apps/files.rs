@@ -246,7 +246,7 @@ impl FilesApp {
         let mut n = 0usize;
         let (is_file, is_epub) = if self.selected < self.count {
             let e = &self.entries[self.selected];
-            let nm = &e.name[..e.name_len as usize];
+            let nm = e.name.as_bytes();
             let epub = !e.is_dir
                 && nm.len() >= 5
                 && nm[nm.len() - 5] == b'.'
@@ -322,14 +322,11 @@ impl App<AppId> for FilesApp {
             self.pending_delete_file = false;
             if let Some(entry) = self.selected_entry() {
                 if !entry.is_dir {
-                    let mut nb = [0u8; 13];
-                    let nl = entry.name_len as usize;
-                    nb[..nl].copy_from_slice(&entry.name[..nl]);
-                    let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+                    let name = entry.name_str();
                     log::info!("files: deleting {}", name);
 
                     // also remove bookmark
-                    k.bookmark_cache_mut().remove(&nb[..nl]);
+                    k.bookmark_cache_mut().remove(name.as_bytes());
 
                     match k.sd().delete_file(name) {
                         Ok(()) => {
@@ -357,8 +354,7 @@ impl App<AppId> for FilesApp {
             self.pending_delete_cache = false;
             if let Some(entry) = self.selected_entry() {
                 if !entry.is_dir {
-                    let nl = entry.name_len as usize;
-                    let name = core::str::from_utf8(&entry.name[..nl]).unwrap_or("");
+                    let name = entry.name_str();
                     let hash = cache::fnv1a(name.as_bytes());
                     let cf = cache::cache_filename(hash);
                     let cf_str = cache::cache_filename_str(&cf);
@@ -560,8 +556,8 @@ struct TitleScanResult {
 }
 
 fn scan_one_epub_title(k: &mut KernelHandle<'_>, from: usize) -> Option<TitleScanResult> {
-    let (idx, name_buf, name_len) = k.dir_cache_mut().next_untitled_epub(from)?;
-    let name = core::str::from_utf8(&name_buf[..name_len as usize]).unwrap_or("");
+    let (idx, name_fs) = k.dir_cache_mut().next_untitled_epub(from)?;
+    let name = name_fs.as_str();
     let next_idx = idx + 1;
 
     log::debug!("titles: scanning {} (idx {})", name, idx);

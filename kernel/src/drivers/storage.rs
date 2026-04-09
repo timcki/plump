@@ -13,6 +13,7 @@ use embedded_sdmmc::{Mode, RawFile};
 
 use crate::drivers::sdcard::{SdStorage, SdStorageInner, poll_once};
 use crate::error::{Error, ErrorKind};
+use crate::util::FixedStr;
 
 // TODO: rename _PULP to _PLUMP on-disk and drop legacy fallback
 pub const PLUMP_DIR: &str = "_PLUMP";
@@ -25,72 +26,66 @@ pub type StorageError = Error;
 
 #[derive(Clone, Copy)]
 pub struct DirEntry {
-    pub name: [u8; 13],
-    pub name_len: u8,
+    pub name: FixedStr<13>,
     pub is_dir: bool,
     pub size: u32,
-    pub title: [u8; TITLE_CAP],
-    pub title_len: u8,
+    pub title: FixedStr<TITLE_CAP>,
+    // true when title is a humanized SFN fallback (not a real resolved title)
+    pub title_humanized: bool,
 }
 
 impl DirEntry {
     pub const EMPTY: Self = Self {
-        name: [0u8; 13],
-        name_len: 0,
+        name: FixedStr::EMPTY,
         is_dir: false,
         size: 0,
-        title: [0u8; TITLE_CAP],
-        title_len: 0,
+        title: FixedStr::EMPTY,
+        title_humanized: false,
     };
 
     pub fn name_str(&self) -> &str {
-        core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("?")
+        self.name.as_str()
     }
 
     pub fn display_name(&self) -> &str {
-        let len = (self.title_len & 0x7F) as usize;
-        if len > 0 {
-            core::str::from_utf8(&self.title[..len]).unwrap_or(self.name_str())
+        if !self.title.is_empty() {
+            self.title.as_str()
         } else {
-            self.name_str()
+            self.name.as_str()
         }
     }
 
     pub fn has_real_title(&self) -> bool {
-        self.title_len > 0 && self.title_len & 0x80 == 0
+        !self.title.is_empty() && !self.title_humanized
     }
 
     pub fn set_title(&mut self, s: &[u8]) {
-        let n = s.len().min(TITLE_CAP);
-        self.title[..n].copy_from_slice(&s[..n]);
-        self.title_len = n as u8;
+        self.title.set(s);
+        self.title_humanized = false;
     }
 
     // write a humanized SFN into the title buffer as a soft fallback;
     // does not prevent the title scanner from resolving a real title
     pub fn humanize_sfn(&mut self) {
-        let nlen = self.name_len as usize;
-        if nlen == 0 || self.has_real_title() {
+        if self.name.is_empty() || self.has_real_title() {
             return;
         }
-        let src = &self.name[..nlen];
-        // check if name is all-uppercase (typical 8.3 SFN)
+        let src = self.name.as_bytes();
         let all_upper = src.iter().all(|&b| !b.is_ascii_lowercase());
         if !all_upper {
             return; // mixed case: user-supplied LFN, leave as-is
         }
-        let n = nlen.min(TITLE_CAP);
-        let dot_pos = src.iter().position(|&b| b == b'.').unwrap_or(n);
+        let n = src.len().min(TITLE_CAP);
+        let buf = self.title.buf_mut();
         for i in 0..n {
-            if i == 0 {
-                self.title[i] = src[i]; // keep first char uppercase
-            } else if i > dot_pos {
-                self.title[i] = src[i].to_ascii_lowercase(); // lowercase ext
+            buf[i] = if i == 0 {
+                src[i] // keep first char uppercase
             } else {
-                self.title[i] = src[i].to_ascii_lowercase();
-            }
+                src[i].to_ascii_lowercase()
+            };
         }
-        self.title_len = 0x80 | n as u8;
+        self.title.set_len(n as u8);
+        self.title_humanized = true;
     }
 }
 
@@ -443,12 +438,11 @@ impl SdStorage {
 
                     if count < buf.len() {
                         buf[count] = DirEntry {
-                            name: name_buf,
-                            name_len,
+                            name: FixedStr::from_raw(name_buf, name_len),
                             is_dir: false,
                             size: entry.size,
-                            title: [0u8; TITLE_CAP],
-                            title_len: 0,
+                            title: FixedStr::EMPTY,
+                            title_humanized: false,
                         };
                         count += 1;
                     }
