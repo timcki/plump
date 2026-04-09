@@ -43,16 +43,51 @@ fn bit_pos(buf_x: usize) -> (usize, u8) {
     (buf_x / 8, 1u8 << (7 - (buf_x & 7)))
 }
 
+/// pre-computed clipping bounds for 270° rotation blit
+struct Clip270 {
+    x0: usize,
+    x1: usize,
+    y0: usize,
+    y1: usize,
+    base_buf_y: usize,
+    rb: usize,
+    wx: i32,
+}
+
+/// clip a glyph at (gx, gy) of size (w, h) against the physical window
+/// for 270° rotation. returns None if fully clipped.
+fn clip_270(win: &Region, row_bytes: u16, gx: i32, gy: i32, w: usize, h: usize) -> Option<Clip270> {
+    let wx = win.x as i32;
+    let wy = win.y as i32;
+    let wx2 = wx + win.w as i32;
+    let wy2 = wy + win.h as i32;
+    let rb = row_bytes as usize;
+
+    // clip glyph rows (y axis) against physical-x window
+    let y0 = (wx - gy).clamp(0, h as i32) as usize;
+    let y1 = (wx2 - gy).clamp(0, h as i32) as usize;
+    if y0 >= y1 {
+        return None;
+    }
+
+    // clip glyph cols (x axis) against physical-y window
+    let x0 = (HEIGHT as i32 - gx - wy2).clamp(0, w as i32) as usize;
+    let x1 = (HEIGHT as i32 - gx - wy).clamp(0, w as i32) as usize;
+    if x0 >= x1 {
+        return None;
+    }
+
+    let base_buf_y = (HEIGHT as i32 - 1 - gx - wy) as usize;
+    Some(Clip270 { x0, x1, y0, y1, base_buf_y, rb, wx })
+}
+
 pub struct StripBuffer {
     buf: [u8; STRIP_BUF_SIZE],
     // secondary buffer for GrayDual mode (MSB plane)
     gray_buf: [u8; STRIP_BUF_SIZE],
     rotation: Rotation,
     gray_mode: GrayMode,
-    win_x: u16,
-    win_y: u16,
-    win_w: u16,
-    win_h: u16,
+    win: Region,
     row_bytes: u16,
 }
 
@@ -63,10 +98,7 @@ impl StripBuffer {
             gray_buf: [0u8; STRIP_BUF_SIZE],
             rotation: Rotation::Deg270,
             gray_mode: GrayMode::Bw,
-            win_x: 0,
-            win_y: 0,
-            win_w: WIDTH,
-            win_h: STRIP_ROWS,
+            win: Region::new(0, 0, WIDTH, STRIP_ROWS),
             row_bytes: (WIDTH / 8),
         }
     }
@@ -81,10 +113,7 @@ impl StripBuffer {
 
     pub fn begin_strip(&mut self, rotation: Rotation, strip_idx: u16) {
         self.rotation = rotation;
-        self.win_x = 0;
-        self.win_y = strip_idx * STRIP_ROWS;
-        self.win_w = WIDTH;
-        self.win_h = STRIP_ROWS;
+        self.win = Region::new(0, strip_idx * STRIP_ROWS, WIDTH, STRIP_ROWS);
         self.row_bytes = PHYS_BYTES_PER_ROW as u16;
 
         let fill = if self.gray_mode == GrayMode::Bw {
@@ -101,8 +130,7 @@ impl StripBuffer {
     pub fn begin_window(&mut self, rotation: Rotation, x: u16, y: u16, w: u16, mut h: u16) {
         let rb = (w / 8) as usize;
         if rb == 0 {
-            self.win_w = 0;
-            self.win_h = 0;
+            self.win = Region::new(x, y, 0, 0);
             self.row_bytes = 0;
             return;
         }
@@ -119,10 +147,7 @@ impl StripBuffer {
         let total = rb * h as usize;
 
         self.rotation = rotation;
-        self.win_x = x;
-        self.win_y = y;
-        self.win_w = w;
-        self.win_h = h;
+        self.win = Region::new(x, y, w, h);
         self.row_bytes = rb as u16;
 
         let fill = if self.gray_mode == GrayMode::Bw {
@@ -137,51 +162,42 @@ impl StripBuffer {
     }
 
     pub fn data(&self) -> &[u8] {
-        let total = self.row_bytes as usize * self.win_h as usize;
+        let total = self.row_bytes as usize * self.win.h as usize;
         &self.buf[..total]
     }
 
     pub fn data_mut(&mut self) -> &mut [u8] {
-        let total = self.row_bytes as usize * self.win_h as usize;
+        let total = self.row_bytes as usize * self.win.h as usize;
         &mut self.buf[..total]
     }
 
     /// Secondary buffer data (MSB plane) for GrayDual mode.
     pub fn gray_data(&self) -> &[u8] {
-        let total = self.row_bytes as usize * self.win_h as usize;
+        let total = self.row_bytes as usize * self.win.h as usize;
         &self.gray_buf[..total]
     }
 
     pub fn gray_data_mut(&mut self) -> &mut [u8] {
-        let total = self.row_bytes as usize * self.win_h as usize;
+        let total = self.row_bytes as usize * self.win.h as usize;
         &mut self.gray_buf[..total]
     }
 
-    pub fn window(&self) -> (u16, u16, u16, u16) {
-        (self.win_x, self.win_y, self.win_w, self.win_h)
+    pub fn window(&self) -> Region {
+        self.win
     }
 
     pub fn logical_window(&self) -> Region {
+        let w = self.win;
         match self.rotation {
-            Rotation::Deg0 => Region::new(self.win_x, self.win_y, self.win_w, self.win_h),
-            Rotation::Deg90 => Region::new(
-                self.win_y,
-                WIDTH - self.win_x - self.win_w,
-                self.win_h,
-                self.win_w,
-            ),
+            Rotation::Deg0 => w,
+            Rotation::Deg90 => Region::new(w.y, WIDTH - w.x - w.w, w.h, w.w),
             Rotation::Deg180 => Region::new(
-                WIDTH - self.win_x - self.win_w,
-                HEIGHT - self.win_y - self.win_h,
-                self.win_w,
-                self.win_h,
+                WIDTH - w.x - w.w,
+                HEIGHT - w.y - w.h,
+                w.w,
+                w.h,
             ),
-            Rotation::Deg270 => Region::new(
-                HEIGHT - self.win_y - self.win_h,
-                self.win_x,
-                self.win_h,
-                self.win_w,
-            ),
+            Rotation::Deg270 => Region::new(HEIGHT - w.y - w.h, w.x, w.h, w.w),
         }
     }
 
@@ -207,15 +223,15 @@ impl StripBuffer {
     }
 
     fn set_pixel_physical(&mut self, px: u16, py: u16, black: bool) {
-        if px < self.win_x || px >= self.win_x + self.win_w {
+        if px < self.win.x || px >= self.win.x + self.win.w {
             return;
         }
-        if py < self.win_y || py >= self.win_y + self.win_h {
+        if py < self.win.y || py >= self.win.y + self.win.h {
             return;
         }
 
-        let local_x = (px - self.win_x) as usize;
-        let local_y = (py - self.win_y) as usize;
+        let local_x = (px - self.win.x) as usize;
+        let local_y = (py - self.win.y) as usize;
         let idx = (local_x / 8) + (local_y * self.row_bytes as usize);
         let bit = 7 - (local_x as u16 % 8);
 
@@ -228,15 +244,15 @@ impl StripBuffer {
 
     /// Set a bit in the secondary gray buffer (for GrayDual generic fallback).
     fn set_gray_pixel_physical(&mut self, px: u16, py: u16) {
-        if px < self.win_x || px >= self.win_x + self.win_w {
+        if px < self.win.x || px >= self.win.x + self.win.w {
             return;
         }
-        if py < self.win_y || py >= self.win_y + self.win_h {
+        if py < self.win.y || py >= self.win.y + self.win.h {
             return;
         }
 
-        let local_x = (px - self.win_x) as usize;
-        let local_y = (py - self.win_y) as usize;
+        let local_x = (px - self.win.x) as usize;
+        let local_y = (py - self.win.y) as usize;
         let idx = (local_x / 8) + (local_y * self.row_bytes as usize);
         self.gray_buf[idx] |= 1 << (7 - (local_x % 8));
     }
@@ -275,56 +291,29 @@ impl StripBuffer {
         gy: i32,
         black: bool,
     ) {
-        // window bounds (wx, wy = origin; wx2, wy2 = extent; rb = row bytes)
-        let wx = self.win_x as i32;
-        let wy = self.win_y as i32;
-        let wx2 = wx + self.win_w as i32;
-        let wy2 = wy + self.win_h as i32;
-        let rb = self.row_bytes as usize;
+        let c = match clip_270(&self.win, self.row_bytes, gx, gy, w, h) {
+            Some(c) => c,
+            None => return,
+        };
 
-        // clip glyph rows (y axis) against physical-x window
-        let y0 = (wx - gy).clamp(0, h as i32) as usize;
-        let y1 = (wx2 - gy).clamp(0, h as i32) as usize;
-        if y0 >= y1 {
-            return;
-        }
-
-        // clip glyph cols (x axis) against physical-y window
-        // phys_y = HEIGHT-1-gx-x, decreasing with x
-        let x0 = (HEIGHT as i32 - gx - wy2).clamp(0, w as i32) as usize;
-        let x1 = (HEIGHT as i32 - gx - wy).clamp(0, w as i32) as usize;
-        if x0 >= x1 {
-            return;
-        }
-
-        // buf_y for x=0: physical row offset into window
-        let base_buf_y_i = HEIGHT as i32 - 1 - gx - wy;
-        debug_assert!(base_buf_y_i >= 0, "blit_1bpp_270: base_buf_y underflow");
-        debug_assert!(gy + y0 as i32 >= wx, "blit_1bpp_270: buf_x underflow");
-        let base_buf_y = base_buf_y_i as usize;
-
-        // loop order: x-outer (strip rows, sequential memory), y-inner
-        // (strip columns, nearby bytes in same row). this is the opposite
-        // of the source row-major order but gives much better cache locality
-        // for the destination strip buffer writes.
-        for x in x0..x1 {
+        for x in c.x0..c.x1 {
             let src_byte_idx = x / 8;
             let src_bit = 1u8 << (7 - (x & 7));
-            let dst_row_base = (base_buf_y - x) * rb;
+            let dst_row_base = (c.base_buf_y - x) * c.rb;
 
             if black {
-                for y in y0..y1 {
+                for y in c.y0..c.y1 {
                     if bitmaps[offset + y * stride + src_byte_idx] & src_bit != 0 {
-                        let buf_x = (gy + y as i32 - wx) as usize;
+                        let buf_x = (gy + y as i32 - c.wx) as usize;
                         let byte_col = buf_x / 8;
                         let inv_mask = !(1u8 << (7 - (buf_x & 7)));
                         self.buf[dst_row_base + byte_col] &= inv_mask;
                     }
                 }
             } else {
-                for y in y0..y1 {
+                for y in c.y0..c.y1 {
                     if bitmaps[offset + y * stride + src_byte_idx] & src_bit != 0 {
-                        let buf_x = (gy + y as i32 - wx) as usize;
+                        let buf_x = (gy + y as i32 - c.wx) as usize;
                         let byte_col = buf_x / 8;
                         let mask = 1u8 << (7 - (buf_x & 7));
                         self.buf[dst_row_base + byte_col] |= mask;
@@ -416,94 +405,68 @@ impl StripBuffer {
         gy: i32,
         black: bool,
     ) {
-        // 270° rotation: logical (lx, ly) → physical (ly, HEIGHT-1-lx)
-        // x-outer loop for cache-friendly destination writes (same as blit_1bpp_270)
-
-        let wx = self.win_x as i32;
-        let wy = self.win_y as i32;
-        let wx2 = wx + self.win_w as i32;
-        let wy2 = wy + self.win_h as i32;
-        let rb = self.row_bytes as usize;
-
-        // clip glyph rows (y axis) against physical-x window
-        let y0 = (wx - gy).clamp(0, h as i32) as usize;
-        let y1 = (wx2 - gy).clamp(0, h as i32) as usize;
-        if y0 >= y1 {
-            return;
-        }
-
-        // clip glyph cols (x axis) against physical-y window
-        let x0 = (HEIGHT as i32 - gx - wy2).clamp(0, w as i32) as usize;
-        let x1 = (HEIGHT as i32 - gx - wy).clamp(0, w as i32) as usize;
-        if x0 >= x1 {
-            return;
-        }
-
-        let base_buf_y_i = HEIGHT as i32 - 1 - gx - wy;
-        debug_assert!(base_buf_y_i >= 0, "blit_2bpp_270: base_buf_y underflow");
-        debug_assert!(gy + y0 as i32 >= wx, "blit_2bpp_270: buf_x underflow");
-        let base_buf_y = base_buf_y_i as usize;
+        let c = match clip_270(&self.win, self.row_bytes, gx, gy, w, h) {
+            Some(c) => c,
+            None => return,
+        };
 
         let data = &bitmaps[offset..];
         let gray_mode = self.gray_mode;
 
-        // x-outer, y-inner (same traversal order as blit_1bpp_270)
-        for x in x0..x1 {
+        for x in c.x0..c.x1 {
             let src_byte_col = x / 4;
             let src_shift = 6 - (x & 3) * 2;
-            let dst_row_base = (base_buf_y - x) * rb;
+            let dst_row_base = (c.base_buf_y - x) * c.rb;
 
             match gray_mode {
                 GrayMode::Bw => {
                     if black {
-                        for y in y0..y1 {
+                        for y in c.y0..c.y1 {
                             let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
                             if val != 0 {
-                                let (col, mask) = bit_pos((gy + y as i32 - wx) as usize);
+                                let (col, mask) = bit_pos((gy + y as i32 - c.wx) as usize);
                                 self.buf[dst_row_base + col] &= !mask;
                             }
                         }
                     } else {
-                        for y in y0..y1 {
+                        for y in c.y0..c.y1 {
                             let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
                             if val != 0 {
-                                let (col, mask) = bit_pos((gy + y as i32 - wx) as usize);
+                                let (col, mask) = bit_pos((gy + y as i32 - c.wx) as usize);
                                 self.buf[dst_row_base + col] |= mask;
                             }
                         }
                     }
                 }
                 GrayMode::GrayLsb => {
-                    for y in y0..y1 {
+                    for y in c.y0..c.y1 {
                         let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
                         if val >= 2 {
-                            let (col, mask) = bit_pos((gy + y as i32 - wx) as usize);
+                            let (col, mask) = bit_pos((gy + y as i32 - c.wx) as usize);
                             self.buf[dst_row_base + col] |= mask;
                         }
                     }
                 }
                 GrayMode::GrayMsb => {
-                    for y in y0..y1 {
+                    for y in c.y0..c.y1 {
                         let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
                         if val == 1 || val == 2 {
-                            let (col, mask) = bit_pos((gy + y as i32 - wx) as usize);
+                            let (col, mask) = bit_pos((gy + y as i32 - c.wx) as usize);
                             self.buf[dst_row_base + col] |= mask;
                         }
                     }
                 }
                 GrayMode::GrayDual => {
-                    for y in y0..y1 {
+                    for y in c.y0..c.y1 {
                         let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
                         if val == 0 {
                             continue;
                         }
-                        let (col, mask) = bit_pos((gy + y as i32 - wx) as usize);
+                        let (col, mask) = bit_pos((gy + y as i32 - c.wx) as usize);
                         let idx = dst_row_base + col;
-                        // LSB plane (buf → BW RAM): dark gray + black
                         if val >= 2 {
                             self.buf[idx] |= mask;
                         }
-                        // MSB plane (gray_buf → RED RAM): light + dark gray
                         if val <= 2 {
                             self.gray_buf[idx] |= mask;
                         }
@@ -571,18 +534,18 @@ impl StripBuffer {
     }
 
     fn fill_physical_rect(&mut self, px0: u16, py0: u16, px1: u16, py1: u16, black: bool) {
-        let cx0 = px0.max(self.win_x);
-        let cx1 = px1.min(self.win_x + self.win_w);
-        let cy0 = py0.max(self.win_y);
-        let cy1 = py1.min(self.win_y + self.win_h);
+        let cx0 = px0.max(self.win.x);
+        let cx1 = px1.min(self.win.x + self.win.w);
+        let cy0 = py0.max(self.win.y);
+        let cy1 = py1.min(self.win.y + self.win.h);
         if cx0 >= cx1 || cy0 >= cy1 {
             return;
         }
 
-        let lx0 = (cx0 - self.win_x) as usize;
-        let lx1 = (cx1 - self.win_x) as usize;
-        let ly0 = (cy0 - self.win_y) as usize;
-        let ly1 = (cy1 - self.win_y) as usize;
+        let lx0 = (cx0 - self.win.x) as usize;
+        let lx1 = (cx1 - self.win.x) as usize;
+        let ly0 = (cy0 - self.win.y) as usize;
+        let ly1 = (cy1 - self.win.y) as usize;
         let rb = self.row_bytes as usize;
 
         let first_byte = lx0 / 8;
