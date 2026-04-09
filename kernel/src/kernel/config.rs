@@ -231,57 +231,53 @@ fn parse_u16(s: &[u8]) -> Option<u16> {
     Some(val)
 }
 
-fn apply_setting(key: &[u8], val: &[u8], s: &mut SystemSettings, w: &mut WifiConfig) {
-    match key {
-        b"sleep_timeout" => {
-            if let Some(v) = parse_u16(val) {
-                s.sleep_timeout = v;
-            }
-        }
-        b"ghost_clear" => {
-            if let Some(v) = parse_u16(val) {
-                s.ghost_clear_every = v as u8;
-            }
-        }
-        b"book_font" => {
-            if let Some(v) = parse_u16(val) {
-                s.book_font_size_idx = v as u8;
-            }
-        }
-        b"ui_font" => {
-            if let Some(v) = parse_u16(val) {
-                s.ui_font_size_idx = v as u8;
-            }
-        }
-        b"reading_theme" => {
-            if let Some(v) = parse_u16(val) {
-                s.reading_theme = v as u8;
-            }
-        }
-        b"swap_buttons" => {
-            s.swap_buttons = val == b"1" || val == b"true";
-        }
-        b"sunlight_fix" => {
-            s.sunlight_fix = val == b"1" || val == b"true";
-        }
-        b"text_aa" => {
-            s.text_aa = val == b"1" || val == b"true";
-        }
-        b"reader_status" => {
-            s.reader_status = val == b"1" || val == b"true";
-        }
-        b"text_alignment" => {
-            if let Some(v) = parse_u16(val) {
-                s.text_alignment = v as u8;
-            }
-        }
-        b"wifi_ssid" => w.set_ssid(val),
-        b"wifi_pass" => w.set_pass(val),
-        _ => {}
-    }
+fn parse_bool(val: &[u8]) -> bool {
+    matches!(val, b"1" | b"true")
 }
 
 impl SystemSettings {
+    fn apply_setting(&mut self, key: &[u8], val: &[u8], wifi: &mut WifiConfig) {
+        match key {
+            b"sleep_timeout" => {
+                if let Some(v) = parse_u16(val) {
+                    self.sleep_timeout = v;
+                }
+            }
+            b"ghost_clear" => {
+                if let Some(v) = parse_u16(val) {
+                    self.ghost_clear_every = v as u8;
+                }
+            }
+            b"book_font" => {
+                if let Some(v) = parse_u16(val) {
+                    self.book_font_size_idx = v as u8;
+                }
+            }
+            b"ui_font" => {
+                if let Some(v) = parse_u16(val) {
+                    self.ui_font_size_idx = v as u8;
+                }
+            }
+            b"reading_theme" => {
+                if let Some(v) = parse_u16(val) {
+                    self.reading_theme = v as u8;
+                }
+            }
+            b"swap_buttons" => self.swap_buttons = parse_bool(val),
+            b"sunlight_fix" => self.sunlight_fix = parse_bool(val),
+            b"text_aa" => self.text_aa = parse_bool(val),
+            b"reader_status" => self.reader_status = parse_bool(val),
+            b"text_alignment" => {
+                if let Some(v) = parse_u16(val) {
+                    self.text_alignment = v as u8;
+                }
+            }
+            b"wifi_ssid" => wifi.set_ssid(val),
+            b"wifi_pass" => wifi.set_pass(val),
+            _ => {}
+        }
+    }
+
     /// Parse a SETTINGS.TXT blob into self + wifi config.
     pub fn parse_txt(&mut self, data: &[u8], wifi: &mut WifiConfig) {
         for line in data.split(|&b| b == b'\n') {
@@ -292,7 +288,7 @@ impl SystemSettings {
             if let Some(eq) = line.iter().position(|&b| b == b'=') {
                 let key = trim(&line[..eq]);
                 let val = trim(&line[eq + 1..]);
-                apply_setting(key, val, self, wifi);
+                self.apply_setting(key, val, wifi);
             }
         }
     }
