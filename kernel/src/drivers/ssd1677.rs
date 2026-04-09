@@ -833,6 +833,26 @@ where
 
         self.start_grayscale_refresh(rs);
         self.wait_busy_async().await;
+
+        // restore BW RAM with correct content so subsequent partial
+        // DU refreshes compute correct pixel deltas. the physical
+        // display keeps the grayscale image (latched by the EPD),
+        // but BW RAM must match what the DU waveform expects as the
+        // "old" image. without this, a partial update on a sub-region
+        // (e.g. quick menu overlay) leaves the rest of BW RAM with
+        // stale gray plane data, causing the next full-region DU to
+        // see a huge delta and drive everything black.
+        self.write_region_strips(
+            strip,
+            rs.px,
+            rs.py,
+            rs.pw,
+            rs.ph,
+            cmd::WRITE_RAM_BW,
+            draw,
+            rs.left_mask,
+            rs.right_mask,
+        );
     }
 
     async fn update_full_async(&mut self) {

@@ -590,7 +590,10 @@ impl super::Kernel {
                             } else {
                                 let draw = |s: &mut StripBuffer| app_mgr.draw(s);
                                 self.epd.partial_phase3_sync(self.strip, &rs, &draw);
-                                self.red_stale = false;
+                                // don't clear red_stale here: phase3_sync only
+                                // covers the dirty region, so RED RAM outside it
+                                // may still be desynchronised (e.g. after a
+                                // grayscale pass). only full GC clears red_stale.
                                 self.epd.power_off_async().await;
                             }
                         }
