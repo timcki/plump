@@ -112,77 +112,44 @@ impl RtcSession {
     // ── RTC FAST memory operations ──────────────────────────────
 
     /// Peek at RTC session validity without consuming it.
-    /// Safe to call multiple times (e.g. from main before boot console,
-    /// then again during boot()). Does NOT prevent subsequent restore.
     pub fn rtc_peek_valid() -> bool {
-        // Safety: single-threaded boot context, volatile read via raw pointer
-        let magic = unsafe {
-            let ptr = core::ptr::addr_of!(RTC_SESSION);
-            core::ptr::read_volatile(core::ptr::addr_of!((*ptr).magic))
-        };
-        magic == RTC_SESSION_MAGIC
+        rtc_read_magic() == RTC_SESSION_MAGIC
     }
 
     /// Check if RTC session data is valid and available for restore.
     /// Returns true only once per boot (subsequent calls return false).
-    /// Must be called from main thread during boot, before async tasks.
     pub fn rtc_consume() -> bool {
-        // Only allow one restore per boot
         if SESSION_CONSUMED.load(Ordering::Relaxed) != 0 {
             return false;
         }
 
-        // Safety: single-threaded boot context, volatile read via raw pointer
-        let valid = unsafe {
-            let ptr = core::ptr::addr_of!(RTC_SESSION);
-            core::ptr::read_volatile(core::ptr::addr_of!((*ptr).magic))
-        } == RTC_SESSION_MAGIC;
-
+        let valid = rtc_read_magic() == RTC_SESSION_MAGIC;
         if valid {
             SESSION_CONSUMED.store(1, Ordering::Relaxed);
         }
-
         valid
     }
 
     /// Load session data from RTC FAST memory.
-    /// Caller should check `rtc_consume()` first.
     pub fn rtc_load() -> Self {
-        // Safety: single-threaded context, volatile read via raw pointer
-        unsafe {
-            let ptr = core::ptr::addr_of!(RTC_SESSION);
-            core::ptr::read_volatile(ptr)
-        }
+        rtc_read_session()
     }
 
     /// Save session data to RTC FAST memory before entering deep sleep.
-    /// Must be called from main thread before sleep, after tasks stopped.
     pub fn rtc_save(&self) {
-        unsafe {
-            let ptr = core::ptr::addr_of_mut!(RTC_SESSION);
-            core::ptr::write_volatile(ptr, *self);
-            // Ensure magic is set (caller may have forgotten)
-            core::ptr::write_volatile(
-                core::ptr::addr_of_mut!((*ptr).magic),
-                RTC_SESSION_MAGIC,
-            );
-        }
+        rtc_write_session(self);
+        // ensure magic is set (caller may have forgotten)
+        rtc_write_magic(RTC_SESSION_MAGIC);
     }
 
     /// Clear RTC session data.
     pub fn rtc_clear() {
-        unsafe {
-            let ptr = core::ptr::addr_of_mut!(RTC_SESSION);
-            core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).magic), 0);
-        }
+        rtc_write_magic(0);
     }
 
     /// Get wake count from RTC for debugging (doesn't consume session).
     pub fn rtc_wake_count() -> u32 {
-        unsafe {
-            let ptr = core::ptr::addr_of!(RTC_SESSION);
-            core::ptr::read_volatile(core::ptr::addr_of!((*ptr).wake_count))
-        }
+        rtc_read_wake_count()
     }
 
     // ── SD-based session persistence ────────────────────────────
@@ -253,10 +220,42 @@ impl RtcSession {
 // - Is zeroed only on power-on reset (not deep sleep wake)
 // - Requires RTC FAST memory to remain powered during sleep
 //
-// Safety: Access is through save()/load() which use volatile operations
-// and are only called from single-threaded boot/sleep contexts.
+// Safety: Access is through the rtc_* helper functions below which use
+// volatile operations. Only called from single-threaded boot/sleep contexts.
 #[unsafe(link_section = ".rtc_fast.persistent")]
 static mut RTC_SESSION: RtcSession = RtcSession::zeroed();
+
+// volatile accessors for RTC FAST memory — consolidates unsafe surface.
+// Safety: caller must be in single-threaded context (boot or pre-sleep).
+
+fn rtc_read_session() -> RtcSession {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(RTC_SESSION)) }
+}
+
+fn rtc_write_session(session: &RtcSession) {
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(RTC_SESSION), *session) }
+}
+
+fn rtc_read_magic() -> u32 {
+    unsafe {
+        let ptr = core::ptr::addr_of!(RTC_SESSION);
+        core::ptr::read_volatile(core::ptr::addr_of!((*ptr).magic))
+    }
+}
+
+fn rtc_write_magic(val: u32) {
+    unsafe {
+        let ptr = core::ptr::addr_of_mut!(RTC_SESSION);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).magic), val);
+    }
+}
+
+fn rtc_read_wake_count() -> u32 {
+    unsafe {
+        let ptr = core::ptr::addr_of!(RTC_SESSION);
+        core::ptr::read_volatile(core::ptr::addr_of!((*ptr).wake_count))
+    }
+}
 
 // Atomic flag to track if we've detected a valid session this boot
 // (prevents re-reading stale data after initial restore)
