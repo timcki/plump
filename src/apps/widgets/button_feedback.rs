@@ -1,9 +1,11 @@
 // button label overlay at screen edges
 //
-// renders action labels ("Back", "OK", "<<", ">>") near the
+// renders action labels ("Back", "OK", "←", "→") near the
 // physical button positions so users know what each button does.
 // uses the shared ButtonMapper so labels update when buttons are
 // swapped via settings.
+//
+
 
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle};
 
@@ -95,8 +97,8 @@ fn action_label(action: Action) -> &'static str {
     match action {
         Action::Next => "Next",
         Action::Prev => "Prev",
-        Action::NextJump => ">>",
-        Action::PrevJump => "<<",
+        Action::NextJump => "\u{2192}",  // →
+        Action::PrevJump => "\u{2190}",  // ←
         Action::Select => "OK",
         Action::Back => "Back",
         Action::Menu => "",
@@ -136,7 +138,7 @@ impl ButtonFeedback {
     }
 
     pub fn draw(&self, strip: &mut StripBuffer) {
-        let font = self.font.unwrap_or(&font_data::REGULAR_BODY_SMALL);
+        let font = self.font.unwrap_or(&font_data::REGULAR_BODY_XSMALL);
         let mapper = if self.swap {
             let mut m = ButtonMapper::new();
             m.set_swap(true);
@@ -156,16 +158,16 @@ impl ButtonFeedback {
                 continue;
             }
 
-            r.to_rect()
-                .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
-                .draw(strip)
-                .unwrap();
-
             let action = mapper.map_button(def.button);
             let label = action_label(action);
             if label.is_empty() {
                 continue;
             }
+
+            r.to_rect()
+                .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+                .draw(strip)
+                .unwrap();
 
             font.draw_aligned(strip, r, label, Alignment::Center, BinaryColor::On);
         }

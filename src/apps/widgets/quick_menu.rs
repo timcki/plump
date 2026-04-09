@@ -1,4 +1,4 @@
-use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle};
+use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::{PrimitiveStyle, RoundedRectangle}};
 
 use crate::board::SCREEN_W;
 use crate::board::action::Action;
@@ -9,21 +9,25 @@ pub use crate::kernel::app::{MAX_APP_ACTIONS, QuickAction, QuickActionKind};
 use crate::ui::stack_fmt::StackFmt;
 use crate::ui::{Alignment, Region, wrap_next, wrap_prev};
 
-use super::selectable_row::SelectableRow;
-
 const OVERLAY_W: u16 = 400;
 const OVERLAY_X: u16 = (SCREEN_W - OVERLAY_W) / 2;
 const OVERLAY_BOTTOM: u16 = 760;
 const ITEM_H: u16 = 40;
 const ITEM_GAP: u16 = 4;
 const ITEM_STRIDE: u16 = ITEM_H + ITEM_GAP;
-const PAD_TOP: u16 = 10;
-const PAD_BOTTOM: u16 = 8;
+const PAD_TOP: u16 = 12;
+const PAD_BOTTOM: u16 = 10;
+const ITEM_INSET: u16 = 8;  // horizontal inset for selection highlight
 const LABEL_X: u16 = OVERLAY_X + 16;
 const LABEL_W: u16 = 150;
 const VALUE_X: u16 = LABEL_X + LABEL_W + 8;
 const VALUE_W: u16 = OVERLAY_W - 16 - LABEL_W - 8 - 16;
 const HELP_H: u16 = 20;
+const SEP_H: u16 = 12;     // vertical space consumed by the separator gap
+const SEP_INSET: u16 = 16; // horizontal inset for separator line
+const R_BORDER: Size = Size::new(8, 8); // overlay corner radius (matches home card)
+const R_ITEM: Size = Size::new(4, 4);   // selection highlight radius (matches home buttons)
+const BORDER_W: u32 = 2;               // overlay border stroke width
 
 const NUM_CORE: usize = 2; // Refresh + Go Home
 const MAX_ITEMS: usize = MAX_APP_ACTIONS + NUM_CORE;
@@ -46,7 +50,6 @@ enum MenuItemKind {
     },
     AppTrigger {
         id: u8,
-        display: &'static str,
     },
     CoreRefresh,
     CoreHome,
@@ -71,6 +74,9 @@ pub struct QuickMenu {
     count: usize,
     app_count: usize,
     selected: usize,
+    /// Index of the last action item; a separator is drawn after it
+    /// when settings items follow.
+    separator_after: Option<usize>,
     pub dirty: bool,
     overlay_region: Region,
     font: Option<&'static BitmapFont>,
@@ -90,6 +96,7 @@ impl QuickMenu {
             count: 0,
             app_count: 0,
             selected: 0,
+            separator_after: None,
             dirty: false,
             overlay_region: Region::new(0, 0, 0, 0),
             font: None,
@@ -104,8 +111,22 @@ impl QuickMenu {
         let n_app = app_actions.len().min(MAX_APP_ACTIONS);
         self.app_count = n_app;
 
-        for (i, a) in app_actions.iter().enumerate().take(n_app) {
-            self.items[i] = MenuItem {
+        // core items first: Go Home (default selected), then Clear ghost
+        let mut idx = 0;
+        self.items[idx] = MenuItem {
+            label: "Go Home",
+            kind: MenuItemKind::CoreHome,
+        };
+        idx += 1;
+        self.items[idx] = MenuItem {
+            label: "Clear ghost",
+            kind: MenuItemKind::CoreRefresh,
+        };
+        idx += 1;
+
+        // app actions follow
+        for a in app_actions.iter().take(n_app) {
+            self.items[idx] = MenuItem {
                 label: a.label,
                 kind: match a.kind {
                     QuickActionKind::Cycle { value, options } => MenuItemKind::AppCycle {
@@ -113,27 +134,34 @@ impl QuickMenu {
                         value,
                         options,
                     },
-                    QuickActionKind::Trigger { display } => {
-                        MenuItemKind::AppTrigger { id: a.id, display }
+                    QuickActionKind::Trigger { .. } => {
+                        MenuItemKind::AppTrigger { id: a.id }
                     }
                 },
             };
+            idx += 1;
         }
-
-        self.items[n_app] = MenuItem {
-            label: "Refresh",
-            kind: MenuItemKind::CoreRefresh,
-        };
-        self.items[n_app + 1] = MenuItem {
-            label: "Go Home",
-            kind: MenuItemKind::CoreHome,
-        };
 
         self.count = n_app + NUM_CORE;
         self.selected = 0;
         self.open = true;
         self.dirty = true;
-        self.overlay_region = Self::compute_region(self.count);
+
+        // find the separator: last action (trigger/core) before first setting (cycle)
+        self.separator_after = None;
+        let mut last_action = None;
+        let mut has_settings = false;
+        for i in 0..self.count {
+            match self.items[i].kind {
+                MenuItemKind::AppCycle { .. } => has_settings = true,
+                _ => last_action = Some(i),
+            }
+        }
+        if has_settings {
+            self.separator_after = last_action;
+        }
+
+        self.overlay_region = self.compute_region();
     }
 
     pub fn hide(&mut self) {
@@ -146,7 +174,7 @@ impl QuickMenu {
     }
 
     pub fn app_cycle_value(&self, id: u8) -> Option<u8> {
-        for i in 0..self.app_count {
+        for i in NUM_CORE..NUM_CORE + self.app_count {
             if let MenuItemKind::AppCycle {
                 id: item_id, value, ..
             } = self.items[i].kind
@@ -242,14 +270,19 @@ impl QuickMenu {
         }
     }
 
-    fn compute_region(total_items: usize) -> Region {
-        let content_h = PAD_TOP + (ITEM_STRIDE * total_items as u16) + HELP_H + PAD_BOTTOM;
+    fn compute_region(&self) -> Region {
+        let sep = if self.separator_after.is_some() { SEP_H } else { 0 };
+        let content_h = PAD_TOP + (ITEM_STRIDE * self.count as u16) + sep + HELP_H + PAD_BOTTOM;
         let y = OVERLAY_BOTTOM - content_h;
         Region::new(OVERLAY_X, y, OVERLAY_W, content_h)
     }
 
     fn item_y(&self, i: usize) -> u16 {
-        self.overlay_region.y + PAD_TOP + i as u16 * ITEM_STRIDE
+        let sep_extra = match self.separator_after {
+            Some(sep_idx) if i > sep_idx => SEP_H,
+            _ => 0,
+        };
+        self.overlay_region.y + PAD_TOP + i as u16 * ITEM_STRIDE + sep_extra
     }
 
     fn item_label_region(&self, i: usize) -> Region {
@@ -278,14 +311,10 @@ impl QuickMenu {
                 };
                 let _ = core::fmt::Write::write_str(buf, text);
             }
-            MenuItemKind::AppTrigger { display, .. } => {
-                let _ = core::fmt::Write::write_str(buf, display);
-            }
-            MenuItemKind::CoreRefresh => {
-                let _ = core::fmt::Write::write_str(buf, "Clear ghost");
-            }
-            MenuItemKind::CoreHome => {
-                let _ = core::fmt::Write::write_str(buf, ">>>");
+            MenuItemKind::AppTrigger { .. }
+            | MenuItemKind::CoreRefresh
+            | MenuItemKind::CoreHome => {
+                let _ = core::fmt::Write::write_str(buf, "\u{2192}"); // →
             }
         }
     }
@@ -299,9 +328,14 @@ impl QuickMenu {
 
         let outer = self.overlay_region;
         if outer.intersects(strip.logical_window()) {
-            outer
-                .to_rect()
+            // rounded white fill + black border
+            let rect = outer.to_rect();
+            RoundedRectangle::with_equal_corners(rect, R_BORDER)
                 .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+                .draw(strip)
+                .unwrap();
+            RoundedRectangle::with_equal_corners(rect, R_BORDER)
+                .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, BORDER_W))
                 .draw(strip)
                 .unwrap();
         }
@@ -310,8 +344,24 @@ impl QuickMenu {
 
         for i in 0..self.count {
             let selected = i == self.selected;
-            let row_region = Region::new(OVERLAY_X, self.item_y(i), OVERLAY_W, ITEM_H);
-            let fg = SelectableRow::new(row_region, selected).draw_if_visible(strip);
+            let row_region = Region::new(
+                OVERLAY_X + ITEM_INSET,
+                self.item_y(i),
+                OVERLAY_W - 2 * ITEM_INSET,
+                ITEM_H,
+            );
+
+            let fg = if selected && row_region.intersects(strip.logical_window()) {
+                RoundedRectangle::with_equal_corners(row_region.to_rect(), R_ITEM)
+                    .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                    .draw(strip)
+                    .unwrap();
+                BinaryColor::Off
+            } else if selected {
+                BinaryColor::Off
+            } else {
+                BinaryColor::On
+            };
 
             let label_region = self.item_label_region(i);
             let value_region = self.item_value_region(i);
@@ -328,7 +378,30 @@ impl QuickMenu {
 
             if value_region.intersects(strip.logical_window()) {
                 self.format_value(i, &mut val_buf);
-                font.draw_aligned(strip, value_region, val_buf.as_str(), Alignment::Center, fg);
+                let val_align = match self.items[i].kind {
+                    MenuItemKind::CoreRefresh | MenuItemKind::CoreHome
+                    | MenuItemKind::AppTrigger { .. } => Alignment::CenterRight,
+                    _ => Alignment::Center,
+                };
+                font.draw_aligned(strip, value_region, val_buf.as_str(), val_align, fg);
+            }
+        }
+
+        // separator line between actions and settings
+        if let Some(sep_idx) = self.separator_after {
+            let sep_y = self.item_y(sep_idx) + ITEM_H + (SEP_H / 2);
+            let sep_region = Region::new(
+                OVERLAY_X + SEP_INSET,
+                sep_y,
+                OVERLAY_W - 2 * SEP_INSET,
+                1,
+            );
+            if sep_region.intersects(strip.logical_window()) {
+                sep_region
+                    .to_rect()
+                    .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                    .draw(strip)
+                    .unwrap();
             }
         }
 

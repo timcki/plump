@@ -635,7 +635,7 @@ impl AppManager {
         let chrome = fonts::chrome_font();
         self.reader.set_chrome_font(chrome);
         self.quick_menu.set_chrome_font(chrome);
-        self.bumps.set_chrome_font(chrome);
+        self.bumps.set_chrome_font(fonts::button_label_font());
     }
 
     fn sync_quick_menu(&mut self) {

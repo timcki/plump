@@ -59,10 +59,15 @@ pub fn body_font(idx: u8) -> &'static BitmapFont {
     }
 }
 
-// chrome font (button labels, quick-menu items, loading text)
+// chrome font (quick-menu items, loading text)
 // always the XSmall body font, compact for UI chrome
 pub fn chrome_font() -> &'static BitmapFont {
     body_font(0)
+}
+
+// button label font
+pub fn button_label_font() -> &'static BitmapFont {
+    &font_data::REGULAR_BODY_XSMALL
 }
 
 pub fn heading_font(idx: u8) -> &'static BitmapFont {

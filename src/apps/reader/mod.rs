@@ -1110,6 +1110,13 @@ impl ReaderApp {
     fn rebuild_quick_actions(&mut self) {
         let mut n = 0usize;
 
+        // contents first (most useful after core items)
+        if self.is_epub && self.epub.toc.as_ref().map_or(false, |t| !t.is_empty()) {
+            self.qa_buf[n] = QuickAction::trigger(QA_TOC, "Contents", "Open");
+            n += 1;
+        }
+
+        // font size last
         self.qa_buf[n] = QuickAction::cycle(
             QA_FONT_SIZE,
             "Book Font",
@@ -1117,18 +1124,6 @@ impl ReaderApp {
             fonts::FONT_SIZE_NAMES,
         );
         n += 1;
-
-        if self.is_epub && self.epub.spine.len() > 1 {
-            self.qa_buf[n] = QuickAction::trigger(QA_PREV_CHAPTER, "Prev Ch", "<<<");
-            n += 1;
-            self.qa_buf[n] = QuickAction::trigger(QA_NEXT_CHAPTER, "Next Ch", ">>>");
-            n += 1;
-        }
-
-        if self.is_epub && self.epub.toc.as_ref().map_or(false, |t| !t.is_empty()) {
-            self.qa_buf[n] = QuickAction::trigger(QA_TOC, "Contents", "Open");
-            n += 1;
-        }
 
         self.qa_count = n as u8;
     }
