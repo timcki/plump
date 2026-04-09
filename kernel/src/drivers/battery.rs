@@ -19,21 +19,22 @@ pub fn battery_percentage(battery_mv: u16) -> u8 {
         return DISCHARGE_CURVE[last].1;
     }
 
-    let mut i = 0;
-    while i + 1 < DISCHARGE_CURVE.len() {
-        let (mv_hi, pct_hi) = DISCHARGE_CURVE[i];
-        let (mv_lo, pct_lo) = DISCHARGE_CURVE[i + 1];
-        if mv >= mv_lo {
-            let span_mv = mv_hi - mv_lo;
-            if span_mv == 0 {
-                return pct_hi;
+    DISCHARGE_CURVE
+        .windows(2)
+        .find_map(|w| {
+            let (mv_hi, pct_hi) = w[0];
+            let (mv_lo, pct_lo) = w[1];
+            if mv >= mv_lo {
+                let span_mv = mv_hi - mv_lo;
+                if span_mv == 0 {
+                    return Some(pct_hi);
+                }
+                let span_pct = (pct_hi - pct_lo) as u32;
+                let frac = mv - mv_lo;
+                Some((pct_lo as u32 + frac * span_pct / span_mv) as u8)
+            } else {
+                None
             }
-            let span_pct = (pct_hi - pct_lo) as u32;
-            let frac = mv - mv_lo;
-            return (pct_lo as u32 + frac * span_pct / span_mv) as u8;
-        }
-        i += 1;
-    }
-
-    0
+        })
+        .unwrap_or(0)
 }

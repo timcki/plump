@@ -7,6 +7,7 @@
 // returns the unified Error type (re-exported as StorageError for
 // backward compat); apps receive it through KernelHandle
 
+use core::cmp::Ordering;
 use core::ops::ControlFlow;
 
 use embedded_sdmmc::{Mode, RawFile};
@@ -86,6 +87,42 @@ impl DirEntry {
         }
         self.title.set_len(n as u8);
         self.title_humanized = true;
+    }
+}
+
+// directories before files, then case-insensitive name order
+impl PartialEq for DirEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_dir == other.is_dir && self.name == other.name
+    }
+}
+
+impl Eq for DirEntry {}
+
+impl PartialOrd for DirEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DirEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // directories sort before files
+        match (self.is_dir, other.is_dir) {
+            (true, false) => return Ordering::Less,
+            (false, true) => return Ordering::Greater,
+            _ => {}
+        }
+        // case-insensitive name comparison
+        let an = self.name.as_bytes();
+        let bn = other.name.as_bytes();
+        for (a, b) in an.iter().zip(bn.iter()) {
+            let ord = a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase());
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        an.len().cmp(&bn.len())
     }
 }
 

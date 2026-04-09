@@ -51,19 +51,10 @@ impl DirCache {
             Err(_) => return,
         };
 
-        let data = &buf[..n];
-        let mut start = 0;
-        while start < data.len() {
-            let end = data[start..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .map(|p| start + p)
-                .unwrap_or(data.len());
-            let line = &data[start..end];
+        for line in buf[..n].split(|&b| b == b'\n') {
             if !line.is_empty() {
                 self.apply_title_line(line);
             }
-            start = end + 1;
         }
     }
 
@@ -83,11 +74,11 @@ impl DirCache {
             Err(_) => return,
         };
 
-        for i in 0..self.count {
-            if self.entries[i].name_str().eq_ignore_ascii_case(file_str) {
-                self.entries[i].set_title(title_part);
-                break;
-            }
+        if let Some(entry) = self.entries[..self.count]
+            .iter_mut()
+            .find(|e| e.name_str().eq_ignore_ascii_case(file_str))
+        {
+            entry.set_title(title_part);
         }
     }
 
@@ -123,20 +114,17 @@ impl DirCache {
 
     // look up the display title for a filename (case-insensitive)
     pub fn find_title(&self, filename: &[u8]) -> Option<&[u8]> {
-        let name = match core::str::from_utf8(filename) {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
-        for i in 0..self.count {
-            let e = &self.entries[i];
-            if e.name_str().eq_ignore_ascii_case(name) {
+        let name = core::str::from_utf8(filename).ok()?;
+        self.entries[..self.count]
+            .iter()
+            .find(|e| e.name_str().eq_ignore_ascii_case(name))
+            .and_then(|e| {
                 if !e.title.is_empty() {
-                    return Some(e.title.as_bytes());
+                    Some(e.title.as_bytes())
+                } else {
+                    None
                 }
-                return None;
-            }
-        }
-        None
+            })
     }
 
     pub fn set_entry_title(&mut self, index: usize, title: &[u8]) {
@@ -148,30 +136,5 @@ impl DirCache {
 
 // insertion sort; count <= 128
 fn sort_entries(entries: &mut [DirEntry], count: usize) {
-    for i in 1..count {
-        let key = entries[i];
-        let mut j = i;
-        while j > 0 && entry_gt(&entries[j - 1], &key) {
-            entries[j] = entries[j - 1];
-            j -= 1;
-        }
-        entries[j] = key;
-    }
-}
-
-// directories before files, then case-insensitive name order
-fn entry_gt(a: &DirEntry, b: &DirEntry) -> bool {
-    if a.is_dir != b.is_dir {
-        return !a.is_dir;
-    }
-    let an = a.name.as_bytes();
-    let bn = b.name.as_bytes();
-    for (ab, bb) in an.iter().zip(bn.iter()) {
-        let ac = ab.to_ascii_lowercase();
-        let bc = bb.to_ascii_lowercase();
-        if ac != bc {
-            return ac > bc;
-        }
-    }
-    an.len() > bn.len()
+    entries[..count].sort_unstable();
 }

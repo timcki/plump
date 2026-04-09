@@ -205,13 +205,10 @@ impl BookmarkCache {
         }
 
         let key = fnv1a_icase(filename);
-        for i in 0..self.count {
-            let slot = &self.slots[i];
-            if slot.valid && slot.name_hash == key && slot.matches_name(filename) {
-                return Some(*slot);
-            }
-        }
-        None
+        self.slots[..self.count]
+            .iter()
+            .find(|s| s.valid && s.name_hash == key && s.matches_name(filename))
+            .copied()
     }
 
     pub fn load_all(&self, out: &mut [BmListEntry]) -> usize {
@@ -339,17 +336,16 @@ impl BookmarkCache {
             return;
         }
         let key = fnv1a_icase(filename);
-        for i in 0..self.count {
-            let slot = &mut self.slots[i];
-            if slot.valid && slot.name_hash == key && slot.matches_name(filename) {
-                slot.valid = false;
-                self.dirty = true;
-                log::debug!(
-                    "bookmark: removed {:?}",
-                    core::str::from_utf8(filename).unwrap_or("?")
-                );
-                return;
-            }
+        if let Some(slot) = self.slots[..self.count]
+            .iter_mut()
+            .find(|s| s.valid && s.name_hash == key && s.matches_name(filename))
+        {
+            slot.valid = false;
+            self.dirty = true;
+            log::debug!(
+                "bookmark: removed {:?}",
+                core::str::from_utf8(filename).unwrap_or("?")
+            );
         }
     }
 
