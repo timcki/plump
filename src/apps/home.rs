@@ -2,6 +2,8 @@
 
 use core::fmt::Write as _;
 
+use plump_kernel::util::FixedStr;
+
 use crate::apps::{App, AppContext, AppId, BgBudget, BgOutcome, RECENT_FILE, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
@@ -81,12 +83,9 @@ pub struct HomeApp {
     item_regions: [Region; MAX_ITEMS],
     item_count: usize,
 
-    recent_book: [u8; 32],
-    recent_book_len: usize,
-    recent_title: [u8; 64],
-    recent_title_len: u8,
-    recent_author: [u8; 64],
-    recent_author_len: u8,
+    recent_book: FixedStr<32>,
+    recent_title: FixedStr<64>,
+    recent_author: FixedStr<64>,
     recent_progress: u8,
     recent_stats_time: u32,
     recent_cover: Option<crate::kernel::work_queue::DecodedImage>,
@@ -116,12 +115,9 @@ impl HomeApp {
             ui_fonts: uf,
             item_regions: compute_item_regions(),
             item_count: 5, // card + 4 menu buttons
-            recent_book: [0u8; 32],
-            recent_book_len: 0,
-            recent_title: [0u8; 64],
-            recent_title_len: 0,
-            recent_author: [0u8; 64],
-            recent_author_len: 0,
+            recent_book: FixedStr::EMPTY,
+            recent_title: FixedStr::EMPTY,
+            recent_author: FixedStr::EMPTY,
             recent_progress: 0,
             recent_stats_time: 0,
             recent_cover: None,
@@ -210,13 +206,11 @@ impl HomeApp {
         let mut buf = [0u8; 196];
         match k.sd().read_file_start_in_dir(k.sd().data_dir(), RECENT_FILE, &mut buf) {
             Ok((_, n)) if n > 0 => self.parse_recent(&buf[..n]),
-            _ => self.recent_book_len = 0,
+            _ => self.recent_book = FixedStr::EMPTY,
         }
         // load reading stats and cover thumb for the recent book
-        if self.recent_book_len > 0 {
-            let fname =
-                core::str::from_utf8(&self.recent_book[..self.recent_book_len]).unwrap_or("");
-            if let Some(s) = crate::apps::stats::ReadingStats::load(k, fname) {
+        if !self.recent_book.is_empty() {
+            if let Some(s) = crate::apps::stats::ReadingStats::load(k, self.recent_book.as_str()) {
                 self.recent_stats_time = s.time_secs;
             } else {
                 self.recent_stats_time = 0;
@@ -224,7 +218,7 @@ impl HomeApp {
             // try to load cached cover thumbnail
             self.recent_cover = crate::apps::cover_cache::load_cover_for(
                 k,
-                &self.recent_book[..self.recent_book_len],
+                self.recent_book.as_bytes(),
             );
             if self.recent_cover.is_some() {
                 log::debug!("home: loaded cover thumbnail for recent book");
@@ -241,40 +235,19 @@ impl HomeApp {
         // fallback: if no \0 found, treat entire data as filename (old format)
         let mut fields = data.splitn(4, |&b| b == 0);
 
-        // filename
         if let Some(fname) = fields.next() {
-            let n = fname.len().min(32);
-            self.recent_book[..n].copy_from_slice(&fname[..n]);
-            self.recent_book_len = n;
+            self.recent_book.set(fname);
         } else {
-            self.recent_book_len = 0;
+            self.recent_book = FixedStr::EMPTY;
             return;
         }
 
-        // title
-        if let Some(title) = fields.next() {
-            let n = title.len().min(64);
-            self.recent_title[..n].copy_from_slice(&title[..n]);
-            self.recent_title_len = n as u8;
-        } else {
-            self.recent_title_len = 0;
-        }
-
-        // author
-        if let Some(author) = fields.next() {
-            let n = author.len().min(64);
-            self.recent_author[..n].copy_from_slice(&author[..n]);
-            self.recent_author_len = n as u8;
-        } else {
-            self.recent_author_len = 0;
-        }
-
-        // progress (single byte after third \0)
-        if let Some(rest) = fields.next() {
-            self.recent_progress = rest.first().copied().unwrap_or(0);
-        } else {
-            self.recent_progress = 0;
-        }
+        self.recent_title = fields.next().map(FixedStr::from_bytes).unwrap_or_default();
+        self.recent_author = fields.next().map(FixedStr::from_bytes).unwrap_or_default();
+        self.recent_progress = fields
+            .next()
+            .and_then(|r| r.first().copied())
+            .unwrap_or(0);
     }
 
     fn rebuild_item_count(&mut self) {
@@ -286,26 +259,20 @@ impl HomeApp {
     }
 
     fn has_recent(&self) -> bool {
-        self.recent_book_len > 0
+        !self.recent_book.is_empty()
     }
 
     fn recent_display_title(&self) -> &str {
-        if self.recent_title_len > 0 {
-            core::str::from_utf8(&self.recent_title[..self.recent_title_len as usize])
-                .unwrap_or(self.recent_filename())
+        if !self.recent_title.is_empty() {
+            self.recent_title.as_str()
         } else {
-            self.recent_filename()
+            self.recent_book.as_str()
         }
     }
 
-    fn recent_filename(&self) -> &str {
-        core::str::from_utf8(&self.recent_book[..self.recent_book_len]).unwrap_or("Book")
-    }
-
     fn recent_author_str(&self) -> &str {
-        if self.recent_author_len > 0 {
-            core::str::from_utf8(&self.recent_author[..self.recent_author_len as usize])
-                .unwrap_or("")
+        if !self.recent_author.is_empty() {
+            self.recent_author.as_str()
         } else {
             ""
         }
@@ -421,13 +388,11 @@ impl App<AppId> for HomeApp {
             let mut buf = [0u8; 196];
             match k.sd().read_file_start_in_dir(k.sd().data_dir(), RECENT_FILE, &mut buf) {
                 Ok((_, n)) if n > 0 => self.parse_recent(&buf[..n]),
-                _ => self.recent_book_len = 0,
+                _ => self.recent_book = FixedStr::EMPTY,
             }
             // load reading stats for the recent book
-            if self.recent_book_len > 0 {
-                let fname =
-                    core::str::from_utf8(&self.recent_book[..self.recent_book_len]).unwrap_or("");
-                if let Some(s) = crate::apps::stats::ReadingStats::load(k, fname) {
+            if !self.recent_book.is_empty() {
+                if let Some(s) = crate::apps::stats::ReadingStats::load(k, self.recent_book.as_str()) {
                     self.recent_stats_time = s.time_secs;
                 } else {
                     self.recent_stats_time = 0;
@@ -435,7 +400,7 @@ impl App<AppId> for HomeApp {
                 // load cached cover thumbnail
                 self.recent_cover = crate::apps::cover_cache::load_cover_for(
                     k,
-                    &self.recent_book[..self.recent_book_len],
+                    self.recent_book.as_bytes(),
                 );
             } else {
                 self.recent_cover = None;
@@ -503,7 +468,7 @@ impl HomeApp {
             ActionEvent::Press(Action::Select) => match self.item_action(self.selected) {
                 MenuAction::Continue => {
                     if self.has_recent() {
-                        ctx.set_message(&self.recent_book[..self.recent_book_len]);
+                        ctx.set_message(self.recent_book.as_bytes());
                     }
                     Transition::Push(AppId::Reader)
                 }
