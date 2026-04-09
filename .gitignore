@@ -5,6 +5,7 @@ target/
 .zed/
 .helix/
 .nvim.lua
+.claude/
 
 **/*.rs.bk
 *.pdb
