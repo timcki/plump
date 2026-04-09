@@ -61,9 +61,8 @@ impl ReadingStats {
         if n == 0 {
             return None;
         }
-        let mut stats = Self::EMPTY;
-        parse_stats(&buf[..n], &mut stats);
-        if stats.pages == 0 && stats.time_secs == 0 && stats.sessions == 0 {
+        let stats = Self::parse(&buf[..n]);
+        if stats.is_empty() {
             return None;
         }
         Some(stats)
@@ -133,24 +132,28 @@ fn fmt_compact_duration<const N: usize>(secs: u32, buf: &mut BitmapDynLabel<N>) 
 
 // ── parsing ──────────────────────────────────────────────────────────
 
-fn parse_stats(data: &[u8], stats: &mut ReadingStats) {
-    for line in data.split(|&b| b == b'\n') {
-        let line = trim_bytes(line);
-        if line.is_empty() || line[0] == b'#' {
-            continue;
+impl ReadingStats {
+    pub fn parse(data: &[u8]) -> Self {
+        let mut stats = Self::EMPTY;
+        for line in data.split(|&b| b == b'\n') {
+            let line = trim_bytes(line);
+            if line.is_empty() || line[0] == b'#' {
+                continue;
+            }
+            let eq = match line.iter().position(|&b| b == b'=') {
+                Some(p) => p,
+                None => continue,
+            };
+            let key = trim_bytes(&line[..eq]);
+            let val = trim_bytes(&line[eq + 1..]);
+            match key {
+                b"pages" => stats.pages = parse_u32(val),
+                b"time" => stats.time_secs = parse_u32(val),
+                b"sessions" => stats.sessions = parse_u32(val) as u16,
+                _ => {}
+            }
         }
-        let eq = match line.iter().position(|&b| b == b'=') {
-            Some(p) => p,
-            None => continue,
-        };
-        let key = trim_bytes(&line[..eq]);
-        let val = trim_bytes(&line[eq + 1..]);
-        match key {
-            b"pages" => stats.pages = parse_u32(val),
-            b"time" => stats.time_secs = parse_u32(val),
-            b"sessions" => stats.sessions = parse_u32(val) as u16,
-            _ => {}
-        }
+        stats
     }
 }
 
@@ -299,7 +302,7 @@ impl StatsApp {
             self.books[idx].filename.set(fname.as_bytes());
             self.books[idx].title.set(entry.display_name().as_bytes());
 
-            parse_stats(&buf[..n], &mut self.books[idx].stats);
+            self.books[idx].stats = ReadingStats::parse(&buf[..n]);
 
             // skip entries with zero stats
             if self.books[idx].stats.is_empty() {
