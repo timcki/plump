@@ -49,8 +49,7 @@ impl<'a> BitmapLabel<'a> {
 
 pub struct BitmapDynLabel<const N: usize> {
     region: Region,
-    buffer: [u8; N],
-    len: usize,
+    buffer: plump_kernel::util::FixedStr<N>,
     font: &'static BitmapFont,
     alignment: Alignment,
     inverted: bool,
@@ -60,8 +59,7 @@ impl<const N: usize> BitmapDynLabel<N> {
     pub fn new(region: Region, font: &'static BitmapFont) -> Self {
         Self {
             region,
-            buffer: [0u8; N],
-            len: 0,
+            buffer: plump_kernel::util::FixedStr::EMPTY,
             font,
             alignment: Alignment::CenterLeft,
             inverted: false,
@@ -79,18 +77,15 @@ impl<const N: usize> BitmapDynLabel<N> {
     }
 
     pub fn set_text(&mut self, text: &str) {
-        let bytes = text.as_bytes();
-        let n = bytes.len().min(N);
-        self.buffer[..n].copy_from_slice(&bytes[..n]);
-        self.len = n;
+        self.buffer.set(text.as_bytes());
     }
 
     pub fn clear_text(&mut self) {
-        self.len = 0;
+        self.buffer.clear();
     }
 
     pub fn text(&self) -> &str {
-        core::str::from_utf8(&self.buffer[..self.len]).unwrap_or("")
+        self.buffer.as_str()
     }
 
     pub fn draw(&self, strip: &mut StripBuffer) -> Result<(), Infallible> {
@@ -107,11 +102,7 @@ impl<const N: usize> BitmapDynLabel<N> {
 
 impl<const N: usize> core::fmt::Write for BitmapDynLabel<N> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let available = N - self.len;
-        let n = bytes.len().min(available);
-        self.buffer[self.len..self.len + n].copy_from_slice(&bytes[..n]);
-        self.len += n;
+        self.buffer.append(s.as_bytes());
         Ok(())
     }
 }

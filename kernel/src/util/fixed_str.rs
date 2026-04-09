@@ -86,6 +86,19 @@ impl<const N: usize> FixedStr<N> {
     pub fn set_len(&mut self, len: u8) {
         self.len = len.min(N as u8);
     }
+
+    /// append bytes, truncating if capacity is exceeded
+    pub fn append(&mut self, src: &[u8]) {
+        let avail = N - self.len as usize;
+        let n = src.len().min(avail);
+        self.buf[self.len as usize..self.len as usize + n].copy_from_slice(&src[..n]);
+        self.len += n as u8;
+    }
+
+    /// reset to empty
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
 }
 
 impl<const N: usize> Default for FixedStr<N> {
