@@ -3,6 +3,7 @@ mod images;
 mod paging;
 
 pub use plump_kernel::util::decode_utf8_char;
+use plump_kernel::util::FixedStr;
 
 use crate::apps::PendingSetting;
 use crate::fonts::bitmap::{self, BitmapFont};
@@ -405,10 +406,8 @@ enum PendingPositionChange {
 }
 
 pub struct ReaderApp {
-    pub(super) filename: [u8; 32],
-    pub(super) filename_len: usize,
-    pub(super) title: [u8; 64],
-    pub(super) title_len: u8,
+    pub(super) filename: FixedStr<32>,
+    pub(super) title: FixedStr<64>,
     pub(super) title_is_real: bool,
     pub(super) file_size: u32,
 
@@ -475,10 +474,8 @@ pub struct ReaderApp {
 impl ReaderApp {
     pub const fn new() -> Self {
         Self {
-            filename: [0u8; 32],
-            filename_len: 0,
-            title: [0u8; 64],
-            title_len: 0,
+            filename: FixedStr::EMPTY,
+            title: FixedStr::EMPTY,
             title_is_real: false,
             file_size: 0,
 
@@ -615,7 +612,7 @@ impl ReaderApp {
     }
 
     fn loading_title(&self) -> Option<&str> {
-        if self.title_is_real && self.title_len > 0 {
+        if self.title_is_real && !self.title.is_empty() {
             Some(self.display_name())
         } else {
             None
@@ -824,14 +821,11 @@ impl ReaderApp {
     }
 
     fn save_title_mapping(&self, k: &mut KernelHandle<'_>) {
-        if !self.title_is_real || self.title_len == 0 || self.filename_len == 0 {
+        if !self.title_is_real || self.title.is_empty() || self.filename.is_empty() {
             return;
         }
 
-        let (nb, nl) = self.name_copy();
-        let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
-        let title = core::str::from_utf8(&self.title[..self.title_len as usize]).unwrap_or("");
-        if let Err(e) = k.sd().save_title(name, title) {
+        if let Err(e) = k.sd().save_title(self.filename.as_str(), self.title.as_str()) {
             log::warn!("epub: failed to save title mapping: {}", e);
         }
     }
@@ -841,8 +835,8 @@ impl ReaderApp {
             return;
         };
 
-        let (nb, nl) = self.name_copy();
-        let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+        let fname = self.filename;
+        let name = fname.as_str();
         let toc_idx = source.zip_index();
 
         let mut toc_dir_buf = [0u8; 256];
@@ -1026,7 +1020,7 @@ impl ReaderApp {
 
     // flush stats to SD; returns Err on write failure (dirty state kept)
     fn stats_flush(&mut self, k: &mut KernelHandle<'_>) -> crate::error::Result<()> {
-        if !self.stats_dirty || self.filename_len == 0 {
+        if !self.stats_dirty || self.filename.is_empty() {
             return Ok(());
         }
         plump_kernel::perf_begin!(_sf_t0);
@@ -1161,24 +1155,18 @@ impl ReaderApp {
     }
 
     fn name(&self) -> &str {
-        core::str::from_utf8(&self.filename[..self.filename_len]).unwrap_or("???")
-    }
-
-    fn name_copy(&self) -> ([u8; 32], usize) {
-        let mut buf = [0u8; 32];
-        buf[..self.filename_len].copy_from_slice(&self.filename[..self.filename_len]);
-        (buf, self.filename_len)
+        self.filename.as_str()
     }
 
     // Session state accessors for RTC persistence
     #[inline]
     pub fn filename_len(&self) -> usize {
-        self.filename_len
+        self.filename.len()
     }
 
     #[inline]
     pub fn filename_bytes(&self) -> &[u8] {
-        &self.filename[..self.filename_len]
+        self.filename.as_bytes()
     }
 
     #[inline]
@@ -1227,15 +1215,11 @@ impl ReaderApp {
         byte_offset: u32,
         font_size: u8,
     ) {
-        let len = filename.len().min(32);
-        self.filename[..len].copy_from_slice(&filename[..len]);
-        self.filename_len = len;
+        self.filename.set(filename);
 
         // set title from filename initially (will be replaced by
         // epub metadata once the book is loaded)
-        let n = self.filename_len.min(self.title.len());
-        self.title[..n].copy_from_slice(&self.filename[..n]);
-        self.title_len = n as u8;
+        self.title.set(self.filename.as_bytes());
         self.title_is_real = false;
 
         self.is_epub = is_epub;
@@ -1296,7 +1280,7 @@ impl ReaderApp {
     pub fn save_position(&self, bm: &mut bookmarks::BookmarkCache) {
         if self.state == State::Ready {
             bm.save(
-                &self.filename[..self.filename_len],
+                self.filename.as_bytes(),
                 self.pg.offsets[self.pg.page],
                 self.epub.chapter,
             );
@@ -1318,7 +1302,7 @@ impl ReaderApp {
             return true;
         }
 
-        if let Some(slot) = bm.find(&self.filename[..self.filename_len]) {
+        if let Some(slot) = bm.find(self.filename.as_bytes()) {
             log::debug!(
                 "bookmark: restoring off={} ch={} for {}",
                 slot.byte_offset,
@@ -1335,20 +1319,20 @@ impl ReaderApp {
     }
 
     fn display_name(&self) -> &str {
-        if self.title_len > 0 {
-            core::str::from_utf8(&self.title[..self.title_len as usize]).unwrap_or(self.name())
+        if !self.title.is_empty() {
+            self.title.as_str()
         } else {
             self.name()
         }
     }
 
     fn try_load_cached_cover_thumb(&mut self, k: &mut KernelHandle<'_>) -> bool {
-        if !self.is_epub || self.filename_len == 0 || self.loading_cover.is_some() {
+        if !self.is_epub || self.filename.is_empty() || self.loading_cover.is_some() {
             return false;
         }
 
         self.loading_cover =
-            crate::apps::cover_cache::load_cover_for(k, &self.filename[..self.filename_len]);
+            crate::apps::cover_cache::load_cover_for(k, self.filename.as_bytes());
 
         if let Some(ref img) = self.loading_cover {
             log::debug!(
@@ -1422,15 +1406,15 @@ impl ReaderApp {
         let mut pos = 0usize;
 
         // filename
-        let fl = self.filename_len.min(32);
-        buf[pos..pos + fl].copy_from_slice(&self.filename[..fl]);
+        let fl = self.filename.len();
+        buf[pos..pos + fl].copy_from_slice(self.filename.as_bytes());
         pos += fl;
         buf[pos] = 0;
         pos += 1;
 
         // title
-        let tl = (self.title_len as usize).min(64);
-        buf[pos..pos + tl].copy_from_slice(&self.title[..tl]);
+        let tl = self.title.len();
+        buf[pos..pos + tl].copy_from_slice(self.title.as_bytes());
         pos += tl;
         buf[pos] = 0;
         pos += 1;
@@ -1579,13 +1563,9 @@ fn draw_truncated_text(
 impl App<AppId> for ReaderApp {
     fn on_enter(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
         let msg = ctx.message();
-        let len = msg.len().min(32);
-        self.filename[..len].copy_from_slice(&msg[..len]);
-        self.filename_len = len;
+        self.filename.set(msg);
 
-        let n = self.filename_len.min(self.title.len());
-        self.title[..n].copy_from_slice(&self.filename[..n]);
-        self.title_len = n as u8;
+        self.title.set(self.filename.as_bytes());
         self.title_is_real = false;
 
         // Bump to a new work-queue generation and drain stale work
@@ -1751,8 +1731,8 @@ impl App<AppId> for ReaderApp {
 
             State::NeedInit => {
                 plump_kernel::perf_begin!(_t0);
-                let (nb, nl) = self.name_copy();
-                let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+                let fname = self.filename;
+        let name = fname.as_str();
                 match self.epub.init_zip(k, name, &mut self.pg.buf) {
                     Ok(()) => {
                         self.try_prefill_title_from_cache_header(k);
@@ -1845,8 +1825,8 @@ impl App<AppId> for ReaderApp {
                     Ok(false) => {
                         // cache miss: start/continue caching the current chapter
                         let ch = self.epub.chapter as usize;
-                        let (nb, nl) = self.name_copy();
-                        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+                        let fname = self.filename;
+                let epub_name = fname.as_str();
 
                         if self.epub.cache_step.is_none() {
                             // begin caching
@@ -1933,8 +1913,8 @@ impl App<AppId> for ReaderApp {
                     && !self.epub.ch_cached[self.epub.chapter as usize]
                 {
                     let ch = self.epub.chapter as usize;
-                    let (nb, nl) = self.name_copy();
-                    let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+                    let fname = self.filename;
+                let epub_name = fname.as_str();
 
                     if self.epub.cache_step.is_none() {
                         if let Err(e) = self.epub.cache_chapter_begin(k, ch, &epub_name) {

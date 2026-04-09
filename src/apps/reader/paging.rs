@@ -223,8 +223,8 @@ impl ReaderApp {
             return Ok(());
         }
 
-        let (nb, nl) = self.name_copy();
-        let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+        let fname = self.filename;
+        let name = fname.as_str();
 
         // -- read stage --
         plump_kernel::perf_begin!(_t_read);

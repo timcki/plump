@@ -372,9 +372,7 @@ impl ReaderApp {
             return false;
         }
 
-        let n = (hdr.title_len as usize).min(self.title.len());
-        self.title[..n].copy_from_slice(&hdr.title[..n]);
-        self.title_len = n as u8;
+        self.title.set(&hdr.title[..hdr.title_len as usize]);
         self.title_is_real = true;
         log::info!(
             "epub: prefilling title from cache header: {}",
@@ -384,8 +382,8 @@ impl ReaderApp {
     }
 
     pub(super) fn epub_init_opf(&mut self, k: &mut KernelHandle<'_>) -> crate::error::Result<()> {
-        let (nb, nl) = self.name_copy();
-        let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+        let fname = self.filename;
+        let name = fname.as_str();
 
         let mut opf_path_buf = [0u8; epub::OPF_PATH_CAP];
         let opf_path_len = if let Some(container_idx) = self.epub.zip.find("META-INF/container.xml")
@@ -442,9 +440,7 @@ impl ReaderApp {
 
         let tlen = self.epub.meta.title_len as usize;
         if tlen > 0 {
-            let n = tlen.min(self.title.len());
-            self.title[..n].copy_from_slice(&self.epub.meta.title[..n]);
-            self.title_len = n as u8;
+            self.title.set(&self.epub.meta.title[..tlen]);
             self.title_is_real = true;
         }
 
@@ -507,8 +503,8 @@ impl ReaderApp {
         };
 
         let entry = *self.epub.zip.entry(cover_idx);
-        let (nb, nl) = self.name_copy();
-        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+        let fname = self.filename;
+        let epub_name = fname.as_str();
 
         // proactively free ch_cache before decode: cover thumbnails are
         // generated once after OPF parse, and large DEFLATED JPEGs need
@@ -577,8 +573,8 @@ impl ReaderApp {
                     // figure out which chapter we're actively caching:
                     // could be a priority adjacent chapter or the sequential one
                     let ch = self.find_active_cache_chapter();
-                    let (nb, nl) = self.name_copy();
-                    let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+                    let fname = self.filename;
+                    let name = fname.as_str();
                     match self.epub.cache_chapter_step(k, ch, &name) {
                         Ok(false) => return BgOutcome::Progress { more: true },
                         Ok(true) => {
@@ -614,8 +610,8 @@ impl ReaderApp {
 
                 // priority: cache chapters adjacent to reading position first
                 let reading_ch = self.epub.chapter as usize;
-                let (nb, nl) = self.name_copy();
-                let name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+                let fname = self.filename;
+                let name = fname.as_str();
 
                 for &adj in &[reading_ch + 1, reading_ch.saturating_sub(1)] {
                     if adj < spine_len && adj != reading_ch && !self.epub.ch_cached[adj] {
@@ -636,8 +632,8 @@ impl ReaderApp {
                 if ch >= spine_len {
                     let _ = self.epub.finish_cache(
                         k,
-                        &self.title[..self.title_len as usize],
-                        &self.filename[..self.filename_len],
+                        self.title.as_bytes(),
+                        self.filename.as_bytes(),
                     );
                     self.epub.img_cache_ch = self.epub.chapter;
                     self.epub.img_cache_offset = 0;

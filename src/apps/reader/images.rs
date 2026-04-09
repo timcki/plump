@@ -170,8 +170,8 @@ impl ReaderApp {
         };
 
         let entry = *self.epub.zip.entry(zip_idx);
-        let (nb, nl) = self.name_copy();
-        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+        let fname = self.filename;
+        let epub_name = fname.as_str();
 
         let data_offset = {
             let mut hdr = [0u8; 30];
@@ -328,8 +328,8 @@ impl ReaderApp {
 
         let dir = self.epub.cache_dir_str();
 
-        let (nb, nl) = self.name_copy();
-        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+        let fname = self.filename;
+        let epub_name = fname.as_str();
 
         let text_w = self.text_w;
         let text_area_h = self.text_area_h;
@@ -424,8 +424,8 @@ impl ReaderApp {
 
         let dir_buf = self.epub.cache_dir;
         let dir = cache::dir_name_str(&dir_buf);
-        let (nb, nl) = self.name_copy();
-        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+        let fname = self.filename;
+        let epub_name = fname.as_str();
 
         let cf = self.epub.cache_file;
         let cf_str = cache::cache_filename_str(&cf);
