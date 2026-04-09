@@ -163,178 +163,159 @@ fn sfn_to_bytes(name: &embedded_sdmmc::ShortFileName, out: &mut [u8; 13]) -> u8 
     pos as u8
 }
 
-// file-operation macros; each evaluates to Result<T, Error>
-// none use ? internally so caller cleanup is never bypassed
+// async file operations on SdStorageInner — replaces the old op_* macros.
+// none use ? internally so caller cleanup is never bypassed.
 
-macro_rules! op_file_size {
-    ($inner:expr, $dir:expr, $name:expr) => {
-        $inner
-            .mgr
-            .find_directory_entry($dir, $name)
+use embedded_sdmmc::RawDirectory;
+
+impl SdStorageInner {
+    async fn file_size(&mut self, dir: RawDirectory, name: &str) -> crate::error::Result<u32> {
+        self.mgr
+            .find_directory_entry(dir, name)
             .await
             .map(|e| e.size)
             .map_err(|_| Error::new(ErrorKind::OpenFile, "file_size"))
-    };
-}
+    }
 
-macro_rules! op_read_chunk {
-    ($inner:expr, $dir:expr, $name:expr, $offset:expr, $buf:expr) => {
-        match $inner
+    async fn read_chunk(
+        &mut self,
+        dir: RawDirectory,
+        name: &str,
+        offset: u32,
+        buf: &mut [u8],
+    ) -> crate::error::Result<usize> {
+        let file = self
             .mgr
-            .open_file_in_dir($dir, $name, Mode::ReadOnly)
+            .open_file_in_dir(dir, name, Mode::ReadOnly)
             .await
-        {
-            Err(_) => Err(Error::new(ErrorKind::OpenFile, "read_chunk")),
-            Ok(file) => {
-                let result = match $inner.mgr.file_seek_from_start(file, $offset) {
-                    Ok(()) => $inner
-                        .mgr
-                        .read(file, $buf)
-                        .await
-                        .map_err(|_| Error::new(ErrorKind::ReadFailed, "read_chunk")),
-                    Err(_) => Err(Error::new(ErrorKind::SeekFailed, "read_chunk")),
-                };
-                let _ = $inner.mgr.close_file(file).await;
-                if let Ok(n) = &result {
-                    $crate::perf::counters::inc_sd_reads();
-                    $crate::perf::counters::add_sd_bytes_read(*n as u32);
-                }
-                result
-            }
-        }
-    };
-}
+            .map_err(|_| Error::new(ErrorKind::OpenFile, "read_chunk"))?;
 
-macro_rules! op_read_start {
-    ($inner:expr, $dir:expr, $name:expr, $buf:expr) => {
-        match $inner
+        let result = match self.mgr.file_seek_from_start(file, offset) {
+            Ok(()) => self
+                .mgr
+                .read(file, buf)
+                .await
+                .map_err(|_| Error::new(ErrorKind::ReadFailed, "read_chunk")),
+            Err(_) => Err(Error::new(ErrorKind::SeekFailed, "read_chunk")),
+        };
+        let _ = self.mgr.close_file(file).await;
+        if let Ok(n) = &result {
+            crate::perf::counters::inc_sd_reads();
+            crate::perf::counters::add_sd_bytes_read(*n as u32);
+        }
+        result
+    }
+
+    async fn read_start(
+        &mut self,
+        dir: RawDirectory,
+        name: &str,
+        buf: &mut [u8],
+    ) -> crate::error::Result<(u32, usize)> {
+        let file = self
             .mgr
-            .open_file_in_dir($dir, $name, Mode::ReadOnly)
+            .open_file_in_dir(dir, name, Mode::ReadOnly)
             .await
-        {
-            Err(_) => Err(Error::new(ErrorKind::OpenFile, "read_start")),
-            Ok(file) => {
-                let size = $inner.mgr.file_length(file).unwrap_or(0);
-                let result = $inner
-                    .mgr
-                    .read(file, $buf)
-                    .await
-                    .map_err(|_| Error::new(ErrorKind::ReadFailed, "read_start"));
-                let _ = $inner.mgr.close_file(file).await;
-                let mapped = result.map(|n| {
-                    $crate::perf::counters::inc_sd_reads();
-                    $crate::perf::counters::add_sd_bytes_read(n as u32);
-                    (size, n)
-                });
-                mapped
-            }
-        }
-    };
-}
+            .map_err(|_| Error::new(ErrorKind::OpenFile, "read_start"))?;
 
-macro_rules! op_write {
-    ($inner:expr, $dir:expr, $name:expr, $data:expr) => {
-        match $inner
+        let size = self.mgr.file_length(file).unwrap_or(0);
+        let result = self
             .mgr
-            .open_file_in_dir($dir, $name, Mode::ReadWriteCreateOrTruncate)
+            .read(file, buf)
             .await
-        {
-            Err(_) => Err(Error::new(ErrorKind::OpenFile, "write")),
-            Ok(file) => {
-                let data_ref = $data;
-                let result = if data_ref.is_empty() {
-                    Ok(())
-                } else {
-                    $inner
-                        .mgr
-                        .write(file, data_ref)
-                        .await
-                        .map_err(|_| Error::new(ErrorKind::WriteFailed, "write"))
-                };
-                let _ = $inner.mgr.close_file(file).await;
-                if result.is_ok() {
-                    $crate::perf::counters::inc_sd_writes();
-                    $crate::perf::counters::add_sd_bytes_written(data_ref.len() as u32);
-                }
-                result
-            }
-        }
-    };
-}
+            .map_err(|_| Error::new(ErrorKind::ReadFailed, "read_start"));
+        let _ = self.mgr.close_file(file).await;
+        result.map(|n| {
+            crate::perf::counters::inc_sd_reads();
+            crate::perf::counters::add_sd_bytes_read(n as u32);
+            (size, n)
+        })
+    }
 
-macro_rules! op_append {
-    ($inner:expr, $dir:expr, $name:expr, $data:expr) => {
-        match $inner
+    async fn write_file(
+        &mut self,
+        dir: RawDirectory,
+        name: &str,
+        data: &[u8],
+    ) -> crate::error::Result<()> {
+        let file = self
             .mgr
-            .open_file_in_dir($dir, $name, Mode::ReadWriteCreateOrAppend)
+            .open_file_in_dir(dir, name, Mode::ReadWriteCreateOrTruncate)
             .await
-        {
-            Err(_) => Err(Error::new(ErrorKind::OpenFile, "append")),
-            Ok(file) => {
-                let data_ref = $data;
-                let result = if data_ref.is_empty() {
-                    Ok(())
-                } else {
-                    $inner
-                        .mgr
-                        .write(file, data_ref)
-                        .await
-                        .map_err(|_| Error::new(ErrorKind::WriteFailed, "append"))
-                };
-                let _ = $inner.mgr.close_file(file).await;
-                if result.is_ok() {
-                    $crate::perf::counters::inc_sd_writes();
-                    $crate::perf::counters::add_sd_bytes_written(data_ref.len() as u32);
-                }
-                result
-            }
-        }
-    };
-}
+            .map_err(|_| Error::new(ErrorKind::OpenFile, "write"))?;
 
-macro_rules! op_delete {
-    ($inner:expr, $dir:expr, $name:expr) => {{
-        $inner
+        let result = if data.is_empty() {
+            Ok(())
+        } else {
+            self.mgr
+                .write(file, data)
+                .await
+                .map_err(|_| Error::new(ErrorKind::WriteFailed, "write"))
+        };
+        let _ = self.mgr.close_file(file).await;
+        if result.is_ok() {
+            crate::perf::counters::inc_sd_writes();
+            crate::perf::counters::add_sd_bytes_written(data.len() as u32);
+        }
+        result
+    }
+
+    async fn append(
+        &mut self,
+        dir: RawDirectory,
+        name: &str,
+        data: &[u8],
+    ) -> crate::error::Result<()> {
+        let file = self
             .mgr
-            .delete_entry_in_dir($dir, $name)
+            .open_file_in_dir(dir, name, Mode::ReadWriteCreateOrAppend)
+            .await
+            .map_err(|_| Error::new(ErrorKind::OpenFile, "append"))?;
+
+        let result = if data.is_empty() {
+            Ok(())
+        } else {
+            self.mgr
+                .write(file, data)
+                .await
+                .map_err(|_| Error::new(ErrorKind::WriteFailed, "append"))
+        };
+        let _ = self.mgr.close_file(file).await;
+        if result.is_ok() {
+            crate::perf::counters::inc_sd_writes();
+            crate::perf::counters::add_sd_bytes_written(data.len() as u32);
+        }
+        result
+    }
+
+    async fn delete(&mut self, dir: RawDirectory, name: &str) -> crate::error::Result<()> {
+        self.mgr
+            .delete_entry_in_dir(dir, name)
             .await
             .map_err(|_| Error::new(ErrorKind::DeleteFailed, "delete"))
-    }};
-}
+    }
 
-// dir-scoping macros; open subdir, execute body, close handle
+    async fn open_dir(&mut self, name: &str) -> crate::error::Result<RawDirectory> {
+        self.mgr
+            .open_dir(self.root, name)
+            .await
+            .map_err(|_| Error::new(ErrorKind::OpenDir, "open_dir"))
+    }
 
-macro_rules! in_dir {
-    ($inner:expr, $dirname:expr, |$dir:ident| $body:expr) => {
-        match $inner.mgr.open_dir($inner.root, $dirname).await {
-            Err(_) => Err(Error::new(ErrorKind::OpenDir, "in_dir")),
-            Ok($dir) => {
-                let _r = $body;
-                let _ = $inner.mgr.close_dir($dir);
-                _r
+    async fn open_subdir(
+        &mut self,
+        d1: &str,
+        d2: &str,
+    ) -> crate::error::Result<(RawDirectory, RawDirectory)> {
+        let mid = self.open_dir(d1).await?;
+        match self.mgr.open_dir(mid, d2).await {
+            Ok(sub) => Ok((mid, sub)),
+            Err(_) => {
+                let _ = self.mgr.close_dir(mid);
+                Err(Error::new(ErrorKind::OpenDir, "open_subdir"))
             }
         }
-    };
-}
-
-macro_rules! in_subdir {
-    ($inner:expr, $d1:expr, $d2:expr, |$dir:ident| $body:expr) => {
-        match $inner.mgr.open_dir($inner.root, $d1).await {
-            Err(_) => Err(Error::new(ErrorKind::OpenDir, "in_subdir")),
-            Ok(_mid) => match $inner.mgr.open_dir(_mid, $d2).await {
-                Err(_) => {
-                    let _ = $inner.mgr.close_dir(_mid);
-                    Err(Error::new(ErrorKind::OpenDir, "in_subdir"))
-                }
-                Ok($dir) => {
-                    let _r = $body;
-                    let _ = $inner.mgr.close_dir($dir);
-                    let _ = $inner.mgr.close_dir(_mid);
-                    _r
-                }
-            },
-        }
-    };
+    }
 }
 
 fn borrow(sd: &SdStorage) -> core::result::Result<core::cell::RefMut<'_, SdStorageInner>, Error> {
@@ -421,8 +402,8 @@ impl SdStorage {
     pub fn write_file(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            op_write!(inner, inner.root, name, data)
+            let root = guard.root;
+            guard.write_file(root, name, data).await
         })
     }
 
@@ -430,8 +411,8 @@ impl SdStorage {
     pub fn append_root_file(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            op_append!(inner, inner.root, name, data)
+            let root = guard.root;
+            guard.append(root, name, data).await
         })
     }
 
@@ -439,8 +420,8 @@ impl SdStorage {
     pub fn delete_file(&self, name: &str) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            op_delete!(inner, inner.root, name)
+            let root = guard.root;
+            guard.delete(root, name).await
         })
     }
 
@@ -506,8 +487,8 @@ impl SdStorage {
     pub fn file_size(&self, name: &str) -> crate::error::Result<u32> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            op_file_size!(inner, inner.root, name)
+            let root = guard.root;
+            guard.file_size(root, name).await
         })
     }
 
@@ -520,8 +501,8 @@ impl SdStorage {
     ) -> crate::error::Result<usize> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            op_read_chunk!(inner, inner.root, name, offset, buf)
+            let root = guard.root;
+            guard.read_chunk(root, name, offset, buf).await
         })
     }
 
@@ -534,8 +515,8 @@ impl SdStorage {
     ) -> crate::error::Result<(u32, usize)> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            op_read_start!(inner, inner.root, name, buf)
+            let root = guard.root;
+            guard.read_start(root, name, buf).await
         })
     }
 
@@ -550,8 +531,10 @@ impl SdStorage {
     ) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            in_dir!(inner, dir, |dir_h| op_write!(inner, dir_h, name, data))
+            let dir_h = guard.open_dir(dir).await?;
+            let r = guard.write_file(dir_h, name, data).await;
+            let _ = guard.mgr.close_dir(dir_h);
+            r
         })
     }
 
@@ -565,8 +548,10 @@ impl SdStorage {
     ) -> crate::error::Result<(u32, usize)> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            in_dir!(inner, dir, |dir_h| op_read_start!(inner, dir_h, name, buf))
+            let dir_h = guard.open_dir(dir).await?;
+            let r = guard.read_start(dir_h, name, buf).await;
+            let _ = guard.mgr.close_dir(dir_h);
+            r
         })
     }
 
@@ -610,17 +595,17 @@ impl SdStorage {
     pub fn ensure_plump_subdir(&self, name: &str) -> crate::error::Result<()> {
         let exists = poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            let dir = inner.data_dir;
-            in_dir!(inner, dir, |plump_h| {
-                match inner.mgr.open_dir(plump_h, name).await {
-                    Ok(sub) => {
-                        let _ = inner.mgr.close_dir(sub);
-                        Ok::<_, Error>(true)
-                    }
-                    Err(_) => Ok(false),
+            let dir = guard.data_dir;
+            let plump_h = guard.open_dir(dir).await?;
+            let r: crate::error::Result<bool> = match guard.mgr.open_dir(plump_h, name).await {
+                Ok(sub) => {
+                    let _ = guard.mgr.close_dir(sub);
+                    Ok(true)
                 }
-            })
+                Err(_) => Ok(false),
+            };
+            let _ = guard.mgr.close_dir(plump_h);
+            r
         })?;
 
         if exists {
@@ -629,15 +614,15 @@ impl SdStorage {
 
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            let dir = inner.data_dir;
-            in_dir!(inner, dir, |plump_h| {
-                match inner.mgr.make_dir_in_dir(plump_h, name).await {
-                    Ok(()) => Ok::<_, Error>(()),
-                    Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
-                    Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_plump_subdir")),
-                }
-            })
+            let dir = guard.data_dir;
+            let plump_h = guard.open_dir(dir).await?;
+            let r = match guard.mgr.make_dir_in_dir(plump_h, name).await {
+                Ok(()) => Ok(()),
+                Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
+                Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_plump_subdir")),
+            };
+            let _ = guard.mgr.close_dir(plump_h);
+            r
         })
     }
 
@@ -652,11 +637,11 @@ impl SdStorage {
     ) -> crate::error::Result<usize> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            let dir = inner.data_dir;
-            in_dir!(inner, dir, |dir_h| op_read_chunk!(
-                inner, dir_h, name, offset, buf
-            ))
+            let dir = guard.data_dir;
+            let dir_h = guard.open_dir(dir).await?;
+            let r = guard.read_chunk(dir_h, name, offset, buf).await;
+            let _ = guard.mgr.close_dir(dir_h);
+            r
         })
     }
 
@@ -664,9 +649,11 @@ impl SdStorage {
     pub fn write_in_plump(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            let dir = inner.data_dir;
-            in_dir!(inner, dir, |dir_h| op_write!(inner, dir_h, name, data))
+            let dir = guard.data_dir;
+            let dir_h = guard.open_dir(dir).await?;
+            let r = guard.write_file(dir_h, name, data).await;
+            let _ = guard.mgr.close_dir(dir_h);
+            r
         })
     }
 
@@ -674,11 +661,11 @@ impl SdStorage {
     pub fn append_in_plump(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            let dir = inner.data_dir;
-            in_dir!(inner, dir, |dir_h| op_append!(
-                inner, dir_h, name, data
-            ))
+            let dir = guard.data_dir;
+            let dir_h = guard.open_dir(dir).await?;
+            let r = guard.append(dir_h, name, data).await;
+            let _ = guard.mgr.close_dir(dir_h);
+            r
         })
     }
 
@@ -686,9 +673,11 @@ impl SdStorage {
     pub fn file_size_in_plump(&self, name: &str) -> crate::error::Result<u32> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            let dir = inner.data_dir;
-            in_dir!(inner, dir, |dir_h| op_file_size!(inner, dir_h, name))
+            let dir = guard.data_dir;
+            let dir_h = guard.open_dir(dir).await?;
+            let r = guard.file_size(dir_h, name).await;
+            let _ = guard.mgr.close_dir(dir_h);
+            r
         })
     }
 
@@ -696,14 +685,15 @@ impl SdStorage {
     pub fn delete_in_plump(&self, name: &str) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            let dir = inner.data_dir;
-            in_dir!(inner, dir, |dir_h| op_delete!(inner, dir_h, name))
+            let dir = guard.data_dir;
+            let dir_h = guard.open_dir(dir).await?;
+            let r = guard.delete(dir_h, name).await;
+            let _ = guard.mgr.close_dir(dir_h);
+            r
         })
     }
 
     /// Seek to offset and write data in a file in the data directory.
-    /// Used to update the chapter offset table after all chapters are appended.
     pub fn write_at_in_plump(
         &self,
         name: &str,
@@ -712,33 +702,34 @@ impl SdStorage {
     ) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            let dir = inner.data_dir;
-            in_dir!(inner, dir, |dir_h| {
-                match inner
-                    .mgr
-                    .open_file_in_dir(dir_h, name, Mode::ReadWriteCreateOrAppend)
-                    .await
-                {
-                    Err(_) => Err(Error::new(ErrorKind::OpenFile, "write_at")),
-                    Ok(file) => {
-                        let result = match inner.mgr.file_seek_from_start(file, offset) {
-                            Ok(()) => inner
-                                .mgr
-                                .write(file, data)
-                                .await
-                                .map_err(|_| Error::new(ErrorKind::WriteFailed, "write_at")),
-                            Err(_) => Err(Error::new(ErrorKind::SeekFailed, "write_at")),
-                        };
-                        let _ = inner.mgr.close_file(file).await;
-                        if result.is_ok() {
-                            crate::perf::counters::inc_sd_writes();
-                            crate::perf::counters::add_sd_bytes_written(data.len() as u32);
-                        }
-                        result
-                    }
+            let dir = guard.data_dir;
+            let dir_h = guard.open_dir(dir).await?;
+            let file = match guard
+                .mgr
+                .open_file_in_dir(dir_h, name, Mode::ReadWriteCreateOrAppend)
+                .await
+            {
+                Ok(f) => f,
+                Err(_) => {
+                    let _ = guard.mgr.close_dir(dir_h);
+                    return Err(Error::new(ErrorKind::OpenFile, "write_at"));
                 }
-            })
+            };
+            let result = match guard.mgr.file_seek_from_start(file, offset) {
+                Ok(()) => guard
+                    .mgr
+                    .write(file, data)
+                    .await
+                    .map_err(|_| Error::new(ErrorKind::WriteFailed, "write_at")),
+                Err(_) => Err(Error::new(ErrorKind::SeekFailed, "write_at")),
+            };
+            let _ = guard.mgr.close_file(file).await;
+            let _ = guard.mgr.close_dir(dir_h);
+            if result.is_ok() {
+                crate::perf::counters::inc_sd_writes();
+                crate::perf::counters::add_sd_bytes_written(data.len() as u32);
+            }
+            result
         })
     }
 
@@ -753,11 +744,12 @@ impl SdStorage {
     ) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            let dd = inner.data_dir;
-            in_subdir!(inner, dd, dir, |sub_h| op_write!(
-                inner, sub_h, name, data
-            ))
+            let dd = guard.data_dir;
+            let (mid, sub) = guard.open_subdir(dd, dir).await?;
+            let r = guard.write_file(sub, name, data).await;
+            let _ = guard.mgr.close_dir(sub);
+            let _ = guard.mgr.close_dir(mid);
+            r
         })
     }
 
@@ -770,11 +762,12 @@ impl SdStorage {
     ) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            let dd = inner.data_dir;
-            in_subdir!(inner, dd, dir, |sub_h| op_append!(
-                inner, sub_h, name, data
-            ))
+            let dd = guard.data_dir;
+            let (mid, sub) = guard.open_subdir(dd, dir).await?;
+            let r = guard.append(sub, name, data).await;
+            let _ = guard.mgr.close_dir(sub);
+            let _ = guard.mgr.close_dir(mid);
+            r
         })
     }
 
@@ -788,11 +781,12 @@ impl SdStorage {
     ) -> crate::error::Result<usize> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            let dd = inner.data_dir;
-            in_subdir!(inner, dd, dir, |sub_h| op_read_chunk!(
-                inner, sub_h, name, offset, buf
-            ))
+            let dd = guard.data_dir;
+            let (mid, sub) = guard.open_subdir(dd, dir).await?;
+            let r = guard.read_chunk(sub, name, offset, buf).await;
+            let _ = guard.mgr.close_dir(sub);
+            let _ = guard.mgr.close_dir(mid);
+            r
         })
     }
 
@@ -804,11 +798,12 @@ impl SdStorage {
     ) -> crate::error::Result<u32> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            let dd = inner.data_dir;
-            in_subdir!(inner, dd, dir, |sub_h| op_file_size!(
-                inner, sub_h, name
-            ))
+            let dd = guard.data_dir;
+            let (mid, sub) = guard.open_subdir(dd, dir).await?;
+            let r = guard.file_size(sub, name).await;
+            let _ = guard.mgr.close_dir(sub);
+            let _ = guard.mgr.close_dir(mid);
+            r
         })
     }
 
@@ -820,9 +815,12 @@ impl SdStorage {
     ) -> crate::error::Result<()> {
         poll_once(async {
             let mut guard = borrow(self)?;
-            let inner = &mut *guard;
-            let dd = inner.data_dir;
-            in_subdir!(inner, dd, dir, |sub_h| op_delete!(inner, sub_h, name))
+            let dd = guard.data_dir;
+            let (mid, sub) = guard.open_subdir(dd, dir).await?;
+            let r = guard.delete(sub, name).await;
+            let _ = guard.mgr.close_dir(sub);
+            let _ = guard.mgr.close_dir(mid);
+            r
         })
     }
 
