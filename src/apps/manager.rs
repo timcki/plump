@@ -208,6 +208,14 @@ impl AppManager {
         with_app!(active, self, |app| app.save_state(bm));
     }
 
+    // drop transient heap on the active app before sleep so the
+    // wallpaper allocator has room. wake path rebuilds state from SD
+    // via `restore_state`, so dropping here is correctness-safe.
+    pub fn on_active_pre_sleep(&mut self, k: &mut KernelHandle<'_>) {
+        let active = self.launcher.active();
+        with_app!(active, self, |app| app.on_pre_sleep(k));
+    }
+
     // collect session state to RTC memory struct before sleep
     pub fn collect_session(&self, session: &mut crate::kernel::rtc_session::RtcSession) {
         use crate::kernel::rtc_session::MAX_NAV_STACK;
@@ -796,6 +804,10 @@ impl AppLayer for AppManager {
 
     fn save_active_state(&mut self, bm: &mut crate::kernel::bookmarks::BookmarkCache) {
         AppManager::save_active_state(self, bm);
+    }
+
+    fn on_active_pre_sleep(&mut self, k: &mut KernelHandle<'_>) {
+        AppManager::on_active_pre_sleep(self, k);
     }
 
     fn flush_deferred_persistence(

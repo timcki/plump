@@ -54,9 +54,14 @@ impl super::Kernel {
     // hardware init progress in the built-in mono font
     pub async fn show_boot_console(&mut self, console: &super::BootConsole) {
         let draw = |s: &mut StripBuffer| console.draw(s);
-        self.epd
+        if self
+            .epd
             .full_refresh_async(self.strip, &mut self.delay, &draw)
-            .await;
+            .await
+            .is_err()
+        {
+            log::warn!("show_boot_console: EPD refresh timed out");
+        }
     }
 
     // check for valid session early (before boot console) so we can
@@ -203,9 +208,14 @@ impl super::Kernel {
 
             let t0 = Instant::now();
             let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-            self.epd
+            if self
+                .epd
                 .full_refresh_async(self.strip, &mut self.delay, &draw)
-                .await;
+                .await
+                .is_err()
+            {
+                log::warn!("boot: first EPD refresh timed out");
+            }
             info!("boot: first EPD refresh ({}ms)", t0.elapsed().as_millis());
         }
         let _ = app_mgr.take_redraw();
@@ -585,7 +595,12 @@ impl super::Kernel {
                                 // both RAMs) and skip post-gray restore (next page
                                 // turn uses inv_red to resync)
                                 let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                                self.epd.grayscale_pass(self.strip, &rs, &draw).await;
+                                if self.epd.grayscale_pass(self.strip, &rs, &draw).await.is_err() {
+                                    log::warn!("render: grayscale_pass timed out, forcing full GC next frame");
+                                    // post-wait BW restore was skipped; next partial would
+                                    // see stale BW delta. force a full GC on the next refresh
+                                    self.partial_refreshes = app_mgr.ghost_clear_every();
+                                }
                                 self.red_stale = true;
                             } else {
                                 let draw = |s: &mut StripBuffer| app_mgr.draw(s);
@@ -594,7 +609,9 @@ impl super::Kernel {
                                 // covers the dirty region, so RED RAM outside it
                                 // may still be desynchronised (e.g. after a
                                 // grayscale pass). only full GC clears red_stale.
-                                self.epd.power_off_async().await;
+                                if self.epd.power_off_async().await.is_err() {
+                                    log::warn!("render: power_off_async timed out after partial DU");
+                                }
                             }
                         }
 
@@ -666,7 +683,12 @@ impl super::Kernel {
                         right_mask: 0,
                     };
                     let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                    self.epd.grayscale_pass(self.strip, &rs, &draw).await;
+                    if self.epd.grayscale_pass(self.strip, &rs, &draw).await.is_err() {
+                        log::warn!(
+                            "render: post-GC grayscale_pass timed out, forcing full GC next frame"
+                        );
+                        self.partial_refreshes = app_mgr.ghost_clear_every();
+                    }
                     self.red_stale = true;
                 }
 
@@ -817,8 +839,20 @@ impl super::Kernel {
 
         // save to SD card (reliable fallback for battery wake)
         session.save_to_sd(&self.sd);
-        debug!(
+        info!(
             "sleep: session saved to RTC + SD ({}ms)",
+            t0.elapsed().as_millis()
+        );
+
+        // let the active app drop transient heap (reader chapter cache,
+        // decoded images, etc.) BEFORE the wallpaper allocator runs in
+        // enter_sleep. session capture must happen first because
+        // collect_session reads reader state we're about to free.
+        info!("sleep: freeing active app transient heap...");
+        let t0 = Instant::now();
+        app_mgr.on_active_pre_sleep(&mut self.handle());
+        info!(
+            "sleep: active app cleanup ({}ms)",
             t0.elapsed().as_millis()
         );
 
@@ -843,24 +877,27 @@ impl super::Kernel {
 
         info!("{}: entering sleep...", reason);
 
+        info!("sleep: flushing bookmarks...");
         let t0 = Instant::now();
         if self.bm_cache.is_dirty() {
             self.bm_cache.flush(&self.sd);
         }
-        debug!("sleep: bookmark flush ({}ms)", t0.elapsed().as_millis());
+        info!("sleep: bookmark flush ({}ms)", t0.elapsed().as_millis());
 
         // load sleep wallpaper from SD before putting the card to sleep
+        info!("sleep: loading wallpaper from SD...");
         let t0 = Instant::now();
         let sleep_img = super::sleep_image::load_sleep_image(&self.sd);
         if sleep_img.is_some() {
-            debug!("sleep: wallpaper loaded ({}ms)", t0.elapsed().as_millis());
+            info!("sleep: wallpaper loaded ({}ms)", t0.elapsed().as_millis());
         } else {
-            debug!("sleep: no wallpaper found ({}ms)", t0.elapsed().as_millis());
+            info!("sleep: no wallpaper found ({}ms)", t0.elapsed().as_millis());
         }
 
+        info!("sleep: putting SD card to sleep...");
         let t0 = Instant::now();
         self.sd_card_sleep();
-        debug!("sleep: SD card sleep ({}ms)", t0.elapsed().as_millis());
+        info!("sleep: SD card sleep ({}ms)", t0.elapsed().as_millis());
 
         let t0 = Instant::now();
         if let Some(ref img) = sleep_img {
@@ -897,31 +934,47 @@ impl super::Kernel {
             // Establish the base black/white image first, then overlay the
             // intermediate gray levels with the grayscale LUT. This matches
             // the normal grayscale text AA flow more closely than a white clear.
+            info!("sleep: rendering wallpaper base BW pass...");
             let t1 = Instant::now();
-            self.epd
+            if self
+                .epd
                 .full_refresh_async(self.strip, &mut self.delay, &draw)
-                .await;
-            debug!("sleep: wallpaper base BW ({}ms)", t1.elapsed().as_millis());
+                .await
+                .is_err()
+            {
+                log::warn!("sleep: wallpaper base refresh timed out, continuing");
+            }
+            info!("sleep: wallpaper base BW ({}ms)", t1.elapsed().as_millis());
 
+            info!("sleep: rendering wallpaper grayscale overlay...");
             let t1 = Instant::now();
             // grayscale_pass writes LSB plane to BW RAM and MSB plane to
             // RED RAM, then triggers a single refresh with the grayscale LUT.
-            self.epd.grayscale_pass(self.strip, &rs, &draw).await;
-            debug!(
+            if self.epd.grayscale_pass(self.strip, &rs, &draw).await.is_err() {
+                log::warn!("sleep: wallpaper grayscale overlay timed out, continuing");
+            }
+            info!(
                 "sleep: wallpaper grayscale overlay ({}ms)",
                 t1.elapsed().as_millis()
             );
         } else {
             // fallback: simple text sleep screen
-            self.epd
+            info!("sleep: rendering fallback sleep text screen...");
+            if self
+                .epd
                 .full_refresh_async(self.strip, &mut self.delay, &|s: &mut StripBuffer| {
                     let style = MonoTextStyle::new(&FONT_9X18, BinaryColor::On);
                     let _ = Text::new("(sleep)", Point::new(210, 400), style).draw(s);
                 })
-                .await;
+                .await
+                .is_err()
+            {
+                log::warn!("sleep: fallback text refresh timed out, continuing");
+            }
         }
-        debug!("sleep: screen rendered ({}ms)", t0.elapsed().as_millis());
+        info!("sleep: screen rendered ({}ms)", t0.elapsed().as_millis());
 
+        info!("sleep: EPD entering deep sleep...");
         self.epd.enter_deep_sleep();
         info!(
             "sleep: EPD deep sleep, total sleep entry {}ms",

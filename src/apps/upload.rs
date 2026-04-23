@@ -1050,10 +1050,13 @@ async fn render_screen(
         bumps.draw(s);
     };
 
-    if full_refresh {
-        epd.full_refresh_async(strip, delay, &draw).await;
+    let result = if full_refresh {
+        epd.full_refresh_async(strip, delay, &draw).await
     } else {
         epd.partial_refresh_async(strip, delay, 0, 0, SCREEN_W, SCREEN_H, &draw)
-            .await;
+            .await
+    };
+    if result.is_err() {
+        log::warn!("upload: EPD refresh timed out");
     }
 }

@@ -716,8 +716,31 @@ where
         &mut self.busy
     }
 
-    async fn wait_busy_async(&mut self) {
-        let _ = self.busy.wait_for_low().await;
+    // bound the busy-pin wait so a stuck EPD cannot wedge the device.
+    // 5s is ~2x worst case (full GC ~1.6s, grayscale ~1-2s, partial DU ~400ms).
+    // `ctx` is logged on timeout so the caller can be identified in serial.
+    async fn wait_busy_async(
+        &mut self,
+        ctx: &'static str,
+    ) -> Result<(), embassy_time::TimeoutError> {
+        use embassy_time::{Duration, with_timeout};
+        const BUSY_TIMEOUT_MS: u64 = 5_000;
+        match with_timeout(
+            Duration::from_millis(BUSY_TIMEOUT_MS),
+            self.busy.wait_for_low(),
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                log::error!(
+                    "wait_busy_async: TIMEOUT after {}ms at {}",
+                    BUSY_TIMEOUT_MS,
+                    ctx
+                );
+                Err(e)
+            }
+        }
     }
 
     pub async fn write_full_frame_async<F>(
@@ -740,12 +763,12 @@ where
         w: u16,
         h: u16,
         draw: &F,
-    ) where
+    ) -> Result<(), embassy_time::TimeoutError>
+    where
         F: Fn(&mut StripBuffer),
     {
         if self.initial_refresh {
-            self.full_refresh_async(strip, delay, draw).await;
-            return;
+            return self.full_refresh_async(strip, delay, draw).await;
         }
         if !self.init_done {
             self.init_display(delay);
@@ -753,7 +776,7 @@ where
 
         let rs = match self.align_partial_region(x, y, w, h) {
             Some(rs) => rs,
-            None => return,
+            None => return Ok(()),
         };
 
         self.write_region_strips(
@@ -769,7 +792,7 @@ where
         );
 
         self.partial_start_du(&rs);
-        self.wait_busy_async().await;
+        self.wait_busy_async("partial_du").await?;
 
         self.write_region_strips_dual(
             strip,
@@ -782,7 +805,7 @@ where
             rs.right_mask,
         );
 
-        self.power_off_async().await;
+        self.power_off_async().await
     }
 
     pub async fn full_refresh_async<F>(
@@ -790,21 +813,23 @@ where
         strip: &mut StripBuffer,
         delay: &mut Delay,
         draw: &F,
-    ) where
+    ) -> Result<(), embassy_time::TimeoutError>
+    where
         F: Fn(&mut StripBuffer),
     {
         self.write_full_frame_async(strip, delay, draw).await;
-        self.update_full_async().await;
+        self.update_full_async().await
     }
 
-    pub async fn power_off_async(&mut self) {
+    pub async fn power_off_async(&mut self) -> Result<(), embassy_time::TimeoutError> {
         if self.power_is_on {
             self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
             self.send_data(&[0x83]);
             self.send_command(cmd::MASTER_ACTIVATION);
-            self.wait_busy_async().await;
+            self.wait_busy_async("power_off").await?;
             self.power_is_on = false;
         }
+        Ok(())
     }
 
     /// Perform a grayscale antialiasing pass.
@@ -813,7 +838,15 @@ where
     /// to BW RAM and MSB plane to RED RAM, then triggers a grayscale LUT
     /// refresh. After this, both RAMs contain gray plane data (not BW
     /// content), so the caller should mark red_stale = true.
-    pub async fn grayscale_pass<F>(&mut self, strip: &mut StripBuffer, rs: &RenderState, draw: &F)
+    ///
+    /// On timeout, the post-wait BW RAM restore is skipped; the caller
+    /// must force a full GC on the next refresh to resync both planes.
+    pub async fn grayscale_pass<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        rs: &RenderState,
+        draw: &F,
+    ) -> Result<(), embassy_time::TimeoutError>
     where
         F: Fn(&mut StripBuffer),
     {
@@ -832,7 +865,7 @@ where
         strip.set_gray_mode(GrayMode::Bw);
 
         self.start_grayscale_refresh(rs);
-        self.wait_busy_async().await;
+        self.wait_busy_async("grayscale_refresh").await?;
 
         // restore BW RAM with correct content so subsequent partial
         // DU refreshes compute correct pixel deltas. the physical
@@ -853,12 +886,14 @@ where
             rs.left_mask,
             rs.right_mask,
         );
+        Ok(())
     }
 
-    async fn update_full_async(&mut self) {
+    async fn update_full_async(&mut self) -> Result<(), embassy_time::TimeoutError> {
         self.start_full_update();
-        self.wait_busy_async().await;
+        self.wait_busy_async("full_update").await?;
         self.finish_full_update();
+        Ok(())
     }
 }
 

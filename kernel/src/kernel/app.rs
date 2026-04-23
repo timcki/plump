@@ -419,6 +419,15 @@ pub trait App<Id> {
 
     fn save_state(&self, _bm: &mut BookmarkCache) {}
 
+    /// Called on the active app right before the scheduler hands
+    /// control to `enter_sleep`. Apps should drop transient heap
+    /// (caches, decoded images, scratch buffers) that can be rebuilt
+    /// from SD/bookmark on wake. The MCU performs a full reset on
+    /// wake so any retained heap is lost anyway; freeing it before
+    /// `load_sleep_image` gives the wallpaper allocator room to
+    /// succeed.
+    fn on_pre_sleep(&mut self, _k: &mut KernelHandle<'_>) {}
+
     /// Flush deferred persistence (e.g. RECENT, reading stats).
     ///
     /// Called periodically in safe no-redraw windows (`Opportunistic`)
@@ -631,6 +640,11 @@ pub trait AppLayer {
     // bookmark cache; called before collect_session during sleep so
     // bookmarks and session stay in sync
     fn save_active_state(&mut self, bm: &mut BookmarkCache);
+
+    /// Dispatch `on_pre_sleep` to the active app. Called from the
+    /// scheduler right before `enter_sleep` so apps can drop transient
+    /// heap to make room for the sleep wallpaper allocator.
+    fn on_active_pre_sleep(&mut self, k: &mut KernelHandle<'_>);
 
     /// Flush deferred persistence for all app singletons.
     ///

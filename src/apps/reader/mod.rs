@@ -1664,6 +1664,36 @@ impl App<AppId> for ReaderApp {
         // task runs independently and our work_gen stays valid
     }
 
+    fn on_pre_sleep(&mut self, _k: &mut KernelHandle<'_>) {
+        // drop transient heap the reader no longer needs before deep
+        // sleep. MCU resets on wake so any retained heap is lost
+        // anyway; freeing now makes room for the sleep wallpaper
+        // allocator (~96KB) which would otherwise OOM and fall back
+        // to the plain text screen.
+        //
+        // wake restores via restore_state -> NeedIndex, which re-reads
+        // the chapter from SD cache. one-time cost: ~1-2s on the first
+        // page turn after wake.
+        let freed = self.epub.ch_cache.capacity()
+            + self.pg.prefetch.capacity()
+            + self.page_img.as_ref().map_or(0, |i| i.data.capacity())
+            + self.loading_cover.as_ref().map_or(0, |i| i.data.capacity());
+
+        // cancel any in-flight image decode so the worker drops its buffer
+        work_queue::reset();
+
+        self.epub.ch_cache = Vec::new();
+        self.pg.prefetch = Vec::new();
+        self.pg.prefetch_len = 0;
+        self.page_img = None;
+        self.loading_cover = None;
+
+        log::info!(
+            "reader: pre-sleep freed ~{}KB of transient heap",
+            freed / 1024
+        );
+    }
+
     fn on_resume(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
         // resume reading-time clock
         self.stats_resume_clock();

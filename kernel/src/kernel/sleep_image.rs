@@ -9,9 +9,8 @@
 // single 96KB contiguous allocation (the ESP32-C3 has two disjoint
 // heap pools of 108KB and 62KB — neither can hold 96KB).
 
-use alloc::vec;
 use alloc::vec::Vec;
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::sdcard::SdStorage;
@@ -42,15 +41,32 @@ pub struct SleepImage {
     pub stride: u16,
 }
 
+/// Per-chunk row count for the 2bpp output layout.
+/// Shared by the chunk allocator and `SleepImage::chunk_rows`.
+#[inline]
+const fn chunk_rows_for(idx: usize) -> usize {
+    if idx < CHUNK_COUNT - 1 {
+        ROWS_PER_CHUNK
+    } else {
+        IMG_H - ROWS_PER_CHUNK * (CHUNK_COUNT - 1)
+    }
+}
+
+/// Allocate a zeroed heap buffer without panicking on OOM;
+/// caller logs and decides how to fall back.
+#[inline]
+fn try_alloc_zeroed(len: usize) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len).ok()?;
+    buf.resize(len, 0);
+    Some(buf)
+}
+
 impl SleepImage {
     /// Number of rows in the given chunk.
     #[inline]
     pub fn chunk_rows(&self, chunk: usize) -> usize {
-        if chunk < CHUNK_COUNT - 1 {
-            ROWS_PER_CHUNK
-        } else {
-            IMG_H - ROWS_PER_CHUNK * (CHUNK_COUNT - 1)
-        }
+        chunk_rows_for(chunk)
     }
 
     /// First logical row of the given chunk.
@@ -157,40 +173,32 @@ fn bmp_row_stride(bpp: u16) -> Option<usize> {
 }
 
 fn alloc_read_batch(row_stride: usize) -> Option<Vec<u8>> {
-    let mut rows = (MAX_BATCH_BYTES / row_stride).max(1);
-    let target_rows = rows;
+    let target_rows = (MAX_BATCH_BYTES / row_stride).max(1);
+    // halving retry sequence: target, target/2, target/4, ... down to 1 (inclusive)
+    let rows_seq = core::iter::successors(
+        Some(target_rows),
+        |&r| (r > 1).then(|| (r / 2).max(1)),
+    );
 
-    loop {
-        let len = rows * row_stride;
-        let mut buf = Vec::new();
-        match buf.try_reserve_exact(len) {
-            Ok(()) => {
-                buf.resize(len, 0);
-                if rows < target_rows {
-                    debug!(
-                        "sleep_image: using reduced read batch ({} rows, {} bytes)",
-                        rows, len
-                    );
-                }
-                return Some(buf);
-            }
-            Err(_) if rows > 1 => {
-                let next_rows = (rows / 2).max(1);
+    let picked = rows_seq
+        .inspect(|&rows| {
+            if rows < target_rows {
                 debug!(
-                    "sleep_image: read batch alloc failed at {} bytes, retrying with {} rows",
-                    len, next_rows
+                    "sleep_image: read batch retry at {} rows ({} bytes)",
+                    rows,
+                    rows * row_stride
                 );
-                rows = next_rows;
             }
-            Err(_) => {
-                info!(
-                    "sleep_image: failed to allocate even a 1-row read batch ({} bytes)",
-                    len
-                );
-                return None;
-            }
-        }
+        })
+        .find_map(|rows| try_alloc_zeroed(rows * row_stride));
+
+    if picked.is_none() {
+        info!(
+            "sleep_image: failed to allocate even a 1-row read batch ({} bytes)",
+            row_stride
+        );
     }
+    picked
 }
 
 /// Quantize a luminance value to the nearest of the 4 gray levels.
@@ -261,30 +269,33 @@ fn decode_row_lum(
 /// Output is 96,000 bytes (480×800 at 2 bits per pixel) split across
 /// 6 chunks of ~16KB each, packed MSB-first (4 pixels per byte).
 pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
+    info!("sleep_image: load_sleep_image start");
+
     let (pixel_offset, bpp, palette_lum) = parse_header(sd)?;
     let row_stride = bmp_row_stride(bpp)?;
-    debug!(
+    info!(
         "sleep_image: {}x{} {}bpp, pixel data at offset {}",
         IMG_W, IMG_H, bpp, pixel_offset
     );
 
-    // allocate 6 chunks — each ~16KB, fits in either heap pool
-    let last_chunk_rows = IMG_H - ROWS_PER_CHUNK * (CHUNK_COUNT - 1);
-    let mut chunks: [Vec<u8>; CHUNK_COUNT] = core::array::from_fn(|i| {
-        let rows = if i < CHUNK_COUNT - 1 {
-            ROWS_PER_CHUNK
-        } else {
-            last_chunk_rows
-        };
-        vec![0u8; rows * OUT_STRIDE]
-    });
+    // allocate 6 output chunks (~16KB each, fits in either heap pool).
+    // short-circuits on first alloc failure; partial array is dropped so
+    // already-allocated chunks are freed before returning None.
+    let mut chunks: [Vec<u8>; CHUNK_COUNT] = (0..CHUNK_COUNT)
+        .map(|i| try_alloc_zeroed(chunk_rows_for(i) * OUT_STRIDE))
+        .collect::<Option<Vec<_>>>()
+        .and_then(|v| <[Vec<u8>; CHUNK_COUNT]>::try_from(v).ok())
+        .or_else(|| {
+            warn!("sleep_image: chunk alloc failed, falling back to text sleep screen");
+            None
+        })?;
 
     // allocate the temporary read buffer after the output chunks so the
     // permanent image storage gets first pick of the heap; if this extra
     // batch buffer cannot fit we back off to smaller batches instead of OOMing.
     let mut read_batch = alloc_read_batch(row_stride)?;
     let batch_rows = read_batch.len() / row_stride;
-    debug!(
+    info!(
         "sleep_image: row_stride={} batch_rows={} batch_bytes={}",
         row_stride,
         batch_rows,
@@ -303,6 +314,11 @@ pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
         let first_bmp_row = IMG_H - out_y - rows;
         let batch_len = rows * row_stride;
         let offset = pixel_offset + (first_bmp_row * row_stride) as u32;
+
+        info!(
+            "sleep_image: reading batch at row {} (rows={}, offset={})",
+            first_bmp_row, rows, offset
+        );
 
         match sd.read_file_chunk(FILENAME, offset, &mut read_batch[..batch_len]) {
             Ok(n) if n == batch_len => {}
@@ -385,7 +401,7 @@ pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
         }
     }
 
-    debug!(
+    info!(
         "sleep_image: converted to 2bpp ({} chunks, {} bytes total)",
         CHUNK_COUNT,
         chunks.iter().map(|c| c.len()).sum::<usize>()
