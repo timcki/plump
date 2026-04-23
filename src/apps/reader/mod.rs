@@ -1285,7 +1285,31 @@ impl ReaderApp {
         }
     }
 
-    fn bookmark_load(&mut self, bm: &bookmarks::BookmarkCache) -> bool {
+    /// Write the current bookmark state into the bundle header. This
+    /// runs in addition to save_position (dual write) until the in-RAM
+    /// BookmarkCache is retired. No-op when the bundle file doesn't
+    /// exist yet (pre-first-chapter-cache).
+    pub(super) fn save_bookmark_to_bundle(&self, k: &mut KernelHandle<'_>) {
+        if self.state != State::Ready || !self.is_epub {
+            return;
+        }
+        let name_hash = self.epub.name_hash;
+        let Some(mut hdr) = plump_kernel::kernel::bundle::read_header(k.sd(), name_hash)
+        else {
+            return;
+        };
+        hdr.bm_chapter = self.epub.chapter;
+        hdr.bm_page_hint = (self.pg.page as u16).min(u16::MAX);
+        hdr.bm_byte_offset = self.pg.offsets[self.pg.page];
+        hdr.bm_font_idx = self.book_font_size_idx;
+        hdr.bm_flags = plump_kernel::kernel::bundle::BM_FLAG_VALID;
+        hdr.set_flag(plump_kernel::kernel::bundle::FLAG_HAS_BOOKMARK, true);
+        if let Err(e) = plump_kernel::kernel::bundle::write_header(k.sd(), name_hash, &hdr) {
+            log::warn!("reader: bundle bookmark write failed: {}", e);
+        }
+    }
+
+    fn bookmark_load(&mut self, k: &mut KernelHandle<'_>) -> bool {
         // if restore_offset is already set (from RTC/SD session restore),
         // keep it — the session has the most recent position, while the
         // bookmark cache may be stale (only flushed periodically or on
@@ -1300,9 +1324,37 @@ impl ReaderApp {
             return true;
         }
 
-        if let Some(slot) = bm.find(self.filename.as_bytes()) {
+        // prefer the bundle header if it has a valid bookmark: written
+        // on every save_position, it's at least as current as BKMK.BIN
+        // (which is flushed periodically). falls back to the RAM cache
+        // when the bundle doesn't yet exist (first-ever open) or has
+        // no bookmark recorded.
+        if self.is_epub {
+            if let Some(hdr) =
+                plump_kernel::kernel::bundle::read_header(k.sd(), self.epub.name_hash)
+            {
+                if hdr.has_valid_bookmark() && hdr.source_size == self.epub.archive_size {
+                    log::debug!(
+                        "bookmark: restoring from bundle off={} ch={} for {}",
+                        hdr.bm_byte_offset,
+                        hdr.bm_chapter,
+                        self.name(),
+                    );
+                    self.epub.chapter = hdr.bm_chapter;
+                    self.restore_offset = Some(hdr.bm_byte_offset);
+                    self.restore_page_hint = if hdr.bm_page_hint == 0 {
+                        None
+                    } else {
+                        Some(hdr.bm_page_hint as usize)
+                    };
+                    return true;
+                }
+            }
+        }
+
+        if let Some(slot) = k.bookmark_cache().find(self.filename.as_bytes()) {
             log::debug!(
-                "bookmark: restoring off={} ch={} for {}",
+                "bookmark: restoring from BKMK.BIN off={} ch={} for {}",
                 slot.byte_offset,
                 slot.chapter,
                 slot.filename_str(),
@@ -1742,7 +1794,7 @@ impl App<AppId> for ReaderApp {
         match self.state {
             State::NeedBookmark => {
                 plump_kernel::perf_begin!(_t0);
-                self.bookmark_load(k.bookmark_cache());
+                self.bookmark_load(k);
                 self.stats_load(k);
                 if self.try_load_cached_cover_thumb(k) {
                     ctx.mark_dirty(self.loading_visual_region());
@@ -2441,6 +2493,10 @@ impl App<AppId> for ReaderApp {
                 log::warn!("reader: deferred write_recent failed: {}", e);
                 first_error.get_or_insert(e);
             }
+            // dual-write the bookmark into the bundle header so bundle
+            // data stays current; the BookmarkCache still flushes on
+            // its own cadence via kernel housekeeping
+            self.save_bookmark_to_bundle(k);
         }
 
         if self.stats_dirty {
