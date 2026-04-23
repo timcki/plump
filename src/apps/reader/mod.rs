@@ -1671,13 +1671,15 @@ impl App<AppId> for ReaderApp {
         // allocator (~96KB) which would otherwise OOM and fall back
         // to the plain text screen.
         //
-        // wake restores via restore_state -> NeedIndex, which re-reads
-        // the chapter from SD cache. one-time cost: ~1-2s on the first
-        // page turn after wake.
+        // wake restores via restore_state which resets the state
+        // machine to NeedBookmark; NeedOpf/NeedToc re-parse metadata
+        // from SD, NeedIndex re-reads the chapter cache. one-time
+        // cost: ~1-2s on the first page turn after wake.
         let freed = self.epub.ch_cache.capacity()
             + self.pg.prefetch.capacity()
             + self.page_img.as_ref().map_or(0, |i| i.data.capacity())
-            + self.loading_cover.as_ref().map_or(0, |i| i.data.capacity());
+            + self.loading_cover.as_ref().map_or(0, |i| i.data.capacity())
+            + self.epub.toc.as_ref().map_or(0, |_| size_of::<EpubToc>());
 
         // cancel any in-flight image decode so the worker drops its buffer
         work_queue::reset();
@@ -1687,6 +1689,9 @@ impl App<AppId> for ReaderApp {
         self.pg.prefetch_len = 0;
         self.page_img = None;
         self.loading_cover = None;
+        // toc/toc_source re-parsed on wake via NeedToc state
+        self.epub.toc = None;
+        self.epub.toc_source = None;
 
         log::info!(
             "reader: pre-sleep freed ~{}KB of transient heap",

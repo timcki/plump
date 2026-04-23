@@ -377,6 +377,18 @@ impl App<AppId> for HomeApp {
         ctx.mark_dirty(CONTENT_REGION);
     }
 
+    fn on_pre_sleep(&mut self, _k: &mut KernelHandle<'_>) {
+        // drop decoded cover thumbnail so the sleep wallpaper allocator
+        // has more headroom. next on_enter/on_resume sets
+        // needs_load_recent = true and the background step reloads it.
+        if let Some(cover) = self.recent_cover.take() {
+            log::info!(
+                "home: pre-sleep freed ~{}KB cover thumb",
+                cover.data.capacity() / 1024
+            );
+        }
+    }
+
     fn background_step(
         &mut self,
         ctx: &mut AppContext,
