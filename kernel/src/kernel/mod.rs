@@ -8,6 +8,7 @@
 
 pub mod app;
 pub mod bookmarks;
+pub mod bundle;
 pub mod config;
 pub mod console;
 pub mod dir_cache;

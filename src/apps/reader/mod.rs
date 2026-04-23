@@ -278,7 +278,9 @@ pub(super) struct EpubState {
     pub(super) spine: EpubSpine,
     pub(super) chapter: u16,
 
-    pub(super) cache_file: [u8; 12],
+    // legacy per-book subdir (`_XXXXXXX`) for the inline image cache;
+    // still used by images.rs until the image table is ported into
+    // the bundle (Phase 2 follow-up).
     pub(super) cache_dir: [u8; 8],
     pub(super) chapter_table: [(u32, u32); cache::MAX_CACHE_CHAPTERS],
     pub(super) chapters_cached: bool,
@@ -303,9 +305,11 @@ pub(super) struct EpubState {
     pub(super) toc_selected: usize,
     pub(super) toc_scroll: usize,
 
-    // --- private: only accessed by impl EpubState methods ---
-    name_hash: u32,
-    archive_size: u32,
+    // hash of the source filename; used as the bundle identity
+    // (bundle path = `_PLUMP/BOOKS/<name_hash>.BIN`)
+    pub(super) name_hash: u32,
+    // source file size; header mismatch triggers bundle rebuild
+    pub(super) archive_size: u32,
 }
 
 impl EpubState {
@@ -315,7 +319,6 @@ impl EpubState {
             meta: EpubMeta::new(),
             spine: EpubSpine::new(),
             chapter: 0,
-            cache_file: [0u8; 12],
             cache_dir: [0u8; 8],
             name_hash: 0,
             archive_size: 0,
@@ -338,11 +341,6 @@ impl EpubState {
             toc_selected: 0,
             toc_scroll: 0,
         }
-    }
-
-    #[inline]
-    pub(super) fn cache_file_str(&self) -> &str {
-        cache::cache_filename_str(&self.cache_file)
     }
 
     #[inline]
@@ -1699,7 +1697,7 @@ impl App<AppId> for ReaderApp {
         );
     }
 
-    fn on_resume(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
+    fn on_resume(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
         // resume reading-time clock
         self.stats_resume_clock();
 
@@ -1717,6 +1715,13 @@ impl App<AppId> for ReaderApp {
         self.apply_font_metrics();
         if font_changed {
             self.reset_paging();
+            // invalidate any persisted page index: the saved breaks
+            // are keyed to the old font and would wrap differently now
+            if self.is_epub {
+                if let Err(e) = self.epub.invalidate_pageidx(k, self.book_font_size_idx) {
+                    log::warn!("reader: invalidate_pageidx failed: {}", e);
+                }
+            }
             if self.is_epub && self.epub.chapters_cached {
                 self.state = State::NeedIndex;
             } else {

@@ -238,11 +238,11 @@ impl ReaderApp {
             self.pg.prefetch_len = 0;
         } else if self.is_epub && self.epub.chapters_cached {
             _read_src = "cache";
-            let cf_str = self.epub.cache_file_str();
             let ch = self.epub.chapter as usize;
             let ch_base = self.epub.chapter_table[ch].0;
-            let n = k.sd().read_chunk_in_plump(
-                cf_str,
+            let n = plump_kernel::kernel::bundle::read_at(
+                k.sd(),
+                self.epub.name_hash,
                 ch_base + self.pg.offsets[self.pg.page],
                 &mut self.pg.buf,
             )?;
@@ -315,10 +315,14 @@ impl ReaderApp {
             }
             let pf_offset = self.pg.offsets[self.pg.page + 1];
             let pf_result = if self.is_epub && self.epub.chapters_cached {
-                let cf_str = self.epub.cache_file_str();
                 let ch = self.epub.chapter as usize;
                 let ch_base = self.epub.chapter_table[ch].0;
-                k.sd().read_chunk_in_plump(cf_str, ch_base + pf_offset, &mut self.pg.prefetch)
+                plump_kernel::kernel::bundle::read_at(
+                    k.sd(),
+                    self.epub.name_hash,
+                    ch_base + pf_offset,
+                    &mut self.pg.prefetch,
+                )
             } else {
                 k.sd().read_file_chunk(name, pf_offset, &mut self.pg.prefetch)
             };
@@ -370,6 +374,30 @@ impl ReaderApp {
         }
 
         plump_kernel::perf_begin!(_pi_t0);
+        let ch = self.epub.chapter as usize;
+        let font_idx = self.book_font_size_idx;
+
+        // try to load a cached page index for this (chapter, font) from
+        // the bundle. only meaningful after FLAG_CORE_READY (load_pageidx
+        // checks FLAG_PAGEIDX_READY internally).
+        if let Some((offsets, count)) = self.epub.load_pageidx(k, ch, font_idx) {
+            self.pg.offsets = offsets;
+            self.pg.total_pages = count.max(1);
+            self.pg.fully_indexed = true;
+            log::debug!(
+                "chapter pre-indexed from bundle: ch{} {} pages",
+                ch,
+                self.pg.total_pages,
+            );
+            plump_kernel::perf_event!(
+                "reader",
+                "preindex_all_pages src=bundle pages={} elapsed_ms={}",
+                self.pg.total_pages,
+                _pi_t0.elapsed().as_millis()
+            );
+            return;
+        }
+
         let total = self.epub.ch_cache.len();
         self.pg.offsets[0] = 0;
         self.pg.total_pages = 1;
@@ -398,11 +426,18 @@ impl ReaderApp {
         log::debug!("chapter pre-indexed: {} pages", self.pg.total_pages);
         plump_kernel::perf_event!(
             "reader",
-            "preindex_all_pages pages={} ch_bytes={} elapsed_ms={}",
+            "preindex_all_pages src=compute pages={} ch_bytes={} elapsed_ms={}",
             self.pg.total_pages,
             total,
             _pi_t0.elapsed().as_millis()
         );
+
+        // persist to bundle for next warm open. no-op if CORE_READY
+        // isn't set yet (bundle still being built).
+        let pages = self.pg.total_pages;
+        if let Err(e) = self.epub.save_pageidx(k, ch, font_idx, &self.pg.offsets[..pages]) {
+            log::warn!("reader: save_pageidx ch{} failed: {}", ch, e);
+        }
     }
 
     pub(super) fn scan_to_last_page(

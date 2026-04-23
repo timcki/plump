@@ -13,9 +13,35 @@ use smol_epub::epub;
 use crate::error::{Error, ErrorKind};
 use crate::kernel::KernelHandle;
 use crate::kernel::work_queue;
+use plump_kernel::kernel::bundle;
 
 use crate::apps::BgOutcome;
 use super::{BgCacheState, CHAPTER_CACHE_MAX, EOCD_TAIL, EpubState, PAGE_BUF, ReaderApp, ZipIndex};
+
+// ── bundle layout helpers ──────────────────────────────────────────
+//
+// v1 layout places sections in this fixed order for simplicity:
+//   header  [0 .. 256)
+//   spine   [256 .. 256 + spine_count * 16)
+//   content [spine_end .. EOF)   grows as chapters stream in
+//
+// covers / TOC / images / pageidx sections are added later and are
+// appended to the file tail. their offsets are recorded in the header.
+
+#[inline]
+fn spine_section_size(spine_len: usize) -> u32 {
+    (spine_len * bundle::SPINE_ENTRY_SIZE) as u32
+}
+
+#[inline]
+fn spine_offset() -> u32 {
+    bundle::HEADER_SIZE as u32
+}
+
+#[inline]
+fn content_start_offset(spine_len: usize) -> u32 {
+    spine_offset() + spine_section_size(spine_len)
+}
 
 impl EpubState {
     pub(super) fn init_zip(
@@ -33,7 +59,6 @@ impl EpubState {
         }
         self.archive_size = epub_size;
         self.name_hash = cache::fnv1a(name.as_bytes());
-        self.cache_file = cache::cache_filename(self.name_hash);
         self.cache_dir = cache::dir_name_for_hash(self.name_hash);
 
         let tail_size = (epub_size as usize).min(EOCD_TAIL);
@@ -71,110 +96,168 @@ impl EpubState {
         k: &mut KernelHandle<'_>,
         scratch: &mut [u8],
     ) -> crate::error::Result<bool> {
-        let cf = self.cache_file;
-        let cf_str = cache::cache_filename_str(&cf);
+        let spine_len = self.spine.len();
 
-        // try reading v3 header
-        let hdr_cap = cache::HEADER_SIZE.min(scratch.len());
-        if let Ok(n) = k.sd().read_chunk_in_plump(cf_str, 0, &mut scratch[..hdr_cap])
-            && n >= cache::HEADER_SIZE
+        // happy-path validation: header must exist, magic/version must match,
+        // source_size + name_hash + spine_count must all match the open file,
+        // and CORE_READY must be set for a hit.
+        let Some(hdr) = bundle::read_header(k.sd(), self.name_hash) else {
+            log::info!("epub: no bundle, building for {} chapters", spine_len);
+            self.prepare_bundle_dirs(k)?;
+            self.cache_chapter = 0;
+            return Ok(false);
+        };
+
+        // stale identity -> the bundle is for a different file; nuke it
+        if hdr.source_size != self.archive_size
+            || hdr.name_hash != self.name_hash
+            || hdr.spine_count as usize != spine_len
         {
-            let hdr_buf: &[u8; cache::HEADER_SIZE] =
-                scratch[..cache::HEADER_SIZE].try_into().unwrap();
-            if let Ok(hdr) = cache::parse_v3_header(hdr_buf) {
-                if cache::validate_v3_header(
-                    &hdr,
-                    self.archive_size,
-                    self.name_hash,
-                    self.spine.len(),
-                )
-                .is_ok()
-                    && hdr.chapters_complete()
-                {
-                    // read chapter table
-                    let count = hdr.chapter_count as usize;
-                    let tbl_bytes = count * cache::CHAPTER_ENTRY_SIZE;
-                    let tbl_offset = hdr.table_offset();
-                    if tbl_bytes <= scratch.len() {
-                        if let Ok(tn) =
-                            k.sd().read_chunk_in_plump(cf_str, tbl_offset, &mut scratch[..tbl_bytes])
-                            && tn >= tbl_bytes
-                        {
-                            if cache::parse_chapter_table(
-                                &scratch[..tbl_bytes],
-                                count,
-                                &mut self.chapter_table,
-                            )
-                            .is_ok()
-                            {
-                                self.chapters_cached = true;
-                                for i in 0..count {
-                                    self.ch_cached[i] = true;
-                                }
-                                // ensure image subdir exists for skip markers
-                                let dir_buf = self.cache_dir;
-                                let dir = cache::dir_name_str(&dir_buf);
-                                let _ = k.sd().ensure_plump_subdir(dir);
-                                log::info!("epub: v3 cache hit ({} chapters)", count);
-                                return Ok(true);
-                            }
-                        }
-                    }
-                }
-            }
+            log::info!(
+                "epub: bundle stale (size {} vs {}, hash {} vs {}, spine {} vs {}), rebuilding",
+                hdr.source_size,
+                self.archive_size,
+                hdr.name_hash,
+                self.name_hash,
+                hdr.spine_count,
+                spine_len,
+            );
+            let _ = bundle::delete(k.sd(), self.name_hash);
+            self.prepare_bundle_dirs(k)?;
+            self.cache_chapter = 0;
+            return Ok(false);
         }
 
-        log::info!("epub: building v3 cache for {} chapters", self.spine.len());
-        // ensure image subdir exists (images stay in _PLUMP/_XXXXXXX/)
+        // bundle is for this file but core not finalized yet (e.g. cover was
+        // extracted but chapter caching didn't finish last run). keep the
+        // file and its covers; resume caching where we left off.
+        if !hdr.has_flag(bundle::FLAG_CORE_READY) {
+            log::info!("epub: bundle in-progress (core not ready), resuming build");
+            self.prepare_bundle_dirs(k)?;
+            self.cache_chapter = 0;
+            return Ok(false);
+        }
+
+        // read spine table into chapter_table + ch_cached
+        let spine_bytes = spine_len * bundle::SPINE_ENTRY_SIZE;
+        if spine_bytes > scratch.len() {
+            log::warn!(
+                "epub: scratch too small for spine ({} > {}), rebuilding",
+                spine_bytes,
+                scratch.len(),
+            );
+            let _ = bundle::delete(k.sd(), self.name_hash);
+            self.prepare_bundle_dirs(k)?;
+            self.cache_chapter = 0;
+            return Ok(false);
+        }
+
+        let n = bundle::read_at(
+            k.sd(),
+            self.name_hash,
+            hdr.spine_offset,
+            &mut scratch[..spine_bytes],
+        )?;
+        if n < spine_bytes {
+            log::warn!("epub: spine read short ({}/{}), rebuilding", n, spine_bytes);
+            let _ = bundle::delete(k.sd(), self.name_hash);
+            self.prepare_bundle_dirs(k)?;
+            self.cache_chapter = 0;
+            return Ok(false);
+        }
+
+        for i in 0..spine_len {
+            let off = i * bundle::SPINE_ENTRY_SIZE;
+            let Some(entry) = bundle::SpineEntry::decode(&scratch[off..off + bundle::SPINE_ENTRY_SIZE])
+            else {
+                continue;
+            };
+            self.chapter_table[i] = (entry.content_offset, entry.content_size);
+            self.ch_cached[i] = entry.is_cached();
+        }
+        self.chapters_cached = true;
+
+        // ensure image subdir exists for skip markers
+        let dir_buf = self.cache_dir;
+        let dir = cache::dir_name_str(&dir_buf);
+        let _ = k.sd().ensure_plump_subdir(dir);
+
+        log::info!("epub: bundle hit ({} chapters)", spine_len);
+        Ok(true)
+    }
+
+    /// Ensure the BOOKS/ subdir and per-book image subdir exist.
+    fn prepare_bundle_dirs(&self, k: &mut KernelHandle<'_>) -> crate::error::Result<()> {
+        bundle::ensure_books_dir(k.sd())?;
+        // per-book image subdir (images not yet ported into bundle)
         let dir_buf = self.cache_dir;
         let dir = cache::dir_name_str(&dir_buf);
         k.sd().ensure_plump_subdir(dir)?;
-        self.cache_chapter = 0;
-        Ok(false)
+        Ok(())
     }
 
     pub(super) fn finish_cache(
         &mut self,
         k: &mut KernelHandle<'_>,
         title: &[u8],
-        filename: &[u8],
+        _filename: &[u8],
     ) -> crate::error::Result<bool> {
-        let cf = self.cache_file;
-        let cf_str = cache::cache_filename_str(&cf);
         let spine_len = self.spine.len();
 
-        // build v3 header with chapters_complete flag
-        let mut hdr = cache::CacheHeader::empty();
-        hdr.version = cache::CACHE_V3;
-        hdr.chapter_count = spine_len as u16;
-        hdr.flags = cache::FLAG_CHAPTERS_COMPLETE;
-        hdr.epub_size = self.archive_size;
+        // read-modify-write the header so we preserve any fields the
+        // bundle picked up during streaming (bookmark, stats, etc.)
+        let mut hdr = bundle::read_header(k.sd(), self.name_hash)
+            .unwrap_or(bundle::BundleHeader::EMPTY);
+
+        hdr.source_size = self.archive_size;
         hdr.name_hash = self.name_hash;
-
-        let tlen = title.len().min(cache::TITLE_CAP);
-        hdr.title[..tlen].copy_from_slice(&title[..tlen]);
-        hdr.title_len = tlen as u8;
-        let nlen = filename.len().min(cache::NAME_CAP);
-        hdr.name[..nlen].copy_from_slice(&filename[..nlen]);
-        hdr.name_len = nlen as u8;
-
-        let mut hdr_buf = [0u8; cache::HEADER_SIZE];
-        cache::encode_v3_header(&hdr, &mut hdr_buf);
-        k.sd().write_at_in_plump(cf_str, 0, &hdr_buf)?;
-
-        // write chapter table
-        let tbl_size = spine_len * cache::CHAPTER_ENTRY_SIZE;
-        // encode in chunks to avoid large stack buffers
-        let mut tbl_buf = [0u8; 8]; // one entry at a time
+        hdr.spine_count = spine_len as u16;
+        hdr.chapter_count = spine_len as u16;
+        hdr.spine_offset = spine_offset();
+        hdr.spine_size = spine_section_size(spine_len);
+        hdr.content_offset = content_start_offset(spine_len);
+        // compute total content bytes = sum of chapter sizes (for reporting)
+        let mut content_bytes: u32 = 0;
         for i in 0..spine_len {
-            cache::encode_chapter_table(&self.chapter_table[i..i + 1], &mut tbl_buf);
-            let offset = cache::HEADER_SIZE as u32 + (i * cache::CHAPTER_ENTRY_SIZE) as u32;
-            k.sd().write_at_in_plump(cf_str, offset, &tbl_buf[..cache::CHAPTER_ENTRY_SIZE])?;
+            content_bytes = content_bytes.saturating_add(self.chapter_table[i].1);
         }
-        let _ = tbl_size; // used for clarity above
+        hdr.content_size = content_bytes;
+
+        hdr.set_flag(bundle::FLAG_CORE_READY, true);
+        hdr.set_flag(bundle::FLAG_IS_EPUB, true);
+
+        let tlen = title.len().min(bundle::TITLE_CAP);
+        hdr.title.set(&title[..tlen]);
+
+        let alen = self.meta.author_len as usize;
+        if alen > 0 {
+            let a = &self.meta.author[..alen.min(bundle::AUTHOR_CAP)];
+            hdr.author.set(a);
+        }
+
+        bundle::write_header(k.sd(), self.name_hash, &hdr)?;
+
+        // write finalized spine entries
+        for i in 0..spine_len {
+            let (off, size) = self.chapter_table[i];
+            let entry = bundle::SpineEntry {
+                content_offset: off,
+                content_size: size,
+                text_bytes: size,
+                flags: if self.ch_cached[i] {
+                    bundle::SPINE_FLAG_CACHED
+                } else {
+                    0
+                },
+                _reserved: 0,
+            };
+            let bytes = entry.encode();
+            let at = hdr.spine_offset + (i * bundle::SPINE_ENTRY_SIZE) as u32;
+            bundle::write_at(k.sd(), self.name_hash, at, &bytes)?;
+        }
 
         self.chapters_cached = true;
-        log::info!("epub: v3 cache complete ({} chapters)", spine_len);
+        log::info!("epub: bundle core ready ({} chapters)", spine_len);
         Ok(false)
     }
 
@@ -189,37 +272,17 @@ impl EpubState {
             return Ok(());
         }
 
-        let cf = self.cache_file;
-        let cf_str = cache::cache_filename_str(&cf);
         let entry_idx = self.spine.items[ch] as usize;
         let entry = *self.zip.entry(entry_idx);
 
-        // if this is the first chapter being cached, create the file
-        // with a placeholder header + empty chapter table so appends
-        // start at the correct data offset.  ch may not be 0 when a
+        // if this is the first chapter being cached, create the bundle
+        // with a placeholder header + zeroed spine section so appends
+        // start at content_start_offset. `ch` may not be 0 when a
         // bookmark restores the reader to a later chapter.
-        if !self.chapters_cached && k.sd().file_size_in_plump(cf_str).is_err() {
-            let spine_len = self.spine.len();
-            let mut init_buf = [0u8; cache::HEADER_SIZE];
-            let mut hdr = cache::CacheHeader::empty();
-            hdr.version = cache::CACHE_V3;
-            hdr.chapter_count = spine_len as u16;
-            hdr.epub_size = self.archive_size;
-            hdr.name_hash = self.name_hash;
-            cache::encode_v3_header(&hdr, &mut init_buf);
-            k.sd().write_in_plump(cf_str, &init_buf)?;
-            let tbl_size = spine_len * cache::CHAPTER_ENTRY_SIZE;
-            let zeros = [0u8; 64];
-            let mut remaining = tbl_size;
-            while remaining > 0 {
-                let chunk = remaining.min(zeros.len());
-                k.sd().append_in_plump(cf_str, &zeros[..chunk])?;
-                remaining -= chunk;
-            }
-        }
+        self.ensure_bundle_exists(k)?;
 
-        // record the offset where this chapter's data starts
-        let ch_offset = k.sd().file_size_in_plump(cf_str)?;
+        // record the offset where this chapter's data starts (current EOF)
+        let ch_offset = bundle::file_size(k.sd(), self.name_hash)?;
         self.chapter_table[ch].0 = ch_offset;
 
         // create the step state machine
@@ -234,6 +297,48 @@ impl EpubState {
         Ok(())
     }
 
+    /// Ensure the bundle file exists. Creates a placeholder (header +
+    /// zeroed spine section) on first use so that later appenders
+    /// (chapter content, cover, images) can be written to known offsets.
+    pub(super) fn ensure_bundle_exists(&self, k: &mut KernelHandle<'_>) -> crate::error::Result<()> {
+        if bundle::exists(k.sd(), self.name_hash) {
+            return Ok(());
+        }
+        bundle::ensure_books_dir(k.sd())?;
+        self.init_bundle_placeholder(k)
+    }
+
+    /// Write an initial bundle file with header + zeroed spine entries,
+    /// so chapter content can be appended starting at `content_start_offset`.
+    fn init_bundle_placeholder(&self, k: &mut KernelHandle<'_>) -> crate::error::Result<()> {
+        let spine_len = self.spine.len();
+        let mut hdr = bundle::BundleHeader::EMPTY;
+        hdr.source_size = self.archive_size;
+        hdr.name_hash = self.name_hash;
+        hdr.spine_count = spine_len as u16;
+        hdr.chapter_count = spine_len as u16;
+        hdr.spine_offset = spine_offset();
+        hdr.spine_size = spine_section_size(spine_len);
+        hdr.content_offset = content_start_offset(spine_len);
+        hdr.content_size = 0;
+        hdr.set_flag(bundle::FLAG_IS_EPUB, true);
+
+        // create file by writing header at offset 0
+        bundle::write_header(k.sd(), self.name_hash, &hdr)?;
+
+        // append zeroed spine entries in 64-byte chunks
+        let mut remaining = spine_section_size(spine_len) as usize;
+        let zeros = [0u8; 64];
+        let mut off = hdr.spine_offset;
+        while remaining > 0 {
+            let chunk = remaining.min(zeros.len());
+            bundle::write_at(k.sd(), self.name_hash, off, &zeros[..chunk])?;
+            off += chunk as u32;
+            remaining -= chunk;
+        }
+        Ok(())
+    }
+
     /// Advance one step of in-progress chapter caching.
     /// Returns Ok(true) when the chapter is done, Ok(false) when more work remains.
     pub(super) fn cache_chapter_step(
@@ -242,22 +347,19 @@ impl EpubState {
         ch: usize,
         epub_name: &str,
     ) -> crate::error::Result<bool> {
-        let cf = self.cache_file;
-        let cf_str = cache::cache_filename_str(&cf);
-
         let step = self
             .cache_step
             .as_mut()
             .expect("cache_chapter_step called without active cache_step");
 
+        let name_hash = self.name_hash;
         let mut read_fn = |offset: u32, buf: &mut [u8]| -> Result<usize, &'static str> {
             k.sd()
                 .read_file_chunk(epub_name, offset, buf)
                 .map_err(|e: Error| -> &'static str { e.into() })
         };
         let mut write_fn = |data: &[u8]| -> Result<(), &'static str> {
-            k.sd()
-                .append_in_plump(cf_str, data)
+            bundle::append(k.sd(), name_hash, data)
                 .map_err(|e: Error| -> &'static str { e.into() })
         };
 
@@ -271,6 +373,22 @@ impl EpubState {
                 self.chapter_table[ch] = (ch_offset, text_size);
                 self.ch_cached[ch] = true;
                 self.cache_step = None;
+
+                // write this chapter's spine entry now so a crash
+                // mid-book still leaves a valid (if partial) bundle
+                let entry = bundle::SpineEntry {
+                    content_offset: ch_offset,
+                    content_size: text_size,
+                    text_bytes: text_size,
+                    flags: bundle::SPINE_FLAG_CACHED,
+                    _reserved: 0,
+                };
+                let bytes = entry.encode();
+                let at = spine_offset() + (ch * bundle::SPINE_ENTRY_SIZE) as u32;
+                if let Err(e) = bundle::write_at(k.sd(), self.name_hash, at, &bytes) {
+                    log::warn!("epub: spine entry write failed for ch{}: {}", ch, e);
+                }
+
                 log::info!(
                     "epub: cached ch{}/{} = {} bytes at offset {}",
                     ch,
@@ -313,21 +431,19 @@ impl EpubState {
         }
         self.ch_cache.resize(ch_size, 0);
 
-        let cf = self.cache_file;
-        let cf_str = cache::cache_filename_str(&cf);
-
         let mut pos = 0usize;
         while pos < ch_size {
             let chunk = (ch_size - pos).min(PAGE_BUF);
-            match k.sd().read_chunk_in_plump(
-                cf_str,
+            match bundle::read_at(
+                k.sd(),
+                self.name_hash,
                 ch_off + pos as u32,
                 &mut self.ch_cache[pos..pos + chunk],
             ) {
                 Ok(n) if n > 0 => pos += n,
                 Ok(_) => break,
                 Err(e) => {
-                    log::info!("chapter cache: SD read failed at {}: {}", pos, e);
+                    log::info!("chapter cache: bundle read failed at {}: {}", pos, e);
                     self.ch_cache = Vec::new();
                     return false;
                 }
@@ -346,37 +462,246 @@ impl EpubState {
     pub(super) fn current_chapter_size(&self) -> u32 {
         self.chapter_size(self.chapter as usize)
     }
+
+    // ── page index persistence ─────────────────────────────────────
+    //
+    // the PIDX section lives at the tail of the bundle. we only
+    // write to it after FLAG_CORE_READY is set on the header: at
+    // that point chapter content has stopped growing, so any bytes
+    // we append become part of PIDX without collision.
+    //
+    // PIDX layout:
+    //   [PageIdxHeader]                          12 bytes
+    //   [ChapterPageDir; spine_count]            12 bytes each
+    //   [u32 breaks; ...]                        appended per chapter
+    //
+    // a chapter with page_count = 0 in its dir entry is treated as
+    // "not indexed yet".
+
+    /// Try to load cached page breaks for chapter `ch` at `font_idx`.
+    /// Returns the loaded breaks and total page count, or None when
+    /// not available (bundle missing, PIDX not ready, font mismatch,
+    /// chapter not indexed yet).
+    pub(super) fn load_pageidx(
+        &self,
+        k: &mut KernelHandle<'_>,
+        ch: usize,
+        font_idx: u8,
+    ) -> Option<([u32; super::MAX_PAGES], usize)> {
+        let hdr = bundle::read_header(k.sd(), self.name_hash)?;
+        if !hdr.has_flag(bundle::FLAG_PAGEIDX_READY)
+            || hdr.pageidx_offset == 0
+            || hdr.pageidx_size < bundle::PAGEIDX_HDR_SIZE as u32
+            || hdr.pageidx_font_idx != font_idx
+        {
+            return None;
+        }
+        let spine_len = self.spine.len();
+        if ch >= spine_len {
+            return None;
+        }
+
+        let dir_off = hdr.pageidx_offset
+            + bundle::PAGEIDX_HDR_SIZE as u32
+            + (ch * bundle::CHAPTER_DIR_ENTRY_SIZE) as u32;
+        let mut dir_buf = [0u8; bundle::CHAPTER_DIR_ENTRY_SIZE];
+        bundle::read_at(k.sd(), self.name_hash, dir_off, &mut dir_buf).ok()?;
+        let entry = bundle::ChapterPageDir::decode(&dir_buf)?;
+        if entry.page_count == 0 || entry.breaks_offset == 0 {
+            return None;
+        }
+        let page_count = entry.page_count as usize;
+        if page_count > super::MAX_PAGES {
+            return None;
+        }
+
+        // breaks_offset is a PIDX-section-relative offset
+        let abs_breaks = hdr.pageidx_offset + entry.breaks_offset;
+        let bytes = page_count * 4;
+        let mut tmp = [0u8; super::MAX_PAGES * 4];
+        bundle::read_at(k.sd(), self.name_hash, abs_breaks, &mut tmp[..bytes]).ok()?;
+
+        let mut offsets = [0u32; super::MAX_PAGES];
+        for i in 0..page_count {
+            offsets[i] = u32::from_le_bytes([
+                tmp[i * 4],
+                tmp[i * 4 + 1],
+                tmp[i * 4 + 2],
+                tmp[i * 4 + 3],
+            ]);
+        }
+        Some((offsets, page_count))
+    }
+
+    /// Persist page breaks for chapter `ch` into the bundle PIDX section.
+    /// Initializes PIDX on first call, resets it on font mismatch. No-op
+    /// when FLAG_CORE_READY is not set (we only persist once content has
+    /// stopped growing, otherwise PIDX wouldn't stay at the tail).
+    pub(super) fn save_pageidx(
+        &self,
+        k: &mut KernelHandle<'_>,
+        ch: usize,
+        font_idx: u8,
+        offsets: &[u32],
+    ) -> crate::error::Result<()> {
+        let mut hdr = bundle::read_header(k.sd(), self.name_hash).ok_or_else(|| {
+            Error::new(ErrorKind::NotFound, "save_pageidx: bundle missing")
+        })?;
+
+        if !hdr.has_flag(bundle::FLAG_CORE_READY) {
+            return Ok(());
+        }
+        let spine_len = self.spine.len();
+        if ch >= spine_len {
+            return Ok(());
+        }
+        let page_count = offsets.len().min(super::MAX_PAGES);
+
+        // detect "need to init": no PIDX yet or font changed
+        let need_init = hdr.pageidx_offset == 0
+            || hdr.pageidx_size < bundle::PAGEIDX_HDR_SIZE as u32
+            || hdr.pageidx_font_idx != font_idx;
+
+        if need_init {
+            // PIDX goes at current bundle EOF; content/covers/images
+            // are frozen post-CORE_READY so this stays at the tail.
+            let pidx_offset = bundle::file_size(k.sd(), self.name_hash)?;
+            let dir_size = spine_len * bundle::CHAPTER_DIR_ENTRY_SIZE;
+
+            let pidx_hdr = bundle::PageIdxHeader {
+                font_idx,
+                flags: 0,
+                total_pages: 0,
+            };
+            bundle::write_at(k.sd(), self.name_hash, pidx_offset, &pidx_hdr.encode())?;
+
+            // append zeroed chapter dir
+            let mut remaining = dir_size;
+            let mut off = pidx_offset + bundle::PAGEIDX_HDR_SIZE as u32;
+            let zeros = [0u8; 64];
+            while remaining > 0 {
+                let chunk = remaining.min(zeros.len());
+                bundle::write_at(k.sd(), self.name_hash, off, &zeros[..chunk])?;
+                off += chunk as u32;
+                remaining -= chunk;
+            }
+
+            hdr.pageidx_offset = pidx_offset;
+            hdr.pageidx_size = bundle::PAGEIDX_HDR_SIZE as u32 + dir_size as u32;
+            hdr.pageidx_font_idx = font_idx;
+            hdr.set_flag(bundle::FLAG_PAGEIDX_READY, true);
+            bundle::write_header(k.sd(), self.name_hash, &hdr)?;
+        }
+
+        // write the break array at current EOF of the bundle
+        let breaks_abs = bundle::file_size(k.sd(), self.name_hash)?;
+        let breaks_rel = breaks_abs - hdr.pageidx_offset;
+        let mut tmp = [0u8; super::MAX_PAGES * 4];
+        for i in 0..page_count {
+            tmp[i * 4..i * 4 + 4].copy_from_slice(&offsets[i].to_le_bytes());
+        }
+        bundle::write_at(k.sd(), self.name_hash, breaks_abs, &tmp[..page_count * 4])?;
+
+        // update chapter dir entry
+        let dir_entry = bundle::ChapterPageDir {
+            chapter_index: ch as u16,
+            page_count: page_count as u16,
+            breaks_offset: breaks_rel,
+            _reserved: 0,
+        };
+        let dir_off = hdr.pageidx_offset
+            + bundle::PAGEIDX_HDR_SIZE as u32
+            + (ch * bundle::CHAPTER_DIR_ENTRY_SIZE) as u32;
+        bundle::write_at(k.sd(), self.name_hash, dir_off, &dir_entry.encode())?;
+
+        // extend pageidx_size + mark ready; persist header
+        let new_pidx_size = (breaks_abs + (page_count * 4) as u32) - hdr.pageidx_offset;
+        let mut dirty = false;
+        if new_pidx_size > hdr.pageidx_size {
+            hdr.pageidx_size = new_pidx_size;
+            dirty = true;
+        }
+        if !hdr.has_flag(bundle::FLAG_PAGEIDX_READY) {
+            hdr.set_flag(bundle::FLAG_PAGEIDX_READY, true);
+            dirty = true;
+        }
+        if dirty {
+            bundle::write_header(k.sd(), self.name_hash, &hdr)?;
+        }
+
+        Ok(())
+    }
+
+    /// Clear all cached page breaks (e.g. after a font-size change) and
+    /// reset the PIDX section in place so subsequent saves reuse the
+    /// existing offset, avoiding linear file growth on repeated font
+    /// cycles.
+    pub(super) fn invalidate_pageidx(
+        &self,
+        k: &mut KernelHandle<'_>,
+        new_font_idx: u8,
+    ) -> crate::error::Result<()> {
+        let mut hdr = match bundle::read_header(k.sd(), self.name_hash) {
+            Some(h) => h,
+            None => return Ok(()),
+        };
+        if hdr.pageidx_offset == 0 {
+            return Ok(());
+        }
+
+        // rewrite PIDX header + zero the chapter dir in place
+        let new_hdr = bundle::PageIdxHeader {
+            font_idx: new_font_idx,
+            flags: 0,
+            total_pages: 0,
+        };
+        bundle::write_at(
+            k.sd(),
+            self.name_hash,
+            hdr.pageidx_offset,
+            &new_hdr.encode(),
+        )?;
+
+        let spine_len = self.spine.len();
+        let dir_size = spine_len * bundle::CHAPTER_DIR_ENTRY_SIZE;
+        let mut remaining = dir_size;
+        let mut off = hdr.pageidx_offset + bundle::PAGEIDX_HDR_SIZE as u32;
+        let zeros = [0u8; 64];
+        while remaining > 0 {
+            let chunk = remaining.min(zeros.len());
+            bundle::write_at(k.sd(), self.name_hash, off, &zeros[..chunk])?;
+            off += chunk as u32;
+            remaining -= chunk;
+        }
+
+        // trim recorded size back to just header+dir; future saves will
+        // append breaks past this and grow pageidx_size naturally
+        hdr.pageidx_size = bundle::PAGEIDX_HDR_SIZE as u32 + dir_size as u32;
+        hdr.pageidx_font_idx = new_font_idx;
+        hdr.set_flag(bundle::FLAG_PAGEIDX_READY, false);
+        bundle::write_header(k.sd(), self.name_hash, &hdr)?;
+        Ok(())
+    }
 }
 
 impl ReaderApp {
     pub(super) fn try_prefill_title_from_cache_header(&mut self, k: &mut KernelHandle<'_>) -> bool {
-        let cf = self.epub.cache_file;
-        let cf_str = cache::cache_filename_str(&cf);
-        let mut hdr_buf = [0u8; cache::HEADER_SIZE];
-
-        let Ok(n) = k.sd().read_chunk_in_plump(cf_str, 0, &mut hdr_buf) else {
+        let Some(hdr) = bundle::read_header(k.sd(), self.epub.name_hash) else {
             return false;
         };
-        if n < cache::HEADER_SIZE {
-            return false;
-        }
-
-        let Ok(hdr) = cache::parse_v3_header(&hdr_buf) else {
-            return false;
-        };
-        if hdr.epub_size != self.epub.archive_size
+        if hdr.source_size != self.epub.archive_size
             || hdr.name_hash != self.epub.name_hash
-            || !hdr.chapters_complete()
-            || hdr.title_len == 0
+            || !hdr.has_flag(bundle::FLAG_CORE_READY)
+            || hdr.title.is_empty()
         {
             return false;
         }
 
-        self.title.set(&hdr.title[..hdr.title_len as usize]);
+        self.title.set(hdr.title.as_bytes());
         self.title_is_real = true;
         log::info!(
-            "epub: prefilling title from cache header: {}",
-            hdr.title_str()
+            "epub: prefilling title from bundle header: {}",
+            hdr.title.as_str()
         );
         true
     }
@@ -463,19 +788,17 @@ impl ReaderApp {
             return;
         }
 
-        // copy cache dir to a local so the borrow on self.epub is released
-        // before oom_retry takes &mut self.epub
-        let dir_buf = self.epub.cache_dir;
-        let dir = smol_epub::cache::dir_name_str(&dir_buf);
-        if cover_cache::has_cover_thumb(k, dir) {
+        let name_hash = self.epub.name_hash;
+        if cover_cache::has_cover_thumb(k, name_hash) {
             log::info!("epub: cover thumb already cached");
             return;
         }
 
-        // ensure the per-book cache directory exists (cover generation
-        // runs before NeedCache which normally creates it)
-        if k.sd().ensure_plump_subdir(dir).is_err() {
-            log::warn!("epub: failed to create cache dir for cover thumb");
+        // cover generation runs during deferred open work, which may
+        // fire before chapter caching has created the bundle file.
+        // create a placeholder so save_cover_thumb has somewhere to write.
+        if let Err(e) = self.epub.ensure_bundle_exists(k) {
+            log::warn!("epub: failed to create bundle for cover: {}", e);
             return;
         }
 
@@ -536,7 +859,7 @@ impl ReaderApp {
                     img.height,
                     img.data.len(),
                 );
-                if let Err(e) = cover_cache::save_cover_thumb(k, dir, &img) {
+                if let Err(e) = cover_cache::save_cover_thumb(k, name_hash, &img) {
                     log::warn!("epub: cover thumb save failed: {}", e);
                 } else {
                     log::info!("epub: cover thumb cached");

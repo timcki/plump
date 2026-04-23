@@ -356,15 +356,18 @@ impl App<AppId> for FilesApp {
                 if !entry.is_dir {
                     let name = entry.name_str();
                     let hash = cache::fnv1a(name.as_bytes());
+                    log::debug!("files: deleting cache for {}", name);
+
+                    // delete bundle (best effort)
+                    match plump_kernel::kernel::bundle::delete(k.sd(), hash) {
+                        Ok(()) => log::debug!("files: bundle deleted for {}", name),
+                        Err(e) => log::warn!("files: bundle delete failed: {}", e),
+                    }
+
+                    // legacy `.DAT` still may exist on older SD cards; best-effort
                     let cf = cache::cache_filename(hash);
                     let cf_str = cache::cache_filename_str(&cf);
-                    log::debug!("files: deleting cache for {} ({})", name, cf_str);
-
-                    // delete v3 flat cache file (best effort)
-                    match k.sd().delete_in_plump(cf_str) {
-                        Ok(()) => log::debug!("files: cache deleted for {}", name),
-                        Err(e) => log::warn!("files: cache delete failed: {}", e),
-                    }
+                    let _ = k.sd().delete_in_plump(cf_str);
                 }
             }
             return BgOutcome::Progress { more: false };

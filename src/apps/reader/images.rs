@@ -427,15 +427,14 @@ impl ReaderApp {
         let fname = self.filename;
         let epub_name = fname.as_str();
 
-        let cf = self.epub.cache_file;
-        let cf_str = cache::cache_filename_str(&cf);
         let ch_base = self.epub.chapter_table[ch].0;
 
         let mut offset = start_offset;
         while offset < ch_size {
             let read_len = PAGE_BUF.min(ch_size - offset);
-            let n = k.sd().read_chunk_in_plump(
-                cf_str,
+            let n = plump_kernel::kernel::bundle::read_at(
+                k.sd(),
+                self.epub.name_hash,
                 ch_base + offset as u32,
                 &mut self.pg.prefetch[..read_len],
             )?;

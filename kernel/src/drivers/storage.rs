@@ -807,6 +807,54 @@ impl SdStorage {
         })
     }
 
+    /// Seek to offset and write data in a file in <data_dir>/<dir>/.
+    ///
+    /// Creates the file if missing. Does not truncate trailing bytes
+    /// past `offset + data.len()` — callers that need logical truncation
+    /// should record the authoritative size elsewhere (e.g. a header
+    /// field) and ignore bytes beyond it.
+    pub fn write_at_in_plump_subdir(
+        &self,
+        dir: &str,
+        name: &str,
+        offset: u32,
+        data: &[u8],
+    ) -> crate::error::Result<()> {
+        poll_once(async {
+            let mut guard = borrow(self)?;
+            let dd = guard.data_dir;
+            let (mid, sub) = guard.open_subdir(dd, dir).await?;
+            let file = match guard
+                .mgr
+                .open_file_in_dir(sub, name, Mode::ReadWriteCreateOrAppend)
+                .await
+            {
+                Ok(f) => f,
+                Err(_) => {
+                    let _ = guard.mgr.close_dir(sub);
+                    let _ = guard.mgr.close_dir(mid);
+                    return Err(Error::new(ErrorKind::OpenFile, "write_at_sub"));
+                }
+            };
+            let result = match guard.mgr.file_seek_from_start(file, offset) {
+                Ok(()) => guard
+                    .mgr
+                    .write(file, data)
+                    .await
+                    .map_err(|_| Error::new(ErrorKind::WriteFailed, "write_at_sub")),
+                Err(_) => Err(Error::new(ErrorKind::SeekFailed, "write_at_sub")),
+            };
+            let _ = guard.mgr.close_file(file).await;
+            let _ = guard.mgr.close_dir(sub);
+            let _ = guard.mgr.close_dir(mid);
+            if result.is_ok() {
+                crate::perf::counters::inc_sd_writes();
+                crate::perf::counters::add_sd_bytes_written(data.len() as u32);
+            }
+            result
+        })
+    }
+
     /// Delete a file in <data_dir>/<dir>/.
     pub fn delete_in_plump_subdir(
         &self,
