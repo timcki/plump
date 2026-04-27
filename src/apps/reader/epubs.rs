@@ -108,6 +108,20 @@ impl EpubState {
             return Ok(false);
         };
 
+        // unknown content stream format -> a future plump wrote this bundle;
+        // we don't understand the markers, rebuild from source.
+        if hdr.content_fmt > bundle::CONTENT_FMT_LATEST {
+            log::info!(
+                "epub: bundle content_fmt {} unknown (we support {}), rebuilding",
+                hdr.content_fmt,
+                bundle::CONTENT_FMT_LATEST,
+            );
+            let _ = bundle::delete(k.sd(), self.name_hash);
+            self.prepare_bundle_dirs(k)?;
+            self.cache_chapter = 0;
+            return Ok(false);
+        }
+
         // stale identity -> the bundle is for a different file; nuke it
         if hdr.source_size != self.archive_size
             || hdr.name_hash != self.name_hash

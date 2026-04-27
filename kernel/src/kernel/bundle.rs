@@ -57,7 +57,14 @@ pub fn bundle_file_str(buf: &[u8; 12]) -> &str {
 
 pub const HEADER_SIZE: usize = 256;
 pub const HEADER_MAGIC: [u8; 4] = *b"PLMP";
-pub const HEADER_VERSION: u16 = 1;
+pub const HEADER_VERSION: u16 = 2;
+
+// content stream format inside the content section. evolves independently
+// of HEADER_VERSION so future marker additions can invalidate stored bundles
+// without forcing a full layout rev.
+//   0 = legacy (Phase 1 marker set: BOLD/ITALIC/H1-H6/U/S/QUOTE/IMG_REF)
+//   1 = Phase 2 (adds ALIGN_*/PAGE_BREAK/FIGCAPTION; tag-keyed defaults)
+pub const CONTENT_FMT_LATEST: u8 = 1;
 
 pub const TITLE_CAP: usize = 80;
 pub const AUTHOR_CAP: usize = 40;
@@ -112,7 +119,8 @@ const OFF_IMAGES_SIZE: usize = 216; // 4
 const OFF_PAGEIDX_OFFSET: usize = 220; // 4
 const OFF_PAGEIDX_SIZE: usize = 224; // 4
 const OFF_PAGEIDX_FONT_IDX: usize = 228; // 1
-// 229..256 reserved
+const OFF_CONTENT_FMT: usize = 229; // 1
+// 230..256 reserved
 
 // bookmark flags bits (inside `bm_flags`)
 pub const BM_FLAG_VALID: u8 = 1 << 0;
@@ -154,6 +162,7 @@ pub struct BundleHeader {
     pub pageidx_offset: u32,
     pub pageidx_size: u32,
     pub pageidx_font_idx: u8,
+    pub content_fmt: u8,
 }
 
 impl BundleHeader {
@@ -188,6 +197,7 @@ impl BundleHeader {
         pageidx_offset: 0,
         pageidx_size: 0,
         pageidx_font_idx: 0,
+        content_fmt: CONTENT_FMT_LATEST,
     };
 
     /// decode a 256-byte header. returns None when magic/version/header_size
@@ -240,6 +250,7 @@ impl BundleHeader {
             pageidx_offset: r_u32(buf, OFF_PAGEIDX_OFFSET),
             pageidx_size: r_u32(buf, OFF_PAGEIDX_SIZE),
             pageidx_font_idx: buf[OFF_PAGEIDX_FONT_IDX],
+            content_fmt: buf[OFF_CONTENT_FMT],
         })
     }
 
@@ -289,6 +300,7 @@ impl BundleHeader {
         w_u32(&mut out, OFF_PAGEIDX_OFFSET, self.pageidx_offset);
         w_u32(&mut out, OFF_PAGEIDX_SIZE, self.pageidx_size);
         out[OFF_PAGEIDX_FONT_IDX] = self.pageidx_font_idx;
+        out[OFF_CONTENT_FMT] = self.content_fmt;
 
         out
     }
