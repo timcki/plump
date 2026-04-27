@@ -34,7 +34,9 @@ use crate::ui::{Alignment, HEADER_W, ProgressBar, Region, StackFmt};
 use smol_epub::cache;
 use smol_epub::epub::{self, EpubMeta, EpubSpine, EpubToc, TocSource};
 use smol_epub::html_strip::{
-    BOLD_OFF, BOLD_ON, HEADING_OFF, HEADING_ON, ITALIC_OFF, ITALIC_ON, MARKER,
+    BOLD_OFF, BOLD_ON, H1_OFF, H1_ON, H2_OFF, H2_ON, H3_OFF, H3_ON, H4_OFF, H4_ON, H5_OFF, H5_ON,
+    H6_OFF, H6_ON, HEADING_OFF, HEADING_ON, ITALIC_OFF, ITALIC_ON, MARKER, STRIKE_OFF, STRIKE_ON,
+    UNDERLINE_OFF, UNDERLINE_ON,
 };
 use smol_epub::zip::{self, ZipIndex};
 
@@ -196,6 +198,17 @@ impl LineSpan {
     pub(super) const END_HARD: u8 = 1 << Self::END_SHIFT;
     pub(super) const END_SOFT: u8 = 2 << Self::END_SHIFT;
 
+    // Heading level, stored in bits 6-7 (only meaningful when FLAG_HEADING set):
+    //   00 = h3-tier  (heading font, left-aligned)
+    //   01 = h2-tier  (heading font, centered)
+    //   10 = h1-tier  (heading font, centered, page-break-before)
+    //   11 = reserved
+    pub(super) const HLEVEL_SHIFT: u8 = 6;
+    pub(super) const HLEVEL_MASK: u8 = 0b11 << Self::HLEVEL_SHIFT;
+    pub(super) const HLEVEL_H3: u8 = 0 << Self::HLEVEL_SHIFT;
+    pub(super) const HLEVEL_H2: u8 = 1 << Self::HLEVEL_SHIFT;
+    pub(super) const HLEVEL_H1: u8 = 2 << Self::HLEVEL_SHIFT;
+
     #[inline]
     pub(super) fn is_soft_wrap(&self) -> bool {
         (self.flags & Self::END_MASK) == Self::END_SOFT
@@ -223,9 +236,34 @@ impl LineSpan {
         }
     }
 
+    /// Heading tier: 0 = h3 (left), 1 = h2 (center), 2 = h1 (center).
+    /// Meaningful only when [`FLAG_HEADING`](Self::FLAG_HEADING) is set;
+    /// returns 0 for body text.
+    #[inline]
+    pub(super) fn heading_level(&self) -> u8 {
+        (self.flags & Self::HLEVEL_MASK) >> Self::HLEVEL_SHIFT
+    }
+
+    /// `true` if this line should render center-aligned (h1 or h2 heading).
+    #[inline]
+    pub(super) fn is_centered_heading(&self) -> bool {
+        self.flags & Self::FLAG_HEADING != 0 && self.heading_level() >= 1
+    }
+
     /// Pack style + line-ending flags. `end` is one of END_BUFFER, END_HARD, END_SOFT.
-    pub(super) fn pack_flags(bold: bool, italic: bool, heading: bool, end: u8) -> u8 {
-        (bold as u8) | ((italic as u8) << 1) | ((heading as u8) << 2) | end
+    /// `hlevel` is one of HLEVEL_H3, HLEVEL_H2, HLEVEL_H1 (already shifted).
+    pub(super) fn pack_flags(
+        bold: bool,
+        italic: bool,
+        heading: bool,
+        hlevel: u8,
+        end: u8,
+    ) -> u8 {
+        (bold as u8)
+            | ((italic as u8) << 1)
+            | ((heading as u8) << 2)
+            | end
+            | (hlevel & Self::HLEVEL_MASK)
     }
 }
 
@@ -2804,7 +2842,18 @@ impl App<AppId> for ReaderApp {
                     let x_indent = INDENT_PX as i32 * span.indent as i32;
 
                     let line = &self.pg.buf[start..end];
-                    let mut cx = self.text_margin as i32 + x_indent;
+
+                    // centered headings (h1 / h2): shift cursor right by
+                    // (avail - measured_width) / 2 so the line sits centered
+                    // in the indented region. h3 stays left-aligned.
+                    let center_offset: i32 = if span.is_centered_heading() {
+                        let m = self.pg.line_measures[i];
+                        let avail = self.text_w.saturating_sub(INDENT_PX * span.indent as u32);
+                        avail.saturating_sub(m.width) as i32 / 2
+                    } else {
+                        0
+                    };
+                    let mut cx = self.text_margin as i32 + x_indent + center_offset;
 
                     // justification: distribute extra space across inter-word gaps.
                     // only applies to soft-wrapped non-heading text lines when
@@ -2837,6 +2886,18 @@ impl App<AppId> for ReaderApp {
                     };
                     let mut gap_idx: i32 = 0;
                     let mut sty = span.style();
+
+                    // underline / strikethrough are rendered as 1-px horizontal
+                    // strokes drawn after a run ends; each *_x_start records cx
+                    // when the marker turned the decoration on. y offsets:
+                    //   underline = baseline + 1 (just below glyphs)
+                    //   strike    = baseline - ascent / 3 (rough mid-line)
+                    let mut underline_active = false;
+                    let mut strike_active = false;
+                    let mut underline_x_start: i32 = 0;
+                    let mut strike_x_start: i32 = 0;
+                    let strike_y = baseline - ascent / 3;
+
                     let mut j = 0usize;
                     while j < line.len() {
                         let b = line[j];
@@ -2844,8 +2905,51 @@ impl App<AppId> for ReaderApp {
                             sty = match line[j + 1] {
                                 BOLD_ON => fonts::Style::Bold,
                                 ITALIC_ON => fonts::Style::Italic,
-                                HEADING_ON => fonts::Style::Heading,
+                                HEADING_ON | H1_ON | H2_ON | H3_ON => fonts::Style::Heading,
+                                H4_ON | H5_ON | H6_ON => fonts::Style::Bold,
                                 BOLD_OFF | ITALIC_OFF | HEADING_OFF => fonts::Style::Regular,
+                                H1_OFF | H2_OFF | H3_OFF => fonts::Style::Regular,
+                                H4_OFF | H5_OFF | H6_OFF => fonts::Style::Regular,
+                                UNDERLINE_ON => {
+                                    if !underline_active {
+                                        underline_active = true;
+                                        underline_x_start = cx;
+                                    }
+                                    sty
+                                }
+                                UNDERLINE_OFF => {
+                                    if underline_active && cx > underline_x_start {
+                                        Rectangle::new(
+                                            Point::new(underline_x_start, baseline + 1),
+                                            Size::new((cx - underline_x_start) as u32, 1),
+                                        )
+                                        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                                        .draw(strip)
+                                        .ok();
+                                    }
+                                    underline_active = false;
+                                    sty
+                                }
+                                STRIKE_ON => {
+                                    if !strike_active {
+                                        strike_active = true;
+                                        strike_x_start = cx;
+                                    }
+                                    sty
+                                }
+                                STRIKE_OFF => {
+                                    if strike_active && cx > strike_x_start {
+                                        Rectangle::new(
+                                            Point::new(strike_x_start, strike_y),
+                                            Size::new((cx - strike_x_start) as u32, 1),
+                                        )
+                                        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                                        .draw(strip)
+                                        .ok();
+                                    }
+                                    strike_active = false;
+                                    sty
+                                }
                                 _ => sty,
                             };
                             j += 2;
@@ -2886,6 +2990,27 @@ impl App<AppId> for ReaderApp {
                             gap_idx += 1;
                         }
                         j += 1;
+                    }
+
+                    // flush any underline / strike that extends to end of line
+                    // (no closing marker arrived before the buffer ran out)
+                    if underline_active && cx > underline_x_start {
+                        Rectangle::new(
+                            Point::new(underline_x_start, baseline + 1),
+                            Size::new((cx - underline_x_start) as u32, 1),
+                        )
+                        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                        .draw(strip)
+                        .ok();
+                    }
+                    if strike_active && cx > strike_x_start {
+                        Rectangle::new(
+                            Point::new(strike_x_start, strike_y),
+                            Size::new((cx - strike_x_start) as u32, 1),
+                        )
+                        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                        .draw(strip)
+                        .ok();
                     }
                 }
             }

@@ -1,7 +1,8 @@
 // text wrapping, page navigation, and load/prefetch
 
 use smol_epub::html_strip::{
-    BOLD_OFF, BOLD_ON, HEADING_OFF, HEADING_ON, IMG_REF, ITALIC_OFF, ITALIC_ON, MARKER, QUOTE_OFF,
+    BOLD_OFF, BOLD_ON, H1_OFF, H1_ON, H2_OFF, H2_ON, H3_OFF, H3_ON, H4_OFF, H4_ON, H5_OFF, H5_ON,
+    H6_OFF, H6_ON, HEADING_OFF, HEADING_ON, IMG_REF, ITALIC_OFF, ITALIC_ON, MARKER, QUOTE_OFF,
     QUOTE_ON,
 };
 
@@ -614,8 +615,11 @@ pub(super) fn measure_line(
             sty = match line[j + 1] {
                 BOLD_ON => fonts::Style::Bold,
                 ITALIC_ON => fonts::Style::Italic,
-                HEADING_ON => fonts::Style::Heading,
+                HEADING_ON | H1_ON | H2_ON | H3_ON => fonts::Style::Heading,
+                H4_ON | H5_ON | H6_ON => fonts::Style::Bold,
                 BOLD_OFF | ITALIC_OFF | HEADING_OFF => fonts::Style::Regular,
+                H1_OFF | H2_OFF | H3_OFF => fonts::Style::Regular,
+                H4_OFF | H5_OFF | H6_OFF => fonts::Style::Regular,
                 _ => sty,
             };
             j += 2;
@@ -753,6 +757,8 @@ pub(super) fn wrap_proportional(
     let mut bold = false;
     let mut italic = false;
     let mut heading = false;
+    // shifted (already in HLEVEL_MASK position); valid when `heading` is set
+    let mut hlevel: u8 = LineSpan::HLEVEL_H3;
     let mut indent: u8 = 0;
     let mut max_w = base_max_w;
     let mut img_idx: usize = 0;
@@ -778,7 +784,7 @@ pub(super) fn wrap_proportional(
                 lines[line_count] = LineSpan {
                     start: ($start) as u16,
                     len: (e - ($start)) as u16,
-                    flags: LineSpan::pack_flags(bold, italic, heading, $end_kind),
+                    flags: LineSpan::pack_flags(bold, italic, heading, hlevel, $end_kind),
                     indent,
                 };
                 line_count += 1;
@@ -853,8 +859,44 @@ pub(super) fn wrap_proportional(
                 BOLD_OFF => bold = false,
                 ITALIC_ON => italic = true,
                 ITALIC_OFF => italic = false,
-                HEADING_ON => heading = true,
-                HEADING_OFF => heading = false,
+                // legacy: keep old bundles visually unchanged (left-aligned heading)
+                HEADING_ON => {
+                    heading = true;
+                    hlevel = LineSpan::HLEVEL_H3;
+                }
+                HEADING_OFF => {
+                    heading = false;
+                    hlevel = LineSpan::HLEVEL_H3;
+                }
+                // h1 forces a page break before the heading whenever we already
+                // have content on this page; on chapter start (no content yet)
+                // the marker just enters h1-tier normally.
+                H1_ON => {
+                    let has_content = line_start < i || line_count > 0;
+                    if has_content {
+                        if line_start < i {
+                            emit!(line_start, i, LineSpan::END_HARD);
+                        }
+                        return (i, line_count);
+                    }
+                    heading = true;
+                    hlevel = LineSpan::HLEVEL_H1;
+                }
+                H2_ON => {
+                    heading = true;
+                    hlevel = LineSpan::HLEVEL_H2;
+                }
+                H3_ON => {
+                    heading = true;
+                    hlevel = LineSpan::HLEVEL_H3;
+                }
+                // h4-h6 render as bold body text rather than a heading font
+                H4_ON | H5_ON | H6_ON => bold = true,
+                H1_OFF | H2_OFF | H3_OFF => {
+                    heading = false;
+                    hlevel = LineSpan::HLEVEL_H3;
+                }
+                H4_OFF | H5_OFF | H6_OFF => bold = false,
                 QUOTE_ON => {
                     indent = indent.saturating_add(1);
                     max_w = base_max_w.saturating_sub(INDENT_PX * indent as u32);
@@ -1045,7 +1087,7 @@ pub(super) fn wrap_proportional(
             lines[line_count] = LineSpan {
                 start: line_start as u16,
                 len: (e - line_start) as u16,
-                flags: LineSpan::pack_flags(bold, italic, heading, LineSpan::END_BUFFER),
+                flags: LineSpan::pack_flags(bold, italic, heading, hlevel, LineSpan::END_BUFFER),
                 indent,
             };
             line_count += 1;
