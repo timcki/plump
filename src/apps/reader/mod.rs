@@ -2834,12 +2834,52 @@ impl App<AppId> for ReaderApp {
                                 }
                                 img_rendered = true;
                             } else {
+                                // alt-text fallback when no decoded image is
+                                // available (decode failed or hasn't run yet).
+                                // image LineSpan stores alt_len in `indent`;
+                                // alt bytes sit at buf[start - alt_len..start].
+                                let alt_len = span.indent as usize;
+                                let alt_origin = if alt_len > 0
+                                    && (span.start as usize) >= alt_len
+                                {
+                                    Some(span.start as usize - alt_len)
+                                } else {
+                                    None
+                                };
+                                let alt: &[u8] = match alt_origin {
+                                    Some(s) => &self.pg.buf[s..span.start as usize],
+                                    None => b"[image]",
+                                };
+                                // measure pixel width to center the run
+                                let mut alt_w: u32 = 0;
+                                let mut k = 0usize;
+                                while k < alt.len() {
+                                    let ab = alt[k];
+                                    if ab >= 0xC0 {
+                                        let (ch, sl) = decode_utf8_char(alt, k);
+                                        alt_w += fs.advance(ch, fonts::Style::Italic) as u32;
+                                        k += sl;
+                                        continue;
+                                    }
+                                    if ab >= 0x80 {
+                                        k += 1;
+                                        continue;
+                                    }
+                                    if ab < bitmap::FIRST_CHAR && ab != b' ' {
+                                        k += 1;
+                                        continue;
+                                    }
+                                    alt_w += fs.advance(ab as char, fonts::Style::Italic) as u32;
+                                    k += 1;
+                                }
                                 let baseline = y_top + ascent;
-                                fs.draw_str(
+                                let alt_x = self.text_margin as i32
+                                    + ((self.text_w as i32 - alt_w as i32).max(0)) / 2;
+                                fs.draw_bytes(
                                     strip,
-                                    "[image]",
+                                    alt,
                                     fonts::Style::Italic,
-                                    self.text_margin as i32,
+                                    alt_x,
                                     baseline,
                                 );
                             }

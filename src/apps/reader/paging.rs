@@ -831,6 +831,19 @@ pub(super) fn wrap_proportional(
                     img_idx += 1;
                     let img_lines = img_h.div_ceil(line_h).max(1) as usize;
 
+                    // page-fit: if the image needs more lines than the page
+                    // has left AND we've already emitted text on this page,
+                    // push the entire image to the next page by returning at
+                    // the marker offset. wrap_proportional is re-entered on
+                    // the next page with i pointing at the IMG_REF marker, so
+                    // the image (and its still-active alt + dims metadata)
+                    // is consumed there. an image that's bigger than the
+                    // whole page is emitted anyway and clipped at the bottom
+                    // (better than infinite-looping).
+                    if line_count > 0 && line_count + img_lines > max_l {
+                        return (i, line_count);
+                    }
+
                     if line_count < max_l {
                         lines[line_count] = LineSpan {
                             start: path_start as u16,
