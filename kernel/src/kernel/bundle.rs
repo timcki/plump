@@ -64,7 +64,8 @@ pub const HEADER_VERSION: u16 = 2;
 // without forcing a full layout rev.
 //   0 = legacy (Phase 1 marker set: BOLD/ITALIC/H1-H6/U/S/QUOTE/IMG_REF)
 //   1 = Phase 2 (adds ALIGN_*/PAGE_BREAK/FIGCAPTION; tag-keyed defaults)
-pub const CONTENT_FMT_LATEST: u8 = 1;
+//   2 = Phase 3 (extended IMG_REF payload: flags + width + height + alt)
+pub const CONTENT_FMT_LATEST: u8 = 2;
 
 pub const TITLE_CAP: usize = 80;
 pub const AUTHOR_CAP: usize = 40;

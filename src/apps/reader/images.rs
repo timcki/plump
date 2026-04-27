@@ -12,7 +12,7 @@ use core::cell::RefCell;
 use crate::kernel::work_queue::DecodedImage;
 use smol_epub::cache;
 use smol_epub::epub;
-use smol_epub::html_strip::{IMG_REF, MARKER};
+use smol_epub::html_strip::{IMG_HEADER_LEN, IMG_REF, MARKER};
 use smol_epub::zip::{self, ZipIndex};
 
 use crate::error::{Error, ErrorKind};
@@ -335,16 +335,23 @@ impl ReaderApp {
         let text_area_h = self.text_area_h;
         let max_inline_h = super::inline_img_max_h(text_area_h);
 
-        // scan for [MARKER, IMG_REF, len, path...] sequences
+        // scan for [MARKER, IMG_REF, flags, w_lo, w_hi, h_lo, h_hi, alt_len,
+        // path_len, alt..., path...] sequences. ignore the flags / dims for
+        // now (the actual height comes from peek_cached / peek_source); the
+        // structural parse just needs alt_len + path_len to find the path.
         let mut i = 0usize;
-        while i + 2 < buf_len && (self.img_height_count as usize) < MAX_IMAGES_PER_PAGE {
+        while i + IMG_HEADER_LEN <= buf_len
+            && (self.img_height_count as usize) < MAX_IMAGES_PER_PAGE
+        {
             if self.pg.buf[i] != MARKER || self.pg.buf[i + 1] != IMG_REF {
                 i += 1;
                 continue;
             }
-            let path_len = self.pg.buf[i + 2] as usize;
-            let path_start = i + 3;
-            if path_len == 0 || path_start + path_len > buf_len {
+            let alt_len = self.pg.buf[i + 7] as usize;
+            let path_len = self.pg.buf[i + 8] as usize;
+            let path_start = i + IMG_HEADER_LEN + alt_len;
+            let payload_end = path_start + path_len;
+            if path_len == 0 || payload_end > buf_len {
                 i += 1;
                 continue;
             }
@@ -358,7 +365,7 @@ impl ReaderApp {
                 _ => {
                     self.img_heights[self.img_height_count as usize] = DEFAULT_IMG_H;
                     self.img_height_count += 1;
-                    i = path_start + path_len;
+                    i = payload_end;
                     continue;
                 }
             };
@@ -370,7 +377,7 @@ impl ReaderApp {
                 Err(_) => {
                     self.img_heights[self.img_height_count as usize] = DEFAULT_IMG_H;
                     self.img_height_count += 1;
-                    i = path_start + path_len;
+                    i = payload_end;
                     continue;
                 }
             };
@@ -392,7 +399,7 @@ impl ReaderApp {
             // reservation entirely and use the full text_area_h
             self.img_heights[self.img_height_count as usize] = out_h.min(max_inline_h);
             self.img_height_count += 1;
-            i = path_start + path_len;
+            i = payload_end;
         }
     }
 
@@ -443,15 +450,17 @@ impl ReaderApp {
             }
 
             let mut i = 0;
-            while i + 2 < n {
+            while i + IMG_HEADER_LEN <= n {
                 if self.pg.prefetch[i] != MARKER || self.pg.prefetch[i + 1] != IMG_REF {
                     i += 1;
                     continue;
                 }
 
-                let path_len = self.pg.prefetch[i + 2] as usize;
-                let path_start = i + 3;
-                if path_len == 0 || path_start + path_len > n {
+                let alt_len = self.pg.prefetch[i + 7] as usize;
+                let path_len = self.pg.prefetch[i + 8] as usize;
+                let path_start = i + IMG_HEADER_LEN + alt_len;
+                let payload_end = path_start + path_len;
+                if path_len == 0 || payload_end > n {
                     i += 1;
                     continue;
                 }
@@ -462,7 +471,7 @@ impl ReaderApp {
                 let src_str = match core::str::from_utf8(&src_buf[..src_n]) {
                     Ok(s) if !s.is_empty() => s,
                     _ => {
-                        i = path_start + path_len;
+                        i = payload_end;
                         continue;
                     }
                 };
@@ -477,7 +486,7 @@ impl ReaderApp {
                 let full_path = match core::str::from_utf8(&path_buf[..plen]) {
                     Ok(s) => s,
                     Err(_) => {
-                        i = path_start + path_len;
+                        i = payload_end;
                         continue;
                     }
                 };
@@ -485,13 +494,13 @@ impl ReaderApp {
                 let path_hash = cache::fnv1a(full_path.as_bytes());
                 let img_name = img_cache_name(path_hash);
                 let img_file = img_cache_str(&img_name);
-                let resume = (offset + path_start + path_len) as u32;
+                let resume = (offset + payload_end) as u32;
 
                 // already cached or skip-marked
                 if k.sd().file_size_in_plump_subdir(dir, img_file).is_ok() {
                     self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
                     self.epub.img_cached_count = self.epub.img_cached_count.saturating_add(1);
-                    i = path_start + path_len;
+                    i = payload_end;
                     continue;
                 }
 
@@ -503,7 +512,7 @@ impl ReaderApp {
                     let _ = k.sd().write_in_plump_subdir(dir, img_file, &[]);
                     self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
                     self.epub.img_cached_count = self.epub.img_cached_count.saturating_add(1);
-                    i = path_start + path_len;
+                    i = payload_end;
                     continue;
                 }
 
@@ -518,7 +527,7 @@ impl ReaderApp {
                         log::warn!("precache: {} not in ZIP", full_path);
                         self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
                         self.epub.img_cached_count = self.epub.img_cached_count.saturating_add(1);
-                        i = path_start + path_len;
+                        i = payload_end;
                         continue;
                     }
                 };
@@ -533,7 +542,7 @@ impl ReaderApp {
                         let _ = k.sd().write_in_plump_subdir(dir, img_file, &[]);
                         self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
                         self.epub.img_cached_count = self.epub.img_cached_count.saturating_add(1);
-                        i = path_start + path_len;
+                        i = payload_end;
                         continue;
                     }
 
@@ -590,7 +599,7 @@ impl ReaderApp {
                         let _ = k.sd().write_in_plump_subdir(dir, img_file, &[]);
                         self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
                         self.epub.img_cached_count = self.epub.img_cached_count.saturating_add(1);
-                        i = path_start + path_len;
+                        i = payload_end;
                         continue;
                     }
                 };
@@ -618,11 +627,14 @@ impl ReaderApp {
                 });
             }
 
-            // advance with overlap so markers at chunk boundaries are not missed
+            // advance with overlap large enough that any IMG_REF payload that
+            // spans a chunk boundary fits entirely in the next read. Worst
+            // case is IMG_HEADER_LEN + IMG_ALT_CAP (48) + path_len_max (135)
+            // ~= 192 bytes; round up to 256.
             if offset + n >= ch_size {
                 break;
             }
-            offset += n.saturating_sub(128).max(1);
+            offset += n.saturating_sub(256).max(1);
         }
 
         Ok(ScanResult::NoneFound)

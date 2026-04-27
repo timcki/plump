@@ -3,7 +3,8 @@
 use smol_epub::html_strip::{
     ALIGN_CENTER, ALIGN_JUSTIFY, ALIGN_LEFT, ALIGN_RESET, ALIGN_RIGHT, BOLD_OFF, BOLD_ON, H1_OFF,
     H1_ON, H2_OFF, H2_ON, H3_OFF, H3_ON, H4_OFF, H4_ON, H5_OFF, H5_ON, H6_OFF, H6_ON, HEADING_OFF,
-    HEADING_ON, IMG_REF, ITALIC_OFF, ITALIC_ON, MARKER, PAGE_BREAK, QUOTE_OFF, QUOTE_ON,
+    HEADING_ON, IMG_HEADER_LEN, IMG_REF, ITALIC_OFF, ITALIC_ON, MARKER, PAGE_BREAK, QUOTE_OFF,
+    QUOTE_ON,
 };
 
 use crate::fonts;
@@ -801,10 +802,14 @@ pub(super) fn wrap_proportional(
         let b = buf[i];
 
         if b == MARKER && i + 1 < n {
-            if buf[i + 1] == IMG_REF && i + 2 < n {
-                let path_len = buf[i + 2] as usize;
-                let path_start = i + 3;
-                if path_start + path_len <= n && path_len > 0 {
+            if buf[i + 1] == IMG_REF && i + IMG_HEADER_LEN <= n {
+                // [MARKER, IMG_REF, flags, w_lo, w_hi, h_lo, h_hi, alt_len, path_len, alt..., path...]
+                let alt_len = buf[i + 7] as usize;
+                let path_len = buf[i + 8] as usize;
+                let alt_start = i + IMG_HEADER_LEN;
+                let path_start = alt_start + alt_len;
+                let payload_end = path_start + path_len;
+                if payload_end <= n && path_len > 0 {
                     if line_start < i {
                         emit!(line_start, i, LineSpan::END_HARD);
                         if line_count >= max_l {
@@ -813,14 +818,17 @@ pub(super) fn wrap_proportional(
                     }
 
                     let line_h = fonts.line_height(fonts::Style::Regular);
-                    // use pre-scanned height if available, else default
+                    // prefer pre-scanned height (peeked from PNG/JPEG header
+                    // by images.rs); fall back to DEFAULT_IMG_H. attribute
+                    // hints from <img width/height> are checked in images.rs
+                    // when prescan is run, so the height we land on already
+                    // accounts for them.
                     let img_h = if img_idx < img_heights.len() && img_heights[img_idx] > 0 {
                         img_heights[img_idx]
                     } else {
                         DEFAULT_IMG_H
                     };
                     img_idx += 1;
-                    // ceiling division: ensure reserved lines fully cover image height
                     let img_lines = img_h.div_ceil(line_h).max(1) as usize;
 
                     if line_count < max_l {
@@ -828,7 +836,11 @@ pub(super) fn wrap_proportional(
                             start: path_start as u16,
                             len: path_len as u16,
                             flags: LineSpan::FLAG_IMAGE,
-                            indent: 0,
+                            // store alt_len in the indent slot for image
+                            // origins (indent isn't used by image renders);
+                            // draw can recover the alt span back from
+                            // `path_start - alt_len`.
+                            indent: alt_len as u8,
                             align: LineSpan::ALIGN_DEFAULT,
                         };
                         line_count += 1;
@@ -848,7 +860,7 @@ pub(super) fn wrap_proportional(
                         line_count += 1;
                     }
 
-                    i = path_start + path_len;
+                    i = payload_end;
                     line_start = i;
                     cursor_x = 0;
                     last_space = line_start;
