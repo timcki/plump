@@ -172,6 +172,7 @@ pub(super) struct LineSpan {
     pub(super) len: u16,
     pub(super) flags: u8,
     pub(super) indent: u8,
+    pub(super) align: u8,
 }
 
 impl LineSpan {
@@ -180,12 +181,21 @@ impl LineSpan {
         len: 0,
         flags: 0,
         indent: 0,
+        align: Self::ALIGN_DEFAULT,
     };
 
     pub(super) const FLAG_BOLD: u8 = 1 << 0;
     pub(super) const FLAG_ITALIC: u8 = 1 << 1;
     pub(super) const FLAG_HEADING: u8 = 1 << 2;
     pub(super) const FLAG_IMAGE: u8 = 1 << 3;
+
+    // per-line alignment, set by ALIGN_* markers in the content stream.
+    // ALIGN_DEFAULT honors the user's text_alignment setting (typically
+    // justify); the others override it for that line only.
+    pub(super) const ALIGN_DEFAULT: u8 = 0;
+    pub(super) const ALIGN_LEFT: u8 = 1;
+    pub(super) const ALIGN_CENTER: u8 = 2;
+    pub(super) const ALIGN_RIGHT: u8 = 3;
 
     // Line-ending kind, stored in bits 4-5:
     //   00 = BufferEnd (last line, end of page buffer or chapter)
@@ -236,18 +246,19 @@ impl LineSpan {
         }
     }
 
-    /// Heading tier: 0 = h3 (left), 1 = h2 (center), 2 = h1 (center).
-    /// Meaningful only when [`FLAG_HEADING`](Self::FLAG_HEADING) is set;
-    /// returns 0 for body text.
     #[inline]
-    pub(super) fn heading_level(&self) -> u8 {
-        (self.flags & Self::HLEVEL_MASK) >> Self::HLEVEL_SHIFT
+    pub(super) fn is_centered(&self) -> bool {
+        self.align == Self::ALIGN_CENTER
     }
 
-    /// `true` if this line should render center-aligned (h1 or h2 heading).
     #[inline]
-    pub(super) fn is_centered_heading(&self) -> bool {
-        self.flags & Self::FLAG_HEADING != 0 && self.heading_level() >= 1
+    pub(super) fn is_right_aligned(&self) -> bool {
+        self.align == Self::ALIGN_RIGHT
+    }
+
+    #[inline]
+    pub(super) fn is_explicit_align(&self) -> bool {
+        self.align != Self::ALIGN_DEFAULT
     }
 
     /// Pack style + line-ending flags. `end` is one of END_BUFFER, END_HARD, END_SOFT.
@@ -2843,24 +2854,33 @@ impl App<AppId> for ReaderApp {
 
                     let line = &self.pg.buf[start..end];
 
-                    // centered headings (h1 / h2): shift cursor right by
-                    // (avail - measured_width) / 2 so the line sits centered
-                    // in the indented region. h3 stays left-aligned.
-                    let center_offset: i32 = if span.is_centered_heading() {
+                    // alignment offset: shift cursor for ALIGN_CENTER / RIGHT
+                    // by (avail - measured_width) / N. ALIGN_LEFT and DEFAULT
+                    // stay at the indent. headings without an ALIGN marker
+                    // (typically h3-tier) also keep the default left position.
+                    let align_offset: i32 = if span.is_explicit_align() {
                         let m = self.pg.line_measures[i];
                         let avail = self.text_w.saturating_sub(INDENT_PX * span.indent as u32);
-                        avail.saturating_sub(m.width) as i32 / 2
+                        let spare = avail.saturating_sub(m.width) as i32;
+                        if span.is_centered() {
+                            spare / 2
+                        } else if span.is_right_aligned() {
+                            spare
+                        } else {
+                            0
+                        }
                     } else {
                         0
                     };
-                    let mut cx = self.text_margin as i32 + x_indent + center_offset;
+                    let mut cx = self.text_margin as i32 + x_indent + align_offset;
 
                     // justification: distribute extra space across inter-word gaps.
-                    // only applies to soft-wrapped non-heading text lines when
-                    // the user has selected Justify alignment.
+                    // applies only to soft-wrapped body lines that don't carry
+                    // an explicit alignment override and aren't a heading.
                     let justify = self.text_alignment == 1
                         && span.is_soft_wrap()
-                        && (span.flags & LineSpan::FLAG_HEADING) == 0;
+                        && (span.flags & LineSpan::FLAG_HEADING) == 0
+                        && !span.is_explicit_align();
                     let (extra_per_gap, remainder) = if justify {
                         let m = self.pg.line_measures[i];
                         let avail = self.text_w.saturating_sub(INDENT_PX * span.indent as u32);

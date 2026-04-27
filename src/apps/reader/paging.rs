@@ -1,9 +1,9 @@
 // text wrapping, page navigation, and load/prefetch
 
 use smol_epub::html_strip::{
-    BOLD_OFF, BOLD_ON, H1_OFF, H1_ON, H2_OFF, H2_ON, H3_OFF, H3_ON, H4_OFF, H4_ON, H5_OFF, H5_ON,
-    H6_OFF, H6_ON, HEADING_OFF, HEADING_ON, IMG_REF, ITALIC_OFF, ITALIC_ON, MARKER, QUOTE_OFF,
-    QUOTE_ON,
+    ALIGN_CENTER, ALIGN_JUSTIFY, ALIGN_LEFT, ALIGN_RESET, ALIGN_RIGHT, BOLD_OFF, BOLD_ON, H1_OFF,
+    H1_ON, H2_OFF, H2_ON, H3_OFF, H3_ON, H4_OFF, H4_ON, H5_OFF, H5_ON, H6_OFF, H6_ON, HEADING_OFF,
+    HEADING_ON, IMG_REF, ITALIC_OFF, ITALIC_ON, MARKER, PAGE_BREAK, QUOTE_OFF, QUOTE_ON,
 };
 
 use crate::fonts;
@@ -111,6 +111,7 @@ impl ReaderApp {
                 len: (end - start) as u16,
                 flags: 0,
                 indent: 0,
+                align: LineSpan::ALIGN_DEFAULT,
             };
             self.pg.line_count += 1;
         }
@@ -759,6 +760,8 @@ pub(super) fn wrap_proportional(
     let mut heading = false;
     // shifted (already in HLEVEL_MASK position); valid when `heading` is set
     let mut hlevel: u8 = LineSpan::HLEVEL_H3;
+    // current paragraph alignment, set by ALIGN_* markers (Phase 2)
+    let mut align: u8 = LineSpan::ALIGN_DEFAULT;
     let mut indent: u8 = 0;
     let mut max_w = base_max_w;
     let mut img_idx: usize = 0;
@@ -786,6 +789,7 @@ pub(super) fn wrap_proportional(
                     len: (e - ($start)) as u16,
                     flags: LineSpan::pack_flags(bold, italic, heading, hlevel, $end_kind),
                     indent,
+                    align,
                 };
                 line_count += 1;
             }
@@ -825,6 +829,7 @@ pub(super) fn wrap_proportional(
                             len: path_len as u16,
                             flags: LineSpan::FLAG_IMAGE,
                             indent: 0,
+                            align: LineSpan::ALIGN_DEFAULT,
                         };
                         line_count += 1;
                     }
@@ -838,6 +843,7 @@ pub(super) fn wrap_proportional(
                             len: 0,
                             flags: LineSpan::FLAG_IMAGE,
                             indent: 0,
+                            align: LineSpan::ALIGN_DEFAULT,
                         };
                         line_count += 1;
                     }
@@ -854,12 +860,30 @@ pub(super) fn wrap_proportional(
                 }
             }
 
+            // explicit page break: end the current page at the marker offset
+            // unless the chapter just started (no content yet). next page
+            // resumes at the marker so it's consumed cleanly on re-entry.
+            if buf[i + 1] == PAGE_BREAK {
+                let has_content = line_start < i || line_count > 0;
+                if has_content {
+                    if line_start < i {
+                        emit!(line_start, i, LineSpan::END_HARD);
+                    }
+                    // skip past the marker so we don't loop on the next pass
+                    return (i + 2, line_count);
+                }
+                // chapter-start PAGE_BREAK is a no-op; consume and continue
+                i += 2;
+                continue;
+            }
+
             match buf[i + 1] {
                 BOLD_ON => bold = true,
                 BOLD_OFF => bold = false,
                 ITALIC_ON => italic = true,
                 ITALIC_OFF => italic = false,
-                // legacy: keep old bundles visually unchanged (left-aligned heading)
+                // legacy v1 bundles: heading marker without level. fall back to
+                // h3-tier (left, no centering) so old bundles don't shift.
                 HEADING_ON => {
                     heading = true;
                     hlevel = LineSpan::HLEVEL_H3;
@@ -868,17 +892,7 @@ pub(super) fn wrap_proportional(
                     heading = false;
                     hlevel = LineSpan::HLEVEL_H3;
                 }
-                // h1 forces a page break before the heading whenever we already
-                // have content on this page; on chapter start (no content yet)
-                // the marker just enters h1-tier normally.
                 H1_ON => {
-                    let has_content = line_start < i || line_count > 0;
-                    if has_content {
-                        if line_start < i {
-                            emit!(line_start, i, LineSpan::END_HARD);
-                        }
-                        return (i, line_count);
-                    }
                     heading = true;
                     hlevel = LineSpan::HLEVEL_H1;
                 }
@@ -897,6 +911,10 @@ pub(super) fn wrap_proportional(
                     hlevel = LineSpan::HLEVEL_H3;
                 }
                 H4_OFF | H5_OFF | H6_OFF => bold = false,
+                ALIGN_LEFT => align = LineSpan::ALIGN_LEFT,
+                ALIGN_CENTER => align = LineSpan::ALIGN_CENTER,
+                ALIGN_RIGHT => align = LineSpan::ALIGN_RIGHT,
+                ALIGN_JUSTIFY | ALIGN_RESET => align = LineSpan::ALIGN_DEFAULT,
                 QUOTE_ON => {
                     indent = indent.saturating_add(1);
                     max_w = base_max_w.saturating_sub(INDENT_PX * indent as u32);
@@ -1089,6 +1107,7 @@ pub(super) fn wrap_proportional(
                 len: (e - line_start) as u16,
                 flags: LineSpan::pack_flags(bold, italic, heading, hlevel, LineSpan::END_BUFFER),
                 indent,
+                align,
             };
             line_count += 1;
         }
