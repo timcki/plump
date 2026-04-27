@@ -102,7 +102,18 @@ impl EpubState {
         // source_size + name_hash + spine_count must all match the open file,
         // and CORE_READY must be set for a hit.
         let Some(hdr) = bundle::read_header(k.sd(), self.name_hash) else {
-            log::info!("epub: no bundle, building for {} chapters", spine_len);
+            // file may exist but its header is unreadable (magic mismatch
+            // or HEADER_VERSION bump). delete it so the subsequent
+            // ensure_bundle_exists / chapter-cache write actually creates
+            // a fresh placeholder rather than appending to a stale file.
+            if bundle::exists(k.sd(), self.name_hash) {
+                log::info!(
+                    "epub: bundle header unreadable (stale version?), deleting"
+                );
+                let _ = bundle::delete(k.sd(), self.name_hash);
+            } else {
+                log::info!("epub: no bundle, building for {} chapters", spine_len);
+            }
             self.prepare_bundle_dirs(k)?;
             self.cache_chapter = 0;
             return Ok(false);
