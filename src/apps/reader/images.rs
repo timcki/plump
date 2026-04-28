@@ -226,32 +226,29 @@ impl ReaderApp {
             let k_cell = RefCell::new(k_ref);
             let read_err = |e: Error| -> &'static str { e.into() };
             let raw = if is_jpeg && entry.method == zip::METHOD_STORED {
-                smol_epub::jpeg::decode_jpeg_sd(
-                    |off, buf| {
-                        k_cell
-                            .borrow_mut()
-                            .sd().read_file_chunk(epub_name, off, buf)
-                            .map_err(read_err)
-                    },
+                let read = |off, buf: &mut [u8]| {
+                    k_cell
+                        .borrow_mut()
+                        .sd().read_file_chunk(epub_name, off, buf)
+                        .map_err(read_err)
+                };
+                let reader = smol_epub::jpeg::ChunkReader::new(
+                    read,
                     data_offset,
-                    entry.uncomp_size,
-                    img_max_w,
-                    img_max_h,
-                )
+                    data_offset + entry.uncomp_size,
+                );
+                smol_epub::jpeg::decode_jpeg(reader, img_max_w, img_max_h)
             } else if is_jpeg {
-                smol_epub::jpeg::decode_jpeg_deflate_sd(
-                    |off, buf| {
-                        k_cell
-                            .borrow_mut()
-                            .sd().read_file_chunk(epub_name, off, buf)
-                            .map_err(read_err)
-                    },
-                    data_offset,
-                    entry.comp_size,
-                    entry.uncomp_size,
-                    img_max_w,
-                    img_max_h,
-                )
+                let read = |off, buf: &mut [u8]| {
+                    k_cell
+                        .borrow_mut()
+                        .sd().read_file_chunk(epub_name, off, buf)
+                        .map_err(read_err)
+                };
+                match smol_epub::jpeg::DeflateReader::new(read, data_offset, entry.comp_size) {
+                    Ok(reader) => smol_epub::jpeg::decode_jpeg(reader, img_max_w, img_max_h),
+                    Err(e) => Err(e),
+                }
             } else if entry.method == zip::METHOD_STORED {
                 smol_epub::png::decode_png_sd(
                     |off, buf| {
@@ -807,22 +804,21 @@ pub(super) fn decode_image_streaming(
     let read_err = |_: Error| -> &'static str { "read failed" };
 
     let result = if is_jpeg && entry.method == zip::METHOD_STORED {
-        smol_epub::jpeg::decode_jpeg_sd(
-            |off, buf| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err),
+        let read =
+            |off, buf: &mut [u8]| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err);
+        let reader = smol_epub::jpeg::ChunkReader::new(
+            read,
             data_offset,
-            entry.uncomp_size,
-            max_w,
-            max_h,
-        )
+            data_offset + entry.uncomp_size,
+        );
+        smol_epub::jpeg::decode_jpeg(reader, max_w, max_h)
     } else if is_jpeg {
-        smol_epub::jpeg::decode_jpeg_deflate_sd(
-            |off, buf| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err),
-            data_offset,
-            entry.comp_size,
-            entry.uncomp_size,
-            max_w,
-            max_h,
-        )
+        let read =
+            |off, buf: &mut [u8]| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err);
+        match smol_epub::jpeg::DeflateReader::new(read, data_offset, entry.comp_size) {
+            Ok(reader) => smol_epub::jpeg::decode_jpeg(reader, max_w, max_h),
+            Err(e) => Err(e),
+        }
     } else if entry.method == zip::METHOD_STORED {
         smol_epub::png::decode_png_sd(
             |off, buf| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err),
@@ -977,11 +973,14 @@ fn peek_source_dimensions(
         )
         .map(|(w, h)| (w as u16, h as u16))
     } else if is_jpeg {
-        smol_epub::jpeg::peek_jpeg_dimensions_streaming(
-            |off, buf| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err),
+        let read =
+            |off, buf: &mut [u8]| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err);
+        let reader = smol_epub::jpeg::ChunkReader::new(
+            read,
             data_offset,
-            entry.uncomp_size,
-        )
+            data_offset + entry.uncomp_size,
+        );
+        smol_epub::jpeg::peek_jpeg_dimensions(reader)
     } else {
         return DEFAULT_IMG_H;
     };
