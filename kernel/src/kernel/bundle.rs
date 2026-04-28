@@ -560,91 +560,268 @@ impl ImageEntry {
     }
 }
 
-// ── page index section ─────────────────────────────────────────────
+// ── layout index section (v2) ──────────────────────────────────────
 //
-// always the last section of a bundle; rewriting it on font change
-// does not touch anything above.
+// always the last section of a bundle; rewriting it on font/dimension
+// change does not touch anything above.
 //
-// layout inside the pageidx section:
-//   [PageIdxHeader]                       12 bytes
-//   [ChapterPageDir; spine_count]         12 bytes each
-//   [break arrays, packed in dir order]   u32 per page break
+// v2 stores per-page AND per-line records, supporting paragraph-level
+// line breaking (Knuth-Plass) cached at the chapter level. v1 stored
+// only page start byte offsets. v1 bundles are detected by the format
+// version byte at offset 4 and are rebuilt by callers when the loader
+// rejects them.
+//
+// layout inside the section:
+//   [LayoutIdxHeader]                          PAGEIDX_HDR_V2_SIZE bytes
+//   [ChapterLayoutDir; spine_count]            CHAPTER_LAYOUT_DIR_SIZE each
+//   [PageRecord; chapter_A_pages]              packed in dir order
+//   [LineRecord; chapter_A_lines]              packed in dir order
+//   ...
+//
+// per-chapter `pages_offset` and `lines_offset` are PIDX-section
+// relative. a chapter with `page_count == 0` is treated as not yet
+// indexed.
 
-pub const PAGEIDX_HDR_SIZE: usize = 12;
 pub const PAGEIDX_MAGIC: [u8; 4] = *b"PIDX";
-pub const CHAPTER_DIR_ENTRY_SIZE: usize = 12;
+pub const PAGEIDX_FORMAT_VERSION: u8 = 2;
+pub const LAYOUT_ALGO_VERSION: u8 = 1;
 
-// pageidx flags
-pub const PIDX_FLAG_FULLY_INDEXED: u8 = 1 << 0;
+pub const PAGEIDX_HDR_V2_SIZE: usize = 20;
+pub const CHAPTER_LAYOUT_DIR_SIZE: usize = 24;
+pub const PAGE_RECORD_SIZE: usize = 12;
+pub const LINE_RECORD_SIZE: usize = 12;
 
-#[derive(Clone, Copy)]
-pub struct PageIdxHeader {
+// LayoutIdxHeader byte layout (20 bytes):
+//   0..4   magic           [u8; 4] = b"PIDX"
+//   4      format_version  u8
+//   5      algo_version    u8
+//   6      font_idx        u8
+//   7      content_fmt     u8
+//   8..10  text_w          u16
+//   10..12 line_h          u16
+//   12     max_lines       u8
+//   13     flags           u8
+//   14..16 _pad            2 bytes
+//   16..20 total_pages     u32
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutIdxHeader {
+    pub format_version: u8,
+    pub algo_version: u8,
     pub font_idx: u8,
+    pub content_fmt: u8,
+    pub text_w: u16,
+    pub line_h: u16,
+    pub max_lines: u8,
     pub flags: u8,
     pub total_pages: u32,
 }
 
-impl PageIdxHeader {
+impl LayoutIdxHeader {
     pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < PAGEIDX_HDR_SIZE {
+        if buf.len() < PAGEIDX_HDR_V2_SIZE {
             return None;
         }
         if buf[0..4] != PAGEIDX_MAGIC {
             return None;
         }
+        if buf[4] != PAGEIDX_FORMAT_VERSION {
+            return None;
+        }
         Some(Self {
-            font_idx: buf[4],
-            flags: buf[5],
-            // 6..8 pad
-            total_pages: r_u32(buf, 8),
+            format_version: buf[4],
+            algo_version: buf[5],
+            font_idx: buf[6],
+            content_fmt: buf[7],
+            text_w: r_u16(buf, 8),
+            line_h: r_u16(buf, 10),
+            max_lines: buf[12],
+            flags: buf[13],
+            // 14..16 pad
+            total_pages: r_u32(buf, 16),
         })
     }
 
-    pub fn encode(&self) -> [u8; PAGEIDX_HDR_SIZE] {
-        let mut out = [0u8; PAGEIDX_HDR_SIZE];
+    pub fn encode(&self) -> [u8; PAGEIDX_HDR_V2_SIZE] {
+        let mut out = [0u8; PAGEIDX_HDR_V2_SIZE];
         out[0..4].copy_from_slice(&PAGEIDX_MAGIC);
-        out[4] = self.font_idx;
-        out[5] = self.flags;
-        // 6..8 pad
-        w_u32(&mut out, 8, self.total_pages);
+        out[4] = self.format_version;
+        out[5] = self.algo_version;
+        out[6] = self.font_idx;
+        out[7] = self.content_fmt;
+        w_u16(&mut out, 8, self.text_w);
+        w_u16(&mut out, 10, self.line_h);
+        out[12] = self.max_lines;
+        out[13] = self.flags;
+        // 14..16 pad
+        w_u32(&mut out, 16, self.total_pages);
         out
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct ChapterPageDir {
+// ChapterLayoutDir byte layout (24 bytes):
+//   0..2   chapter_index  u16
+//   2..4   page_count     u16
+//   4..6   line_count     u16
+//   6..8   flags          u16
+//   8..12  pages_offset   u32  (within pageidx section)
+//   12..16 lines_offset   u32  (within pageidx section; 0 when no lines)
+//   16..20 byte_size      u32  (chapter content byte size at layout time)
+//   20..24 _reserved      u32
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChapterLayoutDir {
     pub chapter_index: u16,
     pub page_count: u16,
-    pub breaks_offset: u32, // within pageidx section
+    pub line_count: u16,
+    pub flags: u16,
+    pub pages_offset: u32,
+    pub lines_offset: u32,
+    pub byte_size: u32,
     pub _reserved: u32,
 }
 
-impl ChapterPageDir {
+impl ChapterLayoutDir {
     pub const EMPTY: Self = Self {
         chapter_index: 0,
         page_count: 0,
-        breaks_offset: 0,
+        line_count: 0,
+        flags: 0,
+        pages_offset: 0,
+        lines_offset: 0,
+        byte_size: 0,
         _reserved: 0,
     };
 
     pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < CHAPTER_DIR_ENTRY_SIZE {
+        if buf.len() < CHAPTER_LAYOUT_DIR_SIZE {
             return None;
         }
         Some(Self {
             chapter_index: r_u16(buf, 0),
             page_count: r_u16(buf, 2),
-            breaks_offset: r_u32(buf, 4),
-            _reserved: r_u32(buf, 8),
+            line_count: r_u16(buf, 4),
+            flags: r_u16(buf, 6),
+            pages_offset: r_u32(buf, 8),
+            lines_offset: r_u32(buf, 12),
+            byte_size: r_u32(buf, 16),
+            _reserved: r_u32(buf, 20),
         })
     }
 
-    pub fn encode(&self) -> [u8; CHAPTER_DIR_ENTRY_SIZE] {
-        let mut out = [0u8; CHAPTER_DIR_ENTRY_SIZE];
+    pub fn encode(&self) -> [u8; CHAPTER_LAYOUT_DIR_SIZE] {
+        let mut out = [0u8; CHAPTER_LAYOUT_DIR_SIZE];
         w_u16(&mut out, 0, self.chapter_index);
         w_u16(&mut out, 2, self.page_count);
-        w_u32(&mut out, 4, self.breaks_offset);
-        w_u32(&mut out, 8, self._reserved);
+        w_u16(&mut out, 4, self.line_count);
+        w_u16(&mut out, 6, self.flags);
+        w_u32(&mut out, 8, self.pages_offset);
+        w_u32(&mut out, 12, self.lines_offset);
+        w_u32(&mut out, 16, self.byte_size);
+        w_u32(&mut out, 20, self._reserved);
+        out
+    }
+}
+
+// PageRecord byte layout (12 bytes):
+//   0..2   first_line  u16  (index into chapter line table)
+//   2      line_count  u8
+//   3      flags       u8
+//   4..8   start_byte  u32  (chapter-relative)
+//   8..12  end_byte    u32  (chapter-relative)
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageRecord {
+    pub first_line: u16,
+    pub line_count: u8,
+    pub flags: u8,
+    pub start_byte: u32,
+    pub end_byte: u32,
+}
+
+impl PageRecord {
+    pub const EMPTY: Self = Self {
+        first_line: 0,
+        line_count: 0,
+        flags: 0,
+        start_byte: 0,
+        end_byte: 0,
+    };
+
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() < PAGE_RECORD_SIZE {
+            return None;
+        }
+        Some(Self {
+            first_line: r_u16(buf, 0),
+            line_count: buf[2],
+            flags: buf[3],
+            start_byte: r_u32(buf, 4),
+            end_byte: r_u32(buf, 8),
+        })
+    }
+
+    pub fn encode(&self) -> [u8; PAGE_RECORD_SIZE] {
+        let mut out = [0u8; PAGE_RECORD_SIZE];
+        w_u16(&mut out, 0, self.first_line);
+        out[2] = self.line_count;
+        out[3] = self.flags;
+        w_u32(&mut out, 4, self.start_byte);
+        w_u32(&mut out, 8, self.end_byte);
+        out
+    }
+}
+
+// LineRecord byte layout (12 bytes):
+//   0..4   start_byte  u32  (chapter-relative)
+//   4..8   end_byte    u32  (chapter-relative)
+//   8      flags       u8   (mirrors LineSpan flags)
+//   9      indent      u8   (or alt_len for image-origin lines)
+//   10     align       u8
+//   11     extra       u8   (layout-only, e.g. visible soft-hyphen)
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineRecord {
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub flags: u8,
+    pub indent: u8,
+    pub align: u8,
+    pub extra: u8,
+}
+
+impl LineRecord {
+    pub const EMPTY: Self = Self {
+        start_byte: 0,
+        end_byte: 0,
+        flags: 0,
+        indent: 0,
+        align: 0,
+        extra: 0,
+    };
+
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() < LINE_RECORD_SIZE {
+            return None;
+        }
+        Some(Self {
+            start_byte: r_u32(buf, 0),
+            end_byte: r_u32(buf, 4),
+            flags: buf[8],
+            indent: buf[9],
+            align: buf[10],
+            extra: buf[11],
+        })
+    }
+
+    pub fn encode(&self) -> [u8; LINE_RECORD_SIZE] {
+        let mut out = [0u8; LINE_RECORD_SIZE];
+        w_u32(&mut out, 0, self.start_byte);
+        w_u32(&mut out, 4, self.end_byte);
+        out[8] = self.flags;
+        out[9] = self.indent;
+        out[10] = self.align;
+        out[11] = self.extra;
         out
     }
 }
@@ -703,6 +880,12 @@ const _: () = {
     assert!(OFF_BM_FLAGS + 1 + 6 == OFF_PAGES_READ);
     assert!(OFF_PROGRESS_PCT + 1 + 1 == OFF_COVERS_OFFSET);
     assert!(OFF_PAGEIDX_FONT_IDX < HEADER_SIZE);
+
+    // PIDX v2 record sizes
+    assert!(PAGEIDX_HDR_V2_SIZE == 20);
+    assert!(CHAPTER_LAYOUT_DIR_SIZE == 24);
+    assert!(PAGE_RECORD_SIZE == 12);
+    assert!(LINE_RECORD_SIZE == 12);
 };
 
 // ── little-endian helpers ──────────────────────────────────────────
@@ -853,4 +1036,110 @@ pub fn read_recent(sd: &SdStorage) -> Option<Recent> {
 pub fn write_recent(sd: &SdStorage, recent: &Recent) -> crate::error::Result<()> {
     let bytes = recent.encode();
     sd.write_in_plump(RECENT_FILE, &bytes)
+}
+
+// ── host-runnable byte-layout tests ──────────────────────────────────
+//
+// the kernel crate currently can't be host-tested directly because
+// esp-hal is a non-optional dependency and only builds for the
+// riscv target. these tests still document the expected round-trip
+// invariants and become live the moment a host-test target is
+// added; on-device they're inert (cfg(test) is set only by `cargo
+// test`, never on a normal riscv build).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_idx_header_round_trip() {
+        let h = LayoutIdxHeader {
+            format_version: PAGEIDX_FORMAT_VERSION,
+            algo_version: LAYOUT_ALGO_VERSION,
+            font_idx: 3,
+            content_fmt: CONTENT_FMT_LATEST,
+            text_w: 472,
+            line_h: 22,
+            max_lines: 37,
+            flags: 0,
+            total_pages: 0xDEAD_BEEF,
+        };
+        let bytes = h.encode();
+        assert_eq!(&bytes[0..4], &PAGEIDX_MAGIC);
+        assert_eq!(bytes[4], PAGEIDX_FORMAT_VERSION);
+        let back = LayoutIdxHeader::decode(&bytes).unwrap();
+        assert_eq!(back, h);
+    }
+
+    #[test]
+    fn layout_idx_header_rejects_v1() {
+        // v1 bytes have format byte where v2 expects format_version=2;
+        // a v1 header writes font_idx into byte 4 (could be 0..n_fonts),
+        // never 2 in well-formed bundles. simulate a v1 header byte 4=0
+        // and verify v2 decoder rejects it.
+        let mut buf = [0u8; PAGEIDX_HDR_V2_SIZE];
+        buf[0..4].copy_from_slice(&PAGEIDX_MAGIC);
+        buf[4] = 0; // not PAGEIDX_FORMAT_VERSION
+        assert!(LayoutIdxHeader::decode(&buf).is_none());
+    }
+
+    #[test]
+    fn chapter_layout_dir_round_trip() {
+        let d = ChapterLayoutDir {
+            chapter_index: 0x1234,
+            page_count: 0x5678,
+            line_count: 0x9ABC,
+            flags: 0xDEF0,
+            pages_offset: 0x1111_2222,
+            lines_offset: 0x3333_4444,
+            byte_size: 0x5555_6666,
+            _reserved: 0x7777_8888,
+        };
+        let bytes = d.encode();
+        let back = ChapterLayoutDir::decode(&bytes).unwrap();
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn page_record_round_trip() {
+        let p = PageRecord {
+            first_line: 0x1234,
+            line_count: 37,
+            flags: 0xA5,
+            start_byte: 0x1111_2222,
+            end_byte: 0x3333_4444,
+        };
+        let bytes = p.encode();
+        let back = PageRecord::decode(&bytes).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn line_record_round_trip() {
+        let l = LineRecord {
+            start_byte: 0x1111_2222,
+            end_byte: 0x3333_4444,
+            flags: 0x55,
+            indent: 0x66,
+            align: 0x77,
+            extra: 0x88,
+        };
+        let bytes = l.encode();
+        let back = LineRecord::decode(&bytes).unwrap();
+        assert_eq!(back, l);
+    }
+
+    #[test]
+    fn record_sizes_match_constants() {
+        assert_eq!(LayoutIdxHeader::EMPTY_BYTES.len(), PAGEIDX_HDR_V2_SIZE);
+        assert_eq!(ChapterLayoutDir::EMPTY.encode().len(), CHAPTER_LAYOUT_DIR_SIZE);
+        assert_eq!(PageRecord::EMPTY.encode().len(), PAGE_RECORD_SIZE);
+        assert_eq!(LineRecord::EMPTY.encode().len(), LINE_RECORD_SIZE);
+    }
+}
+
+#[cfg(test)]
+impl LayoutIdxHeader {
+    // a zero header for size assertions; not exposed in production code
+    const EMPTY_BYTES: [u8; PAGEIDX_HDR_V2_SIZE] = [0u8; PAGEIDX_HDR_V2_SIZE];
 }

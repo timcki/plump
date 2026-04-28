@@ -1,5 +1,7 @@
 // text wrapping, page navigation, and load/prefetch
 
+use alloc::vec::Vec;
+
 use smol_epub::html_strip::{
     ALIGN_CENTER, ALIGN_JUSTIFY, ALIGN_LEFT, ALIGN_RESET, ALIGN_RIGHT, BOLD_OFF, BOLD_ON, H1_OFF,
     H1_ON, H2_OFF, H2_ON, H3_OFF, H3_ON, H4_OFF, H4_ON, H5_OFF, H5_ON, H6_OFF, H6_ON, HEADING_OFF,
@@ -378,19 +380,34 @@ impl ReaderApp {
 
         plump_kernel::perf_begin!(_pi_t0);
         let ch = self.epub.chapter as usize;
-        let font_idx = self.book_font_size_idx;
+        let spine_len = self.epub.spine.len();
+        let name_hash = self.epub.name_hash;
+        let key = super::layout::LayoutKey::current(
+            self.book_font_size_idx,
+            plump_kernel::kernel::bundle::CONTENT_FMT_LATEST,
+            self.text_w as u16,
+            self.font_line_h,
+            self.max_lines,
+        );
 
-        // try to load a cached page index for this (chapter, font) from
-        // the bundle. only meaningful after FLAG_CORE_READY (load_pageidx
-        // checks FLAG_PAGEIDX_READY internally).
-        if let Some((offsets, count)) = self.epub.load_pageidx(k, ch, font_idx) {
-            self.pg.offsets = offsets;
+        // try to load cached layout for (chapter, key). the loader
+        // rejects v1 PIDX bytes via the format-version byte and
+        // returns None on any mismatch, so old bundles fall through
+        // to greedy compute below.
+        if let Some(loaded) =
+            super::layout::cache::load_layoutidx(k, name_hash, ch, spine_len, &key)
+        {
+            let count = loaded.pages.len().min(MAX_PAGES);
+            for (i, p) in loaded.pages.iter().enumerate().take(count) {
+                self.pg.offsets[i] = p.start_byte;
+            }
             self.pg.total_pages = count.max(1);
             self.pg.fully_indexed = true;
             log::debug!(
-                "chapter pre-indexed from bundle: ch{} {} pages",
+                "chapter pre-indexed from bundle: ch{} {} pages (lines={})",
                 ch,
                 self.pg.total_pages,
+                loaded.lines.len(),
             );
             plump_kernel::perf_event!(
                 "reader",
@@ -435,11 +452,41 @@ impl ReaderApp {
             _pi_t0.elapsed().as_millis()
         );
 
-        // persist to bundle for next warm open. no-op if CORE_READY
-        // isn't set yet (bundle still being built).
-        let pages = self.pg.total_pages;
-        if let Err(e) = self.epub.save_pageidx(k, ch, font_idx, &self.pg.offsets[..pages]) {
-            log::warn!("reader: save_pageidx ch{} failed: {}", ch, e);
+        // build PageLayout records from the greedy page-start offsets and
+        // persist via PIDX v2. lines are left empty until the breaker
+        // lands; the loader handles `line_count == 0` gracefully.
+        let page_count = self.pg.total_pages;
+        let mut pages: Vec<super::layout::PageLayout> = Vec::new();
+        if pages.try_reserve_exact(page_count).is_ok() {
+            for i in 0..page_count {
+                let start = self.pg.offsets[i];
+                let end = if i + 1 < page_count {
+                    self.pg.offsets[i + 1]
+                } else {
+                    total as u32
+                };
+                pages.push(super::layout::PageLayout {
+                    first_line: 0,
+                    line_count: 0,
+                    flags: 0,
+                    start_byte: start,
+                    end_byte: end,
+                });
+            }
+            if let Err(e) = super::layout::cache::save_layoutidx(
+                k,
+                name_hash,
+                ch,
+                spine_len,
+                &key,
+                &pages,
+                &[],
+                total as u32,
+            ) {
+                log::warn!("reader: save_layoutidx ch{} failed: {}", ch, e);
+            }
+        } else {
+            log::warn!("reader: save_layoutidx ch{} OOM allocating page records", ch);
         }
     }
 

@@ -1,5 +1,6 @@
 mod epubs;
 mod images;
+mod layout;
 mod paging;
 
 pub use plump_kernel::util::decode_utf8_char;
@@ -1816,11 +1817,24 @@ impl App<AppId> for ReaderApp {
         self.apply_font_metrics();
         if font_changed {
             self.reset_paging();
-            // invalidate any persisted page index: the saved breaks
-            // are keyed to the old font and would wrap differently now
+            // invalidate any persisted layout: the saved breaks are
+            // keyed to the old font and would wrap differently now.
+            // the new key carries the live text_w / line_h / max_lines
+            // so subsequent saves match.
             if self.is_epub {
-                if let Err(e) = self.epub.invalidate_pageidx(k, self.book_font_size_idx) {
-                    log::warn!("reader: invalidate_pageidx failed: {}", e);
+                let new_key = layout::LayoutKey::current(
+                    self.book_font_size_idx,
+                    plump_kernel::kernel::bundle::CONTENT_FMT_LATEST,
+                    self.text_w as u16,
+                    self.font_line_h,
+                    self.max_lines,
+                );
+                let spine_len = self.epub.spine.len();
+                let name_hash = self.epub.name_hash;
+                if let Err(e) =
+                    layout::cache::invalidate_layoutidx(k, name_hash, spine_len, &new_key)
+                {
+                    log::warn!("reader: invalidate_layoutidx failed: {}", e);
                 }
             }
             if self.is_epub && self.epub.chapters_cached {
