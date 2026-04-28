@@ -18,19 +18,22 @@
 
 // Phase 1 only consumes `LayoutKey`, `PageLayout`, and the cache
 // load/save/invalidate fns. The remaining surface (`LineLayout`,
-// `EMPTY` constants, `LoadedChapter::byte_size`) is consumed by
-// Phase 2+; suppress dead-code warnings until then.
-#![allow(dead_code)]
+// scanner types, `EMPTY` constants, `LoadedChapter::byte_size`)
+// is consumed by Phase 3+; suppress dead-code and unused-import
+// warnings until then.
+#![allow(dead_code, unused_imports)]
 
 pub mod cache;
+pub mod scan;
 
 // stubs, populated in later phases. kept as empty modules so that
-// future commits can land scanner/breaker code without restructuring
-// imports.
-pub mod scan;
+// future commits can land breaker / paginator code without
+// restructuring imports.
 pub mod items;
 pub mod breaker;
 pub mod paginate;
+
+pub use scan::{BlockAlign, BlockState, ImageRef, MarkupScanner, TextStyle, Token};
 
 use plump_kernel::kernel::bundle;
 
