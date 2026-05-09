@@ -13,6 +13,10 @@ use crate::fonts;
 use crate::fonts::bitmap::{self, FIRST_CHAR};
 use crate::kernel::KernelHandle;
 
+use super::layout::pipeline::{LayoutPipeline, StepOutcome, TypesetError};
+use super::layout::scan::MarkupScanner;
+use super::layout::{paginate, LineLayout, PageLayout};
+
 use super::{
     DEFAULT_IMG_H, INDENT_PX, LINES_PER_PAGE, LineSpan, MAX_PAGES, NO_PREFETCH, PAGE_BUF,
     PendingPositionChange, ReaderApp, State, decode_utf8_char,
@@ -390,35 +394,121 @@ impl ReaderApp {
             self.max_lines,
         );
 
-        // try to load cached layout for (chapter, key). the loader
-        // rejects v1 PIDX bytes via the format-version byte and
-        // returns None on any mismatch, so old bundles fall through
-        // to greedy compute below.
+        // 1. cache hit (algo=2 with line records): adopt directly.
         if let Some(loaded) =
             super::layout::cache::load_layoutidx(k, name_hash, ch, spine_len, &key)
         {
-            let count = loaded.pages.len().min(MAX_PAGES);
-            for (i, p) in loaded.pages.iter().enumerate().take(count) {
-                self.pg.offsets[i] = p.start_byte;
+            if !loaded.lines.is_empty() && !loaded.pages.is_empty() {
+                self.adopt_loaded_chapter(loaded);
+                plump_kernel::perf_event!(
+                    "reader",
+                    "preindex src=bundle pages={} lines={} elapsed_ms={}",
+                    self.pg.total_pages,
+                    self.pg.chapter_lines.len(),
+                    _pi_t0.elapsed().as_millis()
+                );
+                return;
             }
-            self.pg.total_pages = count.max(1);
-            self.pg.fully_indexed = true;
-            log::debug!(
-                "chapter pre-indexed from bundle: ch{} {} pages (lines={})",
-                ch,
-                self.pg.total_pages,
-                loaded.lines.len(),
-            );
-            plump_kernel::perf_event!(
-                "reader",
-                "preindex_all_pages src=bundle pages={} elapsed_ms={}",
-                self.pg.total_pages,
-                _pi_t0.elapsed().as_millis()
-            );
-            return;
+            // legacy cache without lines: ignore, fall through to typeset
         }
 
+        // 2. K-P typeset (primary path).
+        self.pg.clear_kp_layout();
+        match self.run_kp_typeset() {
+            Ok(()) => {
+                let _ = self.save_kp_to_pidx(k, &key, ch, spine_len, name_hash);
+                plump_kernel::perf_event!(
+                    "reader",
+                    "preindex src=kp pages={} lines={} elapsed_ms={}",
+                    self.pg.kp_pages.len(),
+                    self.pg.chapter_lines.len(),
+                    _pi_t0.elapsed().as_millis()
+                );
+                return;
+            }
+            Err(e) => {
+                log::warn!("reader: K-P typeset failed ch{}: {:?}; greedy fallback", ch, e);
+            }
+        }
+
+        // 3. greedy fallback (no PIDX save — algo=2 is reserved for K-P).
+        self.greedy_preindex_compute(k);
+        plump_kernel::perf_event!(
+            "reader",
+            "preindex src=greedy pages={} elapsed_ms={}",
+            self.pg.total_pages,
+            _pi_t0.elapsed().as_millis()
+        );
+    }
+
+    /// Adopt a `LoadedChapter` from PIDX into `pg`. Populates K-P
+    /// fields (chapter_lines, kp_pages, image_block_lines) and
+    /// mirrors the page-start offsets into the legacy navigation
+    /// arrays.
+    fn adopt_loaded_chapter(&mut self, loaded: super::layout::cache::LoadedChapter) {
+        let n = loaded.pages.len().min(MAX_PAGES);
+        self.pg.clear_kp_layout();
+        self.pg.kp_pages.extend_from_slice(&loaded.pages[..n]);
+        self.pg.chapter_lines = loaded.lines;
+        // recompute image_block_lines from the line table by counting
+        // consecutive FLAG_IMAGE entries starting at each origin
+        // (an "origin" is the first FLAG_IMAGE line in a run).
+        self.pg.image_block_lines.clear();
+        self.pg.image_block_lines.resize(self.pg.chapter_lines.len(), 0);
+        let mut i = 0;
+        while i < self.pg.chapter_lines.len() {
+            if self.pg.chapter_lines[i].is_image() {
+                let mut block = 1usize;
+                while i + block < self.pg.chapter_lines.len()
+                    && self.pg.chapter_lines[i + block].is_image()
+                    && self.pg.chapter_lines[i + block].start_byte == 0
+                    && self.pg.chapter_lines[i + block].end_byte == 0
+                {
+                    block += 1;
+                }
+                self.pg.image_block_lines[i] = block.min(u8::MAX as usize) as u8;
+                i += block;
+            } else {
+                i += 1;
+            }
+        }
+
+        for i in 0..n {
+            self.pg.offsets[i] = self.pg.kp_pages[i].start_byte;
+        }
+        self.pg.total_pages = n.max(1);
+        self.pg.fully_indexed = true;
+    }
+
+    /// Persist K-P typeset output to the bundle's PIDX section.
+    fn save_kp_to_pidx(
+        &self,
+        k: &mut KernelHandle<'_>,
+        key: &super::layout::LayoutKey,
+        ch: usize,
+        spine_len: usize,
+        name_hash: u32,
+    ) -> crate::error::Result<()> {
+        let total_bytes = self.epub.ch_cache.len() as u32;
+        super::layout::cache::save_layoutidx(
+            k,
+            name_hash,
+            ch,
+            spine_len,
+            key,
+            &self.pg.kp_pages,
+            &self.pg.chapter_lines,
+            total_bytes,
+        )
+    }
+
+    /// Greedy first-fit pre-indexer (used only as fallback when K-P
+    /// fails). Populates `pg.offsets` and `pg.total_pages` so the
+    /// existing per-page wrap path can drive navigation; does NOT
+    /// save to PIDX (that section is reserved for K-P data).
+    fn greedy_preindex_compute(&mut self, k: &mut KernelHandle<'_>) {
         let total = self.epub.ch_cache.len();
+        self.pg.clear_kp_layout();
         self.pg.offsets[0] = 0;
         self.pg.total_pages = 1;
 
@@ -441,62 +531,207 @@ impl ReaderApp {
                 break;
             }
         }
-
         self.pg.fully_indexed = true;
-        log::debug!("chapter pre-indexed: {} pages", self.pg.total_pages);
+    }
+
+    /// Knuth-Plass typeset path: drives `LayoutPipeline` over the
+    /// cached chapter bytes, paginates the resulting line table, and
+    /// publishes both into `pg.chapter_lines` / `pg.kp_pages` /
+    /// `pg.image_block_lines`. On any error, leaves `pg` untouched
+    /// so the caller can fall back to greedy pre-indexing.
+    ///
+    /// Caller invariants: `epub.ch_cache` is populated, `fonts` is
+    /// `Some`, and `text_w`/`font_line_h`/`max_lines` are current.
+    pub(super) fn run_kp_typeset(&mut self) -> Result<(), TypesetError> {
+        plump_kernel::perf_begin!(_kp_t0);
+
+        let Some(fs) = self.fonts.as_ref().copied() else {
+            return Err(TypesetError::EmptyChapter);
+        };
+        if self.epub.ch_cache.is_empty() {
+            return Err(TypesetError::EmptyChapter);
+        }
+
+        let mut pipeline = LayoutPipeline::new();
+        let mut out_lines: Vec<LineLayout> = Vec::new();
+        let mut out_image_blocks: Vec<u8> = Vec::new();
+
+        // Bounded pre-allocation: avoid OOM mid-typeset.
+        let _ = out_lines.try_reserve(64);
+        let _ = out_image_blocks.try_reserve(64);
+
+        let mut scanner = MarkupScanner::new(&self.epub.ch_cache);
+
+        loop {
+            let outcome = pipeline.step(
+                &mut scanner,
+                &fs,
+                self.text_w as u16,
+                self.font_line_h,
+                &mut out_lines,
+                &mut out_image_blocks,
+            )?;
+            if matches!(outcome, StepOutcome::Done) {
+                break;
+            }
+        }
+
+        if out_lines.is_empty() {
+            // chapter contained only markers / whitespace; emit a single
+            // empty page so navigation still works.
+            self.pg.clear_kp_layout();
+            self.pg.kp_pages.push(PageLayout::EMPTY);
+            return Ok(());
+        }
+
+        let mut pages: Vec<PageLayout> = Vec::new();
+        let _ = pages.try_reserve(8);
+        if let Err(e) = paginate::paginate(
+            &out_lines,
+            self.max_lines,
+            &out_image_blocks,
+            &mut pages,
+        ) {
+            log::warn!("reader: paginate failed: {:?}", e);
+            return Err(TypesetError::EmptyChapter);
+        }
+
         plump_kernel::perf_event!(
             "reader",
-            "preindex_all_pages src=compute pages={} ch_bytes={} elapsed_ms={}",
-            self.pg.total_pages,
-            total,
-            _pi_t0.elapsed().as_millis()
+            "preindex.kp paragraphs={} pages={} lines={} fallbacks={} elapsed_ms={}",
+            pipeline.paragraphs,
+            pages.len(),
+            out_lines.len(),
+            pipeline.fallback_count,
+            _kp_t0.elapsed().as_millis()
         );
 
-        // build PageLayout records from the greedy page-start offsets and
-        // persist via PIDX v2. lines are left empty until the breaker
-        // lands; the loader handles `line_count == 0` gracefully.
-        let page_count = self.pg.total_pages;
-        let mut pages: Vec<super::layout::PageLayout> = Vec::new();
-        if pages.try_reserve_exact(page_count).is_ok() {
-            for i in 0..page_count {
-                let start = self.pg.offsets[i];
-                let end = if i + 1 < page_count {
-                    self.pg.offsets[i + 1]
-                } else {
-                    total as u32
-                };
-                pages.push(super::layout::PageLayout {
-                    first_line: 0,
-                    line_count: 0,
-                    flags: 0,
-                    start_byte: start,
-                    end_byte: end,
-                });
-            }
-            if let Err(e) = super::layout::cache::save_layoutidx(
-                k,
-                name_hash,
-                ch,
-                spine_len,
-                &key,
-                &pages,
-                &[],
-                total as u32,
-            ) {
-                log::warn!("reader: save_layoutidx ch{} failed: {}", ch, e);
-            }
-        } else {
-            log::warn!("reader: save_layoutidx ch{} OOM allocating page records", ch);
+        // publish
+        self.pg.chapter_lines = out_lines;
+        self.pg.kp_pages = pages;
+        self.pg.image_block_lines = out_image_blocks;
+
+        // mirror page table into the legacy offsets array so the
+        // restore-position / locate-page-for-offset / progress-bar
+        // helpers keep working without per-call branching. This will
+        // go away with R4 (slim PageState) once everything reads
+        // kp_pages directly.
+        let n = self.pg.kp_pages.len().min(MAX_PAGES);
+        for i in 0..n {
+            self.pg.offsets[i] = self.pg.kp_pages[i].start_byte;
         }
+        self.pg.total_pages = n.max(1);
+        self.pg.fully_indexed = true;
+
+        Ok(())
+    }
+
+    /// Dispatch the page-load between K-P and greedy. Used by NeedPage
+    /// after step 6 wiring lands.
+    pub(super) fn load_page_dispatched(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+    ) -> crate::error::Result<()> {
+        if self.pg.has_kp_layout() && self.pg.page < self.pg.kp_pages.len() {
+            self.load_page_from_kp(k)
+        } else {
+            self.load_and_prefetch(k)
+        }
+    }
+
+    /// K-P-driven page loader. Reads the precomputed `LineLayout`s
+    /// for the current page out of `pg.chapter_lines`, copies the
+    /// chapter byte slice into `pg.buf`, and translates LineLayout
+    /// records into LineSpan records (page-buffer-relative offsets)
+    /// for the unmodified renderer.
+    ///
+    /// Caller invariants: `pg.has_kp_layout()` is true and `pg.page <
+    /// pg.kp_pages.len()`.
+    pub(super) fn load_page_from_kp(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+    ) -> crate::error::Result<()> {
+        plump_kernel::perf_begin!(_lp_t0);
+
+        let page = self.pg.kp_pages[self.pg.page];
+        let first = page.first_line as usize;
+        let count = page.line_count as usize;
+        let start_byte = page.start_byte as usize;
+        let end_byte = page.end_byte as usize;
+        // expand end_byte slightly to include the breakpoint byte itself,
+        // since LineLayout.end_byte is the BREAK position (exclusive).
+        let end_byte = end_byte.max(start_byte);
+
+        // copy chapter bytes for this page into pg.buf for the renderer.
+        // ch_cache is the source of truth; if it was dropped under
+        // memory pressure, fall through to the on-disk bundle read.
+        let n = if !self.epub.ch_cache.is_empty() {
+            let ch_len = self.epub.ch_cache.len();
+            let src_end = end_byte.min(ch_len);
+            let src_start = start_byte.min(src_end);
+            let want = (src_end - src_start).min(PAGE_BUF);
+            self.pg.buf[..want]
+                .copy_from_slice(&self.epub.ch_cache[src_start..src_start + want]);
+            want
+        } else {
+            // ch_cache missing: re-read from bundle. uses the same chapter
+            // base used by the cache-hit path in load_and_prefetch above.
+            let ch = self.epub.chapter as usize;
+            let ch_base = self.epub.chapter_table[ch].0;
+            plump_kernel::kernel::bundle::read_at(
+                k.sd(),
+                self.epub.name_hash,
+                ch_base + start_byte as u32,
+                &mut self.pg.buf,
+            )?
+        };
+        self.pg.buf_len = n;
+
+        // translate LineLayout records into per-page LineSpans.
+        self.pg.line_count = 0;
+        let last = (first + count).min(self.pg.chapter_lines.len());
+        for idx in first..last {
+            if self.pg.line_count >= LINES_PER_PAGE {
+                break;
+            }
+            let ll = self.pg.chapter_lines[idx];
+            let span = linelayout_to_span(&ll, start_byte as u32, n as u32);
+            self.pg.lines[self.pg.line_count] = span;
+            self.pg.line_count += 1;
+        }
+
+        // image height prescan so render-side image decode picks the
+        // right dimensions (the K-P paginator already reserved the
+        // line slots, but the byte-stream image marker still needs
+        // its inline header re-read for actual decode metadata).
+        self.prescan_image_heights(k, n);
+        self.precompute_line_metrics();
+        self.decode_page_images(k);
+
+        // disable greedy prefetch when K-P is driving navigation.
+        self.pg.prefetch_page = NO_PREFETCH;
+        self.pg.prefetch_len = 0;
+
+        plump_kernel::perf_event!(
+            "reader",
+            "load_kp page={} bytes={} lines={} elapsed_ms={}",
+            self.pg.page,
+            n,
+            self.pg.line_count,
+            _lp_t0.elapsed().as_millis()
+        );
+        Ok(())
     }
 
     pub(super) fn scan_to_last_page(
         &mut self,
         k: &mut KernelHandle<'_>,
     ) -> crate::error::Result<()> {
+        // K-P populates fully_indexed in one shot, so the discovery
+        // loop only fires on the greedy fallback path.
         while !self.pg.fully_indexed && self.pg.total_pages < MAX_PAGES {
             self.pg.page = self.pg.total_pages - 1;
-            self.load_and_prefetch(k)?;
+            self.load_page_dispatched(k)?;
             if self.pg.page + 1 < self.pg.total_pages {
                 self.pg.page += 1;
             } else {
@@ -507,7 +742,7 @@ impl ReaderApp {
             self.pg.page = self.pg.total_pages - 1;
         }
         self.pg.prefetch_page = NO_PREFETCH;
-        self.load_and_prefetch(k)
+        self.load_page_dispatched(k)
     }
 
     pub(super) fn page_forward(&mut self) -> bool {
@@ -771,6 +1006,65 @@ pub(super) fn measure_line(
 
 // UTF-8 decoding is provided by plump_kernel::util::decode_utf8_char
 // (re-exported via super::decode_utf8_char)
+
+/// Translate a chapter-relative `LineLayout` (K-P output) into a
+/// page-buffer-relative `LineSpan` (greedy renderer's input). Maps
+/// flag bits across the two encodings and clamps offsets so the
+/// renderer never reads past `pg.buf_len`.
+fn linelayout_to_span(ll: &LineLayout, page_start_byte: u32, buf_len: u32) -> LineSpan {
+    // image lines: filler entries carry start=0/len=0; origin entries
+    // carry path_start/path_len. Both encodings use chapter-relative
+    // bytes; translate to page-buffer-relative the same way.
+    let raw_start = ll.start_byte.saturating_sub(page_start_byte);
+    let raw_len = ll.end_byte.saturating_sub(ll.start_byte);
+    let (start, len) = if ll.is_image() {
+        // image origin: clamp into buf so `&buf[start..start+len]`
+        // stays valid even if the path bytes brush the buf edge.
+        let s = raw_start.min(buf_len) as u16;
+        let l = raw_len.min(buf_len.saturating_sub(s as u32)) as u16;
+        (s, l)
+    } else {
+        let s = raw_start.min(buf_len) as u16;
+        let l = raw_len.min(buf_len.saturating_sub(s as u32)) as u16;
+        (s, l)
+    };
+
+    let mut flags: u8 = 0;
+    if ll.flags & LineLayout::FLAG_BOLD != 0 {
+        flags |= LineSpan::FLAG_BOLD;
+    }
+    if ll.flags & LineLayout::FLAG_ITALIC != 0 {
+        flags |= LineSpan::FLAG_ITALIC;
+    }
+    if ll.flags & LineLayout::FLAG_HEADING != 0 {
+        flags |= LineSpan::FLAG_HEADING;
+        // heading-tier translation: LineLayout uses the same bit pattern
+        // (HLEVEL_H1 etc) so we can copy bits 6-7 verbatim.
+        flags |= ll.flags & LineLayout::HLEVEL_MASK;
+    }
+    if ll.is_image() {
+        flags |= LineSpan::FLAG_IMAGE;
+    }
+    // Map paragraph-end / page-break-before flags into LineSpan's
+    // end-kind field. The renderer consults END_MASK to decide
+    // whether a line may justify (it doesn't justify END_HARD lines).
+    if ll.is_paragraph_end() {
+        flags |= LineSpan::END_HARD;
+    } else {
+        flags |= LineSpan::END_SOFT;
+    }
+
+    // align values are identical between the two types.
+    let align = ll.align;
+
+    LineSpan {
+        start,
+        len,
+        flags,
+        indent: ll.indent,
+        align,
+    }
+}
 
 pub(super) fn trim_trailing_cr(buf: &[u8], start: usize, end: usize) -> usize {
     if end > start && buf[end - 1] == b'\r' {

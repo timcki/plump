@@ -584,7 +584,11 @@ impl ImageEntry {
 
 pub const PAGEIDX_MAGIC: [u8; 4] = *b"PIDX";
 pub const PAGEIDX_FORMAT_VERSION: u8 = 2;
-pub const LAYOUT_ALGO_VERSION: u8 = 1;
+// algo_version 1 = greedy first-fit; 2 = Knuth-Plass.
+// bump only when the runtime typesetter switches; greedy results
+// stamped with the K-P version would be served as if they had been
+// produced by K-P, which would be wrong.
+pub const LAYOUT_ALGO_VERSION: u8 = 2;
 
 pub const PAGEIDX_HDR_V2_SIZE: usize = 20;
 pub const CHAPTER_LAYOUT_DIR_SIZE: usize = 24;
@@ -775,10 +779,13 @@ impl PageRecord {
 // LineRecord byte layout (12 bytes):
 //   0..4   start_byte  u32  (chapter-relative)
 //   4..8   end_byte    u32  (chapter-relative)
-//   8      flags       u8   (mirrors LineSpan flags)
+//   8      flags       u8   (see LineLayout::FLAG_* in src/apps/reader/layout/mod.rs)
 //   9      indent      u8   (or alt_len for image-origin lines)
 //   10     align       u8
-//   11     extra       u8   (layout-only, e.g. visible soft-hyphen)
+//   11     extra       u8   (algo_version >= 2: per-gap stretch/shrink in px;
+//                            bit 7 = sign (1 = shrink, 0 = stretch),
+//                            bits 0-6 = magnitude in px-per-gap, cap 127.
+//                            algo_version == 1: layout-only, e.g. visible soft-hyphen)
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LineRecord {

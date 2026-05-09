@@ -298,6 +298,14 @@ pub(super) struct PageState {
     pub(super) prefetch: Vec<u8>,
     pub(super) prefetch_len: usize,
     pub(super) prefetch_page: usize,
+
+    // ── K-P pipeline (algo_version 2) ──────────────────────────────
+    // populated by `run_kp_typeset()`; when non-empty, NeedPage uses
+    // these instead of the greedy wrap path. Empty for .txt files
+    // and as the steady state before K-P runs / after invalidation.
+    pub(super) chapter_lines: Vec<layout::LineLayout>,
+    pub(super) kp_pages: Vec<layout::PageLayout>,
+    pub(super) image_block_lines: Vec<u8>,
 }
 
 impl PageState {
@@ -315,7 +323,26 @@ impl PageState {
             prefetch: Vec::new(),
             prefetch_len: 0,
             prefetch_page: NO_PREFETCH,
+            chapter_lines: Vec::new(),
+            kp_pages: Vec::new(),
+            image_block_lines: Vec::new(),
         }
+    }
+
+    /// True when the K-P pipeline has populated chapter_lines/kp_pages
+    /// for the current chapter; callers can rely on these to drive
+    /// page navigation and rendering.
+    #[inline]
+    pub(super) fn has_kp_layout(&self) -> bool {
+        !self.kp_pages.is_empty()
+    }
+
+    /// Drop K-P state (e.g. on chapter change or font cycle). Cheap;
+    /// vec capacities are released for reuse by subsequent typeset.
+    pub(super) fn clear_kp_layout(&mut self) {
+        self.chapter_lines.clear();
+        self.kp_pages.clear();
+        self.image_block_lines.clear();
     }
 }
 
@@ -2161,7 +2188,7 @@ impl App<AppId> for ReaderApp {
                 if let Some(target_off) = self.restore_offset.take() {
                     if self.pg.fully_indexed && self.pg.total_pages > 0 {
                         self.pg.page = self.locate_page_for_offset(target_off, page_hint);
-                        if let Err(e) = self.load_and_prefetch(k) {
+                        if let Err(e) = self.load_page_dispatched(k) {
                             plump_kernel::perf_event!(
                                 "reader",
                                 "NeedPage mode=restore_indexed err_kind={:?} err_src={} elapsed_ms={}",
@@ -2175,7 +2202,7 @@ impl App<AppId> for ReaderApp {
                     } else {
                         self.pg.page = 0;
                         loop {
-                            match self.load_and_prefetch(k) {
+                            match self.load_page_dispatched(k) {
                                 Ok(()) => {}
                                 Err(e) => {
                                     plump_kernel::perf_event!(
@@ -2209,7 +2236,7 @@ impl App<AppId> for ReaderApp {
                         );
                     }
                 } else {
-                    match self.load_and_prefetch(k) {
+                    match self.load_page_dispatched(k) {
                         Ok(()) => {
                             self.finish_ready_transition(ctx);
                             plump_kernel::perf_event!(

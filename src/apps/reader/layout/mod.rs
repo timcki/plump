@@ -26,12 +26,10 @@
 pub mod cache;
 pub mod scan;
 
-// stubs, populated in later phases. kept as empty modules so that
-// future commits can land breaker / paginator code without
-// restructuring imports.
 pub mod items;
 pub mod breaker;
 pub mod paginate;
+pub mod pipeline;
 
 pub use scan::{BlockAlign, BlockState, ImageRef, MarkupScanner, TextStyle, Token};
 
@@ -147,6 +145,22 @@ impl PageLayout {
 }
 
 /// in-RAM mirror of `bundle::LineRecord`.
+///
+/// `flags` byte layout (defined for algo_version >= 2):
+///   bit 0    FLAG_BOLD
+///   bit 1    FLAG_ITALIC
+///   bit 2    FLAG_HEADING
+///   bit 3    FLAG_IMAGE
+///   bit 4    FLAG_PAGE_BREAK_BEFORE  (was LineSpan END_HARD slot)
+///   bit 5    FLAG_PARAGRAPH_END      (was LineSpan END_SOFT slot)
+///   bits 6-7 HLEVEL_MASK             (only meaningful when FLAG_HEADING set)
+///
+/// `extra` byte layout (algo_version >= 2): per-gap justification spare in px.
+///   bit 7    sign (1 = shrink, 0 = stretch)
+///   bits 0-6 magnitude in px-per-gap (cap 127)
+///
+/// `align` values mirror `LineSpan::ALIGN_*`: 0 = default (honor user setting),
+/// 1 = left, 2 = center, 3 = right.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LineLayout {
     pub start_byte: u32,
@@ -166,6 +180,53 @@ impl LineLayout {
         align: 0,
         extra: 0,
     };
+
+    // style + structural flags (bits 0-5)
+    pub const FLAG_BOLD: u8 = 1 << 0;
+    pub const FLAG_ITALIC: u8 = 1 << 1;
+    pub const FLAG_HEADING: u8 = 1 << 2;
+    pub const FLAG_IMAGE: u8 = 1 << 3;
+    pub const FLAG_PAGE_BREAK_BEFORE: u8 = 1 << 4;
+    pub const FLAG_PARAGRAPH_END: u8 = 1 << 5;
+
+    // heading level (bits 6-7); only meaningful when FLAG_HEADING is set.
+    // values mirror the LineSpan tier ordering so renderer logic ports across.
+    pub const HLEVEL_SHIFT: u8 = 6;
+    pub const HLEVEL_MASK: u8 = 0b11 << Self::HLEVEL_SHIFT;
+    pub const HLEVEL_H3: u8 = 0 << Self::HLEVEL_SHIFT;
+    pub const HLEVEL_H2: u8 = 1 << Self::HLEVEL_SHIFT;
+    pub const HLEVEL_H1: u8 = 2 << Self::HLEVEL_SHIFT;
+
+    // align mirrors LineSpan; kept independent so this module compiles
+    // without depending on the renderer-side type.
+    pub const ALIGN_DEFAULT: u8 = 0;
+    pub const ALIGN_LEFT: u8 = 1;
+    pub const ALIGN_CENTER: u8 = 2;
+    pub const ALIGN_RIGHT: u8 = 3;
+
+    // extra byte sign bit; magnitude is bits 0..6.
+    pub const EXTRA_SIGN_SHRINK: u8 = 1 << 7;
+    pub const EXTRA_MAG_MASK: u8 = 0x7F;
+
+    #[inline]
+    pub fn is_image(&self) -> bool { self.flags & Self::FLAG_IMAGE != 0 }
+    #[inline]
+    pub fn is_paragraph_end(&self) -> bool { self.flags & Self::FLAG_PARAGRAPH_END != 0 }
+    #[inline]
+    pub fn is_page_break_before(&self) -> bool {
+        self.flags & Self::FLAG_PAGE_BREAK_BEFORE != 0
+    }
+    #[inline]
+    pub fn is_heading(&self) -> bool { self.flags & Self::FLAG_HEADING != 0 }
+    #[inline]
+    pub fn hlevel(&self) -> u8 { self.flags & Self::HLEVEL_MASK }
+
+    /// True when the renderer is allowed to distribute extra-byte spare
+    /// across inter-word gaps for justification.
+    #[inline]
+    pub fn may_justify(&self) -> bool {
+        !self.is_paragraph_end() && !self.is_heading() && !self.is_image()
+    }
 
     pub fn to_record(&self) -> bundle::LineRecord {
         bundle::LineRecord {

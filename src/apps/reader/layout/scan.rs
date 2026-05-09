@@ -145,6 +145,20 @@ impl<'a> MarkupScanner<'a> {
         self.buf.len() as u32
     }
 
+    /// the raw chapter byte slice the scanner was constructed with;
+    /// callers index into this by the absolute byte offsets carried
+    /// in `Token::Word { start, end }` etc.
+    #[inline]
+    pub fn buffer(&self) -> &'a [u8] {
+        self.buf
+    }
+
+    /// `true` once the scanner has reached the end of its buffer.
+    #[inline]
+    pub fn is_eof(&self) -> bool {
+        self.pos >= self.buf.len()
+    }
+
     #[inline]
     pub fn text_style(&self) -> TextStyle {
         self.style
