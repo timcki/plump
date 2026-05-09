@@ -1,27 +1,31 @@
 //! Reader layout: paragraph-level (Knuth-Plass) line breaking with
 //! a chapter-level cached page/line index.
 //!
-//! Phase 1 (this commit) lays the groundwork:
+//! Module map:
 //!   - byte-layout records live in `plump_kernel::kernel::bundle`
 //!     (`LayoutIdxHeader`, `ChapterLayoutDir`, `PageRecord`,
-//!     `LineRecord`).
-//!   - this module owns the in-RAM mirrors (`PageLayout`,
-//!     `LineLayout`), the cache key (`LayoutKey`), and the on-disk
-//!     load/save/invalidate glue (`cache`).
-//!   - `scan` / `items` / `breaker` / `paginate` are stubs filled
-//!     in by later phases.
+//!     `LineRecord`); this module owns the in-RAM mirrors.
+//!   - `scan`     — markup tokenizer over the html-stripped chapter
+//!                  byte stream
+//!   - `items`    — converts a `Token` stream into K-P items
+//!                  (paragraph-scoped)
+//!   - `breaker`  — bounded-DP K-P paragraph breaker
+//!   - `paginate` — page builder + `convert::*` adapters that pack
+//!                  break choices into `LineLayout`
+//!   - `pipeline` — `LayoutPipeline` RAII: drives scanner -> items
+//!                  -> breaker -> paginate per paragraph
+//!   - `cache`    — PIDX v2 load / save / invalidate
 //!
-//! Until later phases land, `paging.rs` keeps using the greedy
-//! `wrap_proportional` wrapper. The cache round-trips through the
-//! new format with empty line records, so font-cycle invalidation
-//! and warm page-offset reuse continue to work bit-for-bit.
+//! `paging.rs::preindex_all_pages` is the reader-side entry point;
+//! it tries the PIDX cache first, runs the K-P pipeline on miss,
+//! and falls back to a greedy first-fit only when the breaker
+//! rejects an input outright.
 
-// Phase 1 only consumes `LayoutKey`, `PageLayout`, and the cache
-// load/save/invalidate fns. The remaining surface (`LineLayout`,
-// scanner types, `EMPTY` constants, `LoadedChapter::byte_size`)
-// is consumed by Phase 3+; suppress dead-code and unused-import
-// warnings until then.
-#![allow(dead_code, unused_imports)]
+// `LineLayout::EMPTY`, several scanner accessors, and a few
+// fitness/flag accessors are exercised by host-test infrastructure
+// that doesn't compile on the device target — silence dead-code
+// warnings here rather than peppering individual `#[allow]`s.
+#![allow(dead_code)]
 
 pub mod cache;
 pub mod scan;
@@ -31,7 +35,8 @@ pub mod breaker;
 pub mod paginate;
 pub mod pipeline;
 
-pub use scan::{BlockAlign, BlockState, ImageRef, MarkupScanner, TextStyle, Token};
+// scanner types are re-exported through their submodules; callers
+// import via `super::scan::*` to make the data-flow chain visible.
 
 use plump_kernel::kernel::bundle;
 

@@ -17,7 +17,7 @@
 
 use alloc::vec::Vec;
 
-use super::items::{Item, ItemKind, ParagraphEnd, ParagraphMeta};
+use super::items::{Item, ItemKind, ParagraphMeta};
 use super::scan::BlockAlign;
 use super::{LineLayout, PageLayout};
 
