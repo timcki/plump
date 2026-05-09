@@ -19,14 +19,14 @@ const IMG_W: usize = SCREEN_W as usize; // 480
 const IMG_H: usize = SCREEN_H as usize; // 800
 
 /// Bytes per row in the 2bpp packed output.
-const OUT_STRIDE: usize = IMG_W / 4; // 120
+const OUT_STRIDE: usize = IMG_W.div_ceil(4); // 120
 
 /// Number of chunks to split the image into.
 /// Each chunk is ~16KB, fitting comfortably in either heap pool.
 pub const CHUNK_COUNT: usize = 6;
 
 /// Rows per chunk (last chunk may have fewer).
-const ROWS_PER_CHUNK: usize = (IMG_H + CHUNK_COUNT - 1) / CHUNK_COUNT; // 134
+const ROWS_PER_CHUNK: usize = IMG_H.div_ceil(CHUNK_COUNT); // 134
 
 /// Target cap for a temporary batched SD read buffer.
 /// This stays on the heap so we don't eat into the ~11KB stack margin.
@@ -85,6 +85,18 @@ const BMP_HEADER_SIZE: usize = 54;
 /// Max palette entries we support (8-bit indexed).
 const MAX_PALETTE: usize = 256;
 
+/// Convert a BGRA palette slice (`count` × 4 bytes) into a luminance LUT.
+/// Uses Rec.601 weights scaled by 256: 77*R + 150*G + 29*B.
+fn fill_palette_lum(bgra: &[u8], count: usize, dst: &mut [u8; MAX_PALETTE]) {
+    for i in 0..count {
+        let off = i * 4;
+        let b = bgra[off] as u32;
+        let g = bgra[off + 1] as u32;
+        let r = bgra[off + 2] as u32;
+        dst[i] = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
+    }
+}
+
 /// Read and parse the BMP header. Returns (pixel_data_offset, bits_per_pixel, palette_lum).
 /// `palette_lum` maps each palette index → luminance 0..255 (empty for non-paletted).
 fn parse_header(sd: &SdStorage) -> Option<(u32, u16, [u8; MAX_PALETTE])> {
@@ -124,39 +136,25 @@ fn parse_header(sd: &SdStorage) -> Option<(u32, u16, [u8; MAX_PALETTE])> {
         return None;
     }
 
-    if bpp != 1 && bpp != 8 && bpp != 24 {
-        info!("sleep_image: unsupported bit depth {}", bpp);
-        return None;
-    }
+    // palette entry counts per supported bit depth
+    let palette_entries = match bpp {
+        1 => 2,
+        8 => MAX_PALETTE,
+        24 => 0,
+        _ => {
+            info!("sleep_image: unsupported bit depth {}", bpp);
+            return None;
+        }
+    };
 
-    // build palette luminance LUT
     let mut palette_lum = [0u8; MAX_PALETTE];
-    if bpp == 8 {
-        let palette_start = BMP_HEADER_SIZE;
-        if n < palette_start + MAX_PALETTE * 4 {
-            info!("sleep_image: truncated palette");
+    if palette_entries > 0 {
+        let needed = BMP_HEADER_SIZE + palette_entries * 4;
+        if n < needed {
+            info!("sleep_image: truncated palette ({}bpp)", bpp);
             return None;
         }
-        for i in 0..MAX_PALETTE {
-            let off = palette_start + i * 4;
-            let b = buf[off] as u32;
-            let g = buf[off + 1] as u32;
-            let r = buf[off + 2] as u32;
-            palette_lum[i] = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
-        }
-    } else if bpp == 1 {
-        let palette_start = BMP_HEADER_SIZE;
-        if n < palette_start + 2 * 4 {
-            info!("sleep_image: truncated 1-bit palette");
-            return None;
-        }
-        for i in 0..2 {
-            let off = palette_start + i * 4;
-            let b = buf[off] as u32;
-            let g = buf[off + 1] as u32;
-            let r = buf[off + 2] as u32;
-            palette_lum[i] = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
-        }
+        fill_palette_lum(&buf[BMP_HEADER_SIZE..needed], palette_entries, &mut palette_lum);
     }
 
     Some((pixel_offset, bpp, palette_lum))
@@ -164,10 +162,11 @@ fn parse_header(sd: &SdStorage) -> Option<(u32, u16, [u8; MAX_PALETTE])> {
 
 #[inline]
 fn bmp_row_stride(bpp: u16) -> Option<usize> {
+    // BMP rows are padded to a 4-byte boundary
     match bpp {
-        8 => Some(IMG_W),
-        24 => Some((IMG_W * 3 + 3) & !3),
-        1 => Some(((IMG_W + 31) / 32) * 4),
+        8 => Some(IMG_W.next_multiple_of(4)),
+        24 => Some((IMG_W * 3).next_multiple_of(4)),
+        1 => Some(IMG_W.div_ceil(8).next_multiple_of(4)),
         _ => None,
     }
 }
@@ -247,8 +246,7 @@ fn decode_row_lum(
             true
         }
         1 => {
-            let min_len = (IMG_W + 7) / 8;
-            if row.len() < min_len {
+            if row.len() < IMG_W.div_ceil(8) {
                 return false;
             }
             for x in 0..IMG_W {
@@ -279,16 +277,16 @@ pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
     );
 
     // allocate 6 output chunks (~16KB each, fits in either heap pool).
-    // short-circuits on first alloc failure; partial array is dropped so
-    // already-allocated chunks are freed before returning None.
-    let mut chunks: [Vec<u8>; CHUNK_COUNT] = (0..CHUNK_COUNT)
-        .map(|i| try_alloc_zeroed(chunk_rows_for(i) * OUT_STRIDE))
-        .collect::<Option<Vec<_>>>()
-        .and_then(|v| <[Vec<u8>; CHUNK_COUNT]>::try_from(v).ok())
-        .or_else(|| {
+    // short-circuits on first alloc failure; previously-filled chunks are
+    // dropped via the array's Drop when we return None.
+    let mut chunks: [Vec<u8>; CHUNK_COUNT] = core::array::from_fn(|_| Vec::new());
+    for (i, slot) in chunks.iter_mut().enumerate() {
+        let Some(buf) = try_alloc_zeroed(chunk_rows_for(i) * OUT_STRIDE) else {
             warn!("sleep_image: chunk alloc failed, falling back to text sleep screen");
-            None
-        })?;
+            return None;
+        };
+        *slot = buf;
+    }
 
     // allocate the temporary read buffer after the output chunks so the
     // permanent image storage gets first pick of the heap; if this extra
@@ -306,6 +304,8 @@ pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
     // We process BMP rows bottom-up (row 799..0 in BMP order) and write
     // output top-down (output row 0 = BMP row 799).
     let mut err: [[i16; IMG_W]; 3] = [[0i16; IMG_W]; 3];
+    // reused across all rows; decode_row_lum overwrites every position
+    let mut lum = [0i16; IMG_W];
     let mut cur = 0usize;
     let mut out_y = 0usize;
 
@@ -341,7 +341,6 @@ pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
             let bmp_row = first_bmp_row + batch_row;
             let row = &read_batch[batch_row * row_stride..(batch_row + 1) * row_stride];
 
-            let mut lum = [0i16; IMG_W];
             if !decode_row_lum(row, bpp, &palette_lum, &mut lum) {
                 info!("sleep_image: decode error at row {}", bmp_row);
                 return None;
