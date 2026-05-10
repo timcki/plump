@@ -1,14 +1,17 @@
 // settings app UI; configuration types live in kernel::config
 //
-// settings items (8 total):
-//   0: Sleep After    – power management
-//   1: Ghost Clear    – e-paper refresh interval
-//   2: Book Font      – reading font size
-//   3: UI Font        – chrome font size
-//   4: Reading Theme  – Compact / Default / Relaxed / Spacious
-//   5: Swap Buttons   – swap Back/OK with Left/Right for left-handed use
-//   6: Sunlight Fix   – power off analog after partial refresh (prevents fading)
-//   7: Text AA        – antialiased text via 4-level grayscale LUT
+// settings items (11 total):
+//   0: Sleep After    : power management
+//   1: Ghost Clear    : e-paper refresh interval
+//   2: Book Font      : reading font size
+//   3: Reader Font    : Bookerly / Atkinson Hyperlegible
+//   4: UI Font        : chrome font size
+//   5: Reading Theme  : Compact / Default / Relaxed / Spacious
+//   6: Swap Buttons   : swap Back/OK with Left/Right for left-handed use
+//   7: Sunlight Fix   : power off analog after partial refresh (prevents fading)
+//   8: Text AA        : antialiased text via 4-level grayscale LUT
+//   9: Reader Status  : show book title + page info bar
+//  10: Text Align     : Left or Justify
 
 use core::fmt::Write as _;
 
@@ -21,7 +24,7 @@ use crate::fonts;
 use crate::fonts::max_size_idx;
 use crate::kernel::KernelHandle;
 use crate::kernel::config::{
-    self, GHOST_CLEAR_STEP, MAX_GHOST_CLEAR, MAX_SLEEP_TIMEOUT, MIN_GHOST_CLEAR,
+    self, GHOST_CLEAR_STEP, MAX_GHOST_CLEAR, MAX_SLEEP_TIMEOUT, MIN_GHOST_CLEAR, NUM_READER_FONTS,
     NUM_READING_THEMES, NUM_TEXT_ALIGNMENTS, SLEEP_TIMEOUT_STEP, SystemSettings, WifiConfig,
 };
 use crate::ui::{
@@ -40,7 +43,7 @@ const COL_GAP: u16 = 8;
 const VALUE_X: u16 = LABEL_X + LABEL_W + COL_GAP;
 const VALUE_W: u16 = FULL_CONTENT_W - LABEL_W - COL_GAP;
 
-const NUM_ITEMS: usize = 10;
+const NUM_ITEMS: usize = 11;
 const HEADING_ITEMS_GAP: u16 = SECTION_GAP;
 
 impl Default for SettingsApp {
@@ -163,13 +166,14 @@ impl SettingsApp {
             0 => "Sleep After",
             1 => "Ghost Clear",
             2 => "Book Font",
-            3 => "UI Font",
-            4 => "Theme",
-            5 => "Swap Buttons",
-            6 => "Sunlight Fix",
-            7 => "Text AA",
-            8 => "Reader Status",
-            9 => "Text Align",
+            3 => "Reader Font",
+            4 => "UI Font",
+            5 => "Theme",
+            6 => "Swap Buttons",
+            7 => "Sunlight Fix",
+            8 => "Text AA",
+            9 => "Reader Status",
+            10 => "Text Align",
             _ => "",
         }
     }
@@ -195,17 +199,22 @@ impl SettingsApp {
                 );
             }
             3 => {
+                let idx = (self.settings.reader_font as usize)
+                    .min(fonts::READER_FONT_NAMES.len() - 1);
+                let _ = write!(buf, "{}", fonts::READER_FONT_NAMES[idx]);
+            }
+            4 => {
                 let _ = write!(
                     buf,
                     "{}",
                     fonts::font_size_name(self.settings.ui_font_size_idx)
                 );
             }
-            4 => {
+            5 => {
                 let theme = self.settings.reading_theme();
                 let _ = write!(buf, "{}", theme.name);
             }
-            5 => {
+            6 => {
                 let _ = write!(
                     buf,
                     "{}",
@@ -216,7 +225,7 @@ impl SettingsApp {
                     }
                 );
             }
-            6 => {
+            7 => {
                 let _ = write!(
                     buf,
                     "{}",
@@ -227,10 +236,10 @@ impl SettingsApp {
                     }
                 );
             }
-            7 => {
+            8 => {
                 let _ = write!(buf, "{}", if self.settings.text_aa { "On" } else { "Off" });
             }
-            8 => {
+            9 => {
                 let _ = write!(
                     buf,
                     "{}",
@@ -241,7 +250,7 @@ impl SettingsApp {
                     }
                 );
             }
-            9 => {
+            10 => {
                 let _ = write!(buf, "{}", self.settings.text_alignment_name());
             }
             _ => {}
@@ -272,28 +281,33 @@ impl SettingsApp {
                 }
             }
             3 => {
+                if self.settings.reader_font < NUM_READER_FONTS - 1 {
+                    self.settings.reader_font += 1;
+                }
+            }
+            4 => {
                 if self.settings.ui_font_size_idx < max_size_idx() {
                     self.settings.ui_font_size_idx += 1;
                 }
             }
-            4 => {
+            5 => {
                 if self.settings.reading_theme < NUM_READING_THEMES - 1 {
                     self.settings.reading_theme += 1;
                 }
             }
-            5 => {
+            6 => {
                 self.settings.swap_buttons = !self.settings.swap_buttons;
             }
-            6 => {
+            7 => {
                 self.settings.sunlight_fix = !self.settings.sunlight_fix;
             }
-            7 => {
+            8 => {
                 self.settings.text_aa = !self.settings.text_aa;
             }
-            8 => {
+            9 => {
                 self.settings.reader_status = !self.settings.reader_status;
             }
-            9 => {
+            10 => {
                 if self.settings.text_alignment < NUM_TEXT_ALIGNMENTS - 1 {
                     self.settings.text_alignment += 1;
                 }
@@ -324,28 +338,33 @@ impl SettingsApp {
                 }
             }
             3 => {
+                if self.settings.reader_font > 0 {
+                    self.settings.reader_font -= 1;
+                }
+            }
+            4 => {
                 if self.settings.ui_font_size_idx > 0 {
                     self.settings.ui_font_size_idx -= 1;
                 }
             }
-            4 => {
+            5 => {
                 if self.settings.reading_theme > 0 {
                     self.settings.reading_theme -= 1;
                 }
             }
-            5 => {
+            6 => {
                 self.settings.swap_buttons = !self.settings.swap_buttons;
             }
-            6 => {
+            7 => {
                 self.settings.sunlight_fix = !self.settings.sunlight_fix;
             }
-            7 => {
+            8 => {
                 self.settings.text_aa = !self.settings.text_aa;
             }
-            8 => {
+            9 => {
                 self.settings.reader_status = !self.settings.reader_status;
             }
-            9 => {
+            10 => {
                 if self.settings.text_alignment > 0 {
                     self.settings.text_alignment -= 1;
                 }

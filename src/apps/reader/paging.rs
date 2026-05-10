@@ -388,6 +388,7 @@ impl ReaderApp {
         let name_hash = self.epub.name_hash;
         let key = super::layout::LayoutKey::current(
             self.book_font_size_idx,
+            self.reader_font.to_idx(),
             plump_kernel::kernel::bundle::CONTENT_FMT_LATEST,
             self.text_w as u16,
             self.font_line_h,

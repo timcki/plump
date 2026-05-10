@@ -26,6 +26,7 @@ use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::{GrayMode, StripBuffer};
 use crate::error::{Error, ErrorKind};
 use crate::fonts;
+use crate::fonts::ReaderFont;
 use crate::kernel::KernelHandle;
 use crate::kernel::QuickAction;
 use crate::kernel::bookmarks;
@@ -531,6 +532,8 @@ pub struct ReaderApp {
 
     pub(super) book_font_size_idx: u8,
     pub(super) applied_font_idx: u8,
+    pub(super) reader_font: ReaderFont,
+    pub(super) applied_reader_font: ReaderFont,
 
     pub(super) chrome_font: Option<&'static BitmapFont>,
     pub(super) qa_buf: [QuickAction; QA_MAX],
@@ -595,6 +598,8 @@ impl ReaderApp {
 
             book_font_size_idx: 0,
             applied_font_idx: 0,
+            reader_font: ReaderFont::Bookerly,
+            applied_reader_font: ReaderFont::Bookerly,
 
             chrome_font: None,
 
@@ -613,6 +618,12 @@ impl ReaderApp {
     // 0 = XSmall, 1 = Small, 2 = Medium, 3 = Large, 4 = XLarge
     pub fn set_book_font_size(&mut self, idx: u8) {
         self.book_font_size_idx = idx;
+        self.apply_font_metrics();
+        self.rebuild_quick_actions();
+    }
+
+    pub fn set_reader_font(&mut self, font: ReaderFont) {
+        self.reader_font = font;
         self.apply_font_metrics();
         self.rebuild_quick_actions();
     }
@@ -739,7 +750,10 @@ impl ReaderApp {
         }
 
         let title = self.loading_title();
-        let stage_font = fonts::body_font(1);
+        // stage label is chrome — always Inter
+        let stage_font = fonts::ui_body_font(1);
+        // book title uses the reader font so it matches the body
+        let reader_family = self.reader_font.family();
         let (stage, pct) = self.loading_visual();
 
         let content = self.loading_visual_region();
@@ -748,9 +762,9 @@ impl ReaderApp {
         if let Some(img) = self.loading_cover.as_ref() {
             let title_font = title.map(|title| {
                 if title.len() > 28 {
-                    fonts::heading_font(2)
+                    fonts::heading_font(reader_family, 2)
                 } else {
-                    fonts::heading_font(3)
+                    fonts::heading_font(reader_family, 3)
                 }
             });
             let title_h = title_font.map_or(0, |font| font.line_height);
@@ -815,9 +829,9 @@ impl ReaderApp {
 
         if let Some(title) = title {
             let title_font = if title.len() > 28 {
-                fonts::heading_font(2)
+                fonts::heading_font(reader_family, 2)
             } else {
-                fonts::heading_font(3)
+                fonts::heading_font(reader_family, 3)
             };
             let title_y = content.y + content.h / 3;
             let title_region = Region::new(content.x, title_y, content.w, title_font.line_height);
@@ -852,7 +866,8 @@ impl ReaderApp {
             );
             ProgressBar::new(bar_region, pct).draw(strip);
         } else {
-            let heading_font = fonts::heading_font(2);
+            // no title — purely chrome, use Inter
+            let heading_font = fonts::ui_heading_font(2);
             let stage_y = content.y + content.h / 3 + 6;
             let stage_region = Region::new(content.x, stage_y, content.w, heading_font.line_height);
             let bar_region = Region::new(
@@ -1206,8 +1221,8 @@ impl ReaderApp {
         let theme = crate::kernel::config::ReadingTheme::from_idx(self.reading_theme_idx);
         let spacing_pct = theme.line_spacing_pct;
 
-        if fonts::font_data::HAS_REGULAR {
-            let fs = fonts::FontSet::for_size(self.book_font_size_idx);
+        if self.reader_font.family().has_regular() {
+            let fs = fonts::FontSet::for_reader(self.reader_font, self.book_font_size_idx);
             let native_h = fs.line_height(fonts::Style::Regular).max(1);
             // apply line spacing: scale native line height by theme percentage
             self.font_line_h = ((native_h as u32 * spacing_pct as u32) / 100).max(1) as u16;
@@ -1215,7 +1230,8 @@ impl ReaderApp {
             self.max_lines =
                 ((self.text_area_h / self.font_line_h) as usize).min(LINES_PER_PAGE) as u8;
             log::debug!(
-                "font: size_idx={} line_h={} (native {} x {}%) ascent={} max_lines={} margin={}",
+                "font: family={} size_idx={} line_h={} (native {} x {}%) ascent={} max_lines={} margin={}",
+                self.reader_font.name(),
                 self.book_font_size_idx,
                 self.font_line_h,
                 native_h,
@@ -1227,6 +1243,7 @@ impl ReaderApp {
             self.fonts = Some(fs);
         }
         self.applied_font_idx = self.book_font_size_idx;
+        self.applied_reader_font = self.reader_font;
     }
 
     fn name(&self) -> &str {
@@ -1840,7 +1857,8 @@ impl App<AppId> for ReaderApp {
         // re-derive text area geometry from the (possibly changed) theme
         self.apply_theme_layout();
 
-        let font_changed = self.book_font_size_idx != self.applied_font_idx;
+        let font_changed = self.book_font_size_idx != self.applied_font_idx
+            || self.reader_font != self.applied_reader_font;
         self.apply_font_metrics();
         if font_changed {
             self.reset_paging();
@@ -1851,6 +1869,7 @@ impl App<AppId> for ReaderApp {
             if self.is_epub {
                 let new_key = layout::LayoutKey::current(
                     self.book_font_size_idx,
+                    self.reader_font.to_idx(),
                     plump_kernel::kernel::bundle::CONTENT_FMT_LATEST,
                     self.text_w as u16,
                     self.font_line_h,
@@ -2733,7 +2752,8 @@ impl App<AppId> for ReaderApp {
             let tx = self.text_margin as i32;
             let ty = self.text_y as i32;
             if self.fonts.is_some() {
-                let font = fonts::body_font(self.book_font_size_idx);
+                // ToC entries are book content, so they follow the reader font
+                let font = fonts::body_font(self.reader_font.family(), self.book_font_size_idx);
                 let line_h = font.line_height as i32;
                 let ascent = font.ascent as i32;
                 let vis_max = (self.text_area_h / font.line_height) as usize;

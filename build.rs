@@ -55,8 +55,14 @@ fn linker_be_nice() {
     );
 }
 
-// build-time font rasterisation: scan assets/fonts/ for TTFs, classify
-// by weight/style, rasterise to 2-bit (4-level) bitmaps, emit font_data.rs.
+// build-time font rasterisation: scan assets/fonts/<Family>/ for TTFs,
+// classify by weight/style, rasterise to 2-bit (4-level) bitmaps, emit
+// font_data.rs.
+//
+// per-family subdirectories (e.g. assets/fonts/Bookerly/, .../Atkinson/,
+// .../Inter/). filename matching is hyphen-token strict so Inter's many
+// weight variants (SemiBold, ExtraBold, Black, ...) don't collide with
+// the canonical Bold/Italic.
 //
 // five size tiers: XSmall / Small / Medium / Large / XLarge
 // two glyph sets per font:
@@ -70,6 +76,15 @@ fn linker_be_nice() {
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+// font families to rasterise. tuple is (constant prefix, subdirectory).
+// Bookerly + Atkinson supply reader fonts (selectable); Inter supplies
+// every UI surface (chrome, menus, status bars, button labels).
+const FAMILIES: &[(&str, &str)] = &[
+    ("BOOKERLY", "Bookerly"),
+    ("ATKINSON", "Atkinson"),
+    ("INTER", "Inter"),
+];
 
 // body sizes (px): 0=XSmall 1=Small 2=Medium 3=Large 4=XLarge
 const BODY_PX: [(f32, &str); 5] = [
@@ -266,7 +281,7 @@ fn extended_codepoints() -> Vec<u32> {
 
 // find first .ttf in dir whose name contains all keywords (case-insensitive);
 // excludes BoldItalic unless explicitly requested
-fn find_ttf(dir: &Path, keywords: &[&str]) -> Option<PathBuf> {
+fn find_ttf(dir: &Path, keyword: &str) -> Option<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return None;
     };
@@ -281,29 +296,17 @@ fn find_ttf(dir: &Path, keywords: &[&str]) -> Option<PathBuf> {
         .collect();
     candidates.sort();
 
+    // require the keyword to appear as the LAST hyphen-delimited token
+    // in the file stem. this avoids matching SemiBold / ExtraBold /
+    // BoldItalic when looking for just "Bold" — important for Inter,
+    // which ships ~9 weight variants.
     for path in &candidates {
-        let stem = path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_lowercase();
-
-        let all_match = keywords.iter().all(|kw| stem.contains(&kw.to_lowercase()));
-        if !all_match {
-            continue;
-        }
-
-        // reject BoldItalic when looking for just Bold or just Italic
-        if keywords.len() == 1 {
-            if keywords[0].eq_ignore_ascii_case("Bold") && stem.contains("italic") {
-                continue;
-            }
-            if keywords[0].eq_ignore_ascii_case("Italic") && stem.contains("bold") {
-                continue;
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        if let Some(last) = stem.rsplit('-').next() {
+            if last.eq_ignore_ascii_case(keyword) {
+                return Some(path.clone());
             }
         }
-
-        return Some(path.clone());
     }
     None
 }
@@ -313,23 +316,7 @@ fn generate_bitmap_fonts() {
     let dest = Path::new(&out_dir).join("font_data.rs");
     let mut out = fs::File::create(&dest).unwrap();
 
-    let font_dir = Path::new("assets/fonts");
-
-    // discover TTFs and classify by style
-    let regular = find_ttf(font_dir, &["Regular"]);
-    let bold = find_ttf(font_dir, &["Bold"]);
-    let italic = find_ttf(font_dir, &["Italic"]);
-
-    // re-run build if any TTF changes
-    if let Some(ref p) = regular {
-        println!("cargo:rerun-if-changed={}", p.display());
-    }
-    if let Some(ref p) = bold {
-        println!("cargo:rerun-if-changed={}", p.display());
-    }
-    if let Some(ref p) = italic {
-        println!("cargo:rerun-if-changed={}", p.display());
-    }
+    let assets = Path::new("assets/fonts");
     println!("cargo:rerun-if-changed=assets/fonts");
 
     let ext_codepoints = extended_codepoints();
@@ -343,10 +330,7 @@ fn generate_bitmap_fonts() {
     .unwrap();
     writeln!(out).unwrap();
 
-    let has_regular = regular.is_some();
-    writeln!(out, "pub const HAS_REGULAR: bool = {};", has_regular).unwrap();
-
-    // emit the total number of extended codepoints (used by bitmap.rs)
+    // single global emission: every family shares the same extended set
     writeln!(
         out,
         "pub const EXT_GLYPH_COUNT: usize = {};",
@@ -355,109 +339,107 @@ fn generate_bitmap_fonts() {
     .unwrap();
     writeln!(out).unwrap();
 
-    // regular
-    if let Some(ref path) = regular {
-        let data = fs::read(path).unwrap();
-        let font = fontdue::Font::from_bytes(data.as_slice(), fontdue::FontSettings::default())
-            .expect("failed to parse regular TTF");
-        eprintln!(
-            "cargo:warning=font: rasterising {} ({} glyphs, {} ext codepoints) body {:.0}/{:.0}/{:.0}/{:.0}/{:.0} px heading {:.0}/{:.0}/{:.0}/{:.0}/{:.0} px",
-            path.file_name().unwrap().to_string_lossy(),
-            font.glyph_count(),
-            ext_codepoints.len(),
-            BODY_PX[0].0,
-            BODY_PX[1].0,
-            BODY_PX[2].0,
-            BODY_PX[3].0,
-            BODY_PX[4].0,
-            HEADING_PX[0].0,
-            HEADING_PX[1].0,
-            HEADING_PX[2].0,
-            HEADING_PX[3].0,
-            HEADING_PX[4].0,
-        );
-        for (px, suffix) in &BODY_PX {
-            emit_font(
-                &mut out,
-                &font,
-                &format!("REGULAR_BODY_{suffix}"),
-                *px,
-                &ext_codepoints,
-            );
-        }
-        for (px, suffix) in &HEADING_PX {
-            emit_font(
-                &mut out,
-                &font,
-                &format!("REGULAR_HEADING_{suffix}"),
-                *px,
-                &ext_codepoints,
-            );
-        }
-    } else {
-        for (_px, suffix) in &BODY_PX {
-            emit_stub(&mut out, &format!("REGULAR_BODY_{suffix}"));
-        }
-        for (_px, suffix) in &HEADING_PX {
-            emit_stub(&mut out, &format!("REGULAR_HEADING_{suffix}"));
-        }
-    }
+    for (prefix, dirname) in FAMILIES {
+        let dir = assets.join(dirname);
+        println!("cargo:rerun-if-changed={}", dir.display());
 
-    // bold
-    if let Some(ref path) = bold {
-        let data = fs::read(path).unwrap();
-        let font = fontdue::Font::from_bytes(data.as_slice(), fontdue::FontSettings::default())
-            .expect("failed to parse bold TTF");
-        eprintln!(
-            "cargo:warning=font: rasterising {} body {:.0}/{:.0}/{:.0}/{:.0}/{:.0} px",
-            path.file_name().unwrap().to_string_lossy(),
-            BODY_PX[0].0,
-            BODY_PX[1].0,
-            BODY_PX[2].0,
-            BODY_PX[3].0,
-            BODY_PX[4].0,
-        );
-        for (px, suffix) in &BODY_PX {
-            emit_font(
-                &mut out,
-                &font,
-                &format!("BOLD_BODY_{suffix}"),
-                *px,
-                &ext_codepoints,
-            );
-        }
-    } else {
-        for (_px, suffix) in &BODY_PX {
-            emit_stub(&mut out, &format!("BOLD_BODY_{suffix}"));
-        }
-    }
+        let regular = find_ttf(&dir, "Regular");
+        let bold = find_ttf(&dir, "Bold");
+        let italic = find_ttf(&dir, "Italic");
 
-    // italic
-    if let Some(ref path) = italic {
-        let data = fs::read(path).unwrap();
+        if let Some(ref p) = regular {
+            println!("cargo:rerun-if-changed={}", p.display());
+        }
+        if let Some(ref p) = bold {
+            println!("cargo:rerun-if-changed={}", p.display());
+        }
+        if let Some(ref p) = italic {
+            println!("cargo:rerun-if-changed={}", p.display());
+        }
+
+        writeln!(
+            out,
+            "pub const {prefix}_HAS_REGULAR: bool = {};",
+            regular.is_some()
+        )
+        .unwrap();
+
+        // regular: body + heading sizes
+        emit_or_stub_set(
+            &mut out,
+            regular.as_deref(),
+            prefix,
+            "REGULAR",
+            true,
+            &ext_codepoints,
+        );
+        // bold + italic: body sizes only (headings always use regular)
+        emit_or_stub_set(
+            &mut out,
+            bold.as_deref(),
+            prefix,
+            "BOLD",
+            false,
+            &ext_codepoints,
+        );
+        emit_or_stub_set(
+            &mut out,
+            italic.as_deref(),
+            prefix,
+            "ITALIC",
+            false,
+            &ext_codepoints,
+        );
+    }
+}
+
+fn emit_or_stub_set(
+    out: &mut fs::File,
+    path: Option<&Path>,
+    family_prefix: &str,
+    style_prefix: &str,
+    include_heading: bool,
+    ext_codepoints: &[u32],
+) {
+    if let Some(p) = path {
+        let data = fs::read(p).unwrap();
         let font = fontdue::Font::from_bytes(data.as_slice(), fontdue::FontSettings::default())
-            .expect("failed to parse italic TTF");
+            .unwrap_or_else(|_| panic!("failed to parse {}", p.display()));
         eprintln!(
-            "cargo:warning=font: rasterising {} body {:.0}/{:.0}/{:.0}/{:.0}/{:.0} px",
-            path.file_name().unwrap().to_string_lossy(),
-            BODY_PX[0].0,
-            BODY_PX[1].0,
-            BODY_PX[2].0,
-            BODY_PX[3].0,
-            BODY_PX[4].0,
+            "cargo:warning=font: rasterising {} as {family_prefix}_{style_prefix}",
+            p.file_name().unwrap().to_string_lossy(),
         );
         for (px, suffix) in &BODY_PX {
             emit_font(
-                &mut out,
+                out,
                 &font,
-                &format!("ITALIC_BODY_{suffix}"),
+                &format!("{family_prefix}_{style_prefix}_BODY_{suffix}"),
                 *px,
-                &ext_codepoints,
+                ext_codepoints,
             );
+        }
+        if include_heading {
+            for (px, suffix) in &HEADING_PX {
+                emit_font(
+                    out,
+                    &font,
+                    &format!("{family_prefix}_{style_prefix}_HEADING_{suffix}"),
+                    *px,
+                    ext_codepoints,
+                );
+            }
         }
     } else {
         for (_px, suffix) in &BODY_PX {
-            emit_stub(&mut out, &format!("ITALIC_BODY_{suffix}"));
+            emit_stub(out, &format!("{family_prefix}_{style_prefix}_BODY_{suffix}"));
+        }
+        if include_heading {
+            for (_px, suffix) in &HEADING_PX {
+                emit_stub(
+                    out,
+                    &format!("{family_prefix}_{style_prefix}_HEADING_{suffix}"),
+                );
+            }
         }
     }
 }

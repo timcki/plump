@@ -138,7 +138,7 @@ impl ButtonFeedback {
     }
 
     pub fn draw(&self, strip: &mut StripBuffer) {
-        let font = self.font.unwrap_or(&font_data::REGULAR_BODY_XSMALL);
+        let font = self.font.unwrap_or(&font_data::INTER_REGULAR_BODY_XSMALL);
         let mapper = if self.swap {
             let mut m = ButtonMapper::new();
             m.set_swap(true);

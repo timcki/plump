@@ -130,7 +130,7 @@ impl<'a> UploadScreen<'a> {
             epd,
             strip,
             delay,
-            heading: fonts::heading_font(ui_font_size_idx),
+            heading: fonts::ui_heading_font(ui_font_size_idx),
             body: fonts::chrome_font(),
             bumps,
         }

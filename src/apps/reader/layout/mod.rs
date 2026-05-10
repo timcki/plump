@@ -48,11 +48,16 @@ pub const MAX_LINES_PER_CHAPTER: usize = 4096;
 /// invalidates the cache and forces a re-layout. text_alignment is
 /// intentionally NOT keyed: line breaks are alignment-independent,
 /// so toggling left/justify must not re-typeset.
+///
+/// `font_family` is the reader font's `to_idx()` value (0=Bookerly,
+/// 1=Atkinson). it must be keyed because Atkinson and Bookerly have
+/// different advances at the same size, so wrap points differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LayoutKey {
     pub format_version: u8,
     pub algo_version: u8,
     pub font_idx: u8,
+    pub font_family: u8,
     pub content_fmt: u8,
     pub text_w: u16,
     pub line_h: u16,
@@ -65,6 +70,7 @@ impl LayoutKey {
     /// reader's live state.
     pub fn current(
         font_idx: u8,
+        font_family: u8,
         content_fmt: u8,
         text_w: u16,
         line_h: u16,
@@ -74,6 +80,7 @@ impl LayoutKey {
             format_version: bundle::PAGEIDX_FORMAT_VERSION,
             algo_version: bundle::LAYOUT_ALGO_VERSION,
             font_idx,
+            font_family,
             content_fmt,
             text_w,
             line_h,
@@ -86,6 +93,7 @@ impl LayoutKey {
         h.format_version == self.format_version
             && h.algo_version == self.algo_version
             && h.font_idx == self.font_idx
+            && h.font_family == self.font_family
             && h.content_fmt == self.content_fmt
             && h.text_w == self.text_w
             && h.line_h == self.line_h
@@ -104,6 +112,7 @@ impl LayoutKey {
             line_h: self.line_h,
             max_lines: self.max_lines,
             flags: 0,
+            font_family: self.font_family,
             total_pages,
         }
     }

@@ -324,7 +324,7 @@ impl QuickMenu {
             return;
         }
 
-        let font = self.font.unwrap_or(&font_data::REGULAR_BODY_SMALL);
+        let font = self.font.unwrap_or(&font_data::INTER_REGULAR_BODY_SMALL);
 
         let outer = self.overlay_region;
         if outer.intersects(strip.logical_window()) {

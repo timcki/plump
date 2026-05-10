@@ -611,8 +611,13 @@ pub const LINE_RECORD_SIZE: usize = 12;
 //   10..12 line_h          u16
 //   12     max_lines       u8
 //   13     flags           u8
-//   14..16 _pad            2 bytes
+//   14     font_family     u8   reader font family (0=Bookerly, 1=Atkinson)
+//   15     _pad            1 byte
 //   16..20 total_pages     u32
+//
+// font_family default 0 keeps pre-upgrade caches valid for users who
+// stay on Bookerly; switching reader font invalidates the cache because
+// wrap points differ between families at the same size.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LayoutIdxHeader {
@@ -624,6 +629,7 @@ pub struct LayoutIdxHeader {
     pub line_h: u16,
     pub max_lines: u8,
     pub flags: u8,
+    pub font_family: u8,
     pub total_pages: u32,
 }
 
@@ -647,7 +653,8 @@ impl LayoutIdxHeader {
             line_h: r_u16(buf, 10),
             max_lines: buf[12],
             flags: buf[13],
-            // 14..16 pad
+            font_family: buf[14],
+            // 15 pad
             total_pages: r_u32(buf, 16),
         })
     }
@@ -663,7 +670,8 @@ impl LayoutIdxHeader {
         w_u16(&mut out, 10, self.line_h);
         out[12] = self.max_lines;
         out[13] = self.flags;
-        // 14..16 pad
+        out[14] = self.font_family;
+        // 15 pad
         w_u32(&mut out, 16, self.total_pages);
         out
     }

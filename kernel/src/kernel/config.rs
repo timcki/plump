@@ -29,6 +29,12 @@ pub const GHOST_CLEAR_STEP: u8 = 5;
 // default font size index (0=XSmall, 1=Small, 2=Medium, 3=Large, 4=XLarge)
 pub const DEFAULT_FONT_SIZE_IDX: u8 = 2;
 
+// reader font family (0 = Bookerly, 1 = Atkinson Hyperlegible). the
+// distro maps this u8 onto its `ReaderFont` enum; the kernel stores it
+// opaquely so the kernel/distro split is preserved.
+pub const DEFAULT_READER_FONT: u8 = 0;
+pub const NUM_READER_FONTS: u8 = 2;
+
 // reading themes: named presets for margins, spacing, and overall feel.
 // each theme bundles margin_h, margin_v, line_spacing_pct into one
 // user-friendly selection instead of exposing raw pixel values.
@@ -100,6 +106,7 @@ pub struct SystemSettings {
     // font settings
     pub book_font_size_idx: u8, // 0 = XSmall, 1 = Small, 2 = Medium, 3 = Large, 4 = XLarge
     pub ui_font_size_idx: u8,   // 0 = XSmall, 1 = Small, 2 = Medium, 3 = Large, 4 = XLarge
+    pub reader_font: u8,        // 0 = Bookerly, 1 = Atkinson Hyperlegible
 
     // reading settings
     pub reading_theme: u8, // index into READING_THEMES
@@ -129,6 +136,7 @@ impl SystemSettings {
             ghost_clear_every: DEFAULT_GHOST_CLEAR,
             book_font_size_idx: DEFAULT_FONT_SIZE_IDX,
             ui_font_size_idx: DEFAULT_FONT_SIZE_IDX,
+            reader_font: DEFAULT_READER_FONT,
             reading_theme: DEFAULT_READING_THEME,
             swap_buttons: false,
             sunlight_fix: false,
@@ -160,6 +168,7 @@ impl SystemSettings {
             .clamp(MIN_GHOST_CLEAR, MAX_GHOST_CLEAR);
         self.book_font_size_idx = self.book_font_size_idx.min(max_font);
         self.ui_font_size_idx = self.ui_font_size_idx.min(max_font);
+        self.reader_font = self.reader_font.min(NUM_READER_FONTS - 1);
         self.reading_theme = self.reading_theme.min(NUM_READING_THEMES - 1);
         self.text_alignment = self.text_alignment.min(NUM_TEXT_ALIGNMENTS - 1);
     }
@@ -256,6 +265,11 @@ impl SystemSettings {
             b"ui_font" => {
                 if let Some(v) = parse_u16(val) {
                     self.ui_font_size_idx = v as u8;
+                }
+            }
+            b"reader_font" => {
+                if let Some(v) = parse_u16(val) {
+                    self.reader_font = v as u8;
                 }
             }
             b"reading_theme" => {
@@ -355,6 +369,8 @@ impl SystemSettings {
     wr.put(b"\n# font settings\n");
     wr.kv_num(b"book_font", self.book_font_size_idx as u16);
     wr.kv_num(b"ui_font", self.ui_font_size_idx as u16);
+    wr.put(b"# reader font (0=Bookerly, 1=Atkinson)\n");
+    wr.kv_num(b"reader_font", self.reader_font as u16);
 
     wr.put(b"\n# reading settings (0=Compact, 1=Default, 2=Relaxed, 3=Spacious)\n");
     wr.kv_num(b"reading_theme", self.reading_theme as u16);
