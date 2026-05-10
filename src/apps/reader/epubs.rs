@@ -14,6 +14,7 @@ use crate::error::{Error, ErrorKind};
 use crate::kernel::KernelHandle;
 use crate::kernel::work_queue;
 use plump_kernel::kernel::bundle;
+use plump_kernel::kernel::bundle::{BundleFile, SectionId};
 
 use crate::apps::BgOutcome;
 use super::{BgCacheState, CHAPTER_CACHE_MAX, EOCD_TAIL, EpubState, PAGE_BUF, ReaderApp, ZipIndex};
@@ -42,6 +43,7 @@ fn spine_offset() -> u32 {
 fn content_start_offset(spine_len: usize) -> u32 {
     spine_offset() + spine_section_size(spine_len)
 }
+
 
 impl EpubState {
     pub(super) fn init_zip(
@@ -260,6 +262,25 @@ impl EpubState {
             hdr.author.set(a);
         }
 
+        // PidxDir comes immediately after Content. Reserve its range
+        // here (typed allocation enforces non-overlap with Content
+        // and with the Covers / PidxData sections that follow), so
+        // later cover generation and pagination start from a clean
+        // layout.
+        let dir_size = (bundle::PAGEIDX_HDR_V2_SIZE
+            + spine_len * bundle::CHAPTER_LAYOUT_DIR_SIZE) as u32;
+        let pidx_dir_offset = hdr.content_offset.saturating_add(hdr.content_size);
+        hdr.pidx_dir_offset = pidx_dir_offset;
+        hdr.pidx_dir_size = dir_size;
+        hdr.pidx_data_offset = 0;
+        hdr.pidx_data_size = 0;
+        hdr.covers_offset = 0;
+        hdr.covers_size = 0;
+
+        // verify_layout catches any overlap (spine/content/pidx_dir)
+        // before the header is committed.
+        hdr.verify_layout()?;
+
         bundle::write_header(k.sd(), self.name_hash, &hdr)?;
 
         // write finalized spine entries
@@ -281,8 +302,22 @@ impl EpubState {
             bundle::write_at(k.sd(), self.name_hash, at, &bytes)?;
         }
 
+        // zero-fill the PidxDir region so its contents are well-defined
+        // before any chapter is paginated. uses the bounded Section
+        // handle, so this write cannot reach beyond PidxDir.
+        let mut bf = BundleFile::open(k.sd(), self.name_hash)?;
+        let mut dir = bf
+            .section_mut(SectionId::PidxDir)
+            ?;
+        dir.fill_zero()?;
+
         self.chapters_cached = true;
-        log::info!("epub: bundle core ready ({} chapters)", spine_len);
+        log::info!(
+            "epub: bundle core ready ({} chapters, PidxDir [{}, +{}))",
+            spine_len,
+            pidx_dir_offset,
+            dir_size,
+        );
         Ok(false)
     }
 
@@ -440,6 +475,20 @@ impl EpubState {
         let ch_size = ch_size_u32 as usize;
 
         if ch_size == 0 || ch_size > CHAPTER_CACHE_MAX {
+            if ch_size > CHAPTER_CACHE_MAX {
+                // silent rejection used to mask oversized chapters: K-P
+                // can't run, greedy preindex degrades to a single page,
+                // and most of the chapter becomes unreachable. Surface
+                // it loudly; the bundle-streaming greedy fallback in
+                // greedy_preindex_compute keeps navigation working.
+                log::warn!(
+                    "chapter cache: ch{} too large ({} bytes > cap {}), \
+                     falling back to bundle-streamed greedy",
+                    ch,
+                    ch_size,
+                    CHAPTER_CACHE_MAX,
+                );
+            }
             self.ch_cache = Vec::new();
             return false;
         }
@@ -592,9 +641,13 @@ impl ReaderApp {
     /// Generate a cover thumbnail for the home screen if the EPUB has
     /// cover metadata and no cached thumbnail exists yet.
     ///
-    /// Called once after OPF parse succeeds.  Uses the streaming SD
-    /// decode path so it works for arbitrarily large cover images
-    /// without buffering the entire file in RAM.
+    /// Uses the streaming SD decode path so it works for arbitrarily
+    /// large cover images without buffering the entire file in RAM.
+    ///
+    /// Caller must only invoke this after `FLAG_CORE_READY` is set on
+    /// the bundle (see arming sites in `mod.rs` and
+    /// `bg_cache_step_sync`); the Covers section requires `PidxDir`
+    /// as its predecessor and that's only allocated by `finish_cache`.
     pub(super) fn generate_cover_thumb(&mut self, k: &mut KernelHandle<'_>) {
         use crate::apps::cover_cache;
         use smol_epub::epub::CoverMediaType;
@@ -609,9 +662,9 @@ impl ReaderApp {
             return;
         }
 
-        // cover generation runs during deferred open work, which may
-        // fire before chapter caching has created the bundle file.
-        // create a placeholder so save_cover_thumb has somewhere to write.
+        // safety net: the bundle file is guaranteed to exist by the
+        // time CORE_READY is set, but recreate a placeholder if the
+        // user deleted it externally between sessions.
         if let Err(e) = self.epub.ensure_bundle_exists(k) {
             log::warn!("epub: failed to create bundle for cover: {}", e);
             return;
@@ -768,11 +821,18 @@ impl ReaderApp {
 
                 let ch = self.epub.cache_chapter as usize;
                 if ch >= spine_len {
-                    let _ = self.epub.finish_cache(
-                        k,
-                        self.title.as_bytes(),
-                        self.filename.as_bytes(),
-                    );
+                    let finished = self
+                        .epub
+                        .finish_cache(k, self.title.as_bytes(), self.filename.as_bytes())
+                        .is_ok();
+                    if finished && self.epub.meta.has_cover() {
+                        // CORE_READY just flipped 0→1; arm cover-thumb work
+                        // for the next Phase 2 tick. matched gate at OPF
+                        // parse (mod.rs) so the flag is only ever raised
+                        // when generate_cover_thumb is guaranteed to find
+                        // CORE ready.
+                        self.pending_cover_thumb = true;
+                    }
                     self.epub.img_cache_ch = self.epub.chapter;
                     self.epub.img_cache_offset = 0;
                     self.epub.img_scan_wrapped = false;

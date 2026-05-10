@@ -384,12 +384,22 @@ impl ReaderApp {
             let img_file = img_cache_str(&img_name);
 
             // try 1: read cached image header (4 bytes, very fast)
-            let out_h = if let Some((_w, h)) = peek_cached_image_size(k, dir, img_file) {
+            let out_h = if let Some((_w, h)) = peek_cached_image_size(k.sd(), dir, img_file) {
                 // cached image is already at the final decoded size
                 h
             } else {
-                // try 2: peek source dimensions from the ZIP entry
-                peek_source_dimensions(k, epub_name, &self.epub.zip, full_path, text_w, text_area_h)
+                // try 2: peek source dimensions from the ZIP entry; on
+                // miss (deflate-compressed, unknown format, I/O error)
+                // fall back to the generic placeholder.
+                peek_source_dimensions(
+                    k.sd(),
+                    epub_name,
+                    &self.epub.zip,
+                    full_path,
+                    text_w,
+                    text_area_h,
+                )
+                .unwrap_or(DEFAULT_IMG_H)
             };
 
             // cap to the inline budget; fullscreen images bypass line
@@ -889,13 +899,17 @@ pub(super) fn load_cached_image(
 // extract its decoded dimensions without loading the pixel data.
 // returns None if the file doesn't exist, is too small, or has
 // zero dimensions.
-fn peek_cached_image_size(k: &mut KernelHandle<'_>, dir: &str, name: &str) -> Option<(u16, u16)> {
-    let size = k.sd().file_size_in_plump_subdir(dir, name).ok()?;
+fn peek_cached_image_size(
+    sd: &plump_kernel::board::SdStorage,
+    dir: &str,
+    name: &str,
+) -> Option<(u16, u16)> {
+    let size = sd.file_size_in_plump_subdir(dir, name).ok()?;
     if size < 5 {
         return None;
     }
     let mut hdr = [0u8; 4];
-    k.sd().read_chunk_in_plump_subdir(dir, name, 0, &mut hdr).ok()?;
+    sd.read_chunk_in_plump_subdir(dir, name, 0, &mut hdr).ok()?;
     let w = u16::from_le_bytes([hdr[0], hdr[1]]);
     let h = u16::from_le_bytes([hdr[2], hdr[3]]);
     if w == 0 || h == 0 {
@@ -913,91 +927,122 @@ fn peek_cached_image_size(k: &mut KernelHandle<'_>, dir: &str, name: &str) -> Op
 // raw pixels, so we return DEFAULT_IMG_H as a reasonable fallback
 // (the actual decode will happen later and may produce a different
 // height, but it's close enough for line reservation).
-fn peek_source_dimensions(
-    k: &mut KernelHandle<'_>,
+/// Peek a JPEG/PNG's source dimensions from inside a ZIP entry and
+/// replicate the decoder's integer downscale, returning the rendered
+/// pixel height the decoder would produce at the given `(text_w,
+/// text_area_h)` cap. Handles both `METHOD_STORED` and DEFLATE-
+/// compressed entries (the latter via the same `DeflateReader` the
+/// full decode path uses).
+///
+/// Returns `None` on unknown formats, ambiguous extension on a
+/// DEFLATE entry, or any I/O / parse failure — callers fall back to
+/// `DEFAULT_IMG_H` (or, in the K-P pipeline, to whatever attr-based
+/// hint they have).
+pub(super) fn peek_source_dimensions(
+    sd: &plump_kernel::board::SdStorage,
     epub_name: &str,
     zip: &ZipIndex,
     full_path: &str,
     text_w: u32,
     text_area_h: u16,
-) -> u16 {
-    let zip_idx = match zip.find(full_path).or_else(|| zip.find_icase(full_path)) {
-        Some(idx) => idx,
-        None => return DEFAULT_IMG_H,
-    };
+) -> Option<u16> {
+    let zip_idx = zip.find(full_path).or_else(|| zip.find_icase(full_path))?;
     let entry = *zip.entry(zip_idx);
-
-    // deflate-compressed images: can't peek dimensions cheaply
-    if entry.method != zip::METHOD_STORED {
-        return DEFAULT_IMG_H;
-    }
 
     // read local header to find data offset
     let data_offset = {
         let mut hdr = [0u8; 30];
-        if k.sd().read_file_chunk(epub_name, entry.local_offset, &mut hdr)
-            .is_err()
-        {
-            return DEFAULT_IMG_H;
-        }
-        match ZipIndex::local_header_data_skip(&hdr) {
-            Ok(skip) => entry.local_offset + skip,
-            Err(_) => return DEFAULT_IMG_H,
-        }
+        sd.read_file_chunk(epub_name, entry.local_offset, &mut hdr)
+            .ok()?;
+        let skip = ZipIndex::local_header_data_skip(&hdr).ok()?;
+        entry.local_offset + skip
     };
 
-    let is_jpeg = is_image_ext_jpeg(full_path);
-    let is_png = is_image_ext_png(full_path);
+    let is_jpeg_ext = is_image_ext_jpeg(full_path);
+    let is_png_ext = is_image_ext_png(full_path);
 
-    // fall back to magic-byte detection if extension is ambiguous
-    let (is_jpeg, is_png) = if is_jpeg || is_png {
-        (is_jpeg, is_png)
-    } else {
+    // Disambiguate by magic bytes only for STORED entries (DEFLATE
+    // would need to spin up an inflater just to detect the format).
+    let (is_jpeg, is_png) = if is_jpeg_ext || is_png_ext {
+        (is_jpeg_ext, is_png_ext)
+    } else if entry.method == zip::METHOD_STORED {
         let mut magic = [0u8; 8];
-        let n = k
-            .sd().read_file_chunk(epub_name, data_offset, &mut magic)
+        let n = sd
+            .read_file_chunk(epub_name, data_offset, &mut magic)
             .unwrap_or(0);
         (
             n >= 2 && magic[0] == 0xFF && magic[1] == 0xD8,
             n >= 8 && magic[..8] == [137, 80, 78, 71, 13, 10, 26, 10],
         )
+    } else {
+        return None;
     };
 
-    let read_err = |_: crate::error::Error| -> &'static str { "read failed" };
+    if !is_jpeg && !is_png {
+        return None;
+    }
 
-    let dims = if is_png {
-        smol_epub::png::peek_png_dimensions_streaming(
-            |off, buf| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err),
+    let read_err = |_: crate::error::Error| -> &'static str { "read failed" };
+    let read =
+        |off, buf: &mut [u8]| sd.read_file_chunk(epub_name, off, buf).map_err(read_err);
+
+    let dims = match (is_jpeg, entry.method) {
+        (true, zip::METHOD_STORED) => {
+            let reader = smol_epub::jpeg::ChunkReader::new(
+                read,
+                data_offset,
+                data_offset + entry.uncomp_size,
+            );
+            smol_epub::jpeg::peek_jpeg_dimensions(reader).ok()?
+        }
+        (true, _) => {
+            // DEFLATE-compressed JPEG: same `JpegRead` interface, just
+            // a different byte source.
+            let reader = smol_epub::jpeg::DeflateReader::new(read, data_offset, entry.comp_size)
+                .ok()?;
+            smol_epub::jpeg::peek_jpeg_dimensions(reader).ok()?
+        }
+        (false, zip::METHOD_STORED) => smol_epub::png::peek_png_dimensions_streaming(
+            read,
             data_offset,
             entry.uncomp_size,
         )
-        .map(|(w, h)| (w as u16, h as u16))
-    } else if is_jpeg {
-        let read =
-            |off, buf: &mut [u8]| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err);
-        let reader = smol_epub::jpeg::ChunkReader::new(
-            read,
-            data_offset,
-            data_offset + entry.uncomp_size,
-        );
-        smol_epub::jpeg::peek_jpeg_dimensions(reader)
-    } else {
-        return DEFAULT_IMG_H;
+        .ok()
+        .map(|(w, h)| (w as u16, h as u16))?,
+        (false, _) => peek_png_dims_deflate(read, data_offset, entry.comp_size)?,
     };
 
-    match dims {
-        Ok((src_w, src_h)) if src_w > 0 && src_h > 0 => {
-            // replicate the decoder's integer downscale logic:
-            // scale = max(ceil(src_w/max_w), ceil(src_h/max_h), 1)
-            let max_w = text_w as u16;
-            let max_h = text_area_h;
-            let sw = src_w.div_ceil(max_w);
-            let sh = src_h.div_ceil(max_h);
-            let scale = sw.max(sh).max(1);
-            src_h / scale
-        }
-        _ => DEFAULT_IMG_H,
+    let (src_w, src_h) = dims;
+    if src_w == 0 || src_h == 0 {
+        return None;
     }
+    // replicate the decoder's integer downscale logic:
+    // scale = max(ceil(src_w/max_w), ceil(src_h/max_h), 1)
+    let max_w = text_w as u16;
+    let max_h = text_area_h;
+    let sw = src_w.div_ceil(max_w);
+    let sh = src_h.div_ceil(max_h);
+    let scale = sw.max(sh).max(1);
+    Some(src_h / scale)
+}
+
+/// PNG IHDR sits at a fixed offset: 8-byte signature + 4-byte chunk
+/// length + 4-byte `"IHDR"` chunk type + 4-byte width + 4-byte height
+/// = 24 bytes from the start of the decompressed stream. We decompress
+/// exactly those 24 bytes through a `DeflateReader` and hand them to
+/// `peek_png_dimensions`, which already knows how to parse the header.
+fn peek_png_dims_deflate<F>(read: F, data_offset: u32, comp_size: u32) -> Option<(u16, u16)>
+where
+    F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>,
+{
+    use smol_epub::jpeg::JpegRead;
+    let mut reader = smol_epub::jpeg::DeflateReader::new(read, data_offset, comp_size).ok()?;
+    let mut buf = [0u8; 24];
+    for slot in buf.iter_mut() {
+        *slot = reader.read_byte().ok()?;
+    }
+    let (w, h) = smol_epub::png::peek_png_dimensions(&buf).ok()?;
+    Some((w as u16, h as u16))
 }
 
 pub(super) fn save_cached_image(
@@ -1012,4 +1057,115 @@ pub(super) fn save_cached_image(
     k.sd().write_in_plump_subdir(dir, name, &header)?;
     k.sd().append_in_plump_subdir(dir, name, &img.data)?;
     Ok(())
+}
+
+// ── ChapterImagePeek: production ImageHeightHint impl ──────────────
+//
+// Lets the K-P pipeline (`src/apps/reader/layout/pipeline.rs`) ask for
+// real source dimensions when an `<img>` tag has no width/height
+// attrs. Holds a tiny linear cache keyed by `fnv1a(full_path)` to
+// dedupe peeks across paragraphs in the same chapter — typical
+// chapter has ≤20 unique images, so 24 slots is comfortable headroom.
+
+const PEEK_CACHE_CAP: usize = 24;
+
+pub(super) struct ChapterImagePeek<'a> {
+    /// Immutable SD reference. Sharing `&SdStorage` (rather than
+    /// `&mut KernelHandle`) lets `BundleByteSource` and this peek
+    /// coexist in `run_kp_typeset` — both hold immutable borrows of
+    /// the same `*k`, no aliasing conflict.
+    pub sd: &'a plump_kernel::board::SdStorage,
+    pub zip: &'a ZipIndex,
+    pub epub_name: &'a str,
+    pub ch_dir: &'a str,
+    /// Per-book image cache directory (`self.epub.cache_dir_str()`).
+    /// Consulted before falling through to a ZIP source-peek.
+    pub cache_dir: &'a str,
+    pub text_w: u32,
+    pub text_area_h: u16,
+    cache: [(u32, u16); PEEK_CACHE_CAP],
+    cache_len: u8,
+}
+
+impl<'a> ChapterImagePeek<'a> {
+    pub(super) fn new(
+        sd: &'a plump_kernel::board::SdStorage,
+        zip: &'a ZipIndex,
+        epub_name: &'a str,
+        ch_dir: &'a str,
+        cache_dir: &'a str,
+        text_w: u32,
+        text_area_h: u16,
+    ) -> Self {
+        Self {
+            sd,
+            zip,
+            epub_name,
+            ch_dir,
+            cache_dir,
+            text_w,
+            text_area_h,
+            cache: [(0, 0); PEEK_CACHE_CAP],
+            cache_len: 0,
+        }
+    }
+
+    fn lookup(&self, key: u32) -> Option<u16> {
+        self.cache[..self.cache_len as usize]
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, h)| *h)
+    }
+
+    fn insert(&mut self, key: u32, h: u16) {
+        if (self.cache_len as usize) < self.cache.len() {
+            self.cache[self.cache_len as usize] = (key, h);
+            self.cache_len += 1;
+        }
+        // when the cache is full, we just stop caching — extra peeks
+        // for the same image are cheap (one SD chunk) and correctness
+        // is preserved.
+    }
+}
+
+impl<'a> super::layout::pipeline::ImageHeightHint for ChapterImagePeek<'a> {
+    fn rendered_height(&mut self, src: &[u8]) -> Option<u16> {
+        let src_str = core::str::from_utf8(src).ok()?;
+        if src_str.is_empty() {
+            return None;
+        }
+        let mut path_buf = [0u8; 512];
+        let plen = epub::resolve_path(self.ch_dir, src_str, &mut path_buf);
+        let full_path = core::str::from_utf8(&path_buf[..plen]).ok()?;
+        let key = cache::fnv1a(full_path.as_bytes());
+        if let Some(h) = self.lookup(key) {
+            return Some(h);
+        }
+
+        // Cheapest oracle: 4-byte header of the decoded-image cache.
+        // Returns the exact pixel height the renderer will blit (the
+        // bitmap is already dithered and on disk). Almost always hits
+        // on the second open of a chapter, which is the symptom we're
+        // chasing. Mirrors the cache-first ordering in
+        // `prescan_image_heights` above.
+        let img_name = img_cache_name(key);
+        let img_file = img_cache_str(&img_name);
+        if let Some((_w, h)) = peek_cached_image_size(self.sd, self.cache_dir, img_file) {
+            self.insert(key, h);
+            return Some(h);
+        }
+
+        // Fall through to a ZIP source-peek (handles both STORED and
+        // DEFLATE-compressed entries; see `peek_source_dimensions`).
+        let h = peek_source_dimensions(
+            self.sd,
+            self.epub_name,
+            self.zip,
+            full_path,
+            self.text_w,
+            self.text_area_h,
+        )?;
+        self.insert(key, h);
+        Some(h)
+    }
 }

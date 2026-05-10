@@ -207,6 +207,12 @@ pub struct ParagraphMeta {
 /// badness.
 pub const HYPHEN_PENALTY: i16 = 50;
 
+/// Maximum word size measured by `build_paragraph`. Bytes beyond this
+/// are silently dropped from the width calculation; the breaker still
+/// emits the right Item via single_overfull_box logic for unbreakable
+/// runs. Sized for English prose + URLs (~100 bytes typical).
+const WORD_MEASURE_BUF: usize = 256;
+
 // ── builder ───────────────────────────────────────────────────────
 
 /// Drive the scanner until one paragraph is consumed; emit its K-P
@@ -226,8 +232,12 @@ pub fn build_paragraph(
     let block_at_start = scanner.block_state();
     let style_at_start = scanner.text_style();
     let byte_start = scanner.position();
-    let buf = scanner.buffer();
     let mut last_end: u32 = byte_start;
+    // stack scratch for word bytes, replacing the old `&buf[start..end]`
+    // slice. typical English words / URLs comfortably fit in 256 bytes;
+    // longer runs are truncated and the K-P breaker still handles them
+    // correctly via single_overfull_box.
+    let mut word_buf = [0u8; WORD_MEASURE_BUF];
 
     loop {
         let Some(tok) = scanner.next() else {
@@ -244,16 +254,30 @@ pub fn build_paragraph(
 
         match tok {
             Token::Word { start, end, style } => {
-                let bytes = &buf[start as usize..end as usize];
-                let width = measure_word(bytes, style, &mut advance);
+                let len = (end - start) as usize;
+                let n = scanner.read_into(start, &mut word_buf[..len.min(WORD_MEASURE_BUF)]);
+                let width = measure_word(&word_buf[..n], style, &mut advance);
                 out.push(Item::boxed(width, start).with_style(style));
                 last_end = end;
             }
 
             Token::Space { start, style, end } => {
                 let space = advance(' ', style) as u32;
-                let stretch = space / 2;
-                let shrink = (space / 3).min(255) as u8;
+                // per-glue elasticity. TeX's cmr10 uses (space/2, space/3),
+                // matched by classical K-P implementations. We use a wider
+                // budget here because we have neither hyphenation nor
+                // \emergencystretch — without them the (space/2, space/3)
+                // window is narrower than one typical word width on narrow
+                // columns + chunky fonts (Atkinson Small at 464 px), so
+                // K-P's loose-line badness saturates against
+                // BADNESS_INFINITY and the breaker can't distinguish a
+                // loose-but-readable line from an overflow line. Stretch=
+                // space (1× natural) lets gaps double under full stretch;
+                // shrink=space/2 lets gaps halve. Standard professional
+                // typesetting range; the renderer's floor and ceiling
+                // already accommodate this.
+                let stretch = space;
+                let shrink = (space / 2).min(255) as u8;
                 out.push(
                     Item::glue(
                         space.min(u16::MAX as u32) as u16,
@@ -453,7 +477,8 @@ mod tests {
     }
 
     fn build(bytes: &[u8]) -> (Vec<Item>, ParagraphMeta) {
-        let mut scanner = MarkupScanner::new(bytes);
+        let mut src = crate::apps::reader::layout::scan::SliceByteSource::new(bytes);
+        let mut scanner = MarkupScanner::new(&mut src);
         let mut out: Vec<Item> = Vec::new();
         let meta = build_paragraph(&mut scanner, unit_advance, &mut out);
         (out, meta)
@@ -483,8 +508,8 @@ mod tests {
         assert_eq!(items.len(), 3);
         assert_eq!(items[1].kind(), ItemKind::Glue);
         assert_eq!(items[1].width, 1);
-        assert_eq!(items[1].stretch, 0); // 1/2 truncates to 0
-        assert_eq!(items[1].shrink, 0); // 1/3 truncates to 0
+        assert_eq!(items[1].stretch, 1); // = space (1)
+        assert_eq!(items[1].shrink, 0); // = space / 2 = 0 (truncated)
     }
 
     #[test]
@@ -686,7 +711,8 @@ mod tests {
         bytes.push(MARKER);
         bytes.push(BOLD_ON);
         bytes.extend_from_slice(b"cd");
-        let mut scanner = MarkupScanner::new(&bytes);
+        let mut src = crate::apps::reader::layout::scan::SliceByteSource::new(&bytes);
+        let mut scanner = MarkupScanner::new(&mut src);
         let mut out: Vec<Item> = Vec::new();
         build_paragraph(&mut scanner, styled_advance, &mut out);
         // Box("ab") width 2 + Glue(space) width 1 + Box("cd", bold) width 6

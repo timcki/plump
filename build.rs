@@ -113,11 +113,22 @@ const GLYPH_COUNT: usize = (LAST_CHAR - FIRST_CHAR + 1) as usize;
 fn extended_codepoints() -> Vec<u32> {
     let mut cps: Vec<u32> = Vec::new();
 
-    // latin-1 supplement (0x00A0-0x00FF): accented letters, symbols
-    // skip 0x00A0 (NBSP) and 0x00AD (soft hyphen), they are whitespace
-    for cp in 0x00A1..=0x00FFu32 {
+    // latin-1 supplement (0x00A0-0x00FF): accented letters, symbols.
+    // NBSP (U+00A0) is included: in every shipped reader font it
+    // rasterises to a zero-ink glyph whose advance matches the ASCII
+    // space, which is exactly what K-P measures it as in items.rs
+    // (advance(' ', style)). No special-case needed at the draw site.
+    // SHY (U+00AD) is excluded: fonts ship it as a visible
+    // discretionary-hyphen glyph with a positive advance (~2× space)
+    // and a small bitmap. K-P models SHY as a zero-width Penalty
+    // (items.rs:280), so resolving SHY through the font would both
+    // overflow lines and draw spurious hyphens at every syllable
+    // boundary. The draw loop in src/apps/reader/mod.rs skips SHY
+    // bytes outright. Visible-hyphen rendering at a chosen break is
+    // a separate concern (deferred per items.rs comment).
+    for cp in 0x00A0..=0x00FFu32 {
         if cp == 0x00AD {
-            continue; // soft hyphen, handled as whitespace
+            continue;
         }
         cps.push(cp);
     }

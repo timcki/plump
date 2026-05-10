@@ -226,6 +226,10 @@ pub mod convert {
         items: &[Item],
         choices: &[BreakChoice],
         meta: &ParagraphMeta,
+        // kept on the API surface for future per-line diagnostics; the
+        // KPDIAG-li log this used to feed has been removed (it was
+        // only there for the K-P collapse investigation).
+        _line_width: u16,
         page_break_pending: &mut bool,
         out: &mut Vec<LineLayout>,
     ) {
@@ -257,22 +261,18 @@ pub mod convert {
                 }
             }
 
-            // skip computing per-gap stretch on lines the renderer
-            // will never justify: paragraph-end (END_HARD) and headings.
-            // mirrors LineLayout::may_justify so cached extra matches
-            // runtime behaviour. without this, paragraph-final lines
-            // pick up u16::MAX stretch from the forced-break glue and
-            // saturate extra to +127 px-per-gap, which is wrong even
-            // though the renderer currently ignores it.
-            let no_justify = (flags
+            // `no_stretch` covers the typography rule: don't fully-justify
+            // a paragraph's trailing line and don't stretch headings.
+            // shrink is preserved regardless — K-P emits it precisely
+            // because the natural width overshoots the column, and
+            // dropping it would leave the line clipping past the margin
+            // (the common Stories-of-Your-Life single-line shrink-fit
+            // paragraph). see `encode_extra` for the per-direction split.
+            let no_stretch = (flags
                 & (LineLayout::FLAG_PARAGRAPH_END | LineLayout::FLAG_HEADING))
                 != 0;
-            let extra = if no_justify {
-                0
-            } else {
-                let gap_count = count_gaps(items, lo, item_idx);
-                encode_extra(ch, gap_count)
-            };
+            let gap_count = count_gaps(items, lo, item_idx);
+            let extra = encode_extra(ch, gap_count, no_stretch);
 
             out.push(LineLayout {
                 start_byte,
@@ -501,18 +501,27 @@ pub mod convert {
         sum
     }
 
-    fn encode_extra(choice: &BreakChoice, gap_count: u16) -> u8 {
+    fn encode_extra(choice: &BreakChoice, gap_count: u16, no_stretch: bool) -> u8 {
         if gap_count == 0 {
             return 0;
         }
         match choice.adjustment() {
             Adjustment::Overflow | Adjustment::Perfect => 0,
+            // suppress stretch on paragraph-end and heading lines: those
+            // either pick up u16::MAX from the forced-break glue (saturating
+            // extra to +127 px-per-gap) or violate the typography rule
+            // against fully-justifying a paragraph's trailing line.
+            Adjustment::Stretch(_) if no_stretch => 0,
             Adjustment::Stretch(r_q8) => {
                 let total_spare = (choice.stretch_total as u32 * r_q8 as u32) / 256;
                 let per_gap = (total_spare / gap_count as u32).min(127) as u8;
                 per_gap & LineLayout::EXTRA_MAG_MASK
             }
             Adjustment::Shrink(r_q8) => {
+                // shrink is layout-driven (the paragraph won't fit otherwise);
+                // preserve it even on paragraph-end / heading lines so the
+                // renderer can squeeze the inter-word spaces. dropping the
+                // signal here leaves the line overflowing the column.
                 let total_squeeze = (choice.shrink_total as u32 * r_q8 as u32) / 256;
                 let per_gap = (total_squeeze / gap_count as u32).min(127) as u8;
                 (per_gap & LineLayout::EXTRA_MAG_MASK) | LineLayout::EXTRA_SIGN_SHRINK
@@ -574,7 +583,7 @@ pub mod convert {
 
             let mut out = Vec::new();
             let mut pending = false;
-            append_lines(&items, &choices, &meta(), &mut pending, &mut out);
+            append_lines(&items, &choices, &meta(), 100, &mut pending, &mut out);
             assert_eq!(out.len(), choices.len());
             assert!(out.last().unwrap().is_paragraph_end());
         }
@@ -593,7 +602,7 @@ pub mod convert {
 
             let mut out = Vec::new();
             let mut pending = true;
-            append_lines(&items, &choices, &meta(), &mut pending, &mut out);
+            append_lines(&items, &choices, &meta(), 100, &mut pending, &mut out);
             assert!(out[0].is_page_break_before());
             assert!(!pending);
         }
@@ -620,7 +629,7 @@ pub mod convert {
 
             let mut out = Vec::new();
             let mut pending = false;
-            append_lines(&items, &choices, &meta(), &mut pending, &mut out);
+            append_lines(&items, &choices, &meta(), 464, &mut pending, &mut out);
             let last = out.last().unwrap();
             assert!(last.is_paragraph_end());
             assert_eq!(
@@ -646,7 +655,7 @@ pub mod convert {
 
             let mut out = Vec::new();
             let mut pending = false;
-            append_lines(&items, &choices, &meta(), &mut pending, &mut out);
+            append_lines(&items, &choices, &meta(), 464, &mut pending, &mut out);
             // breaker may emit 0 lines for an empty paragraph; if it
             // emits any, none may have non-zero extra.
             for ll in &out {
@@ -678,7 +687,7 @@ pub mod convert {
 
             let mut out = Vec::new();
             let mut pending = false;
-            append_lines(&items, &choices, &meta(), &mut pending, &mut out);
+            append_lines(&items, &choices, &meta(), 464, &mut pending, &mut out);
             for ll in &out {
                 assert!(ll.is_heading() || ll.is_paragraph_end());
                 assert_eq!(ll.extra, 0, "heading line extra must be 0");
@@ -715,7 +724,7 @@ pub mod convert {
 
             let mut out = Vec::new();
             let mut pending = false;
-            append_lines(&items, &choices, &meta(), &mut pending, &mut out);
+            append_lines(&items, &choices, &meta(), 464, &mut pending, &mut out);
             let first = &out[0];
             assert!(
                 first.flags & LineLayout::FLAG_BOLD != 0,
@@ -748,7 +757,7 @@ pub mod convert {
 
             let mut out = Vec::new();
             let mut pending = false;
-            append_lines(&items, &choices, &meta(), &mut pending, &mut out);
+            append_lines(&items, &choices, &meta(), 80, &mut pending, &mut out);
             assert!(out.len() >= 4, "expected multi-line break, got {}", out.len());
             // last line is paragraph-end → extra=0 (the fix).
             assert_eq!(out.last().unwrap().extra, 0);

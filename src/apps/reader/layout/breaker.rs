@@ -110,7 +110,16 @@ pub struct BreakConfig {
 impl BreakConfig {
     pub const DEFAULT: Self = Self {
         line_width: 0, // caller fills
-        tolerance: 200,
+        // 10000 is loose by TeX's `\pretolerance` standards but matches
+        // TeX's `\tolerance` ballpark. We don't have hyphenation or
+        // emergencystretch, so 200 leaves the breaker with no feasible
+        // interior breaks for narrow columns + chunky-glyph fonts
+        // (e.g. Atkinson Small at 464 px) — every paragraph collapses
+        // to one forced-terminal line that overflows the column. K-P
+        // still prefers tight breaks via demerits=(badness+penalty)²,
+        // so loosening tolerance does not produce visibly looser type
+        // when feasible interior breaks exist.
+        tolerance: 10000,
         looseness: 0,
         line_penalty: 10,
         double_hyphen_demerit: 100,
@@ -283,26 +292,34 @@ pub fn break_paragraph(
     Ok(())
 }
 
-/// Try once at default tolerance; on `NoFeasibleBreaks`, retry with
-/// emergency loosening (`tolerance = 1000`, `line_penalty = 0`).
-/// Handles "URL longer than column" and similarly nasty inputs.
+/// Try once at default tolerance; retry with emergency loosening
+/// (`tolerance = 1000`, `line_penalty = 0`) when the primary pass either:
+/// 1. errored with `NoFeasibleBreaks` (e.g., URL longer than column), or
+/// 2. returned a single `Overflow` choice — the signature of "every
+///    intermediate breakpoint was rejected as too loose/tight and only
+///    the forced terminal break landed". A correctly-scaled `badness`
+///    makes this rare in normal prose, but the second trigger protects
+///    against pathological paragraphs and future tolerance tweaks.
 pub fn break_paragraph_with_fallback(
     items: &[Item],
     cfg: &BreakConfig,
     out: &mut Vec<BreakChoice>,
 ) -> Result<(), BreakError> {
-    match break_paragraph(items, cfg, out) {
-        Err(BreakError::NoFeasibleBreaks) => {
-            out.clear();
-            let loose = BreakConfig {
-                tolerance: cfg.tolerance.max(1000),
-                line_penalty: 0,
-                ..*cfg
-            };
-            break_paragraph(items, &loose, out)
-        }
-        other => other,
+    let retry = match break_paragraph(items, cfg, out) {
+        Err(BreakError::NoFeasibleBreaks) => true,
+        Err(other) => return Err(other),
+        Ok(()) => out.len() == 1 && matches!(out[0].adjustment(), Adjustment::Overflow),
+    };
+    if !retry {
+        return Ok(());
     }
+    out.clear();
+    let loose = BreakConfig {
+        tolerance: cfg.tolerance.max(1000),
+        line_penalty: 0,
+        ..*cfg
+    };
+    break_paragraph(items, &loose, out)
 }
 
 // ── internals ─────────────────────────────────────────────────────
@@ -369,6 +386,13 @@ fn consider_break(
     let slack = line_width - line_w_i;
     let forced = matches!(items[i].kind(), ItemKind::Penalty) && items[i].is_forced();
 
+    // tracks "the raw shrink ratio was below RATIO_SHRINK_MAX and we had to
+    // clamp because forced=true." used below to override badness so K-P
+    // does not prefer a forced single-line collapse (badness 100 with
+    // post-clamp r=-1.0) over a feasible multi-line solution (each line
+    // ~badness 1000–1500 in narrow columns).
+    let mut forced_clamp_was_overshrunk = false;
+
     // adjustment ratio in Q8
     let r_q8 = if slack == 0 {
         0
@@ -394,15 +418,23 @@ fn consider_break(
             }
         } else {
             let r = (slack * Q8_ONE) / line_z as i32;
-            if r < RATIO_SHRINK_MAX && !forced {
-                // line cannot shrink enough: infeasible
-                if single_overfull_box(items, lo, i) {
+            if r < RATIO_SHRINK_MAX {
+                if forced {
+                    // forced clamp; record so we can override badness
+                    forced_clamp_was_overshrunk = true;
+                    RATIO_SHRINK_MAX
+                } else if single_overfull_box(items, lo, i) {
                     BreakChoice::ADJUSTMENT_OVERFLOW as i32
                 } else {
-                    return;
+                    // accept as Overflow rather than rejecting outright,
+                    // so paragraphs whose only feasible interior breaks
+                    // need r < -1.0 still produce multi-line output. K-P
+                    // sees Overflow as BADNESS_INFINITY → demerits ~100M
+                    // and prefers any non-overflow alternative.
+                    BreakChoice::ADJUSTMENT_OVERFLOW as i32
                 }
             } else {
-                r.max(RATIO_SHRINK_MAX)
+                r
             }
         }
     };
@@ -415,7 +447,17 @@ fn consider_break(
         return;
     }
 
-    let badness = badness(r_q8);
+    // forced single-line collapse stores r_q8 = RATIO_SHRINK_MAX so the
+    // renderer's encoded `extra` carries the shrink magnitude. but the
+    // *true* badness was much higher than badness(-1.0) = 100 — the
+    // raw r could have been -10 or worse. report BADNESS_INFINITY in
+    // that case so the demerits sum reflects how bad this line really
+    // is and K-P picks any feasible multi-line path over it.
+    let badness = if forced_clamp_was_overshrunk {
+        BADNESS_INFINITY
+    } else {
+        badness(r_q8)
+    };
     let fit = fitness_class(r_q8);
 
     // Demerits: (line_penalty + badness)² plus fitness adjacency penalty
@@ -522,6 +564,13 @@ fn q8_to_badness_input(r_q8: i32) -> i32 {
 }
 
 /// Knuth's badness: 100·|r|³, capped at BADNESS_INFINITY.
+///
+/// The final divide-by-Q8_ONE normalises r³ out of fixed-point. Without
+/// it the result is 256× over-scale (r_cubed_q8 is r³ in Q8), and the
+/// classical tolerance values (200 / 1000) become effectively r ≤ 0.2,
+/// which rejects every realistic intermediate breakpoint in prose. K-P
+/// then only records the forced terminal break, collapsing every
+/// paragraph into one Overflow line.
 fn badness(r_q8: i32) -> i32 {
     if r_q8 == BreakChoice::ADJUSTMENT_OVERFLOW as i32 {
         return BADNESS_INFINITY;
@@ -530,7 +579,7 @@ fn badness(r_q8: i32) -> i32 {
     // r_q8 ∈ [-2048, 2048] keeps r³/65536 ≤ 131072; *100 fits in i32.
     let r_squared_q8 = (r * r) / Q8_ONE;
     let r_cubed_q8 = (r_squared_q8 * r) / Q8_ONE;
-    (100 * r_cubed_q8).min(BADNESS_INFINITY)
+    (100 * r_cubed_q8 / Q8_ONE).min(BADNESS_INFINITY)
 }
 
 #[inline]
@@ -694,6 +743,38 @@ mod tests {
         let _ = break_paragraph_with_fallback(&items, &cfg(42), &mut out);
         // Just assert we got a non-empty output (didn't return error).
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn fallback_loosens_tolerance_on_single_overflow() {
+        // Many wide boxes joined by zero-stretch glue: every interior
+        // breakpoint runs short and (with strict tolerance) is rejected,
+        // so primary break_paragraph emits one Overflow choice spanning
+        // the whole paragraph. The fallback detects this and retries
+        // with tolerance=1000, which accepts interior breaks and emits
+        // multiple lines.
+        let mut items = Vec::new();
+        for _ in 0..6 {
+            items.push(boxed(20));
+            items.push(glue(2, 0, 0));
+        }
+        items.extend(forced_triple());
+
+        // Primary alone: one Overflow line.
+        let strict = BreakConfig {
+            line_width: 80,
+            tolerance: 1, // exclude every interior break
+            ..BreakConfig::DEFAULT
+        };
+        let mut primary_out = Vec::new();
+        break_paragraph(&items, &strict, &mut primary_out).unwrap();
+        assert_eq!(primary_out.len(), 1, "primary should collapse to one line");
+        assert_eq!(primary_out[0].adjustment(), Adjustment::Overflow);
+
+        // Fallback wrapper: detects single-Overflow and retries loose.
+        let mut out = Vec::new();
+        break_paragraph_with_fallback(&items, &strict, &mut out).unwrap();
+        assert!(out.len() > 1, "fallback should emit >1 line, got {}", out.len());
     }
 
     #[test]

@@ -113,7 +113,12 @@ pub(super) fn inline_img_max_h(text_area_h: u16) -> u16 {
     ((text_area_h as u32 * INLINE_IMG_MAX_PCT as u32) / 100) as u16
 }
 
-pub(super) const CHAPTER_CACHE_MAX: usize = 98304;
+// 128 KB. Sized to hold long-novella chapters like Stories of Your Life's
+// "Seventy-Two Letters" (~109 KB stripped). Old 96 KB cap silently rejected
+// such chapters and degraded the reader to a single greedy page (the rest
+// of the chapter became unreachable). See greedy_preindex_compute for the
+// bundle-streamed fallback when even this cap is exceeded.
+pub(super) const CHAPTER_CACHE_MAX: usize = 131072;
 
 // images <= this size are dispatched to async worker for decoding;
 // images > this size are decoded on main loop via streaming SD reads
@@ -175,6 +180,12 @@ pub(super) struct LineSpan {
     pub(super) flags: u8,
     pub(super) indent: u8,
     pub(super) align: u8,
+    // mirrors `LineLayout::extra` encoding: bit 7 sign (1 = shrink), bits
+    // 0-6 magnitude. 0 means "no justify direction signaled" — greedy
+    // lines and K-P Perfect/Overflow lines all land here. The renderer
+    // re-derives the actual per-gap magnitude from measure_line at draw
+    // time; only the sign bit affects the justify decision.
+    pub(super) extra: u8,
 }
 
 impl LineSpan {
@@ -184,7 +195,15 @@ impl LineSpan {
         flags: 0,
         indent: 0,
         align: Self::ALIGN_DEFAULT,
+        extra: 0,
     };
+
+    pub(super) const EXTRA_SIGN_SHRINK: u8 = 0x80;
+
+    #[inline]
+    pub(super) fn extra_is_shrink(&self) -> bool {
+        self.extra & Self::EXTRA_SIGN_SHRINK != 0
+    }
 
     pub(super) const FLAG_BOLD: u8 = 1 << 0;
     pub(super) const FLAG_ITALIC: u8 = 1 << 1;
@@ -237,14 +256,23 @@ impl LineSpan {
     }
 
     pub(super) fn style(&self) -> fonts::Style {
-        if self.flags & Self::FLAG_HEADING != 0 {
-            fonts::Style::Heading
-        } else if self.flags & Self::FLAG_BOLD != 0 {
-            fonts::Style::Bold
-        } else if self.flags & Self::FLAG_ITALIC != 0 {
-            fonts::Style::Italic
-        } else {
-            fonts::Style::Regular
+        let bold = self.flags & Self::FLAG_BOLD != 0;
+        let italic = self.flags & Self::FLAG_ITALIC != 0;
+        let heading = self.flags & Self::FLAG_HEADING != 0;
+        let hlevel = if heading { self.start_hlevel() } else { 0 };
+        fonts::Style::from_flags(bold, italic, heading, hlevel)
+    }
+
+    /// Decode the line's initial heading level from `HLEVEL_*` flag
+    /// bits. Only meaningful when `FLAG_HEADING` is set; returns the
+    /// 1-based level (1 / 2 / 3). h4-h6 collapse to 3 in the
+    /// LineLayout encoding today — see plan note.
+    #[inline]
+    pub(super) fn start_hlevel(&self) -> u8 {
+        match self.flags & Self::HLEVEL_MASK {
+            Self::HLEVEL_H1 => 1,
+            Self::HLEVEL_H2 => 2,
+            _ => 3,
         }
     }
 
@@ -338,12 +366,19 @@ impl PageState {
         !self.kp_pages.is_empty()
     }
 
-    /// Drop K-P state (e.g. on chapter change or font cycle). Cheap;
-    /// vec capacities are released for reuse by subsequent typeset.
+    /// Drop K-P state (e.g. on chapter change or font cycle). Releases
+    /// vec capacities (not just length) so the heap is freed for the
+    /// next chapter's ch_cache allocation. `chapter_lines` for a long
+    /// chapter is ~22 KB; without the explicit shrink, that capacity
+    /// stays allocated until the next K-P typeset reallocates, which
+    /// can cause `try_cache_chapter` to OOM mid-jump on tight heaps.
     pub(super) fn clear_kp_layout(&mut self) {
         self.chapter_lines.clear();
+        self.chapter_lines.shrink_to_fit();
         self.kp_pages.clear();
+        self.kp_pages.shrink_to_fit();
         self.image_block_lines.clear();
+        self.image_block_lines.shrink_to_fit();
     }
 }
 
@@ -975,6 +1010,9 @@ impl ReaderApp {
 
         if self.pending_cover_thumb {
             self.pending_cover_thumb = false;
+            // arming is gated on FLAG_CORE_READY at every callsite (OPF
+            // parse + finish_cache success), so generate_cover_thumb is
+            // guaranteed to find CORE ready here.
             self.generate_cover_thumb(k);
             return true;
         }
@@ -1819,11 +1857,15 @@ impl App<AppId> for ReaderApp {
         // machine to NeedBookmark; NeedOpf/NeedToc re-parse metadata
         // from SD, NeedIndex re-reads the chapter cache. one-time
         // cost: ~1-2s on the first page turn after wake.
+        let kp_state = self.pg.chapter_lines.capacity() * size_of::<crate::apps::reader::layout::LineLayout>()
+            + self.pg.kp_pages.capacity() * size_of::<crate::apps::reader::layout::PageLayout>()
+            + self.pg.image_block_lines.capacity();
         let freed = self.epub.ch_cache.capacity()
             + self.pg.prefetch.capacity()
             + self.page_img.as_ref().map_or(0, |i| i.data.capacity())
             + self.loading_cover.as_ref().map_or(0, |i| i.data.capacity())
-            + self.epub.toc.as_ref().map_or(0, |_| size_of::<EpubToc>());
+            + self.epub.toc.as_ref().map_or(0, |_| size_of::<EpubToc>())
+            + kp_state;
 
         // cancel any in-flight image decode so the worker drops its buffer
         work_queue::reset();
@@ -1836,6 +1878,13 @@ impl App<AppId> for ReaderApp {
         // toc/toc_source re-parsed on wake via NeedToc state
         self.epub.toc = None;
         self.epub.toc_source = None;
+
+        // K-P chapter state is biggest hidden retainer for long
+        // chapters: 2113 LineLayout × 16 B ≈ 33 KB for "Seventy-Two
+        // Letters". With ch_cache freed but K-P state retained, the
+        // wallpaper allocator OOMs. The on-disk PIDX cache means
+        // re-typesetting on wake is fast (cache hit, no K-P pass).
+        self.pg.clear_kp_layout();
 
         log::info!(
             "reader: pre-sleep freed ~{}KB of transient heap",
@@ -1970,7 +2019,21 @@ impl App<AppId> for ReaderApp {
                             self.epub.chapter = (spine_len - 1) as u16;
                         }
                         self.pending_title_save = self.title_is_real;
-                        self.pending_cover_thumb = self.epub.meta.has_cover();
+                        // only arm when the bundle is already complete — for
+                        // incomplete bundles the fresh-import path
+                        // (epubs.rs::bg_cache_step_sync) arms the flag on the
+                        // CORE_READY rising edge. arming before then spins
+                        // `run_deferred_open_work` (defer + re-arm) and
+                        // starves the background caching that flips
+                        // CORE_READY.
+                        self.pending_cover_thumb = self.epub.meta.has_cover()
+                            && plump_kernel::kernel::bundle::read_header(
+                                k.sd(),
+                                self.epub.name_hash,
+                            )
+                            .is_some_and(|h| {
+                                h.has_flag(plump_kernel::kernel::bundle::FLAG_CORE_READY)
+                            });
                         self.state = State::NeedToc;
                         self.set_loading_ui(ctx, "Loading", 40);
                         plump_kernel::perf_event!(
@@ -2160,7 +2223,14 @@ impl App<AppId> for ReaderApp {
 
                 self.epub_index_chapter();
 
-                if self.is_epub && self.epub.try_cache_chapter(k) {
+                if self.is_epub {
+                    // try_cache_chapter is best-effort: it can return false
+                    // (oversized chapter, OOM). preindex_all_pages must run
+                    // either way so it can clear the prior chapter's K-P
+                    // state (otherwise has_kp_layout() stays true with
+                    // stale data) and fall back to bundle-streamed greedy
+                    // when ch_cache is empty.
+                    self.epub.try_cache_chapter(k);
                     self.preindex_all_pages(k);
                 }
 
@@ -2975,38 +3045,85 @@ impl App<AppId> for ReaderApp {
                     };
                     let mut cx = self.text_margin as i32 + x_indent + align_offset;
 
-                    // justification: distribute extra space across inter-word gaps.
-                    // applies only to soft-wrapped body lines that don't carry
-                    // an explicit alignment override and aren't a heading.
-                    let justify = self.text_alignment == 1
+                    // justification: distribute spare (signed) across inter-word
+                    // gaps. stretch and shrink are decided independently:
+                    //
+                    // - stretch is aesthetic (justify-vs-left preference) — only
+                    //   fires when the user picked justified text AND this is a
+                    //   mid-paragraph soft-wrap.
+                    // - shrink is layout-driven — fires whenever K-P signalled
+                    //   it via `extra`, regardless of user alignment preference
+                    //   and regardless of paragraph-end status. without this,
+                    //   single-line shrink-fit paragraphs overflow the column
+                    //   (Stories of Your Life's dense prose, Leviathan ch5's
+                    //   "Using the Knight..." paragraph).
+                    //
+                    // headings and explicit-align lines skip both directions.
+                    let is_heading = (span.flags & LineSpan::FLAG_HEADING) != 0;
+                    let explicit = span.is_explicit_align();
+                    let can_stretch = self.text_alignment == 1
                         && span.is_soft_wrap()
-                        && (span.flags & LineSpan::FLAG_HEADING) == 0
-                        && !span.is_explicit_align();
-                    let (extra_per_gap, remainder) = if justify {
+                        && !is_heading
+                        && !explicit;
+                    let can_shrink = span.extra_is_shrink() && !is_heading && !explicit;
+                    let (extra_per_gap, remainder) = if can_stretch || can_shrink {
                         let m = self.pg.line_measures[i];
-                        let avail = self.text_w.saturating_sub(INDENT_PX * span.indent as u32);
-                        let spare = avail.saturating_sub(m.width);
-                        // skip if: no gaps, tiny spare (< 3px — invisible),
-                        // or spare > 40% of line width (line too short to justify)
-                        if m.gaps >= 2 && spare >= 3 && spare * 5 < avail * 2 {
-                            let per = spare / m.gaps as u32;
-                            // cap per-gap extra to 3× natural space width to
-                            // avoid rivers when a line has very few gaps
-                            let space_w = fs.advance(' ', span.style()) as u32;
-                            let max_per = space_w.saturating_mul(3);
-                            if per <= max_per {
-                                (per as i32, (spare % m.gaps as u32) as i32)
+                        let avail = self
+                            .text_w
+                            .saturating_sub(INDENT_PX * span.indent as u32)
+                            as i32;
+                        let spare = avail - m.width as i32;
+                        let gaps = m.gaps as i32;
+                        let space_w = fs.advance(' ', span.style()) as i32;
+
+                        if gaps < 2 {
+                            (0, 0)
+                        } else if can_stretch && spare >= 3 && spare * 5 < avail * 2 {
+                            // stretch: distribute positive spare across gaps,
+                            // capped at 3× natural space width per gap so a
+                            // sparse line doesn't open rivers.
+                            let per = spare / gaps;
+                            if per <= space_w.saturating_mul(3) {
+                                (per, spare - per * gaps)
                             } else {
-                                (0i32, 0i32)
+                                (0, 0)
+                            }
+                        } else if can_shrink && spare <= -1 {
+                            // shrink: K-P decided this paragraph fits by
+                            // squeezing inter-word spaces. honor it up to K-P's
+                            // own per-glue shrink budget (space/2, matching
+                            // `Item::glue`'s shrink in items.rs and
+                            // `RATIO_SHRINK_MAX` in breaker.rs).
+                            let per = spare / gaps; // signed; rounds toward 0
+                            let floor = -(space_w / 2).max(1);
+                            if per >= floor {
+                                (per, spare - per * gaps)
+                            } else {
+                                // K-P / renderer disagree on widths beyond the
+                                // shrink budget — draw at natural width rather
+                                // than crush letters together.
+                                (0, 0)
                             }
                         } else {
-                            (0i32, 0i32)
+                            (0, 0)
                         }
                     } else {
-                        (0i32, 0i32)
+                        (0, 0)
                     };
                     let mut gap_idx: i32 = 0;
-                    let mut sty = span.style();
+
+                    // Track style by accumulated flags (matches K-P's
+                    // `fonts::Style::from_flags` resolver) so nested
+                    // markup (e.g. `<b><i>x</i></b>`) draws under the
+                    // same style K-P measured. The line's initial
+                    // flags come from `LineSpan::style()`'s underlying
+                    // bits.
+                    let mut in_bold = span.flags & LineSpan::FLAG_BOLD != 0;
+                    let mut in_italic = span.flags & LineSpan::FLAG_ITALIC != 0;
+                    let mut in_heading = span.flags & LineSpan::FLAG_HEADING != 0;
+                    let mut hlevel: u8 = if in_heading { span.start_hlevel() } else { 0 };
+                    let mut sty =
+                        fonts::Style::from_flags(in_bold, in_italic, in_heading, hlevel);
 
                     // underline / strikethrough are rendered as 1-px horizontal
                     // strokes drawn after a run ends; each *_x_start records cx
@@ -3023,20 +3140,54 @@ impl App<AppId> for ReaderApp {
                     while j < line.len() {
                         let b = line[j];
                         if b == MARKER && j + 1 < line.len() {
-                            sty = match line[j + 1] {
-                                BOLD_ON => fonts::Style::Bold,
-                                ITALIC_ON => fonts::Style::Italic,
-                                HEADING_ON | H1_ON | H2_ON | H3_ON => fonts::Style::Heading,
-                                H4_ON | H5_ON | H6_ON => fonts::Style::Bold,
-                                BOLD_OFF | ITALIC_OFF | HEADING_OFF => fonts::Style::Regular,
-                                H1_OFF | H2_OFF | H3_OFF => fonts::Style::Regular,
-                                H4_OFF | H5_OFF | H6_OFF => fonts::Style::Regular,
+                            match line[j + 1] {
+                                BOLD_ON => in_bold = true,
+                                BOLD_OFF => in_bold = false,
+                                ITALIC_ON => in_italic = true,
+                                ITALIC_OFF => in_italic = false,
+                                HEADING_ON => {
+                                    in_heading = true;
+                                    if hlevel == 0 {
+                                        hlevel = 3;
+                                    }
+                                }
+                                HEADING_OFF => {
+                                    in_heading = false;
+                                    hlevel = 0;
+                                }
+                                H1_ON => {
+                                    in_heading = true;
+                                    hlevel = 1;
+                                }
+                                H2_ON => {
+                                    in_heading = true;
+                                    hlevel = 2;
+                                }
+                                H3_ON => {
+                                    in_heading = true;
+                                    hlevel = 3;
+                                }
+                                H4_ON => {
+                                    in_heading = true;
+                                    hlevel = 4;
+                                }
+                                H5_ON => {
+                                    in_heading = true;
+                                    hlevel = 5;
+                                }
+                                H6_ON => {
+                                    in_heading = true;
+                                    hlevel = 6;
+                                }
+                                H1_OFF | H2_OFF | H3_OFF | H4_OFF | H5_OFF | H6_OFF => {
+                                    in_heading = false;
+                                    hlevel = 0;
+                                }
                                 UNDERLINE_ON => {
                                     if !underline_active {
                                         underline_active = true;
                                         underline_x_start = cx;
                                     }
-                                    sty
                                 }
                                 UNDERLINE_OFF => {
                                     if underline_active && cx > underline_x_start {
@@ -3049,14 +3200,12 @@ impl App<AppId> for ReaderApp {
                                         .ok();
                                     }
                                     underline_active = false;
-                                    sty
                                 }
                                 STRIKE_ON => {
                                     if !strike_active {
                                         strike_active = true;
                                         strike_x_start = cx;
                                     }
-                                    sty
                                 }
                                 STRIKE_OFF => {
                                     if strike_active && cx > strike_x_start {
@@ -3069,22 +3218,40 @@ impl App<AppId> for ReaderApp {
                                         .ok();
                                     }
                                     strike_active = false;
-                                    sty
                                 }
-                                _ => sty,
-                            };
+                                _ => {}
+                            }
+                            sty =
+                                fonts::Style::from_flags(in_bold, in_italic, in_heading, hlevel);
                             j += 2;
                             continue;
                         }
                         if b >= 0xC0 {
                             let (ch, seq_len) = decode_utf8_char(line, j);
+                            // SHY (U+00AD): K-P models soft hyphens as
+                            // zero-width Penalty items (items.rs:280)
+                            // so the draw path must also contribute
+                            // zero advance. fonts ship SHY as a visible
+                            // hyphen glyph with positive advance, which
+                            // would overflow every line carrying soft
+                            // hyphens and draw spurious mid-word marks.
+                            // build.rs excludes SHY from the font tables
+                            // for the same reason; this skip is the
+                            // matching renderer-side policy.
+                            if ch == '\u{00AD}' {
+                                j += seq_len;
+                                continue;
+                            }
                             cx += fs.draw_char(strip, ch, sty, cx, baseline) as i32;
-                            // justify: add extra space after NBSP is
-                            // intentionally skipped (NBSP is not stretchable)
-                            if ch == ' ' && extra_per_gap > 0 {
+                            // justify: add extra space (or shrink, when
+                            // extra_per_gap is negative). NBSP is intentionally
+                            // skipped — it's not a stretchable gap.
+                            if ch == ' ' && (extra_per_gap != 0 || remainder != 0) {
                                 cx += extra_per_gap;
-                                if gap_idx < remainder {
+                                if remainder > 0 && gap_idx < remainder {
                                     cx += 1;
+                                } else if remainder < 0 && gap_idx < -remainder {
+                                    cx -= 1;
                                 }
                                 gap_idx += 1;
                             }
@@ -3102,11 +3269,13 @@ impl App<AppId> for ReaderApp {
                             continue; // control char
                         }
                         cx += fs.draw_char(strip, b as char, sty, cx, baseline) as i32;
-                        // justify: distribute extra pixels at ASCII space gaps
-                        if b == b' ' && extra_per_gap > 0 {
+                        // justify: distribute extra (signed) at ASCII space gaps
+                        if b == b' ' && (extra_per_gap != 0 || remainder != 0) {
                             cx += extra_per_gap;
-                            if gap_idx < remainder {
+                            if remainder > 0 && gap_idx < remainder {
                                 cx += 1;
+                            } else if remainder < 0 && gap_idx < -remainder {
+                                cx -= 1;
                             }
                             gap_idx += 1;
                         }

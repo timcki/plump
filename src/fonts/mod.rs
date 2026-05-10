@@ -251,6 +251,41 @@ pub enum Style {
     Heading,
 }
 
+impl Style {
+    /// Resolve a font style from accumulated markup-state flags.
+    ///
+    /// Both the K-P typesetting pipeline (`layout::pipeline`) and the
+    /// runtime renderer (`apps::reader::mod`/`paging::measure_line`)
+    /// funnel through this single resolver, so K-P's measurement and
+    /// the renderer's draw widths cannot diverge on nested markup
+    /// (e.g. `<b><i>x</i></b>` previously measured as Bold and drew
+    /// as Italic, overrunning the column).
+    ///
+    /// Policy:
+    ///   * `h1` / `h2` / `h3` (`hlevel ∈ 1..=3` with `heading=true`)
+    ///     resolve to `Heading`.
+    ///   * `h4` / `h5` / `h6` resolve to `Bold` — matches the
+    ///     `TextStyle::is_h4_h6_bold` intent that low-tier headings
+    ///     render as body bold, not heading font.
+    ///   * Otherwise `bold` beats `italic` (heading-priority then
+    ///     bold-priority, matching the in-scanner flag composition).
+    ///
+    /// `underline` / `strike` are draw-side decorations only — they
+    /// never change glyph metrics, so callers track those separately.
+    #[inline]
+    pub const fn from_flags(bold: bool, italic: bool, heading: bool, hlevel: u8) -> Self {
+        if heading && hlevel >= 1 && hlevel <= 3 {
+            Style::Heading
+        } else if bold || (heading && hlevel >= 4) {
+            Style::Bold
+        } else if italic {
+            Style::Italic
+        } else {
+            Style::Regular
+        }
+    }
+}
+
 // complete set of four style variants from a single family at a given
 // size tier. missing weights fall back to regular automatically.
 #[derive(Clone, Copy)]

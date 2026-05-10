@@ -57,7 +57,12 @@ pub fn bundle_file_str(buf: &[u8; 12]) -> &str {
 
 pub const HEADER_SIZE: usize = 256;
 pub const HEADER_MAGIC: [u8; 4] = *b"PLMP";
-pub const HEADER_VERSION: u16 = 2;
+// v3 splits PIDX into a fixed-size `PidxDir` section and a growable
+// `PidxData` section; chapter-dir `pages_offset` / `lines_offset` are
+// now relative to PidxData. v2 bundles cannot be reinterpreted (the
+// covers region in v2 routinely overlapped PidxDir/content) so they
+// are deleted and rebuilt on open.
+pub const HEADER_VERSION: u16 = 3;
 
 // content stream format inside the content section. evolves independently
 // of HEADER_VERSION so future marker additions can invalidate stored bundles
@@ -117,14 +122,187 @@ const OFF_CONTENT_OFFSET: usize = 204; // 4
 const OFF_CONTENT_SIZE: usize = 208; // 4
 const OFF_IMAGES_OFFSET: usize = 212; // 4
 const OFF_IMAGES_SIZE: usize = 216; // 4
-const OFF_PAGEIDX_OFFSET: usize = 220; // 4
-const OFF_PAGEIDX_SIZE: usize = 224; // 4
-const OFF_PAGEIDX_FONT_IDX: usize = 228; // 1
+const OFF_PIDX_DIR_OFFSET: usize = 220; // 4
+const OFF_PIDX_DIR_SIZE: usize = 224; // 4
+const OFF_PIDX_FONT_IDX: usize = 228; // 1
 const OFF_CONTENT_FMT: usize = 229; // 1
-// 230..256 reserved
+const OFF_PIDX_DATA_OFFSET: usize = 230; // 4
+const OFF_PIDX_DATA_SIZE: usize = 234; // 4
+// 238..256 reserved
 
 // bookmark flags bits (inside `bm_flags`)
 pub const BM_FLAG_VALID: u8 = 1 << 0;
+
+// ── typed section table ────────────────────────────────────────────
+//
+// `SectionId` enumerates the named regions inside a bundle file. Each
+// section has a fixed allocation order (encoded by `predecessor`) so
+// that `BundleFile::allocate` can only place a new section at the
+// current file tail, immediately after its predecessor. This makes
+// section-range overlap impossible by construction — the bug that
+// silently destroyed cover bytes in the v2 layout when the covers
+// region happened to land inside the PIDX zero-fill range.
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SectionId {
+    Spine = 0,
+    Content = 1,
+    PidxDir = 2,
+    Covers = 3,
+    PidxData = 4,
+}
+
+pub const SECTION_COUNT: usize = 5;
+
+impl SectionId {
+    /// Allocation order: each section requires its predecessor to
+    /// exist before it can be allocated. `Spine` has no predecessor.
+    pub const fn predecessor(self) -> Option<SectionId> {
+        match self {
+            SectionId::Spine => None,
+            SectionId::Content => Some(SectionId::Spine),
+            SectionId::PidxDir => Some(SectionId::Content),
+            SectionId::Covers => Some(SectionId::PidxDir),
+            SectionId::PidxData => Some(SectionId::Covers),
+        }
+    }
+
+    pub const ALL: [SectionId; SECTION_COUNT] = [
+        SectionId::Spine,
+        SectionId::Content,
+        SectionId::PidxDir,
+        SectionId::Covers,
+        SectionId::PidxData,
+    ];
+}
+
+/// Half-open byte range `[offset, offset + size)` within a bundle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SectionRange {
+    pub offset: u32,
+    pub size: u32,
+}
+
+impl SectionRange {
+    pub const EMPTY: Self = Self { offset: 0, size: 0 };
+
+    #[inline]
+    pub fn end(&self) -> u32 {
+        self.offset.saturating_add(self.size)
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// True when the two ranges share at least one byte. Two empty
+    /// ranges never overlap (an unallocated section occupies no
+    /// bytes).
+    pub fn overlaps(&self, other: &Self) -> bool {
+        !self.is_empty()
+            && !other.is_empty()
+            && self.offset < other.end()
+            && other.offset < self.end()
+    }
+}
+
+/// Errors returned by the typed `BundleFile` API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BundleError {
+    /// `allocate(id)` called when `id` already has a range in the header.
+    AlreadyAllocated(SectionId),
+    /// `section_mut(id)` / `grow_tail(id)` called when `id` has no range.
+    NotAllocated(SectionId),
+    /// `allocate(id)` called before `id.predecessor()` was allocated.
+    PredecessorMissing { id: SectionId, needs: SectionId },
+    /// `grow_tail(id)` called when `id` is not the section at file tail.
+    NotAtTail(SectionId),
+    /// `Section::write_at` / `read_at` outside the section's bounded size.
+    OutOfBounds { section: SectionId, rel: u32, len: u32, size: u32 },
+    /// Two recorded sections overlap (detected by `verify_layout`).
+    Overlap { a: SectionId, b: SectionId },
+    /// The bundle on disk has an older `HEADER_VERSION` than this code
+    /// understands; caller should delete and rebuild.
+    StaleVersion(u16),
+    /// The bundle file is missing or its header could not be decoded.
+    MissingOrCorrupt,
+    /// An underlying SD I/O call failed.
+    Io(crate::error::Error),
+}
+
+impl From<crate::error::Error> for BundleError {
+    fn from(e: crate::error::Error) -> Self {
+        BundleError::Io(e)
+    }
+}
+
+impl From<BundleError> for crate::error::Error {
+    fn from(e: BundleError) -> Self {
+        match e {
+            BundleError::Io(err) => err,
+            BundleError::OutOfBounds {
+                section,
+                rel,
+                len,
+                size,
+            } => {
+                log::warn!(
+                    "bundle: out-of-bounds write in {:?}: rel={} len={} size={}",
+                    section,
+                    rel,
+                    len,
+                    size,
+                );
+                crate::error::Error::new(
+                    crate::error::ErrorKind::InvalidData,
+                    "bundle: section bounds",
+                )
+            }
+            BundleError::Overlap { a, b } => {
+                log::warn!("bundle: section overlap {:?} vs {:?}", a, b);
+                crate::error::Error::new(
+                    crate::error::ErrorKind::InvalidData,
+                    "bundle: section overlap",
+                )
+            }
+            BundleError::PredecessorMissing { id, needs } => {
+                log::warn!("bundle: {:?} needs predecessor {:?}", id, needs);
+                crate::error::Error::new(
+                    crate::error::ErrorKind::InvalidData,
+                    "bundle: predecessor missing",
+                )
+            }
+            BundleError::AlreadyAllocated(id) => {
+                log::warn!("bundle: {:?} already allocated", id);
+                crate::error::Error::new(
+                    crate::error::ErrorKind::InvalidData,
+                    "bundle: already allocated",
+                )
+            }
+            BundleError::NotAllocated(_) => crate::error::Error::new(
+                crate::error::ErrorKind::NotFound,
+                "bundle: section not allocated",
+            ),
+            BundleError::NotAtTail(id) => {
+                log::warn!("bundle: {:?} not at tail", id);
+                crate::error::Error::new(
+                    crate::error::ErrorKind::InvalidData,
+                    "bundle: section not at tail",
+                )
+            }
+            BundleError::StaleVersion(v) => {
+                log::warn!("bundle: stale v{}", v);
+                crate::error::Error::new(crate::error::ErrorKind::NotFound, "bundle: stale version")
+            }
+            BundleError::MissingOrCorrupt => crate::error::Error::new(
+                crate::error::ErrorKind::NotFound,
+                "bundle: missing or corrupt",
+            ),
+        }
+    }
+}
 
 /// owned, decoded bundle header
 #[derive(Clone, Copy)]
@@ -160,9 +338,11 @@ pub struct BundleHeader {
     pub content_size: u32,
     pub images_offset: u32,
     pub images_size: u32,
-    pub pageidx_offset: u32,
-    pub pageidx_size: u32,
-    pub pageidx_font_idx: u8,
+    pub pidx_dir_offset: u32,
+    pub pidx_dir_size: u32,
+    pub pidx_data_offset: u32,
+    pub pidx_data_size: u32,
+    pub pidx_font_idx: u8,
     pub content_fmt: u8,
 }
 
@@ -195,9 +375,11 @@ impl BundleHeader {
         content_size: 0,
         images_offset: 0,
         images_size: 0,
-        pageidx_offset: 0,
-        pageidx_size: 0,
-        pageidx_font_idx: 0,
+        pidx_dir_offset: 0,
+        pidx_dir_size: 0,
+        pidx_data_offset: 0,
+        pidx_data_size: 0,
+        pidx_font_idx: 0,
         content_fmt: CONTENT_FMT_LATEST,
     };
 
@@ -248,9 +430,11 @@ impl BundleHeader {
             content_size: r_u32(buf, OFF_CONTENT_SIZE),
             images_offset: r_u32(buf, OFF_IMAGES_OFFSET),
             images_size: r_u32(buf, OFF_IMAGES_SIZE),
-            pageidx_offset: r_u32(buf, OFF_PAGEIDX_OFFSET),
-            pageidx_size: r_u32(buf, OFF_PAGEIDX_SIZE),
-            pageidx_font_idx: buf[OFF_PAGEIDX_FONT_IDX],
+            pidx_dir_offset: r_u32(buf, OFF_PIDX_DIR_OFFSET),
+            pidx_dir_size: r_u32(buf, OFF_PIDX_DIR_SIZE),
+            pidx_data_offset: r_u32(buf, OFF_PIDX_DATA_OFFSET),
+            pidx_data_size: r_u32(buf, OFF_PIDX_DATA_SIZE),
+            pidx_font_idx: buf[OFF_PIDX_FONT_IDX],
             content_fmt: buf[OFF_CONTENT_FMT],
         })
     }
@@ -298,9 +482,11 @@ impl BundleHeader {
         w_u32(&mut out, OFF_CONTENT_SIZE, self.content_size);
         w_u32(&mut out, OFF_IMAGES_OFFSET, self.images_offset);
         w_u32(&mut out, OFF_IMAGES_SIZE, self.images_size);
-        w_u32(&mut out, OFF_PAGEIDX_OFFSET, self.pageidx_offset);
-        w_u32(&mut out, OFF_PAGEIDX_SIZE, self.pageidx_size);
-        out[OFF_PAGEIDX_FONT_IDX] = self.pageidx_font_idx;
+        w_u32(&mut out, OFF_PIDX_DIR_OFFSET, self.pidx_dir_offset);
+        w_u32(&mut out, OFF_PIDX_DIR_SIZE, self.pidx_dir_size);
+        w_u32(&mut out, OFF_PIDX_DATA_OFFSET, self.pidx_data_offset);
+        w_u32(&mut out, OFF_PIDX_DATA_SIZE, self.pidx_data_size);
+        out[OFF_PIDX_FONT_IDX] = self.pidx_font_idx;
         out[OFF_CONTENT_FMT] = self.content_fmt;
 
         out
@@ -323,6 +509,78 @@ impl BundleHeader {
     #[inline]
     pub fn has_valid_bookmark(&self) -> bool {
         self.bm_flags & BM_FLAG_VALID != 0 && self.has_flag(FLAG_HAS_BOOKMARK)
+    }
+
+    /// Return the `SectionRange` recorded in the header for `id`, or
+    /// `None` when the section has not been allocated yet (size == 0).
+    pub fn section(&self, id: SectionId) -> Option<SectionRange> {
+        let r = match id {
+            SectionId::Spine => SectionRange {
+                offset: self.spine_offset,
+                size: self.spine_size,
+            },
+            SectionId::Content => SectionRange {
+                offset: self.content_offset,
+                size: self.content_size,
+            },
+            SectionId::PidxDir => SectionRange {
+                offset: self.pidx_dir_offset,
+                size: self.pidx_dir_size,
+            },
+            SectionId::Covers => SectionRange {
+                offset: self.covers_offset,
+                size: self.covers_size,
+            },
+            SectionId::PidxData => SectionRange {
+                offset: self.pidx_data_offset,
+                size: self.pidx_data_size,
+            },
+        };
+        if r.is_empty() { None } else { Some(r) }
+    }
+
+    /// Set the `SectionRange` for `id` in the header (does not write
+    /// to disk; caller must invoke `write_header` separately).
+    pub fn set_section(&mut self, id: SectionId, range: SectionRange) {
+        match id {
+            SectionId::Spine => {
+                self.spine_offset = range.offset;
+                self.spine_size = range.size;
+            }
+            SectionId::Content => {
+                self.content_offset = range.offset;
+                self.content_size = range.size;
+            }
+            SectionId::PidxDir => {
+                self.pidx_dir_offset = range.offset;
+                self.pidx_dir_size = range.size;
+            }
+            SectionId::Covers => {
+                self.covers_offset = range.offset;
+                self.covers_size = range.size;
+            }
+            SectionId::PidxData => {
+                self.pidx_data_offset = range.offset;
+                self.pidx_data_size = range.size;
+            }
+        }
+    }
+
+    /// Walk every allocated section and assert pairwise non-overlap.
+    /// Catches misordered section placement (the v2 covers/PidxDir
+    /// overlap bug) before any write is committed.
+    pub fn verify_layout(&self) -> Result<(), BundleError> {
+        for i in 0..SECTION_COUNT {
+            let a_id = SectionId::ALL[i];
+            let Some(a) = self.section(a_id) else { continue };
+            for b_id in &SectionId::ALL[i + 1..] {
+                let Some(b) = self.section(*b_id) else { continue };
+                if a.overlaps(&b) {
+                    return Err(BundleError::Overlap { a: a_id, b: *b_id });
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -594,7 +852,85 @@ pub const PAGEIDX_FORMAT_VERSION: u8 = 2;
 // the renderer never justifies). v2 caches stamped these lines with
 // stretch saturated to +127 px-per-gap, which mismatched what the
 // renderer actually drew and is corrected by re-typesetting.
-pub const LAYOUT_ALGO_VERSION: u8 = 3;
+//
+// v4 fixes two K-P regressions caught on Leviathan Wakes ch5:
+// 1. `badness` returned 100·r³·256 instead of 100·r³ (missing final
+//    Q8 normalisation), so the default tolerance rejected every
+//    realistic intermediate breakpoint and K-P collapsed each source
+//    paragraph into a single Overflow line.
+// 2. Image-line reservation used the raw HTML `attr_h` instead of
+//    the decoder's downscaled rendered height, leaving large empty
+//    space above and below small inline images.
+//
+// v5 plumbs JPEG/PNG source-dimension peeks into K-P typesetting so
+// images with no HTML width/height attrs (EPUBs that size via CSS,
+// e.g. Leviathan Wakes ornaments) reserve the exact rendered height
+// instead of falling back to DEFAULT_IMG_H. v4 caches contain over-
+// reserved image blocks and must be regenerated.
+//
+// v6 makes the K-P hint actually return real image heights: it now
+// checks the decoded-image cache first (4-byte header, exact pixel
+// height) before falling back to a ZIP source-peek, and the source-
+// peek path now handles DEFLATE-compressed entries via DeflateReader.
+// v5 caches contain the same DEFAULT_IMG_H over-reservation as v4
+// for any image whose source peek silently bailed (DEFLATE entries,
+// every uncached image on a Calibre-packaged EPUB).
+//
+// v7 unifies font-style resolution between K-P measurement and the
+// renderer (`fonts::Style::from_flags`). v6 caches measured nested
+// markup like `<b><i>…</i></b>` as Bold while the renderer drew it
+// as Italic, so K-P-chosen wrap points overran the column on any
+// line containing such spans (markup-order-sensitive). The new
+// resolver also routes h4-h6 to Bold on the K-P side, matching the
+// renderer's existing behaviour.
+//
+// v8 preserves K-P `Adjustment::Shrink` in `LineLayout::extra` on
+// paragraph-end and heading lines. v7 zeroed extra for those lines
+// via a blanket no-justify guard, so single-line shrink-fit
+// paragraphs (the common Stories of Your Life pattern) cached with
+// extra=0 and the renderer drew them at natural width past the
+// right margin. v8 only suppresses stretch in that guard; shrink
+// flows through to the renderer so it can squeeze inter-word
+// spacing.
+//
+// v10 changes the breaker so it stops collapsing paragraphs to a
+// single forced-terminal line on narrow columns. Three breaker
+// changes: (1) BreakConfig::DEFAULT.tolerance bumped 200 -> 10000
+// so loose-but-acceptable interior breaks pass the badness check;
+// (2) over-shrunk non-forced interior lines now emit Overflow
+// instead of being rejected, so narrow paragraphs always have a
+// feasible (if expensive) interior path; (3) the forced shrink-
+// clamp boosts badness to BADNESS_INFINITY in the demerits sum so
+// K-P stops preferring single-line collapses over multi-line
+// alternatives. Pre-v10 caches measured Stories of Your Life
+// "Evolution of Human Science" as ~12 single-line paragraphs at
+// 2700-6800 px width into a 464 px column.
+//
+// v11 widens the per-glue elasticity in items.rs from (space/2,
+// space/3) to (space, space/2). v10's tighter ratios saturated
+// loose-line badness against BADNESS_INFINITY for narrow columns
+// + chunky-glyph fonts (Atkinson Small at 464 px), so K-P could
+// not distinguish a loose-but-readable line from a true overflow
+// line — half the body paragraphs still collapsed because every
+// candidate multi-line path looked equally bad demerits-wise.
+// v11 gives K-P a meaningful badness gradient so it picks
+// multi-line even on the hardest paragraphs. The renderer's
+// shrink floor in mod.rs is moved from space/3 to space/2 to
+// match.
+//
+// v12 migrates `MarkupScanner` to a `ByteSource` trait so K-P
+// can stream chapters that don't fit in `ch_cache` (the largest
+// contiguous heap region on ESP32-C3 is ~108 KB; novella-length
+// chapters like Stories of Your Life "Seventy-Two Letters" at
+// ~109 KB stripped) via the same in-RAM-buffer-over-SD pattern
+// the JPEG decoder uses for big covers. Two impls behind the
+// trait: `SliceByteSource` (zero-cost over `&ch_cache`, the
+// fast path) and `BundleByteSource` (4 KB sliding window,
+// `bundle::read_at` on miss). Layout output should be byte-
+// identical to v11 for chapters that fit either path; bumping
+// for safety in case rounding or buffer-boundary edge cases
+// shift any single break decision.
+pub const LAYOUT_ALGO_VERSION: u8 = 12;
 
 pub const PAGEIDX_HDR_V2_SIZE: usize = 20;
 pub const CHAPTER_LAYOUT_DIR_SIZE: usize = 24;
@@ -900,7 +1236,9 @@ const _: () = {
     assert!(OFF_SPINE_COUNT + 2 + 2 == OFF_BM_CHAPTER);
     assert!(OFF_BM_FLAGS + 1 + 6 == OFF_PAGES_READ);
     assert!(OFF_PROGRESS_PCT + 1 + 1 == OFF_COVERS_OFFSET);
-    assert!(OFF_PAGEIDX_FONT_IDX < HEADER_SIZE);
+    assert!(OFF_PIDX_FONT_IDX < HEADER_SIZE);
+    assert!(OFF_PIDX_DATA_OFFSET + 4 == OFF_PIDX_DATA_SIZE);
+    assert!(OFF_PIDX_DATA_SIZE + 4 <= HEADER_SIZE);
 
     // PIDX v2 record sizes
     assert!(PAGEIDX_HDR_V2_SIZE == 20);
@@ -1042,6 +1380,342 @@ pub fn write_header(
     write_at(sd, name_hash, 0, &bytes)
 }
 
+// ── typed BundleFile / Section API ─────────────────────────────────
+//
+// `BundleFile` is the only sanctioned way to mutate a bundle's section
+// layout. It enforces, via `SectionId::predecessor` and
+// `BundleHeader::verify_layout`, that:
+//
+//   * sections are allocated in fixed order from the file tail;
+//   * a section's range is recorded in the header before any byte of
+//     it is written;
+//   * `Section::write_at` is bounded by the recorded `size`, so a
+//     mis-computed offset cannot punch into a neighbouring section
+//     (the v2 cover-overwrite bug).
+//
+// Free `write_at` / `read_at` remain available as raw primitives but
+// new code should funnel through `BundleFile`.
+
+use core::marker::PhantomData;
+
+/// Decoded view of an existing bundle file, with bounded section
+/// access. Created via [`BundleFile::open`] (existing file) or
+/// [`BundleFile::create_or_open`] (creates an empty bundle on first use).
+pub struct BundleFile<'a> {
+    sd: &'a SdStorage,
+    name_hash: u32,
+    header: BundleHeader,
+    file_size: u32,
+}
+
+impl<'a> BundleFile<'a> {
+    /// Open an existing bundle, decoding and validating its header.
+    /// Returns `MissingOrCorrupt` when the file is absent or its
+    /// header doesn't decode, `StaleVersion(v)` when the on-disk
+    /// version differs from `HEADER_VERSION`, or `Overlap` when the
+    /// recorded sections do not pass `verify_layout`.
+    pub fn open(sd: &'a SdStorage, name_hash: u32) -> Result<Self, BundleError> {
+        let mut buf = [0u8; HEADER_SIZE];
+        let nread = read_at(sd, name_hash, 0, &mut buf)?;
+        if nread < HEADER_SIZE {
+            return Err(BundleError::MissingOrCorrupt);
+        }
+        // detect stale on-disk version before BundleHeader::decode
+        // rejects it on the version mismatch path
+        if buf[OFF_MAGIC..OFF_MAGIC + 4] != HEADER_MAGIC {
+            return Err(BundleError::MissingOrCorrupt);
+        }
+        let on_disk_version = r_u16(&buf, OFF_VERSION);
+        if on_disk_version != HEADER_VERSION {
+            return Err(BundleError::StaleVersion(on_disk_version));
+        }
+        let header = BundleHeader::decode(&buf).ok_or(BundleError::MissingOrCorrupt)?;
+        header.verify_layout()?;
+        let file_size = file_size(sd, name_hash)?;
+        Ok(Self {
+            sd,
+            name_hash,
+            header,
+            file_size,
+        })
+    }
+
+    /// Create a fresh bundle file by writing `header` at offset 0.
+    /// Caller is responsible for populating section ranges in
+    /// `header` before invoking; typically `BundleHeader::EMPTY`
+    /// suffices for the first call.
+    pub fn create(
+        sd: &'a SdStorage,
+        name_hash: u32,
+        mut header: BundleHeader,
+    ) -> Result<Self, BundleError> {
+        header.name_hash = name_hash;
+        header.verify_layout()?;
+        write_header(sd, name_hash, &header)?;
+        let file_size = file_size(sd, name_hash)?;
+        Ok(Self {
+            sd,
+            name_hash,
+            header,
+            file_size,
+        })
+    }
+
+    /// Open an existing bundle, or create a fresh one when missing.
+    /// Returns `StaleVersion` when the on-disk version is wrong so
+    /// the caller can choose to delete and rebuild.
+    pub fn open_or_create(
+        sd: &'a SdStorage,
+        name_hash: u32,
+        on_create: BundleHeader,
+    ) -> Result<Self, BundleError> {
+        if exists(sd, name_hash) {
+            Self::open(sd, name_hash)
+        } else {
+            Self::create(sd, name_hash, on_create)
+        }
+    }
+
+    #[inline]
+    pub fn header(&self) -> &BundleHeader {
+        &self.header
+    }
+
+    #[inline]
+    pub fn header_mut(&mut self) -> &mut BundleHeader {
+        &mut self.header
+    }
+
+    #[inline]
+    pub fn name_hash(&self) -> u32 {
+        self.name_hash
+    }
+
+    #[inline]
+    pub fn file_size(&self) -> u32 {
+        self.file_size
+    }
+
+    /// Persist the in-memory header back to disk. Validates layout
+    /// before writing, refusing to commit an overlapping layout.
+    pub fn commit_header(&mut self) -> Result<(), BundleError> {
+        self.header.verify_layout()?;
+        write_header(self.sd, self.name_hash, &self.header)?;
+        Ok(())
+    }
+
+    /// Section range, if allocated.
+    #[inline]
+    pub fn section(&self, id: SectionId) -> Option<SectionRange> {
+        self.header.section(id)
+    }
+
+    /// Allocate `id` at the current bundle tail with `reserved` zero
+    /// bytes pre-written. Updates the in-memory header, calls
+    /// `verify_layout`, then commits the header to disk before
+    /// returning the bounded handle.
+    pub fn allocate(
+        &mut self,
+        id: SectionId,
+        reserved: u32,
+    ) -> Result<Section<'_, 'a>, BundleError> {
+        if self.header.section(id).is_some() {
+            return Err(BundleError::AlreadyAllocated(id));
+        }
+        if let Some(prev) = id.predecessor() {
+            if self.header.section(prev).is_none() {
+                return Err(BundleError::PredecessorMissing { id, needs: prev });
+            }
+        }
+        let offset = self.file_size;
+        let new_range = SectionRange {
+            offset,
+            size: reserved,
+        };
+
+        // record + validate before any write — this is the first
+        // moment we can detect overlap (shouldn't happen with the
+        // predecessor invariant, but we belt-and-brace it).
+        self.header.set_section(id, new_range);
+        if let Err(e) = self.header.verify_layout() {
+            self.header.set_section(id, SectionRange::EMPTY);
+            return Err(e);
+        }
+        // zero-fill the reserved bytes so the section is well-defined
+        // even before the caller writes its first byte
+        zero_fill(self.sd, self.name_hash, offset, reserved)?;
+        self.file_size = offset.saturating_add(reserved);
+        // commit header after the bytes are on disk so a power-loss
+        // mid-allocation leaves the section invisible rather than
+        // half-zeroed
+        if let Err(e) = self.commit_header() {
+            // failed commit: revert the in-memory range so the file
+            // and header agree (the zero-filled bytes become garbage
+            // but no other section's bounds reference them)
+            self.header.set_section(id, SectionRange::EMPTY);
+            return Err(e);
+        }
+        Ok(self.make_section(id, new_range))
+    }
+
+    /// Open an already-allocated section for write/read.
+    pub fn section_mut(&mut self, id: SectionId) -> Result<Section<'_, 'a>, BundleError> {
+        let range = self
+            .header
+            .section(id)
+            .ok_or(BundleError::NotAllocated(id))?;
+        Ok(self.make_section(id, range))
+    }
+
+    /// Append `extra` bytes to a section whose range ends at the
+    /// current file tail. Updates `pidx_data_size` (or whichever
+    /// section's size field corresponds to `id`) and commits the
+    /// header. Returns a handle to the *full* (grown) section.
+    pub fn grow_tail(
+        &mut self,
+        id: SectionId,
+        extra: u32,
+    ) -> Result<Section<'_, 'a>, BundleError> {
+        let current = self
+            .header
+            .section(id)
+            .ok_or(BundleError::NotAllocated(id))?;
+        if current.end() != self.file_size {
+            return Err(BundleError::NotAtTail(id));
+        }
+        let new_size = current.size.saturating_add(extra);
+        let new_range = SectionRange {
+            offset: current.offset,
+            size: new_size,
+        };
+        // pre-extend the file with zero bytes so partial writes never
+        // shrink the recorded range without on-disk backing
+        zero_fill(self.sd, self.name_hash, current.end(), extra)?;
+        self.file_size = current.end().saturating_add(extra);
+        self.header.set_section(id, new_range);
+        if let Err(e) = self.commit_header() {
+            // header commit failed; revert in-memory size to avoid
+            // diverging from the bytes that were just appended
+            self.header.set_section(id, current);
+            return Err(e);
+        }
+        Ok(self.make_section(id, new_range))
+    }
+
+    fn make_section(&mut self, id: SectionId, range: SectionRange) -> Section<'_, 'a> {
+        Section {
+            sd: self.sd,
+            name_hash: self.name_hash,
+            id,
+            offset: range.offset,
+            size: range.size,
+            _h: PhantomData,
+        }
+    }
+}
+
+/// Bounded write/read handle for a single section. Outlives only as
+/// long as the borrowing `BundleFile`. All offsets are *relative* to
+/// the section's start; `write_at(rel, data)` checks
+/// `rel + data.len() <= size` and returns `OutOfBounds` otherwise —
+/// it can never silently touch a neighbouring section.
+pub struct Section<'h, 'sd: 'h> {
+    sd: &'sd SdStorage,
+    name_hash: u32,
+    id: SectionId,
+    offset: u32,
+    size: u32,
+    _h: PhantomData<&'h mut ()>,
+}
+
+impl<'h, 'sd> Section<'h, 'sd> {
+    #[inline]
+    pub fn id(&self) -> SectionId {
+        self.id
+    }
+
+    #[inline]
+    pub fn range(&self) -> SectionRange {
+        SectionRange {
+            offset: self.offset,
+            size: self.size,
+        }
+    }
+
+    /// Write `data` at `rel` bytes from the start of this section.
+    pub fn write_at(&mut self, rel: u32, data: &[u8]) -> Result<(), BundleError> {
+        let len = data.len() as u32;
+        let end = rel
+            .checked_add(len)
+            .ok_or(BundleError::OutOfBounds {
+                section: self.id,
+                rel,
+                len,
+                size: self.size,
+            })?;
+        if end > self.size {
+            return Err(BundleError::OutOfBounds {
+                section: self.id,
+                rel,
+                len,
+                size: self.size,
+            });
+        }
+        write_at(self.sd, self.name_hash, self.offset + rel, data)?;
+        Ok(())
+    }
+
+    /// Read `buf.len()` bytes starting at `rel`. Returns the number
+    /// of bytes actually read.
+    pub fn read_at(&self, rel: u32, buf: &mut [u8]) -> Result<usize, BundleError> {
+        let len = buf.len() as u32;
+        let end = rel
+            .checked_add(len)
+            .ok_or(BundleError::OutOfBounds {
+                section: self.id,
+                rel,
+                len,
+                size: self.size,
+            })?;
+        if end > self.size {
+            return Err(BundleError::OutOfBounds {
+                section: self.id,
+                rel,
+                len,
+                size: self.size,
+            });
+        }
+        let n = read_at(self.sd, self.name_hash, self.offset + rel, buf)?;
+        Ok(n)
+    }
+
+    /// Zero-fill the entire section in place (e.g. to invalidate the
+    /// PIDX chapter dir). Bounded by the section's own `size` — by
+    /// construction this cannot reach into another section.
+    pub fn fill_zero(&mut self) -> Result<(), BundleError> {
+        zero_fill(self.sd, self.name_hash, self.offset, self.size).map_err(BundleError::Io)
+    }
+}
+
+// 256-byte zero block used by `zero_fill` to avoid allocating.
+const ZERO_BLOCK: [u8; 256] = [0u8; 256];
+
+fn zero_fill(
+    sd: &SdStorage,
+    name_hash: u32,
+    offset: u32,
+    bytes: u32,
+) -> crate::error::Result<()> {
+    let mut written: u32 = 0;
+    while written < bytes {
+        let remaining = bytes - written;
+        let chunk = remaining.min(ZERO_BLOCK.len() as u32) as usize;
+        write_at(sd, name_hash, offset + written, &ZERO_BLOCK[..chunk])?;
+        written += chunk as u32;
+    }
+    Ok(())
+}
+
 /// read the RECENT pointer from `_PLUMP/RECENT`; returns None when
 /// missing or invalid
 pub fn read_recent(sd: &SdStorage) -> Option<Recent> {
@@ -1156,6 +1830,142 @@ mod tests {
         assert_eq!(ChapterLayoutDir::EMPTY.encode().len(), CHAPTER_LAYOUT_DIR_SIZE);
         assert_eq!(PageRecord::EMPTY.encode().len(), PAGE_RECORD_SIZE);
         assert_eq!(LineRecord::EMPTY.encode().len(), LINE_RECORD_SIZE);
+    }
+
+    // ── section table / overlap unit tests ──────────────────────────────
+
+    #[test]
+    fn section_range_overlaps_truth_table() {
+        let a = SectionRange { offset: 10, size: 5 }; // [10, 15)
+        let b = SectionRange { offset: 15, size: 5 }; // [15, 20) -- adjacent, no overlap
+        let c = SectionRange { offset: 12, size: 5 }; // [12, 17) -- straddles a's tail
+        let d = SectionRange { offset: 5, size: 6 }; //  [5, 11)  -- straddles a's head
+        let e = SectionRange { offset: 11, size: 2 }; // [11, 13) -- strictly inside a
+        let empty = SectionRange::EMPTY;
+
+        assert!(!a.overlaps(&b));
+        assert!(!b.overlaps(&a));
+        assert!(a.overlaps(&c));
+        assert!(c.overlaps(&a));
+        assert!(a.overlaps(&d));
+        assert!(a.overlaps(&e));
+        // empty ranges never overlap anything
+        assert!(!empty.overlaps(&a));
+        assert!(!a.overlaps(&empty));
+        assert!(!empty.overlaps(&empty));
+    }
+
+    #[test]
+    fn section_predecessor_chain() {
+        assert_eq!(SectionId::Spine.predecessor(), None);
+        assert_eq!(SectionId::Content.predecessor(), Some(SectionId::Spine));
+        assert_eq!(SectionId::PidxDir.predecessor(), Some(SectionId::Content));
+        assert_eq!(SectionId::Covers.predecessor(), Some(SectionId::PidxDir));
+        assert_eq!(SectionId::PidxData.predecessor(), Some(SectionId::Covers));
+    }
+
+    #[test]
+    fn verify_layout_rejects_covers_inside_pidx_dir() {
+        // This is the actual v2 bug we're regressing against: PidxDir
+        // [1015153, +1676) and Covers [1016065, +4006). The covers
+        // section's start sits inside the dir region; verify_layout
+        // must catch this before the header is committed to disk.
+        let mut hdr = BundleHeader::EMPTY;
+        hdr.spine_offset = 256;
+        hdr.spine_size = 1104;
+        hdr.content_offset = 1360;
+        hdr.content_size = 1_013_793;
+        hdr.pidx_dir_offset = 1_015_153;
+        hdr.pidx_dir_size = 1676;
+        hdr.covers_offset = 1_016_065;
+        hdr.covers_size = 4006;
+
+        match hdr.verify_layout() {
+            Err(BundleError::Overlap { a, b }) => {
+                let pair = if a == SectionId::PidxDir && b == SectionId::Covers
+                    || a == SectionId::Covers && b == SectionId::PidxDir
+                {
+                    true
+                } else {
+                    false
+                };
+                assert!(pair, "expected PidxDir/Covers overlap, got {:?} / {:?}", a, b);
+            }
+            other => panic!("expected Err(Overlap), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn verify_layout_accepts_contiguous_disjoint_layout() {
+        // Spine -> Content -> PidxDir -> Covers -> PidxData, end-to-end.
+        let mut hdr = BundleHeader::EMPTY;
+        hdr.spine_offset = 256;
+        hdr.spine_size = 1104;
+        hdr.content_offset = 1360;
+        hdr.content_size = 1_013_793;
+        hdr.pidx_dir_offset = 1_015_153;
+        hdr.pidx_dir_size = 1676;
+        hdr.covers_offset = 1_016_829;
+        hdr.covers_size = 4006;
+        hdr.pidx_data_offset = 1_020_835;
+        hdr.pidx_data_size = 8000;
+
+        hdr.verify_layout().expect("contiguous disjoint must pass");
+    }
+
+    #[test]
+    fn verify_layout_accepts_unallocated_sections() {
+        // Only spine recorded; everything else is empty.
+        let mut hdr = BundleHeader::EMPTY;
+        hdr.spine_offset = 256;
+        hdr.spine_size = 1104;
+        hdr.verify_layout().expect("empty sections never overlap");
+        assert_eq!(hdr.section(SectionId::Content), None);
+        assert!(hdr.section(SectionId::Spine).is_some());
+    }
+
+    #[test]
+    fn set_section_round_trips() {
+        let mut hdr = BundleHeader::EMPTY;
+        let range = SectionRange { offset: 4096, size: 64 };
+        hdr.set_section(SectionId::Covers, range);
+        assert_eq!(hdr.section(SectionId::Covers), Some(range));
+        // setting back to EMPTY drops it
+        hdr.set_section(SectionId::Covers, SectionRange::EMPTY);
+        assert_eq!(hdr.section(SectionId::Covers), None);
+    }
+
+    #[test]
+    fn header_encode_decode_preserves_v3_pidx_fields() {
+        let mut h = BundleHeader::EMPTY;
+        h.spine_offset = 256;
+        h.spine_size = 1104;
+        h.content_offset = 1360;
+        h.content_size = 100_000;
+        h.pidx_dir_offset = 101_360;
+        h.pidx_dir_size = 1676;
+        h.pidx_data_offset = 107_042;
+        h.pidx_data_size = 8000;
+        h.pidx_font_idx = 5;
+        let bytes = h.encode();
+        let back = BundleHeader::decode(&bytes).expect("round-trip");
+        assert_eq!(back.pidx_dir_offset, 101_360);
+        assert_eq!(back.pidx_dir_size, 1676);
+        assert_eq!(back.pidx_data_offset, 107_042);
+        assert_eq!(back.pidx_data_size, 8000);
+        assert_eq!(back.pidx_font_idx, 5);
+    }
+
+    #[test]
+    fn header_decode_rejects_v2_magic_version() {
+        // Forge a v2 header (magic ok, version=2). decode rejects it
+        // on the version mismatch path so v2 bundles can't be reopened
+        // and silently reinterpreted as v3.
+        let mut buf = [0u8; HEADER_SIZE];
+        buf[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&HEADER_MAGIC);
+        w_u16(&mut buf, OFF_VERSION, 2);
+        w_u16(&mut buf, OFF_HEADER_SIZE, HEADER_SIZE as u16);
+        assert!(BundleHeader::decode(&buf).is_none());
     }
 }
 

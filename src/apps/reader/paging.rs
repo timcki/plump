@@ -13,13 +13,13 @@ use crate::fonts;
 use crate::fonts::bitmap::{self, FIRST_CHAR};
 use crate::kernel::KernelHandle;
 
-use super::layout::pipeline::{LayoutPipeline, StepOutcome, TypesetError};
-use super::layout::scan::MarkupScanner;
+use super::layout::pipeline::{ImageBudget, LayoutPipeline, StepOutcome, TypesetError};
+use super::layout::scan::{ByteSource, MarkupScanner, SliceByteSource};
 use super::layout::{paginate, LineLayout, PageLayout};
 
 use super::{
     DEFAULT_IMG_H, INDENT_PX, LINES_PER_PAGE, LineSpan, MAX_PAGES, NO_PREFETCH, PAGE_BUF,
-    PendingPositionChange, ReaderApp, State, decode_utf8_char,
+    PendingPositionChange, ReaderApp, State, decode_utf8_char, inline_img_max_h,
 };
 
 impl ReaderApp {
@@ -49,13 +49,45 @@ impl ReaderApp {
     /// across all strip passes instead of re-running `measure_line()` per strip.
     pub(super) fn precompute_line_metrics(&mut self) {
         if let Some(ref fs) = self.fonts {
+            // KPDIAG-C: chapter-line index for this page (so logs pair
+            // with KPDIAG-B by ch_li).
+            let page_first_line = self
+                .pg
+                .kp_pages
+                .get(self.pg.page)
+                .map(|p| p.first_line as usize)
+                .unwrap_or(0);
+            let text_w = self.text_w;
             for i in 0..self.pg.line_count {
-                let span = &self.pg.lines[i];
+                let span = self.pg.lines[i];
                 // Images and empty spans don't need measurement.
                 if span.is_image() || span.len == 0 {
                     self.pg.line_measures[i] = LineMeasure::default();
-                } else {
-                    self.pg.line_measures[i] = measure_line(&self.pg.buf, span, fs);
+                    continue;
+                }
+                let measured = measure_line(&self.pg.buf, &span, fs);
+                self.pg.line_measures[i] = measured;
+                // KPDIAG-C: log lines that overflow the column visibly
+                // (heuristic: width > 1.3x avail). gives byte dump so
+                // we can see what content K-P collapsed.
+                let avail = text_w.saturating_sub(INDENT_PX * span.indent as u32);
+                if avail > 0 && measured.width > avail.saturating_mul(13) / 10 {
+                    let s = span.start as usize;
+                    let dump_max = (s + (span.len as usize).min(40)).min(self.pg.buf_len);
+                    let dump = &self.pg.buf[s..dump_max];
+                    log::info!(
+                        "KPDIAG rd ch_li={} pg={} pg_li={} len={} m_w={} avail={} gaps={} flags=0x{:02x} extra=0x{:02x} bytes={:?}",
+                        page_first_line + i,
+                        self.pg.page,
+                        i,
+                        span.len,
+                        measured.width,
+                        avail,
+                        measured.gaps,
+                        span.flags,
+                        span.extra,
+                        dump,
+                    );
                 }
             }
         }
@@ -119,6 +151,7 @@ impl ReaderApp {
                 flags: 0,
                 indent: 0,
                 align: LineSpan::ALIGN_DEFAULT,
+                extra: 0,
             };
             self.pg.line_count += 1;
         }
@@ -136,6 +169,13 @@ impl ReaderApp {
         self.img_height_count = 0;
         self.page_img = None;
         self.fullscreen_img = false;
+        // free prior chapter's K-P state. has_kp_layout() returns true
+        // while these vecs are non-empty; load_page_dispatched would
+        // otherwise route the new chapter's bytes through the old
+        // chapter's line layout and produce garbled formatting. Also
+        // releases ~22 KB of heap so the new chapter's ch_cache can
+        // allocate without OOM on tight heaps.
+        self.pg.clear_kp_layout();
     }
 
     pub(super) fn locate_page_for_offset(
@@ -378,11 +418,13 @@ impl ReaderApp {
     }
 
     pub(super) fn preindex_all_pages(&mut self, k: &mut KernelHandle<'_>) {
-        if self.epub.ch_cache.is_empty() {
-            return;
-        }
-
         plump_kernel::perf_begin!(_pi_t0);
+
+        // Empty ch_cache no longer bypasses K-P: `run_kp_typeset` falls
+        // back to streaming via `BundleByteSource` when ch_cache didn't
+        // load. Pre-empting it with greedy-bundle here would force the
+        // greedy path even on chapters K-P can handle just fine.
+
         let ch = self.epub.chapter as usize;
         let spine_len = self.epub.spine.len();
         let name_hash = self.epub.name_hash;
@@ -415,7 +457,7 @@ impl ReaderApp {
 
         // 2. K-P typeset (primary path).
         self.pg.clear_kp_layout();
-        match self.run_kp_typeset() {
+        match self.run_kp_typeset(k) {
             Ok(()) => {
                 let _ = self.save_kp_to_pidx(k, &key, ch, spine_len, name_hash);
                 plump_kernel::perf_event!(
@@ -507,17 +549,54 @@ impl ReaderApp {
     /// fails). Populates `pg.offsets` and `pg.total_pages` so the
     /// existing per-page wrap path can drive navigation; does NOT
     /// save to PIDX (that section is reserved for K-P data).
+    ///
+    /// Reads from `epub.ch_cache` when populated; falls back to
+    /// streaming the chapter from the on-disk bundle when ch_cache
+    /// was rejected as oversized (see CHAPTER_CACHE_MAX). The
+    /// bundle-streamed path keeps long chapters navigable even
+    /// when they don't fit in RAM.
     fn greedy_preindex_compute(&mut self, k: &mut KernelHandle<'_>) {
-        let total = self.epub.ch_cache.len();
         self.pg.clear_kp_layout();
         self.pg.offsets[0] = 0;
         self.pg.total_pages = 1;
 
+        let from_bundle = self.epub.ch_cache.is_empty()
+            && self.is_epub
+            && self.epub.chapters_cached;
+        let total = if from_bundle {
+            let ch = self.epub.chapter as usize;
+            self.epub.chapter_table[ch].1 as usize
+        } else {
+            self.epub.ch_cache.len()
+        };
+
+        if total == 0 {
+            self.pg.fully_indexed = true;
+            return;
+        }
+
         let mut offset = 0usize;
         while offset < total && self.pg.total_pages < MAX_PAGES {
-            let end = (offset + PAGE_BUF).min(total);
-            let n = end - offset;
-            self.pg.buf[..n].copy_from_slice(&self.epub.ch_cache[offset..end]);
+            let n = if from_bundle {
+                let ch = self.epub.chapter as usize;
+                let ch_base = self.epub.chapter_table[ch].0;
+                let want = (total - offset).min(PAGE_BUF);
+                let buf = &mut self.pg.buf[..want];
+                match plump_kernel::kernel::bundle::read_at(
+                    k.sd(),
+                    self.epub.name_hash,
+                    ch_base + offset as u32,
+                    buf,
+                ) {
+                    Ok(n) if n > 0 => n,
+                    _ => break,
+                }
+            } else {
+                let end = (offset + PAGE_BUF).min(total);
+                let len = end - offset;
+                self.pg.buf[..len].copy_from_slice(&self.epub.ch_cache[offset..end]);
+                len
+            };
             self.pg.buf_len = n;
             self.prescan_image_heights(k, n);
 
@@ -543,15 +622,54 @@ impl ReaderApp {
     ///
     /// Caller invariants: `epub.ch_cache` is populated, `fonts` is
     /// `Some`, and `text_w`/`font_line_h`/`max_lines` are current.
-    pub(super) fn run_kp_typeset(&mut self) -> Result<(), TypesetError> {
+    pub(super) fn run_kp_typeset(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+    ) -> Result<(), TypesetError> {
         plump_kernel::perf_begin!(_kp_t0);
 
         let Some(fs) = self.fonts.as_ref().copied() else {
             return Err(TypesetError::EmptyChapter);
         };
-        if self.epub.ch_cache.is_empty() {
+
+        // ch_cache empty but the chapter IS in the bundle: stream via
+        // BundleByteSource (sliding 4 KB window over SD reads). Only
+        // truly-empty chapters (no bundle entry, no SD content) bail.
+        let ch_idx_check = self.epub.chapter as usize;
+        let ch_size_in_bundle = if self.is_epub
+            && self.epub.chapters_cached
+            && ch_idx_check < smol_epub::cache::MAX_CACHE_CHAPTERS
+        {
+            self.epub.chapter_table[ch_idx_check].1
+        } else {
+            0
+        };
+        if self.epub.ch_cache.is_empty() && ch_size_in_bundle == 0 {
             return Err(TypesetError::EmptyChapter);
         }
+
+        // KPDIAG-D: probe FontSet at K-P entry. If these advances are
+        // tiny (~1-2 px) but the renderer draws at ~8-12 px, K-P will
+        // measure lines ~6x narrower than reality, fail tolerance on
+        // every interior break, and collapse paragraphs to one line.
+        log::info!(
+            "KPDIAG fonts size_idx={} text_w={} line_h={} ascent={} adv_A_reg={} adv_A_bold={} adv_a_reg={} adv_M_reg={} adv_i_reg={} adv_space_reg={} adv_space_bold={} adv_period_reg={} adv_emdash_reg={} adv_apos_reg={} adv_smartapos_reg={}",
+            self.book_font_size_idx,
+            self.text_w,
+            self.font_line_h,
+            self.font_ascent,
+            fs.advance('A', crate::fonts::Style::Regular),
+            fs.advance('A', crate::fonts::Style::Bold),
+            fs.advance('a', crate::fonts::Style::Regular),
+            fs.advance('M', crate::fonts::Style::Regular),
+            fs.advance('i', crate::fonts::Style::Regular),
+            fs.advance(' ', crate::fonts::Style::Regular),
+            fs.advance(' ', crate::fonts::Style::Bold),
+            fs.advance('.', crate::fonts::Style::Regular),
+            fs.advance('\u{2014}', crate::fonts::Style::Regular),
+            fs.advance('\'', crate::fonts::Style::Regular),
+            fs.advance('\u{2019}', crate::fonts::Style::Regular),
+        );
 
         let mut pipeline = LayoutPipeline::new();
         let mut out_lines: Vec<LineLayout> = Vec::new();
@@ -561,21 +679,80 @@ impl ReaderApp {
         let _ = out_lines.try_reserve(64);
         let _ = out_image_blocks.try_reserve(64);
 
-        let mut scanner = MarkupScanner::new(&self.epub.ch_cache);
+        let budget = ImageBudget {
+            text_w: self.text_w as u16,
+            inline_cap: inline_img_max_h(self.text_area_h),
+            line_h: self.font_line_h,
+        };
 
-        loop {
-            let outcome = pipeline.step(
-                &mut scanner,
-                &fs,
-                self.text_w as u16,
-                self.font_line_h,
-                &mut out_lines,
-                &mut out_image_blocks,
-            )?;
-            if matches!(outcome, StepOutcome::Done) {
-                break;
+        // Image-height hint that peeks JPEG/PNG dimensions for any
+        // <img> tag missing width/height attrs, so K-P reserves
+        // exactly the lines the decoder will fill.
+        let ch_idx = self.epub.chapter as usize;
+        let ch_zip_idx = self.epub.spine.items[ch_idx] as usize;
+        let ch_path = self.epub.zip.entry_name(ch_zip_idx);
+        let ch_dir = ch_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let cache_dir = self.epub.cache_dir_str();
+        let fname = self.filename;
+        let epub_name = fname.as_str();
+        let text_w_u32 = self.text_w as u32;
+        let text_area_h = self.text_area_h;
+        let name_hash = self.epub.name_hash;
+        let ch_base = self.epub.chapter_table[ch_idx].0;
+        let use_bundle_source = self.epub.ch_cache.is_empty();
+
+        // Single immutable SD borrow shared between peek and the
+        // streaming source. Both ChapterImagePeek and BundleByteSource
+        // hold &SdStorage (not &mut KernelHandle), so they coexist as
+        // disjoint immutable borrows of *k.
+        let sd_ref = k.sd();
+
+        let mut peek = super::images::ChapterImagePeek::new(
+            sd_ref,
+            &self.epub.zip,
+            epub_name,
+            ch_dir,
+            cache_dir,
+            text_w_u32,
+            text_area_h,
+        );
+
+        // Pick source. Each branch scopes its own source for the typeset
+        // loop, then the loop body is identical, so we run it inline.
+        if use_bundle_source {
+            let mut src = BundleByteSource::new(sd_ref, name_hash, ch_base, ch_size_in_bundle);
+            let mut scanner = MarkupScanner::new(&mut src);
+            loop {
+                let outcome = pipeline.step(
+                    &mut scanner,
+                    &fs,
+                    budget,
+                    &mut peek,
+                    &mut out_lines,
+                    &mut out_image_blocks,
+                )?;
+                if matches!(outcome, StepOutcome::Done) {
+                    break;
+                }
+            }
+        } else {
+            let mut src = SliceByteSource::new(&self.epub.ch_cache);
+            let mut scanner = MarkupScanner::new(&mut src);
+            loop {
+                let outcome = pipeline.step(
+                    &mut scanner,
+                    &fs,
+                    budget,
+                    &mut peek,
+                    &mut out_lines,
+                    &mut out_image_blocks,
+                )?;
+                if matches!(outcome, StepOutcome::Done) {
+                    break;
+                }
             }
         }
+        drop(peek);
 
         if out_lines.is_empty() {
             // chapter contained only markers / whitespace; emit a single
@@ -883,11 +1060,20 @@ pub(super) fn measure_line(
     let start = span.start as usize;
     let end = start + span.len as usize;
     let line = &buf[start..end];
-    let sty_initial = span.style();
+
+    // Track style as accumulated flags rather than last-marker-wins,
+    // so nested markup (e.g. `<b><i>x</i></b>`) measures the same way
+    // K-P measured it. `fonts::Style::from_flags` is the shared
+    // resolver — see plan.
+    let mut in_bold = span.flags & super::LineSpan::FLAG_BOLD != 0;
+    let mut in_italic = span.flags & super::LineSpan::FLAG_ITALIC != 0;
+    let mut in_heading = span.flags & super::LineSpan::FLAG_HEADING != 0;
+    let mut hlevel: u8 = if in_heading { span.start_hlevel() } else { 0 };
+    let mut sty = fonts::Style::from_flags(in_bold, in_italic, in_heading, hlevel);
+    let sty_initial = sty;
 
     let mut width: u32 = 0;
     let mut gaps: u16 = 0;
-    let mut sty = sty_initial;
     let mut last_space_width: u32 = 0; // width contribution of the last trailing space run
     let mut in_trailing_space = false;
 
@@ -895,18 +1081,56 @@ pub(super) fn measure_line(
     while j < line.len() {
         let b = line[j];
 
-        // style markers: zero width, update style
+        // style markers: zero width, update accumulated flag state
         if b == MARKER && j + 1 < line.len() {
-            sty = match line[j + 1] {
-                BOLD_ON => fonts::Style::Bold,
-                ITALIC_ON => fonts::Style::Italic,
-                HEADING_ON | H1_ON | H2_ON | H3_ON => fonts::Style::Heading,
-                H4_ON | H5_ON | H6_ON => fonts::Style::Bold,
-                BOLD_OFF | ITALIC_OFF | HEADING_OFF => fonts::Style::Regular,
-                H1_OFF | H2_OFF | H3_OFF => fonts::Style::Regular,
-                H4_OFF | H5_OFF | H6_OFF => fonts::Style::Regular,
-                _ => sty,
-            };
+            match line[j + 1] {
+                BOLD_ON => in_bold = true,
+                BOLD_OFF => in_bold = false,
+                ITALIC_ON => in_italic = true,
+                ITALIC_OFF => in_italic = false,
+                HEADING_ON => {
+                    in_heading = true;
+                    if hlevel == 0 {
+                        hlevel = 3;
+                    }
+                }
+                HEADING_OFF => {
+                    in_heading = false;
+                    hlevel = 0;
+                }
+                H1_ON => {
+                    in_heading = true;
+                    hlevel = 1;
+                }
+                H2_ON => {
+                    in_heading = true;
+                    hlevel = 2;
+                }
+                H3_ON => {
+                    in_heading = true;
+                    hlevel = 3;
+                }
+                H4_ON => {
+                    in_heading = true;
+                    hlevel = 4;
+                }
+                H5_ON => {
+                    in_heading = true;
+                    hlevel = 5;
+                }
+                H6_ON => {
+                    in_heading = true;
+                    hlevel = 6;
+                }
+                H1_OFF | H2_OFF | H3_OFF | H4_OFF | H5_OFF | H6_OFF => {
+                    in_heading = false;
+                    hlevel = 0;
+                }
+                // underline/strike are draw-side decorations; don't
+                // change glyph metrics, so they don't update `sty`.
+                _ => {}
+            }
+            sty = fonts::Style::from_flags(in_bold, in_italic, in_heading, hlevel);
             j += 2;
             continue;
         }
@@ -1064,6 +1288,7 @@ fn linelayout_to_span(ll: &LineLayout, page_start_byte: u32, buf_len: u32) -> Li
         flags,
         indent: ll.indent,
         align,
+        extra: ll.extra,
     }
 }
 
@@ -1133,6 +1358,7 @@ pub(super) fn wrap_proportional(
                     flags: LineSpan::pack_flags(bold, italic, heading, hlevel, $end_kind),
                     indent,
                     align,
+                    extra: 0,
                 };
                 line_count += 1;
             }
@@ -1197,6 +1423,7 @@ pub(super) fn wrap_proportional(
                             // `path_start - alt_len`.
                             indent: alt_len as u8,
                             align: LineSpan::ALIGN_DEFAULT,
+                            extra: 0,
                         };
                         line_count += 1;
                     }
@@ -1211,6 +1438,7 @@ pub(super) fn wrap_proportional(
                             flags: LineSpan::FLAG_IMAGE,
                             indent: 0,
                             align: LineSpan::ALIGN_DEFAULT,
+                            extra: 0,
                         };
                         line_count += 1;
                     }
@@ -1475,10 +1703,130 @@ pub(super) fn wrap_proportional(
                 flags: LineSpan::pack_flags(bold, italic, heading, hlevel, LineSpan::END_BUFFER),
                 indent,
                 align,
+                extra: 0,
             };
             line_count += 1;
         }
     }
 
     (n, line_count)
+}
+
+// ── BundleByteSource ────────────────────────────────────────────────
+//
+// Streaming `ByteSource` impl that pulls chapter bytes from the bundle
+// file on SD via `bundle::read_at` through a sliding 4 KB window. Used
+// by `run_kp_typeset` when the chapter is too big to fit in `ch_cache`
+// (largest contiguous heap region on ESP32-C3 is ~108 KB; chapters
+// past that — e.g. Stories of Your Life "Seventy-Two Letters" at
+// ~109 KB stripped — would otherwise OOM at allocation).
+//
+// Mirrors `smol_epub::jpeg::ChunkReader`'s pattern: small fixed-size
+// internal buffer, refills on miss, sequential access is hot. The K-P
+// scanner's access pattern is mostly sequential with occasional small
+// re-reads for word measurement (which usually stay within the same
+// 4 KB window), so refill rate is roughly `ceil(chapter_size / 4096)`
+// SD reads per typeset pass.
+
+const BUNDLE_SOURCE_CHUNK: usize = 4096;
+
+pub(super) struct BundleByteSource<'a> {
+    sd: &'a plump_kernel::board::SdStorage,
+    name_hash: u32,
+    /// Absolute offset into the bundle of byte 0 of this source.
+    base: u32,
+    /// Total bytes addressable.
+    total_len: u32,
+    buf: [u8; BUNDLE_SOURCE_CHUNK],
+    /// Source-relative offset of `buf[0]` (chunk-aligned).
+    buf_offset: u32,
+    /// Bytes valid in `buf` (always <= BUNDLE_SOURCE_CHUNK).
+    buf_valid: usize,
+}
+
+impl<'a> BundleByteSource<'a> {
+    pub(super) fn new(
+        sd: &'a plump_kernel::board::SdStorage,
+        name_hash: u32,
+        base: u32,
+        total_len: u32,
+    ) -> Self {
+        Self {
+            sd,
+            name_hash,
+            base,
+            total_len,
+            buf: [0u8; BUNDLE_SOURCE_CHUNK],
+            buf_offset: 0,
+            buf_valid: 0,
+        }
+    }
+
+    /// Ensure the internal window covers `pos`. Returns `true` when the
+    /// position is in-window after the call. Refills are chunk-aligned
+    /// so consecutive sequential reads cost one SD read per chunk.
+    fn ensure_window(&mut self, pos: u32) -> bool {
+        if self.buf_valid > 0
+            && pos >= self.buf_offset
+            && pos < self.buf_offset + self.buf_valid as u32
+        {
+            return true;
+        }
+        if pos >= self.total_len {
+            return false;
+        }
+        let chunk = pos & !((BUNDLE_SOURCE_CHUNK - 1) as u32);
+        let want = (self.total_len - chunk).min(BUNDLE_SOURCE_CHUNK as u32) as usize;
+        match plump_kernel::kernel::bundle::read_at(
+            self.sd,
+            self.name_hash,
+            self.base + chunk,
+            &mut self.buf[..want],
+        ) {
+            Ok(n) if n > 0 => {
+                self.buf_offset = chunk;
+                self.buf_valid = n;
+                pos < self.buf_offset + self.buf_valid as u32
+            }
+            _ => {
+                self.buf_valid = 0;
+                false
+            }
+        }
+    }
+}
+
+impl<'a> ByteSource for BundleByteSource<'a> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.total_len as usize
+    }
+
+    fn byte_at(&mut self, pos: usize) -> Option<u8> {
+        if pos as u32 >= self.total_len {
+            return None;
+        }
+        if !self.ensure_window(pos as u32) {
+            return None;
+        }
+        Some(self.buf[(pos as u32 - self.buf_offset) as usize])
+    }
+
+    fn read_into(&mut self, pos: usize, dst: &mut [u8]) -> usize {
+        let mut written = 0usize;
+        let mut cur = pos as u32;
+        while written < dst.len() && cur < self.total_len {
+            if !self.ensure_window(cur) {
+                break;
+            }
+            let buf_off = (cur - self.buf_offset) as usize;
+            let avail = self.buf_valid - buf_off;
+            let to_copy = (dst.len() - written).min(avail);
+            dst[written..written + to_copy]
+                .copy_from_slice(&self.buf[buf_off..buf_off + to_copy]);
+            written += to_copy;
+            cur += to_copy as u32;
+        }
+        written
+    }
 }

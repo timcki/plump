@@ -116,19 +116,95 @@ pub enum Token {
     UnknownMarker { start: u32, end: u32, tag: u8 },
 }
 
+// ── byte source abstraction ────────────────────────────────────────
+//
+// The scanner reads from a `ByteSource` rather than a flat slice so K-P
+// typesetting can run on chapters that don't fit in a single contiguous
+// heap allocation. Two impls live here / in `paging.rs`:
+//
+//   * `SliceByteSource` — wraps `&[u8]`; zero-cost; used for the common
+//     case where the chapter cache is in RAM, and for unit tests.
+//   * `paging.rs::BundleByteSource` — sliding 4 KB buffer + on-demand
+//     SD reads via `plump_kernel::kernel::bundle::read_at`. Used when
+//     the chapter is larger than the largest contiguous heap block
+//     (~108 KB on ESP32-C3); mirrors `smol_epub::jpeg::ChunkReader`.
+//
+// `MarkupScanner` holds `&mut dyn ByteSource`, so neither the scanner
+// nor downstream items/pipeline code is generic over the source type.
+
+/// Random-access (mostly sequential) byte source for the markup
+/// scanner. The streaming impl is fastest when accesses cluster near
+/// each other — backward seeks across the internal buffer trigger
+/// refills.
+pub trait ByteSource {
+    /// Total bytes addressable.
+    fn len(&self) -> usize;
+
+    /// Single-byte read. Returns `None` on `pos >= len()` or read failure.
+    /// Hot path: the scanner calls this once per source byte, so the
+    /// slice impl must inline to a plain `slice.get(pos).copied()`.
+    fn byte_at(&mut self, pos: usize) -> Option<u8>;
+
+    /// Bulk read into `dst`; returns the number of bytes actually
+    /// written (short at EOF or on partial SD reads). Used for word
+    /// bytes in `items::measure_word`, IMG_REF payloads, and image
+    /// src extraction in pipeline.
+    fn read_into(&mut self, pos: usize, dst: &mut [u8]) -> usize;
+
+    #[inline]
+    fn is_eof(&self, pos: usize) -> bool {
+        pos >= self.len()
+    }
+}
+
+/// Zero-cost wrapper over `&[u8]`. Used when the chapter cache is in
+/// RAM (the common case) and for tests.
+pub struct SliceByteSource<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> SliceByteSource<'a> {
+    #[inline]
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+}
+
+impl<'a> ByteSource for SliceByteSource<'a> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[inline]
+    fn byte_at(&mut self, pos: usize) -> Option<u8> {
+        self.bytes.get(pos).copied()
+    }
+
+    #[inline]
+    fn read_into(&mut self, pos: usize, dst: &mut [u8]) -> usize {
+        if pos >= self.bytes.len() {
+            return 0;
+        }
+        let n = dst.len().min(self.bytes.len() - pos);
+        dst[..n].copy_from_slice(&self.bytes[pos..pos + n]);
+        n
+    }
+}
+
 // ── scanner ────────────────────────────────────────────────────────
 
-pub struct MarkupScanner<'a> {
-    buf: &'a [u8],
+pub struct MarkupScanner<'s> {
+    source: &'s mut (dyn ByteSource + 's),
     pos: usize,
     style: TextStyle,
     block: BlockState,
 }
 
-impl<'a> MarkupScanner<'a> {
-    pub fn new(buf: &'a [u8]) -> Self {
+impl<'s> MarkupScanner<'s> {
+    pub fn new(source: &'s mut (dyn ByteSource + 's)) -> Self {
         Self {
-            buf,
+            source,
             pos: 0,
             style: TextStyle::default(),
             block: BlockState::default(),
@@ -142,21 +218,22 @@ impl<'a> MarkupScanner<'a> {
 
     #[inline]
     pub fn buffer_len(&self) -> u32 {
-        self.buf.len() as u32
+        self.source.len() as u32
     }
 
-    /// the raw chapter byte slice the scanner was constructed with;
-    /// callers index into this by the absolute byte offsets carried
-    /// in `Token::Word { start, end }` etc.
+    /// Copy `dst.len()` bytes (or fewer at EOF) starting at chapter-
+    /// absolute offset `start` into `dst`. Replaces the old `buffer()`
+    /// accessor — callers used to slice the chapter buffer directly,
+    /// which is incompatible with streaming sources.
     #[inline]
-    pub fn buffer(&self) -> &'a [u8] {
-        self.buf
+    pub fn read_into(&mut self, start: u32, dst: &mut [u8]) -> usize {
+        self.source.read_into(start as usize, dst)
     }
 
     /// `true` once the scanner has reached the end of its buffer.
     #[inline]
     pub fn is_eof(&self) -> bool {
-        self.pos >= self.buf.len()
+        self.pos >= self.source.len()
     }
 
     #[inline]
@@ -173,14 +250,11 @@ impl<'a> MarkupScanner<'a> {
     /// exhausted; subsequent calls keep returning `None`.
     pub fn next(&mut self) -> Option<Token> {
         loop {
-            if self.pos >= self.buf.len() {
-                return None;
-            }
-            let b = self.buf[self.pos];
+            let b = self.source.byte_at(self.pos)?;
 
             // marker pair
             if b == MARKER {
-                if self.pos + 1 >= self.buf.len() {
+                if self.pos + 1 >= self.source.len() {
                     // dangling MARKER at end: drop one byte and stop
                     self.pos += 1;
                     continue;
@@ -197,8 +271,8 @@ impl<'a> MarkupScanner<'a> {
                 let start = self.pos;
                 self.pos += 1;
                 // collapse a run of >= 2 newlines into ParagraphBreak
-                if self.pos < self.buf.len() && self.buf[self.pos] == b'\n' {
-                    while self.pos < self.buf.len() && self.buf[self.pos] == b'\n' {
+                if self.source.byte_at(self.pos) == Some(b'\n') {
+                    while self.source.byte_at(self.pos) == Some(b'\n') {
                         self.pos += 1;
                     }
                     return Some(Token::ParagraphBreak {
@@ -234,7 +308,7 @@ impl<'a> MarkupScanner<'a> {
 
             // multi-byte UTF-8: special-case NBSP and soft hyphen
             if b >= 0xC0 {
-                let (ch, len) = decode_utf8(self.buf, self.pos);
+                let (ch, len) = self.decode_utf8_at(self.pos);
                 let start = self.pos;
                 self.pos += len;
                 match ch {
@@ -270,6 +344,19 @@ impl<'a> MarkupScanner<'a> {
         }
     }
 
+    /// Read up to 4 bytes into a stack scratch and decode one UTF-8
+    /// codepoint at `pos`. The existing `decode_utf8` helper takes a
+    /// plain `&[u8]` and a position; we feed it the scratch slice.
+    #[inline]
+    fn decode_utf8_at(&mut self, pos: usize) -> (char, usize) {
+        let mut scratch = [0u8; 4];
+        let n = self.source.read_into(pos, &mut scratch);
+        if n == 0 {
+            return ('\u{FFFD}', 1);
+        }
+        decode_utf8(&scratch[..n], 0)
+    }
+
     /// at `self.buf[self.pos] == MARKER` with at least one more byte
     /// available. consumes the marker pair (or extended payload for
     /// `IMG_REF`) and returns the matching `Token`, or `None` when
@@ -277,7 +364,7 @@ impl<'a> MarkupScanner<'a> {
     /// loop.
     fn consume_marker(&mut self) -> Option<Token> {
         let marker_start = self.pos;
-        let tag = self.buf[self.pos + 1];
+        let tag = self.source.byte_at(self.pos + 1)?;
 
         match tag {
             IMG_REF => return self.consume_img_ref(marker_start),
@@ -433,7 +520,7 @@ impl<'a> MarkupScanner<'a> {
     /// `UnknownMarker { tag: IMG_REF }` is returned so the caller
     /// can log without panicking.
     fn consume_img_ref(&mut self, marker_start: usize) -> Option<Token> {
-        if self.pos + IMG_HEADER_LEN > self.buf.len() {
+        if self.pos + IMG_HEADER_LEN > self.source.len() {
             self.pos += 2;
             return Some(Token::UnknownMarker {
                 start: marker_start as u32,
@@ -441,7 +528,16 @@ impl<'a> MarkupScanner<'a> {
                 tag: IMG_REF,
             });
         }
-        let header = &self.buf[self.pos..self.pos + IMG_HEADER_LEN];
+        let mut header = [0u8; IMG_HEADER_LEN];
+        let n = self.source.read_into(self.pos, &mut header);
+        if n < IMG_HEADER_LEN {
+            self.pos += 2;
+            return Some(Token::UnknownMarker {
+                start: marker_start as u32,
+                end: self.pos as u32,
+                tag: IMG_REF,
+            });
+        }
         let flags = header[2];
         let attr_w = u16::from_le_bytes([header[3], header[4]]);
         let attr_h = u16::from_le_bytes([header[5], header[6]]);
@@ -450,7 +546,7 @@ impl<'a> MarkupScanner<'a> {
         let alt_start = self.pos + IMG_HEADER_LEN;
         let path_start = alt_start + alt_len as usize;
         let end = path_start + path_len as usize;
-        if end > self.buf.len() || path_len == 0 {
+        if end > self.source.len() || path_len == 0 {
             self.pos += 2;
             return Some(Token::UnknownMarker {
                 start: marker_start as u32,
@@ -472,30 +568,32 @@ impl<'a> MarkupScanner<'a> {
         }))
     }
 
-    /// at `self.buf[start]` is a wordy byte (printable ASCII or
+    /// at byte `start` is a wordy byte (printable ASCII or
     /// multi-byte non-NBSP/SHY). `self.pos` points anywhere in
     /// `[start, end_of_word)`; we extend it to the end of the word.
     fn consume_word(&mut self, start: usize) -> Token {
         let style = self.style;
         let mut p = if self.pos > start { self.pos } else { start };
+        let total = self.source.len();
         // include the byte at `start` if we haven't moved yet
-        if p == start && start < self.buf.len() {
+        if p == start && start < total {
             // sniff one byte/code-point worth of advance into the word
-            let b = self.buf[p];
-            if b >= 0xC0 {
-                let (_, len) = decode_utf8(self.buf, p);
-                p += len;
-            } else {
-                p += 1;
+            if let Some(b) = self.source.byte_at(p) {
+                if b >= 0xC0 {
+                    let (_, len) = self.decode_utf8_at(p);
+                    p += len;
+                } else {
+                    p += 1;
+                }
             }
         }
-        while p < self.buf.len() {
-            let c = self.buf[p];
+        while p < total {
+            let Some(c) = self.source.byte_at(p) else { break };
             if c == MARKER || c == b' ' || c == b'\n' || c == b'\r' || c < 0x20 {
                 break;
             }
             if c >= 0xC0 {
-                let (ch, len) = decode_utf8(self.buf, p);
+                let (ch, len) = self.decode_utf8_at(p);
                 if ch == '\u{00A0}' || ch == '\u{00AD}' {
                     break;
                 }
@@ -569,12 +667,36 @@ mod tests {
     use super::*;
 
     fn drain(bytes: &[u8]) -> Vec<Token> {
-        let mut s = MarkupScanner::new(bytes);
+        let mut src = SliceByteSource::new(bytes);
+        let mut s = MarkupScanner::new(&mut src);
         let mut out = Vec::new();
         while let Some(t) = s.next() {
             out.push(t);
         }
         out
+    }
+
+    // ── ByteSource impls ──────────────────────────────────────────
+
+    #[test]
+    fn slice_source_byte_at_and_read_into() {
+        let mut s = SliceByteSource::new(b"hello world");
+        assert_eq!(s.len(), 11);
+        assert_eq!(s.byte_at(0), Some(b'h'));
+        assert_eq!(s.byte_at(10), Some(b'd'));
+        assert_eq!(s.byte_at(11), None);
+
+        let mut buf = [0u8; 5];
+        assert_eq!(s.read_into(6, &mut buf), 5);
+        assert_eq!(&buf, b"world");
+
+        // short read at EOF
+        let mut buf2 = [0u8; 10];
+        assert_eq!(s.read_into(8, &mut buf2), 3);
+        assert_eq!(&buf2[..3], b"rld");
+
+        // reads past EOF return 0
+        assert_eq!(s.read_into(20, &mut buf2), 0);
     }
 
     fn marker(tag: u8) -> [u8; 2] {
@@ -978,7 +1100,8 @@ mod tests {
 
     #[test]
     fn next_returns_none_after_exhaustion() {
-        let mut s = MarkupScanner::new(b"a");
+        let mut src = SliceByteSource::new(b"a");
+        let mut s = MarkupScanner::new(&mut src);
         assert!(s.next().is_some());
         assert!(s.next().is_none());
         assert!(s.next().is_none());

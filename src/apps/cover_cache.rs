@@ -1,24 +1,27 @@
 // cover thumbnail helpers: read and write pre-dithered 1-bit covers
 // inside the per-book bundle.
 //
-// v1 stores a single `Card` variant (matching the previous behavior);
-// Phase 5 extends the covers section with additional sizes (tiny,
-// small, detail) and the raw source bytes.
+// v3 stores a single `Card` variant in the `Covers` section managed by
+// `bundle::BundleFile`. Phase 5 will extend the section with extra
+// sizes (tiny, small, detail) and the raw source bytes.
 //
-// the covers section layout inside a bundle (appended to bundle tail
-// the first time a cover is generated, then overwritten in place on
-// later regenerations):
+// the covers section layout is unchanged from v2:
 //
 //   [CoversHeader      12 bytes]
 //   [CoverVariant[0]   16 bytes per entry]  variant_count entries
 //   [variant[0] bitmap data]                1-bit packed, stride = w/8
 //   ...
+//
+// The placement of the section is now under `BundleFile` control,
+// which guarantees it can't overlap PidxDir / Content (the v2 bug
+// that silently zeroed cover bytes on every PIDX zero-fill).
 
 use alloc::vec::Vec;
 
 use smol_epub::cache;
 
 use plump_kernel::kernel::bundle;
+use plump_kernel::kernel::bundle::{BundleError, BundleFile, SectionId};
 
 use crate::kernel::KernelHandle;
 use crate::kernel::work_queue::DecodedImage;
@@ -31,9 +34,7 @@ pub const COVER_THUMB_MAX_H: u16 = 240;
 
 /// Write the Card variant of a cover for the given book (by filename).
 ///
-/// The bundle must exist (chapter caching initializes it). Appends or
-/// overwrites the covers section at the bundle tail and updates the
-/// bundle header with covers_offset/covers_size and COVERS_READY.
+/// The bundle must exist (chapter caching initializes it).
 pub fn save_cover_thumb_for(
     k: &mut KernelHandle<'_>,
     filename: &[u8],
@@ -44,17 +45,31 @@ pub fn save_cover_thumb_for(
 }
 
 /// Write the Card variant of a cover into the bundle identified by
-/// `name_hash`.
+/// `name_hash`. On regeneration the section is reused in place when
+/// the new bytes fit; otherwise a fresh `Covers` section is allocated
+/// at the bundle tail (only valid after `PidxDir` exists, enforced by
+/// `BundleFile::allocate`).
 pub fn save_cover_thumb(
     k: &mut KernelHandle<'_>,
     name_hash: u32,
     img: &DecodedImage,
 ) -> crate::error::Result<()> {
-    let mut hdr = bundle::read_header(k.sd(), name_hash)
-        .ok_or_else(|| crate::error::Error::new(
-            crate::error::ErrorKind::NotFound,
-            "save_cover_thumb: bundle missing",
-        ))?;
+    let mut bf = match BundleFile::open(k.sd(), name_hash) {
+        Ok(bf) => bf,
+        Err(BundleError::StaleVersion(v)) => {
+            log::info!(
+                "bundle: v{} stale on save_cover_thumb, deleting {:#010X}",
+                v,
+                name_hash,
+            );
+            bundle::delete(k.sd(), name_hash)?;
+            return Err(crate::error::Error::new(
+                crate::error::ErrorKind::NotFound,
+                "save_cover_thumb: stale bundle",
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     // section layout: CoversHeader + 1 variant entry + bitmap data
     let hdr_bytes = bundle::COVERS_HDR_SIZE as u32;
@@ -62,27 +77,40 @@ pub fn save_cover_thumb(
     let data_bytes = img.data.len() as u32;
     let section_size = hdr_bytes + var_bytes + data_bytes;
 
-    // place covers at EOF (first time) or at the existing covers_offset
-    // (on regeneration). overwriting in place keeps the file compact when
-    // the new section is <= the old one; when it's larger, trailing bytes
-    // past (covers_offset + section_size) become dead space but are
-    // never read because the header's covers_size is authoritative.
-    let covers_offset = if hdr.covers_offset != 0 {
-        hdr.covers_offset
-    } else {
-        bundle::file_size(k.sd(), name_hash).unwrap_or(bundle::HEADER_SIZE as u32)
+    // Existing `Covers` section: reuse iff the new bytes fit in the
+    // already-recorded range. We deliberately don't widen the recorded
+    // size in place — that would invalidate the layout invariant for
+    // neighbouring sections (e.g. PidxData), and BundleFile would
+    // reject the resulting overlap on `commit_header` anyway.
+    let existing = bf.section(SectionId::Covers);
+    let mut section = match existing {
+        Some(range) if range.size >= section_size => bf.section_mut(SectionId::Covers)?,
+        Some(_) => {
+            // Existing section is too small for the new bitmap. Today
+            // this shouldn't happen (one variant, fixed thumb size),
+            // but if it does we surface a clear error rather than
+            // silently overflowing.
+            log::warn!(
+                "save_cover_thumb: existing Covers section too small; refusing to grow"
+            );
+            return Err(crate::error::Error::new(
+                crate::error::ErrorKind::InvalidData,
+                "cover: section size shrunk",
+            ));
+        }
+        None => bf.allocate(SectionId::Covers, section_size)?,
     };
 
-    // write CoversHeader
+    // write CoversHeader at offset 0 of the section
     let covers_hdr = bundle::CoversHeader {
         variant_count: 1,
         raw_format: bundle::RAW_FMT_NONE,
         raw_offset: 0,
         raw_size: 0,
     };
-    bundle::write_at(k.sd(), name_hash, covers_offset, &covers_hdr.encode())?;
+    section.write_at(0, &covers_hdr.encode())?;
 
-    // write variant entry (offsets within the section)
+    // write variant entry at offset COVERS_HDR_SIZE
     let data_offset_in_section = hdr_bytes + var_bytes;
     let variant = bundle::CoverVariant {
         kind: bundle::COVER_KIND_CARD,
@@ -92,55 +120,44 @@ pub fn save_cover_thumb(
         data_offset: data_offset_in_section,
         data_size: data_bytes,
     };
-    bundle::write_at(
-        k.sd(),
-        name_hash,
-        covers_offset + hdr_bytes,
-        &variant.encode(),
-    )?;
+    section.write_at(hdr_bytes, &variant.encode())?;
 
-    // write bitmap bytes
-    bundle::write_at(
-        k.sd(),
-        name_hash,
-        covers_offset + data_offset_in_section,
-        &img.data,
-    )?;
+    // write bitmap bytes — `Section::write_at` bounds check ensures
+    // we cannot punch past the recorded size (the v2 bug surface).
+    section.write_at(data_offset_in_section, &img.data)?;
+    drop(section);
 
-    // update bundle header
-    hdr.covers_offset = covers_offset;
-    hdr.covers_size = section_size;
-    hdr.set_flag(bundle::FLAG_COVERS_READY, true);
-    bundle::write_header(k.sd(), name_hash, &hdr)?;
+    bf.header_mut().set_flag(bundle::FLAG_COVERS_READY, true);
+    bf.commit_header()?;
 
     Ok(())
 }
 
 /// Load the Card variant (only variant in v1) from the bundle.
 pub fn load_cover_thumb(k: &mut KernelHandle<'_>, name_hash: u32) -> Option<DecodedImage> {
-    let hdr = bundle::read_header(k.sd(), name_hash)?;
-    if !hdr.has_flag(bundle::FLAG_COVERS_READY)
-        || hdr.covers_offset == 0
-        || hdr.covers_size < (bundle::COVERS_HDR_SIZE + bundle::COVER_VARIANT_SIZE) as u32
-    {
+    let mut bf = BundleFile::open(k.sd(), name_hash).ok()?;
+    if !bf.header().has_flag(bundle::FLAG_COVERS_READY) {
+        return None;
+    }
+    let covers_range = bf.section(SectionId::Covers)?;
+    if covers_range.size < (bundle::COVERS_HDR_SIZE + bundle::COVER_VARIANT_SIZE) as u32 {
         return None;
     }
 
     let mut covers_hdr_buf = [0u8; bundle::COVERS_HDR_SIZE];
-    bundle::read_at(k.sd(), name_hash, hdr.covers_offset, &mut covers_hdr_buf).ok()?;
+    let section = bf.section_mut(SectionId::Covers).ok()?;
+    section.read_at(0, &mut covers_hdr_buf).ok()?;
     let covers_hdr = bundle::CoversHeader::decode(&covers_hdr_buf)?;
     if covers_hdr.variant_count == 0 {
         return None;
     }
 
     // pick the first variant whose kind is Card; fall back to variant 0
-    // (v1 writes exactly one Card variant, so variant 0 is always it)
     let mut var_buf = [0u8; bundle::COVER_VARIANT_SIZE];
     let mut chosen: Option<bundle::CoverVariant> = None;
     for i in 0..covers_hdr.variant_count as u32 {
-        let off = hdr.covers_offset + bundle::COVERS_HDR_SIZE as u32
-            + i * bundle::COVER_VARIANT_SIZE as u32;
-        bundle::read_at(k.sd(), name_hash, off, &mut var_buf).ok()?;
+        let rel = bundle::COVERS_HDR_SIZE as u32 + i * bundle::COVER_VARIANT_SIZE as u32;
+        section.read_at(rel, &mut var_buf).ok()?;
         let v = bundle::CoverVariant::decode(&var_buf)?;
         if chosen.is_none() || v.kind == bundle::COVER_KIND_CARD {
             chosen = Some(v);
@@ -158,13 +175,7 @@ pub fn load_cover_thumb(k: &mut KernelHandle<'_>, name_hash: u32) -> Option<Deco
     let mut data = Vec::new();
     data.try_reserve_exact(data_len).ok()?;
     data.resize(data_len, 0);
-    bundle::read_at(
-        k.sd(),
-        name_hash,
-        hdr.covers_offset + variant.data_offset,
-        &mut data,
-    )
-    .ok()?;
+    section.read_at(variant.data_offset, &mut data).ok()?;
 
     Some(DecodedImage {
         width: variant.width,
@@ -176,10 +187,10 @@ pub fn load_cover_thumb(k: &mut KernelHandle<'_>, name_hash: u32) -> Option<Deco
 
 /// Whether a cover has been generated for this book.
 pub fn has_cover_thumb(k: &mut KernelHandle<'_>, name_hash: u32) -> bool {
-    let Some(hdr) = bundle::read_header(k.sd(), name_hash) else {
+    let Ok(bf) = BundleFile::open(k.sd(), name_hash) else {
         return false;
     };
-    hdr.has_flag(bundle::FLAG_COVERS_READY) && hdr.covers_size > 0
+    bf.header().has_flag(bundle::FLAG_COVERS_READY) && bf.section(SectionId::Covers).is_some()
 }
 
 // ── filename-based convenience wrappers ─────────────────────────────
