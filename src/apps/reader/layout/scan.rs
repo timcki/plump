@@ -665,6 +665,132 @@ mod tests {
     }
 
     #[test]
+    fn italic_marker_splits_word_and_propagates_style() {
+        // "a" + ITALIC_ON + "b" + ITALIC_OFF + "c"
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"a");
+        bytes.extend_from_slice(&marker(ITALIC_ON));
+        bytes.extend_from_slice(b"b");
+        bytes.extend_from_slice(&marker(ITALIC_OFF));
+        bytes.extend_from_slice(b"c");
+        let toks = drain(&bytes);
+        assert_eq!(toks.len(), 3);
+        match toks[0] {
+            Token::Word { style, .. } => assert!(!style.italic && !style.bold),
+            _ => panic!(),
+        }
+        match toks[1] {
+            Token::Word { style, .. } => assert!(style.italic),
+            _ => panic!(),
+        }
+        match toks[2] {
+            Token::Word { style, .. } => assert!(!style.italic),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn nested_bold_italic_carries_both_flags() {
+        // BOLD_ON + ITALIC_ON + "x" + ITALIC_OFF + "y" + BOLD_OFF + "z"
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&marker(BOLD_ON));
+        bytes.extend_from_slice(&marker(ITALIC_ON));
+        bytes.extend_from_slice(b"x");
+        bytes.extend_from_slice(&marker(ITALIC_OFF));
+        bytes.extend_from_slice(b"y");
+        bytes.extend_from_slice(&marker(BOLD_OFF));
+        bytes.extend_from_slice(b"z");
+        let toks = drain(&bytes);
+        // expected: Word("x", bold+italic), Word("y", bold), Word("z", regular)
+        assert_eq!(toks.len(), 3);
+        let styles: Vec<TextStyle> = toks
+            .iter()
+            .filter_map(|t| match t {
+                Token::Word { style, .. } => Some(*style),
+                _ => None,
+            })
+            .collect();
+        assert!(styles[0].bold && styles[0].italic);
+        assert!(styles[1].bold && !styles[1].italic);
+        assert!(!styles[2].bold && !styles[2].italic);
+    }
+
+    #[test]
+    fn single_letter_bold_dropcap_emits_two_words() {
+        // The actual Leviathan pattern: <b>M</b>iller
+        // BOLD_ON + "M" + BOLD_OFF + "iller"
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&marker(BOLD_ON));
+        bytes.extend_from_slice(b"M");
+        bytes.extend_from_slice(&marker(BOLD_OFF));
+        bytes.extend_from_slice(b"iller");
+        let toks = drain(&bytes);
+        // expected: Word("M", bold), Word("iller", regular). No Space between
+        // — the markers join the words logically.
+        assert_eq!(toks.len(), 2);
+        match toks[0] {
+            Token::Word { start, end, style } => {
+                assert_eq!(start, 2);
+                assert_eq!(end, 3);
+                assert!(style.bold);
+            }
+            _ => panic!("first token must be the bold M"),
+        }
+        match toks[1] {
+            Token::Word { start, end, style } => {
+                assert_eq!(start, 5);
+                assert_eq!(end, 10);
+                assert!(!style.bold);
+            }
+            _ => panic!("second token must be regular 'iller'"),
+        }
+    }
+
+    #[test]
+    fn marker_at_word_punctuation_boundary() {
+        // BOLD_ON + "Hello" + BOLD_OFF + "."
+        // Word boundary handling at punctuation: "." is its own "word" and
+        // carries regular style after BOLD_OFF.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&marker(BOLD_ON));
+        bytes.extend_from_slice(b"Hello");
+        bytes.extend_from_slice(&marker(BOLD_OFF));
+        bytes.extend_from_slice(b".");
+        let toks = drain(&bytes);
+        assert_eq!(toks.len(), 2);
+        match toks[0] {
+            Token::Word { style, .. } => assert!(style.bold),
+            _ => panic!(),
+        }
+        match toks[1] {
+            Token::Word { style, .. } => assert!(!style.bold),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn underline_strike_propagate_per_run() {
+        // UNDERLINE_ON + "u" + UNDERLINE_OFF + " " + STRIKE_ON + "s" + STRIKE_OFF
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&marker(UNDERLINE_ON));
+        bytes.extend_from_slice(b"u");
+        bytes.extend_from_slice(&marker(UNDERLINE_OFF));
+        bytes.extend_from_slice(b" ");
+        bytes.extend_from_slice(&marker(STRIKE_ON));
+        bytes.extend_from_slice(b"s");
+        bytes.extend_from_slice(&marker(STRIKE_OFF));
+        let toks = drain(&bytes);
+        // expected: Word("u", underline), Space, Word("s", strike)
+        let mut got: Vec<(bool, bool)> = Vec::new();
+        for t in &toks {
+            if let Token::Word { style, .. } = t {
+                got.push((style.underline, style.strike));
+            }
+        }
+        assert_eq!(got, vec![(true, false), (false, true)]);
+    }
+
+    #[test]
     fn heading_levels() {
         let pairs = [
             (H1_ON, 1u8),

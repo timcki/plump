@@ -257,8 +257,22 @@ pub mod convert {
                 }
             }
 
-            let gap_count = count_gaps(items, lo, item_idx);
-            let extra = encode_extra(ch, gap_count);
+            // skip computing per-gap stretch on lines the renderer
+            // will never justify: paragraph-end (END_HARD) and headings.
+            // mirrors LineLayout::may_justify so cached extra matches
+            // runtime behaviour. without this, paragraph-final lines
+            // pick up u16::MAX stretch from the forced-break glue and
+            // saturate extra to +127 px-per-gap, which is wrong even
+            // though the renderer currently ignores it.
+            let no_justify = (flags
+                & (LineLayout::FLAG_PARAGRAPH_END | LineLayout::FLAG_HEADING))
+                != 0;
+            let extra = if no_justify {
+                0
+            } else {
+                let gap_count = count_gaps(items, lo, item_idx);
+                encode_extra(ch, gap_count)
+            };
 
             out.push(LineLayout {
                 start_byte,
@@ -521,6 +535,7 @@ pub mod convert {
     mod tests {
         use super::*;
         use crate::apps::reader::layout::breaker::{break_paragraph, BreakConfig};
+        use crate::apps::reader::layout::items::ParagraphEnd;
         use crate::apps::reader::layout::scan::{BlockState, TextStyle};
 
         fn meta() -> ParagraphMeta {
@@ -581,6 +596,289 @@ pub mod convert {
             append_lines(&items, &choices, &meta(), &mut pending, &mut out);
             assert!(out[0].is_page_break_before());
             assert!(!pending);
+        }
+
+        #[test]
+        fn paragraph_end_line_has_zero_extra() {
+            // a short paragraph fitting on one line. The K-P forced-break
+            // triple carries u16::MAX stretch on its terminal glue, which
+            // (before the no-justify guard) inflated encode_extra to the
+            // +127 cap even though the renderer never justifies
+            // paragraph-end lines.
+            let mut items = Vec::new();
+            items.push(Item::boxed(10, 0));
+            items.push(Item::glue(5, 2, 1, 10));
+            items.push(Item::boxed(10, 11));
+            items.extend(forced_triple());
+
+            let cfg = BreakConfig {
+                line_width: 464,
+                ..BreakConfig::DEFAULT
+            };
+            let mut choices = Vec::new();
+            break_paragraph(&items, &cfg, &mut choices).unwrap();
+
+            let mut out = Vec::new();
+            let mut pending = false;
+            append_lines(&items, &choices, &meta(), &mut pending, &mut out);
+            let last = out.last().unwrap();
+            assert!(last.is_paragraph_end());
+            assert_eq!(
+                last.extra, 0,
+                "paragraph-end extra must be 0, got {:#x}",
+                last.extra
+            );
+        }
+
+        #[test]
+        fn empty_paragraph_has_zero_extra() {
+            // the exact pattern seen in Leviathan ch11 line 1: a paragraph
+            // that produces no Words/Spaces, only the forced-break triple.
+            let mut items = Vec::new();
+            items.extend(forced_triple());
+
+            let cfg = BreakConfig {
+                line_width: 464,
+                ..BreakConfig::DEFAULT
+            };
+            let mut choices = Vec::new();
+            break_paragraph(&items, &cfg, &mut choices).unwrap();
+
+            let mut out = Vec::new();
+            let mut pending = false;
+            append_lines(&items, &choices, &meta(), &mut pending, &mut out);
+            // breaker may emit 0 lines for an empty paragraph; if it
+            // emits any, none may have non-zero extra.
+            for ll in &out {
+                assert_eq!(ll.extra, 0, "empty-paragraph line extra must be 0");
+            }
+        }
+
+        #[test]
+        fn heading_line_has_zero_extra() {
+            // headings render in the heading font with no justification.
+            // The cached extra must reflect that.
+            let mut items = Vec::new();
+            let heading_style = TextStyle {
+                heading: true,
+                hlevel: 2,
+                ..TextStyle::default()
+            };
+            items.push(Item::boxed(40, 0).with_style(heading_style));
+            items.push(Item::glue(5, 2, 1, 40).with_style(heading_style));
+            items.push(Item::boxed(40, 50).with_style(heading_style));
+            items.extend(forced_triple());
+
+            let cfg = BreakConfig {
+                line_width: 464,
+                ..BreakConfig::DEFAULT
+            };
+            let mut choices = Vec::new();
+            break_paragraph(&items, &cfg, &mut choices).unwrap();
+
+            let mut out = Vec::new();
+            let mut pending = false;
+            append_lines(&items, &choices, &meta(), &mut pending, &mut out);
+            for ll in &out {
+                assert!(ll.is_heading() || ll.is_paragraph_end());
+                assert_eq!(ll.extra, 0, "heading line extra must be 0");
+            }
+        }
+
+        #[test]
+        fn dropcap_first_line_flags_bold() {
+            // A line whose first Box is the bold drop-cap "M" and whose
+            // subsequent Boxes are regular. first_box_style must return
+            // FLAG_BOLD so the renderer's initial sty is Bold; the
+            // renderer then re-walks markers and flips to Regular at the
+            // BOLD_OFF marker inside the line's byte range.
+            let bold_style = TextStyle {
+                bold: true,
+                ..TextStyle::default()
+            };
+            let regular = TextStyle::default();
+            let mut items = Vec::new();
+            // bold "M" at byte 0
+            items.push(Item::boxed(3, 0).with_style(bold_style));
+            // (no glue; markers join the words logically — the BOLD_OFF
+            // marker bytes live between the two boxes in the source
+            // stream but are zero-width in the K-P model.)
+            items.push(Item::boxed(15, 5).with_style(regular));
+            items.extend(forced_triple());
+
+            let cfg = BreakConfig {
+                line_width: 464,
+                ..BreakConfig::DEFAULT
+            };
+            let mut choices = Vec::new();
+            break_paragraph(&items, &cfg, &mut choices).unwrap();
+
+            let mut out = Vec::new();
+            let mut pending = false;
+            append_lines(&items, &choices, &meta(), &mut pending, &mut out);
+            let first = &out[0];
+            assert!(
+                first.flags & LineLayout::FLAG_BOLD != 0,
+                "drop-cap line must carry FLAG_BOLD (got flags={:#x})",
+                first.flags
+            );
+            assert!(first.is_paragraph_end(), "single-line paragraph is paragraph-end");
+            assert_eq!(first.extra, 0, "paragraph-end ⇒ extra zeroed");
+        }
+
+        #[test]
+        fn mid_paragraph_line_can_carry_extra() {
+            // a long paragraph forced into multiple lines: intermediate
+            // (non-final) lines may carry per-gap stretch from the K-P
+            // adjustment ratio. Confirms the no-justify guard isn't
+            // over-zealous and zeroing every line.
+            let mut items = Vec::new();
+            for k in 0..16u32 {
+                items.push(Item::boxed(20, k * 100));
+                items.push(Item::glue(5, 3, 2, k * 100 + 50));
+            }
+            items.extend(forced_triple());
+
+            let cfg = BreakConfig {
+                line_width: 80,
+                ..BreakConfig::DEFAULT
+            };
+            let mut choices = Vec::new();
+            break_paragraph(&items, &cfg, &mut choices).unwrap();
+
+            let mut out = Vec::new();
+            let mut pending = false;
+            append_lines(&items, &choices, &meta(), &mut pending, &mut out);
+            assert!(out.len() >= 4, "expected multi-line break, got {}", out.len());
+            // last line is paragraph-end → extra=0 (the fix).
+            assert_eq!(out.last().unwrap().extra, 0);
+            // at least one intermediate line should carry non-zero extra
+            // (Stretch or Shrink adjustment); otherwise the breaker
+            // produced only Perfect/Overflow which would be unusual.
+            let any_extra = out.iter().take(out.len() - 1).any(|ll| ll.extra != 0);
+            assert!(
+                any_extra,
+                "expected at least one mid-paragraph line with non-zero extra"
+            );
+        }
+
+        // ── marker-replay contract (Phase 3) ──────────────────────
+        //
+        // The renderer's draw loop (`mod.rs` around line 2989) initialises
+        // its style from `LineSpan::style()` and re-walks marker bytes
+        // per glyph, swapping the active font at every `0x01 X` marker.
+        // The cache stamps the line's *initial* style into
+        // `LineLayout.flags` via `first_box_style`. This test pair locks
+        // the contract: given a synthetic line, the (position, style)
+        // trace produced by replaying markers against the initial style
+        // must match what the renderer would draw.
+
+        /// Style enum mirroring `fonts::Style`. Kept local so this test
+        /// has no dependency on the rendering crate.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum StyleTrace {
+            Regular,
+            Bold,
+            Italic,
+            Heading,
+        }
+
+        /// Walk `bytes` exactly the way `mod.rs:draw()` does for one
+        /// line: start at `initial`, flip on inline-style markers, and
+        /// emit a `(glyph_byte_index, style)` for every printable byte.
+        fn replay_markers(bytes: &[u8], initial: StyleTrace) -> Vec<(usize, StyleTrace)> {
+            use smol_epub::html_strip::{
+                BOLD_OFF, BOLD_ON, H1_OFF, H1_ON, H2_OFF, H2_ON, H3_OFF, H3_ON, H4_OFF, H4_ON,
+                H5_OFF, H5_ON, H6_OFF, H6_ON, ITALIC_OFF, ITALIC_ON, MARKER,
+            };
+            let mut sty = initial;
+            let mut out = Vec::new();
+            let mut j = 0usize;
+            while j < bytes.len() {
+                let b = bytes[j];
+                if b == MARKER && j + 1 < bytes.len() {
+                    let tag = bytes[j + 1];
+                    sty = match tag {
+                        BOLD_ON => StyleTrace::Bold,
+                        BOLD_OFF => StyleTrace::Regular,
+                        ITALIC_ON => StyleTrace::Italic,
+                        ITALIC_OFF => StyleTrace::Regular,
+                        H1_ON | H2_ON | H3_ON | H4_ON | H5_ON | H6_ON => StyleTrace::Heading,
+                        H1_OFF | H2_OFF | H3_OFF | H4_OFF | H5_OFF | H6_OFF => StyleTrace::Regular,
+                        _ => sty, // unhandled marker (align, page break, etc.) leaves style alone
+                    };
+                    j += 2;
+                    continue;
+                }
+                out.push((j, sty));
+                j += 1;
+            }
+            out
+        }
+
+        #[test]
+        fn marker_replay_dropcap_swaps_at_close() {
+            // The Leviathan ch11 line 3 byte pattern (compressed):
+            // "M<01>biller" where 'M' is the bold drop-cap (line start
+            // is AFTER the BOLD_ON marker that lives upstream).
+            // Initial style = Bold (LineLayout.flags carries FLAG_BOLD).
+            use smol_epub::html_strip::{BOLD_OFF, MARKER};
+            let mut line = Vec::new();
+            line.push(b'M');
+            line.push(MARKER);
+            line.push(BOLD_OFF);
+            line.extend_from_slice(b"iller");
+            let trace = replay_markers(&line, StyleTrace::Bold);
+            // 6 printable bytes: M, i, l, l, e, r. Only 'M' is bold;
+            // the rest flip to Regular after the BOLD_OFF marker.
+            assert_eq!(trace.len(), 6);
+            assert_eq!(trace[0], (0, StyleTrace::Bold), "M must be bold");
+            for (pos, sty) in &trace[1..] {
+                assert_eq!(*sty, StyleTrace::Regular, "byte {} must be regular", pos);
+            }
+        }
+
+        #[test]
+        fn marker_replay_line_begins_mid_bold_span() {
+            // A continuation line whose start_byte sits inside a bold
+            // span that opened on a previous line. The line's bytes
+            // contain no BOLD_OFF marker; the entire line draws bold.
+            // first_box_style sets FLAG_BOLD ⇒ initial=Bold.
+            let line = b"continuation in bold";
+            let trace = replay_markers(line, StyleTrace::Bold);
+            assert!(trace.iter().all(|(_, s)| *s == StyleTrace::Bold));
+        }
+
+        #[test]
+        fn marker_replay_nested_italic_inside_bold() {
+            // "bold <i>italic-in-bold</i> still-bold"
+            // initial=Bold; ITALIC_ON flips to Italic; ITALIC_OFF flips
+            // back to Regular (NOT Bold) — this is the current draw
+            // loop's behaviour. Off markers reset to Regular; nesting
+            // is flattened. The renderer doesn't maintain a style
+            // stack — markers are commutative resets. Document the
+            // contract here.
+            use smol_epub::html_strip::{ITALIC_OFF, ITALIC_ON, MARKER};
+            let mut line = Vec::new();
+            line.extend_from_slice(b"bold ");
+            line.push(MARKER);
+            line.push(ITALIC_ON);
+            line.extend_from_slice(b"em");
+            line.push(MARKER);
+            line.push(ITALIC_OFF);
+            line.extend_from_slice(b" stl");
+            let trace = replay_markers(&line, StyleTrace::Bold);
+            // "bold " in Bold, "em" in Italic, " stl" in Regular (the
+            // ITALIC_OFF reset overrides any prior bold).
+            // This is a known limitation: nested styles can't survive
+            // OFF markers without a style stack. The fix is on the
+            // smol-epub side: emit the *outer* OPEN marker again when
+            // closing an inner inline that overlapped. Documented for
+            // future work — not addressed here.
+            let style_at = |b: usize| trace.iter().find(|(p, _)| *p == b).map(|(_, s)| *s);
+            assert_eq!(style_at(0), Some(StyleTrace::Bold)); // 'b' of "bold"
+            assert_eq!(style_at(7), Some(StyleTrace::Italic)); // 'e' of "em"
+            assert_eq!(style_at(12), Some(StyleTrace::Regular)); // ' ' before "stl"
         }
 
         #[test]

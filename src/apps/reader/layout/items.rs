@@ -443,7 +443,8 @@ mod tests {
     use super::*;
     use crate::apps::reader::layout::scan::{MarkupScanner, TextStyle};
     use smol_epub::html_strip::{
-        ALIGN_CENTER, BOLD_OFF, BOLD_ON, IMG_REF, MARKER, PAGE_BREAK, QUOTE_ON,
+        ALIGN_CENTER, BOLD_OFF, BOLD_ON, IMG_REF, ITALIC_OFF, ITALIC_ON, MARKER, PAGE_BREAK,
+        QUOTE_ON,
     };
 
     /// minimal mock advance: every char is 1 px regardless of style.
@@ -578,6 +579,123 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].kind(), ItemKind::Box);
         assert_eq!(items[1].kind(), ItemKind::Box);
+        // first Box is pre-bold; second carries STYLE_BOLD
+        assert!(!items[0].style_is_bold());
+        assert!(items[1].style_is_bold());
+    }
+
+    #[test]
+    fn single_letter_bold_dropcap_stamps_only_first_box() {
+        // The Leviathan pattern: <b>M</b>iller — a single bold-letter
+        // drop-cap followed by regular continuation. Items must reflect
+        // the per-Box style so K-P measures bold-M with the bold font
+        // and so first_box_style picks the right initial flag.
+        let mut bytes = Vec::new();
+        bytes.push(MARKER);
+        bytes.push(BOLD_ON);
+        bytes.push(b'M');
+        bytes.push(MARKER);
+        bytes.push(BOLD_OFF);
+        bytes.extend_from_slice(b"iller");
+        let (items, _) = build(&bytes);
+        // expect Box("M", bold) + Box("iller", regular). No Glue, the
+        // markers join the two words logically (no whitespace between).
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind(), ItemKind::Box);
+        assert!(
+            items[0].style_is_bold(),
+            "first Box (drop-cap M) must carry STYLE_BOLD"
+        );
+        assert_eq!(items[1].kind(), ItemKind::Box);
+        assert!(
+            !items[1].style_is_bold(),
+            "second Box (regular 'iller') must NOT carry STYLE_BOLD"
+        );
+    }
+
+    #[test]
+    fn nested_bold_italic_stamps_combined_style() {
+        // BOLD_ON + ITALIC_ON + "x" + ITALIC_OFF + "y" + BOLD_OFF + "z"
+        // → Box("x", bold+italic), Box("y", bold), Box("z", regular)
+        let mut bytes = Vec::new();
+        bytes.push(MARKER);
+        bytes.push(BOLD_ON);
+        bytes.push(MARKER);
+        bytes.push(ITALIC_ON);
+        bytes.push(b'x');
+        bytes.push(MARKER);
+        bytes.push(ITALIC_OFF);
+        bytes.push(b'y');
+        bytes.push(MARKER);
+        bytes.push(BOLD_OFF);
+        bytes.push(b'z');
+        let (items, _) = build(&bytes);
+        assert_eq!(items.len(), 3);
+        let boxes: Vec<&Item> = items.iter().filter(|it| it.kind() == ItemKind::Box).collect();
+        assert!(boxes[0].style_is_bold() && boxes[0].style_is_italic());
+        assert!(boxes[1].style_is_bold() && !boxes[1].style_is_italic());
+        assert!(!boxes[2].style_is_bold() && !boxes[2].style_is_italic());
+    }
+
+    #[test]
+    fn glue_inherits_leading_word_style() {
+        // BOLD_ON + "a" + " " (space) + "b" + BOLD_OFF + " " + "c"
+        // The space after "a" is encountered while bold=true; the
+        // intermediate space after "b" is also bold (close happens
+        // AFTER the space). This documents the existing convention.
+        let mut bytes = Vec::new();
+        bytes.push(MARKER);
+        bytes.push(BOLD_ON);
+        bytes.extend_from_slice(b"a b");
+        bytes.push(MARKER);
+        bytes.push(BOLD_OFF);
+        bytes.extend_from_slice(b" c");
+        let (items, _) = build(&bytes);
+        // Box("a", bold) + Glue(bold) + Box("b", bold) + Glue(regular) + Box("c", regular)
+        assert!(items.len() >= 5);
+        let kinds: Vec<ItemKind> = items.iter().map(|it| it.kind()).collect();
+        assert_eq!(
+            &kinds[..5],
+            &[
+                ItemKind::Box,
+                ItemKind::Glue,
+                ItemKind::Box,
+                ItemKind::Glue,
+                ItemKind::Box,
+            ]
+        );
+        assert!(items[0].style_is_bold(), "Box 'a' must be bold");
+        assert!(items[1].style_is_bold(), "Glue after 'a' inherits bold");
+        assert!(items[2].style_is_bold(), "Box 'b' still bold (close not seen yet)");
+        // Glue after "b" — by the time we encounter the space, we've
+        // already seen the BOLD_OFF marker between "b" and " ", so it
+        // carries regular style.
+        assert!(!items[3].style_is_bold(), "Glue after BOLD_OFF must be regular");
+        assert!(!items[4].style_is_bold(), "Box 'c' must be regular");
+    }
+
+    #[test]
+    fn width_measurement_is_style_aware() {
+        // Custom advance: regular = 1 px, bold = 3 px per character.
+        // Confirms per-character style propagates into K-P widths.
+        fn styled_advance(_c: char, s: TextStyle) -> u16 {
+            if s.bold { 3 } else { 1 }
+        }
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"ab ");
+        bytes.push(MARKER);
+        bytes.push(BOLD_ON);
+        bytes.extend_from_slice(b"cd");
+        let mut scanner = MarkupScanner::new(&bytes);
+        let mut out: Vec<Item> = Vec::new();
+        build_paragraph(&mut scanner, styled_advance, &mut out);
+        // Box("ab") width 2 + Glue(space) width 1 + Box("cd", bold) width 6
+        let box_widths: Vec<u16> = out
+            .iter()
+            .filter(|it| it.kind() == ItemKind::Box)
+            .map(|it| it.width)
+            .collect();
+        assert_eq!(box_widths, vec![2, 6]);
     }
 
     #[test]

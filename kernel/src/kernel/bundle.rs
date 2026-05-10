@@ -588,7 +588,13 @@ pub const PAGEIDX_FORMAT_VERSION: u8 = 2;
 // bump only when the runtime typesetter switches; greedy results
 // stamped with the K-P version would be served as if they had been
 // produced by K-P, which would be wrong.
-pub const LAYOUT_ALGO_VERSION: u8 = 2;
+//
+// v3 also bumps for a behaviour change without an algo swap: K-P now
+// zeroes the per-gap stretch on paragraph-end / heading lines (lines
+// the renderer never justifies). v2 caches stamped these lines with
+// stretch saturated to +127 px-per-gap, which mismatched what the
+// renderer actually drew and is corrected by re-typesetting.
+pub const LAYOUT_ALGO_VERSION: u8 = 3;
 
 pub const PAGEIDX_HDR_V2_SIZE: usize = 20;
 pub const CHAPTER_LAYOUT_DIR_SIZE: usize = 24;
