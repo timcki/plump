@@ -60,7 +60,19 @@ pub(super) const CHROME_PAD: u16 = 2;
 const CHROME_BAR_GAP: u16 = 3;
 pub(super) const CHROME_Y: u16 = BOTTOM_BAR_Y - CHROME_H - CHROME_BAR_GAP;
 
-pub(super) const TEXT_Y: u16 = SCREEN_PAD + 4;
+// reader text starts here when the user has chrome disabled (full
+// page reading) - just below the physical screen pad.
+pub(super) const TEXT_Y_NO_CHROME: u16 = SCREEN_PAD + 4;
+
+// when chrome is enabled, text starts below the shared top status
+// bar (chunk D adds it for every screen). value derived from the
+// kernel theme so the constants stay in lockstep.
+const THEME_V1: plump_kernel::ui::Theme = plump_kernel::ui::Theme::default_v1();
+pub(super) const TEXT_Y_WITH_CHROME: u16 = THEME_V1.content_top() + 4;
+
+// historical alias still used by callers that don't care about the
+// chrome / no-chrome split (loading screen position, etc).
+pub(super) const TEXT_Y: u16 = TEXT_Y_NO_CHROME;
 
 pub(super) const LINE_H: u16 = 20;
 
@@ -693,7 +705,15 @@ impl ReaderApp {
     fn apply_theme_layout(&mut self) {
         let theme = crate::kernel::config::ReadingTheme::from_idx(self.reading_theme_idx);
         self.text_margin = theme.margin_h;
-        self.text_y = TEXT_Y + theme.margin_v;
+        // when chrome is on, text starts below the shared top status
+        // bar drawn by the manager; when off, it goes near the top
+        // edge for a full-page reading experience.
+        let top = if self.show_chrome {
+            TEXT_Y_WITH_CHROME
+        } else {
+            TEXT_Y_NO_CHROME
+        };
+        self.text_y = top + theme.margin_v;
         self.text_w = (SCREEN_W - 2 * self.text_margin) as u32;
         let bottom = if self.show_chrome {
             CHROME_Y - CHROME_PAD
@@ -2645,11 +2665,16 @@ impl App<AppId> for ReaderApp {
         true
     }
 
-    /// Reader keeps its legacy chrome (HEADER_REGION / STATUS_REGION
-    /// drawn inline in `draw`) until chunk G replaces it with the
-    /// new top-status / footer design. opt out of the shared chrome
-    /// so the two don't overlap.
-    fn show_chrome(&self) -> bool {
+    /// Reader shows the shared top status bar (same today / battery
+    /// line as the tab screens) when the user's "show chrome" setting
+    /// is on, and paints its own progress footer in place of the tab
+    /// bar via `draw`. Returns false during loading / TOC / non-Ready
+    /// states so the loading screen renders edge-to-edge.
+    fn show_top_status(&self) -> bool {
+        self.show_chrome && matches!(self.state, State::Ready | State::ShowToc)
+    }
+
+    fn show_tab_bar(&self) -> bool {
         false
     }
 

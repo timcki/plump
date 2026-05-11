@@ -91,9 +91,11 @@ pub const READING_THEMES: [ReadingTheme; NUM_READING_THEMES as usize] = [
     },
 ];
 
-// text alignment for the reader (0 = Left, 1 = Justify)
+// text alignment for the reader (0 = Left, 1 = Justify).
+// the v1 mockup assumes justified body text; users can flip to left
+// via Settings if they prefer.
 pub const NUM_TEXT_ALIGNMENTS: u8 = 2;
-pub const DEFAULT_TEXT_ALIGNMENT: u8 = 0;
+pub const DEFAULT_TEXT_ALIGNMENT: u8 = 1;
 
 const TEXT_ALIGNMENT_NAMES: &[&str] = &["Left", "Justify"];
 

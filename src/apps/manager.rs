@@ -743,19 +743,25 @@ impl AppManager {
 
     pub fn draw(&self, strip: &mut StripBuffer) {
         let active = self.launcher.active();
-        let app_shows_chrome = with_app_ref!(active, self, |app| app.show_chrome());
+        let show_top = with_app_ref!(active, self, |app| app.show_top_status());
+        let show_tabs = with_app_ref!(active, self, |app| app.show_tab_bar());
 
         with_app_ref!(active, self, |app| app.draw(strip));
 
-        // shared chrome (top status + tab bar) is drawn on top of the
-        // app's content so the bars always win the painter's-algorithm
-        // over any app pixel that strays into the bar regions.
-        if app_shows_chrome {
+        // shared chrome is drawn on top of the app's content so the
+        // bars always win the painter's-algorithm over any app pixel
+        // that strays into the bar regions.
+        if show_top || show_tabs {
             let theme = Theme::default_v1();
             let text_font = fonts::chrome_font();
             let icon_font = fonts::icon_font(2);
             let mut painter = Painter::new(strip, &theme);
-            self.chrome.draw(&mut painter, text_font, icon_font);
+            if show_top {
+                self.chrome.draw_top(&mut painter, text_font);
+            }
+            if show_tabs {
+                self.chrome.draw_tabs(&mut painter, text_font, icon_font);
+            }
         }
 
         // loading indicator: after app content, before overlays.
@@ -783,7 +789,7 @@ impl AppManager {
         // chunk G lands the new reader footer, button feedback gets
         // deleted entirely in chunk N.
         let hide = with_app_ref!(active, self, |app| app.hide_button_bar());
-        if !hide && !app_shows_chrome {
+        if !hide && !show_tabs {
             self.bumps.draw(strip);
         }
     }

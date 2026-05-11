@@ -53,11 +53,22 @@ impl Chrome {
         self.tabs.active = active_tab;
     }
 
-    /// `text_font` is used for top-status text and tab-bar edge hints;
-    /// `icon_font` is the Phosphor bitmap font for tab icons.
-    pub fn draw(&self, p: &mut Painter<'_>, text_font: &BitmapFont, icon_font: &BitmapFont) {
+    /// Paint just the top status bar (today's stats + battery).
+    /// Reader uses this and skips `draw_tabs` because it paints its
+    /// own progress footer instead.
+    pub fn draw_top(&self, p: &mut Painter<'_>, text_font: &BitmapFont) {
         self.top.draw(p, text_font);
+    }
+
+    /// Paint just the bottom tab bar (5 Phosphor icons).
+    pub fn draw_tabs(&self, p: &mut Painter<'_>, text_font: &BitmapFont, icon_font: &BitmapFont) {
         self.tabs.draw(p, text_font, icon_font);
+    }
+
+    /// Convenience: draw top and tabs in one call.
+    pub fn draw(&self, p: &mut Painter<'_>, text_font: &BitmapFont, icon_font: &BitmapFont) {
+        self.draw_top(p, text_font);
+        self.draw_tabs(p, text_font, icon_font);
     }
 }
 
