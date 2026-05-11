@@ -23,6 +23,7 @@ use crate::drivers::sdcard::SdStorage;
 #[allow(unused_imports)]
 use crate::drivers::strip::StripBuffer;
 use crate::kernel::input_policy::SemanticInput;
+use crate::kernel::nav::{HDir, HResult};
 use crate::ui::Region;
 
 use super::KernelHandle;
@@ -445,6 +446,24 @@ pub trait App<Id> {
 
     fn hide_button_bar(&self) -> bool {
         false
+    }
+
+    /// True if the kernel should paint the shared chrome (top status
+    /// bar + bottom tab bar) around this app's content. Reader will
+    /// override to false in chunk G; until then every app shows
+    /// chrome by default.
+    fn show_chrome(&self) -> bool {
+        true
+    }
+
+    /// Handle a horizontal navigation gesture (physical Left / Right,
+    /// semantic `PrevJump` / `NextJump`).
+    ///
+    /// Default returns `HResult::AtEdge` so screens without horizontal
+    /// content get free tab switching. Library overrides in chunk J
+    /// to consume the gesture for its filter chips and grid.
+    fn on_horizontal(&mut self, _dir: HDir, _ctx: &mut AppContext) -> HResult {
+        HResult::AtEdge
     }
 }
 

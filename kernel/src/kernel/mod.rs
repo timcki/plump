@@ -14,6 +14,7 @@ pub mod console;
 pub mod dir_cache;
 pub mod handle;
 pub mod input_policy;
+pub mod nav;
 pub mod rtc_session;
 pub mod scheduler;
 pub mod sleep_image;

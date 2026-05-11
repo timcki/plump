@@ -1,6 +1,9 @@
 // app modules, AppId definition, and re-exports from kernel::app
 //
-// AppId is defined here (the distro side) the kernel attempts to be generic
+// AppId is defined here (the distro side); the kernel attempts to be
+// generic. Modal + the Tab / Nav type aliases are reserved for the
+// rebuild: chunks B.3+ migrate `on_event` away from `Transition<AppId>`
+// to `NavCmd<Tab, Modal>`.
 
 pub mod cover_cache;
 pub mod files;
@@ -46,3 +49,22 @@ pub use crate::kernel::{Error, ErrorKind, Result, ResultExt};
 
 // backward-compatible alias
 pub use crate::kernel::StorageError;
+
+// ── nav rebuild types (unused until chunk B.3+) ───────────────────────
+
+pub use tab::Tab;
+
+/// Modal slot kinds: only Reader for now. Files is being retired
+/// (deleted in chunk N); Library replaces it as a tab.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum Modal {
+    Reader,
+}
+
+pub type AppNavCmd = plump_kernel::kernel::nav::NavCmd<Tab, Modal>;
+pub type AppNavEvent = plump_kernel::kernel::nav::NavEvent<Tab, Modal>;
+pub type AppNavSlot = plump_kernel::kernel::nav::NavSlot<Tab, Modal>;
+pub type AppNav = plump_kernel::kernel::nav::Nav<Tab, Modal>;
+
+pub use plump_kernel::kernel::nav::{HDir, HResult};
