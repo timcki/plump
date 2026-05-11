@@ -46,6 +46,32 @@ const VALUE_W: u16 = FULL_CONTENT_W - LABEL_W - COL_GAP;
 const NUM_ITEMS: usize = 11;
 const HEADING_ITEMS_GAP: u16 = SECTION_GAP;
 
+// reorder rows to match the mockup grouping (READING / DISPLAY / SYSTEM).
+// visual position -> internal logical id (used by item_label /
+// format_value / increment / decrement match arms).
+const VISUAL_TO_LOGICAL: [usize; NUM_ITEMS] = [
+    3,  // Reader Font          | READING
+    2,  // Book Font
+    5,  // Theme
+    4,  // UI Font
+    9,  // Reader Status
+    10, // Text Align
+    1,  // Ghost Clear          | DISPLAY
+    7,  // Sunlight Fix
+    8,  // Text AA
+    0,  // Sleep After          | SYSTEM
+    6,  // Swap Buttons
+];
+
+// visual indices at which a new section caption is rendered.
+const SECTION_AT: &[(usize, &str)] = &[
+    (0, "READING"),
+    (6, "DISPLAY"),
+    (9, "SYSTEM"),
+];
+
+const CAPTION_H: u16 = 14;
+
 impl Default for SettingsApp {
     fn default() -> Self {
         Self::new()
@@ -260,7 +286,7 @@ impl SettingsApp {
     // increment/decrement:
 
     fn increment(&mut self) {
-        match self.selected {
+        match VISUAL_TO_LOGICAL[self.selected] {
             0 => {
                 self.settings.sleep_timeout = match self.settings.sleep_timeout {
                     0 => SLEEP_TIMEOUT_STEP,
@@ -318,7 +344,7 @@ impl SettingsApp {
     }
 
     fn decrement(&mut self) {
-        match self.selected {
+        match VISUAL_TO_LOGICAL[self.selected] {
             0 => {
                 self.settings.sleep_timeout = match self.settings.sleep_timeout {
                     t if t <= SLEEP_TIMEOUT_STEP => 0,
@@ -382,16 +408,6 @@ impl SettingsApp {
     }
 
     // row region helpers (visible_idx = position on screen, 0 = first visible):
-
-    #[inline]
-    fn label_region(&self, visible_idx: usize) -> Region {
-        Region::new(
-            LABEL_X,
-            self.items_top + visible_idx as u16 * ROW_STRIDE,
-            LABEL_W,
-            ROW_H,
-        )
-    }
 
     #[inline]
     fn value_region(&self, visible_idx: usize) -> Region {
@@ -525,18 +541,6 @@ impl App<AppId> for SettingsApp {
     }
 
     fn draw(&self, strip: &mut StripBuffer) {
-        // heading
-        let title_region = Region::new(
-            LARGE_MARGIN,
-            TITLE_Y,
-            FULL_CONTENT_W,
-            self.ui_fonts.heading.line_height,
-        );
-        BitmapLabel::new(title_region, "Settings", self.ui_fonts.heading)
-            .alignment(Alignment::CenterLeft)
-            .draw(strip)
-            .unwrap();
-
         if !self.loaded {
             let r = Region::new(LABEL_X, self.items_top, 200, ROW_H);
             BitmapLabel::new(r, "Loading...", self.ui_fonts.body)
@@ -546,31 +550,48 @@ impl App<AppId> for SettingsApp {
             return;
         }
 
-        // draw visible settings rows
+        // draw visible settings rows. each visible row at visual index
+        // `item_idx` dispatches through VISUAL_TO_LOGICAL to look up
+        // the underlying setting. captions are interleaved when a
+        // section starts at the current visual position.
         let vis = self.visible_items();
         let visible_count = vis.min(NUM_ITEMS - self.scroll);
         let mut val_buf = StackFmt::<20>::new();
 
+        let mut row_y = self.items_top;
         for vi in 0..visible_count {
             let item_idx = self.scroll + vi;
             let selected = item_idx == self.selected;
+            let logical = VISUAL_TO_LOGICAL[item_idx];
 
-            BitmapLabel::new(
-                self.label_region(vi),
-                Self::item_label(item_idx),
-                self.ui_fonts.body,
-            )
-            .alignment(Alignment::CenterLeft)
-            .inverted(selected)
-            .draw(strip)
-            .unwrap();
+            // section caption above the first item of each section.
+            for (sec_at, caption) in SECTION_AT.iter().copied() {
+                if sec_at == item_idx {
+                    let cap_r = Region::new(LABEL_X, row_y, FULL_CONTENT_W, CAPTION_H);
+                    BitmapLabel::new(cap_r, caption, self.ui_fonts.body)
+                        .alignment(Alignment::CenterLeft)
+                        .draw(strip)
+                        .unwrap();
+                    row_y += CAPTION_H + 2;
+                }
+            }
 
-            self.format_value(item_idx, &mut val_buf);
-            BitmapLabel::new(self.value_region(vi), val_buf.as_str(), self.ui_fonts.body)
+            let label_r = Region::new(LABEL_X, row_y, LABEL_W, ROW_H);
+            let value_r = Region::new(VALUE_X, row_y, VALUE_W, ROW_H);
+            BitmapLabel::new(label_r, Self::item_label(logical), self.ui_fonts.body)
+                .alignment(Alignment::CenterLeft)
+                .inverted(selected)
+                .draw(strip)
+                .unwrap();
+
+            self.format_value(logical, &mut val_buf);
+            BitmapLabel::new(value_r, val_buf.as_str(), self.ui_fonts.body)
                 .alignment(Alignment::Center)
                 .inverted(selected)
                 .draw(strip)
                 .unwrap();
+
+            row_y += ROW_STRIDE;
         }
     }
 }
