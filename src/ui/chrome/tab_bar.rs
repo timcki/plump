@@ -3,9 +3,10 @@
 // outermost side of the active slot whenever the next Left / Right
 // press would switch tabs (chunk E).
 //
-// icons are placeholder ASCII letters today (H L S G U). when a
-// Phosphor (or hand-traced) icon font lands, swap `slot_glyph` to
-// return private-use codepoints instead.
+// icons are drawn from the Phosphor icon font (PUA codepoints in
+// U+E0EA..U+E758). the `icon_font` parameter on `draw` is passed by
+// the chrome owner; chrome size constants pick a single Phosphor
+// rasterisation tier.
 
 use embedded_graphics::pixelcolor::BinaryColor;
 
@@ -30,7 +31,10 @@ impl TabBar {
         }
     }
 
-    pub fn draw(&self, p: &mut Painter<'_>, font: &BitmapFont) {
+    /// `text_font`: UI font for edge-hint chevrons (ASCII < > used
+    /// today; Phosphor caret-left / caret-right available for future).
+    /// `icon_font`: Phosphor font for tab slot glyphs.
+    pub fn draw(&self, p: &mut Painter<'_>, text_font: &BitmapFont, icon_font: &BitmapFont) {
         let theme = *p.theme();
         let parent = p.region();
         let bar = Region::new(
@@ -50,7 +54,7 @@ impl TabBar {
         let slot_w = bar.w / SLOTS as u16;
         for (i, tab) in Tab::ORDER.iter().copied().enumerate() {
             let slot = Region::new(bar.x + i as u16 * slot_w, bar.y, slot_w, bar.h);
-            self.draw_slot(p, font, tab, slot);
+            self.draw_slot(p, icon_font, tab, slot);
         }
 
         // edge hint chevrons sit just outside the active slot.
@@ -62,26 +66,27 @@ impl TabBar {
                 slot_w,
                 bar.h,
             );
-            self.draw_edge_hint(p, font, dir, active_slot);
+            self.draw_edge_hint(p, text_font, dir, active_slot);
         }
     }
 
-    fn draw_slot(&self, p: &mut Painter<'_>, font: &BitmapFont, tab: Tab, slot: Region) {
+    fn draw_slot(&self, p: &mut Painter<'_>, icon_font: &BitmapFont, tab: Tab, slot: Region) {
         let theme = *p.theme();
         let active = tab == self.active;
-        let glyph = slot_glyph(tab);
+        let glyph = tab.icon();
+
+        let mut buf = [0u8; 4];
+        let s = glyph.encode_utf8(&mut buf);
 
         if active {
             // filled square centred in the slot, then knockout glyph.
-            let size = (theme.bottom_bar_h.saturating_sub(2 * ACTIVE_PAD)).min(slot.w.saturating_sub(2 * ACTIVE_PAD));
+            let size = (theme.bottom_bar_h.saturating_sub(2 * ACTIVE_PAD))
+                .min(slot.w.saturating_sub(2 * ACTIVE_PAD));
             let sx = slot.x + (slot.w.saturating_sub(size)) / 2;
             let sy = slot.y + (slot.h.saturating_sub(size)) / 2;
             let square = Region::new(sx, sy, size, size);
             p.rounded_rect(square, 4, true);
-            // knockout glyph (background colour over the filled rect)
-            let mut buf = [0u8; 4];
-            let s = glyph.encode_utf8(&mut buf);
-            font.draw_aligned(
+            icon_font.draw_aligned(
                 p.strip_mut(),
                 square,
                 s,
@@ -89,9 +94,7 @@ impl TabBar {
                 BinaryColor::Off,
             );
         } else {
-            let mut buf = [0u8; 4];
-            let s = glyph.encode_utf8(&mut buf);
-            font.draw_aligned(
+            icon_font.draw_aligned(
                 p.strip_mut(),
                 slot,
                 s,
@@ -140,16 +143,3 @@ impl TabBar {
     }
 }
 
-/// ASCII placeholder glyph for each tab. Swap to private-use
-/// codepoints once an icon font is wired up; `Tab::icon()` already
-/// reserves U+E000..U+E004 for that purpose.
-#[inline]
-fn slot_glyph(tab: Tab) -> char {
-    match tab {
-        Tab::Home => 'H',
-        Tab::Library => 'L',
-        Tab::Stats => 'S',
-        Tab::Settings => 'G',
-        Tab::Upload => 'U',
-    }
-}

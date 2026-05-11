@@ -77,13 +77,20 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-// font families to rasterise. tuple is (constant prefix, subdirectory).
-// Bookerly + Atkinson supply reader fonts (selectable); Inter supplies
-// every UI surface (chrome, menus, status bars, button labels).
-const FAMILIES: &[(&str, &str)] = &[
-    ("BOOKERLY", "Bookerly"),
-    ("ATKINSON", "Atkinson"),
-    ("INTER", "Inter"),
+// font families to rasterise. tuple is (constant prefix, subdirectory,
+// base weight keyword). Bookerly + Atkinson supply reader fonts
+// (selectable); Inter supplies every UI surface; Phosphor supplies the
+// icon glyphs for tab bar + panel rows.
+//
+// `base_weight` is the keyword used to find the file we treat as the
+// "Regular" rasterisation. Bookerly/Atkinson/Inter pick the canonical
+// Regular TTF; Phosphor only ships Bold, so we treat its Bold file as
+// the Regular variant and skip emitting separate Bold/Italic sets.
+const FAMILIES: &[(&str, &str, &str)] = &[
+    ("BOOKERLY", "Bookerly", "Regular"),
+    ("ATKINSON", "Atkinson", "Regular"),
+    ("INTER", "Inter", "Regular"),
+    ("PHOSPHOR", "Phosphor", "Bold"),
 ];
 
 // body sizes (px): 0=XSmall 1=Small 2=Medium 3=Large 4=XLarge
@@ -270,6 +277,31 @@ fn extended_codepoints() -> Vec<u32> {
     ];
     cps.extend_from_slice(misc);
 
+    // Phosphor icon codepoints (private-use area) used by the chrome
+    // widgets in src/ui/chrome/. Bookerly / Atkinson / Inter emit empty
+    // glyph stubs for these (no PUA glyphs in the source TTFs); only
+    // the Phosphor family rasterises real bitmaps at this codepoint.
+    //
+    // The codepoint mapping is Phosphor v2.1.x Bold style.css. Keep
+    // this list in lockstep with `src/apps/tab.rs::Tab::icon` and any
+    // future icon usage in chrome panels.
+    let phosphor_icons: &[u32] = &[
+        0xE2C2, // house
+        0xE758, // books
+        0xE150, // chart-bar
+        0xE272, // gear-six
+        0xE1AE, // cloud-arrow-up
+        0xE0EA, // bookmark-simple
+        0xE0EC, // bookmarks
+        0xE2F2, // list-bullets
+        0xE21E, // eraser
+        0xE230, // file
+        0xE06C, // arrow-right
+        0xE138, // caret-left
+        0xE13A, // caret-right
+    ];
+    cps.extend_from_slice(phosphor_icons);
+
     // Additional Latin Extended-B for more complete European language support
     let latin_ext_b: &[u32] = &[
         0x0180, // ƀ b with stroke (Croatian)
@@ -350,13 +382,25 @@ fn generate_bitmap_fonts() {
     .unwrap();
     writeln!(out).unwrap();
 
-    for (prefix, dirname) in FAMILIES {
+    for (prefix, dirname, base_weight) in FAMILIES {
         let dir = assets.join(dirname);
         println!("cargo:rerun-if-changed={}", dir.display());
 
-        let regular = find_ttf(&dir, "Regular");
-        let bold = find_ttf(&dir, "Bold");
-        let italic = find_ttf(&dir, "Italic");
+        let regular = find_ttf(&dir, base_weight);
+        // only emit bold / italic when the family ships its own
+        // dedicated regular file (i.e. base_weight is "Regular").
+        // Phosphor only has Bold; reusing it as bold / italic would
+        // bloat the binary with duplicate bitmaps.
+        let bold = if *base_weight == "Regular" {
+            find_ttf(&dir, "Bold")
+        } else {
+            None
+        };
+        let italic = if *base_weight == "Regular" {
+            find_ttf(&dir, "Italic")
+        } else {
+            None
+        };
 
         if let Some(ref p) = regular {
             println!("cargo:rerun-if-changed={}", p.display());

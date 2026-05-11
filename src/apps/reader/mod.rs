@@ -2633,6 +2633,14 @@ impl App<AppId> for ReaderApp {
         true
     }
 
+    /// Reader keeps its legacy chrome (HEADER_REGION / STATUS_REGION
+    /// drawn inline in `draw`) until chunk G replaces it with the
+    /// new top-status / footer design. opt out of the shared chrome
+    /// so the two don't overlap.
+    fn show_chrome(&self) -> bool {
+        false
+    }
+
     fn save_state(&self, bm: &mut bookmarks::BookmarkCache) {
         self.save_position(bm);
     }

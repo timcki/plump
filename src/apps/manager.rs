@@ -28,7 +28,8 @@ use crate::kernel::app::AppLayer;
 use crate::kernel::bookmarks::BookmarkCache;
 use crate::kernel::config::{SystemSettings, WifiConfig};
 use crate::kernel::input_policy::SemanticInput;
-use crate::ui::Region;
+use crate::ui::chrome::Chrome;
+use crate::ui::{Painter, Region, Theme};
 
 // monomorphized dispatch from AppId to concrete app type
 macro_rules! with_app {
@@ -115,6 +116,11 @@ pub struct AppManager {
     /// C/D/E/G consume this; the underlying `Launcher` stays as the
     /// dispatch backend until chunk N retires both it and `with_app!`.
     pub nav: AppNav,
+
+    /// persistent top status bar + bottom tab bar. drawn around tab
+    /// screens (`App::show_chrome() == true`). reader opts out and
+    /// keeps its legacy chrome until chunk G.
+    pub chrome: Chrome,
 }
 
 /// map a (legacy) `AppId` to the `Tab` it represents in the new model,
@@ -182,6 +188,7 @@ impl AppManager {
             bumps,
             mapper,
             nav: AppNav::new(Tab::Home),
+            chrome: Chrome::new(),
         }
     }
 
@@ -191,6 +198,8 @@ impl AppManager {
     fn sync_nav_from_launcher(&mut self) {
         let (tab, modal) = nav_state_from_launcher(self.launcher);
         self.nav.restore(tab, modal);
+        // chrome's tab bar always reflects the current tab.
+        self.chrome.tabs.active = tab;
     }
 
     /// Currently active tab in the new nav model. Chrome reads this
@@ -677,7 +686,20 @@ impl AppManager {
 
     pub fn draw(&self, strip: &mut StripBuffer) {
         let active = self.launcher.active();
+        let app_shows_chrome = with_app_ref!(active, self, |app| app.show_chrome());
+
         with_app_ref!(active, self, |app| app.draw(strip));
+
+        // shared chrome (top status + tab bar) is drawn on top of the
+        // app's content so the bars always win the painter's-algorithm
+        // over any app pixel that strays into the bar regions.
+        if app_shows_chrome {
+            let theme = Theme::default_v1();
+            let text_font = fonts::chrome_font();
+            let icon_font = fonts::icon_font(2);
+            let mut painter = Painter::new(strip, &theme);
+            self.chrome.draw(&mut painter, text_font, icon_font);
+        }
 
         // loading indicator: after app content, before overlays.
         // the reader draws its own centered loading screen while a
@@ -699,8 +721,12 @@ impl AppManager {
             self.quick_menu.draw(strip);
         }
 
+        // legacy button feedback bumps: only drawn when the active app
+        // does NOT use the new chrome (today, only Reader). once
+        // chunk G lands the new reader footer, button feedback gets
+        // deleted entirely in chunk N.
         let hide = with_app_ref!(active, self, |app| app.hide_button_bar());
-        if !hide {
+        if !hide && !app_shows_chrome {
             self.bumps.draw(strip);
         }
     }
@@ -858,6 +884,27 @@ impl AppLayer for AppManager {
                 crate::board::SCREEN_H - crate::ui::BUTTON_BAR_H,
                 crate::board::SCREEN_W,
                 crate::ui::BUTTON_BAR_H,
+            ));
+        }
+    }
+
+    fn set_chrome_state(&mut self, battery_pct: u8, today_pages: u16, today_secs: u32) {
+        let prev_pct = self.chrome.top.battery_pct;
+        let prev_pages = self.chrome.top.today_pages;
+        let prev_secs = self.chrome.top.today_secs;
+        self.chrome.top.battery_pct = battery_pct;
+        self.chrome.top.today_pages = today_pages;
+        self.chrome.top.today_secs = today_secs;
+        if prev_pct != battery_pct || prev_pages != today_pages || prev_secs != today_secs {
+            // chrome top bar changed; queue a coalesced redraw so the
+            // next paintable window picks it up. width spans the full
+            // bar; height is the top chrome region.
+            let theme = Theme::default_v1();
+            self.launcher.ctx.mark_dirty_coalesced(crate::ui::Region::new(
+                0,
+                0,
+                crate::board::SCREEN_W,
+                theme.top_bar_h,
             ));
         }
     }

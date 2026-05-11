@@ -330,6 +330,12 @@ impl super::Kernel {
                 }
             }
 
+            // push live chrome state into the app layer so the new
+            // top status bar (chunk D) shows up-to-date numbers.
+            // today_pages / today_secs land in chunk F; for now zero.
+            let pct = crate::drivers::battery::battery_percentage(self.cached_battery_mv);
+            app_mgr.set_chrome_state(pct, 0, 0);
+
             // opportunistic flush of deferred app persistence (RECENT,
             // reading stats) in safe no-redraw windows. apps own their
             // debounce logic so most calls are cheap no-ops.

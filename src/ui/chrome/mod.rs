@@ -55,9 +55,11 @@ impl Chrome {
         self.tabs.edge_hint = edge_hint;
     }
 
-    pub fn draw(&self, p: &mut Painter<'_>, font: &BitmapFont) {
-        self.top.draw(p, font);
-        self.tabs.draw(p, font);
+    /// `text_font` is used for top-status text and tab-bar edge hints;
+    /// `icon_font` is the Phosphor bitmap font for tab icons.
+    pub fn draw(&self, p: &mut Painter<'_>, text_font: &BitmapFont, icon_font: &BitmapFont) {
+        self.top.draw(p, text_font);
+        self.tabs.draw(p, text_font, icon_font);
     }
 }
 

@@ -25,7 +25,10 @@ pub const FONT_SIZE_NAMES: &[&str] = &["XSmall", "Small", "Medium", "Large", "XL
 
 // font family identifies which TTF source the glyphs were rasterised
 // from. Inter is reserved for UI; Bookerly and Atkinson are user-
-// selectable for the reader's body + heading.
+// selectable for the reader's body + heading. Phosphor is built but
+// deliberately not in this enum: it's an icon font (private-use
+// codepoints only), accessed via `icon_font` rather than as a body
+// face the user can pick.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Family {
     Bookerly,
@@ -241,6 +244,19 @@ pub fn chrome_font() -> &'static BitmapFont {
 #[inline]
 pub fn button_label_font() -> &'static BitmapFont {
     ui_body_font(0)
+}
+
+/// Phosphor icon font for chrome widgets. Tab bar uses MEDIUM (idx 2);
+/// panel rows pick smaller sizes via the same dispatch.
+#[inline]
+pub fn icon_font(idx: u8) -> &'static BitmapFont {
+    match idx.min(max_size_idx()) {
+        0 => &font_data::PHOSPHOR_REGULAR_BODY_XSMALL,
+        1 => &font_data::PHOSPHOR_REGULAR_BODY_SMALL,
+        2 => &font_data::PHOSPHOR_REGULAR_BODY_MEDIUM,
+        3 => &font_data::PHOSPHOR_REGULAR_BODY_LARGE,
+        _ => &font_data::PHOSPHOR_REGULAR_BODY_XLARGE,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

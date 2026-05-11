@@ -646,6 +646,13 @@ pub trait AppLayer {
     /// must propagate the new value itself.
     fn on_swap_buttons_changed(&mut self, swap: bool);
 
+    /// Push live chrome state (battery percentage + today's reading
+    /// stats) into the app layer so chunk D's persistent top status
+    /// bar has up-to-date numbers without consulting `KernelHandle`
+    /// per render. The default is a no-op so distros that don't yet
+    /// render chrome aren't forced to plumb anything.
+    fn set_chrome_state(&mut self, _battery_pct: u8, _today_pages: u16, _today_secs: u32) {}
+
     fn ghost_clear_every(&self) -> u32;
     fn wants_grayscale(&self) -> bool;
     fn wifi_config(&self) -> &WifiConfig;

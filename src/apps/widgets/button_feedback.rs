@@ -21,7 +21,15 @@ use crate::ui::{Alignment, Region};
 const TAB_W: u16 = 60;
 const TAB_H: u16 = 22;
 
-pub const BUTTON_BAR_H: u16 = TAB_H + BOTTOM_INSET;
+// "how much space tab apps should reserve at the bottom of the
+// screen". historically just enough for the button feedback labels
+// (~26 px); now matches the new chrome tab bar height so apps that
+// continue to use this constant automatically shift their content
+// above the tab bar drawn in chunk D. legacy button_feedback bumps
+// keep their own internal TAB_H + BOTTOM_INSET (~26 px) at the very
+// bottom edge; the manager skips drawing them whenever the chrome
+// tab bar is active so they don't overlap.
+pub const BUTTON_BAR_H: u16 = plump_kernel::ui::Theme::default_v1().bottom_bar_h;
 
 const RIDGE_W: u16 = 22;
 const RIDGE_H: u16 = 36;

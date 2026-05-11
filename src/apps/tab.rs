@@ -61,16 +61,15 @@ impl Tab {
         }
     }
 
-    /// Private-use codepoint resolved by the Phosphor icon font added
-    /// in Chunk C. Codepoints are reserved here so Tab can be used at
-    /// chrome-render time without further plumbing.
+    /// Phosphor Bold v2.1 codepoint for this tab's icon. Keep this in
+    /// lockstep with the `phosphor_icons` list in `build.rs`.
     pub fn icon(self) -> char {
         match self {
-            Tab::Home => '\u{E000}',
-            Tab::Library => '\u{E001}',
-            Tab::Stats => '\u{E002}',
-            Tab::Settings => '\u{E003}',
-            Tab::Upload => '\u{E004}',
+            Tab::Home => '\u{E2C2}',     // house
+            Tab::Library => '\u{E758}',  // books
+            Tab::Stats => '\u{E150}',    // chart-bar
+            Tab::Settings => '\u{E272}', // gear-six
+            Tab::Upload => '\u{E1AE}',   // cloud-arrow-up
         }
     }
 }
