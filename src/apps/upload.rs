@@ -1023,6 +1023,10 @@ async fn render_screen(
     let footer_region = Region::new(BODY_X, FOOTER_Y, BODY_W, body_h);
 
     let draw = |s: &mut StripBuffer| {
+        use embedded_graphics::pixelcolor::BinaryColor;
+        use embedded_graphics::prelude::*;
+        use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
+
         BitmapLabel::new(heading_region, "Upload", heading)
             .alignment(Alignment::CenterLeft)
             .draw(s)
@@ -1035,6 +1039,29 @@ async fn render_screen(
             let y = body_start_y + (i as u16) * body_stride;
             let region = Region::new(BODY_X, y, BODY_W, body_h);
             BitmapLabel::new(region, line, body)
+                .alignment(Alignment::Center)
+                .draw(s)
+                .unwrap();
+        }
+
+        // QR placeholder square below the connection info. real QR
+        // encoder is a follow-up; for now we draw a labelled box so
+        // the layout matches the mockup intent (mockup also shows the
+        // QR centred below the host name).
+        let qr_size: u16 = 160;
+        let qr_x = (SCREEN_W - qr_size) / 2;
+        let qr_y = body_start_y + (lines.len() as u16) * body_stride + 12;
+        if qr_y + qr_size < FOOTER_Y.saturating_sub(8) {
+            let qr_rect = Rectangle::new(
+                Point::new(qr_x as i32, qr_y as i32),
+                Size::new(qr_size as u32, qr_size as u32),
+            );
+            qr_rect
+                .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 2))
+                .draw(s)
+                .ok();
+            let qr_label = Region::new(qr_x, qr_y + qr_size / 2 - body_h / 2, qr_size, body_h);
+            BitmapLabel::new(qr_label, "QR coming", body)
                 .alignment(Alignment::Center)
                 .draw(s)
                 .unwrap();
