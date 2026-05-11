@@ -1,6 +1,16 @@
-// launcher screen: menu, bookmarks browser
+// home screen: continue-reading card + recent list.
+//
+// the v1 mockup collapses the old launcher menu (5 buttons) into a
+// single content surface: one big card for the most recently opened
+// book, then a short list of the next 3 by bookmark generation. all
+// app navigation now happens through the bottom tab bar; only Reader
+// is reachable from here (by selecting the card or a recent row).
 
 use core::fmt::Write as _;
+
+use embedded_graphics::pixelcolor::BinaryColor;
+use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::{PrimitiveStyle, Rectangle, RoundedRectangle};
 
 use plump_kernel::util::FixedStr;
 
@@ -8,95 +18,100 @@ use crate::apps::{App, AppContext, AppId, BgBudget, BgOutcome, RECENT_FILE, Tran
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::battery;
-
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::kernel::KernelHandle;
 use crate::kernel::bookmarks::{self, BmListEntry};
 use crate::ui::{
-    Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, HEADER_W, LARGE_MARGIN,
-    Region, SECTION_GAP, TITLE_Y_OFFSET,
+    Alignment, BitmapDynLabel, CONTENT_TOP, FULL_CONTENT_W, LARGE_MARGIN, Region, SectionLabel,
 };
 
-// status bar at top
-const STATUS_Y: u16 = CONTENT_TOP + 4;
-const STATUS_H: u16 = 20;
-const STATUS_PAD: u16 = 12;
-const STATUS_TITLE_REGION: Region = Region::new(STATUS_PAD, STATUS_Y, 160, STATUS_H);
-const STATUS_BAT_REGION: Region = Region::new(SCREEN_W - STATUS_PAD - 80, STATUS_Y, 80, STATUS_H);
+// section caption strip height.
+const CAPTION_H: u16 = 16;
+const CAPTION_GAP: u16 = 8;
 
-// book card (shown when a recent book exists)
-const CARD_X: u16 = 40;
-const CARD_W: u16 = SCREEN_W - 2 * CARD_X;
-const CARD_H: u16 = 280;
-const CARD_Y: u16 = STATUS_Y + STATUS_H + 16;
-const CARD_PAD: u16 = 16;
+// continue-reading card.
+const CARD_X: u16 = LARGE_MARGIN;
+const CARD_W: u16 = FULL_CONTENT_W;
+const CARD_H: u16 = 180;
+const CARD_PAD: u16 = 14;
+const CARD_PROGRESS_H: u16 = 5;
+
+// recent list.
+const MAX_RECENT_ROWS: usize = 3;
+const ROW_H: u16 = 56;
+const ROW_GAP: u16 = 4;
+const ROW_STRIDE: u16 = ROW_H + ROW_GAP;
+const ROW_X: u16 = LARGE_MARGIN;
+const ROW_W: u16 = FULL_CONTENT_W;
+
+// 1 card + N rows.
+const MAX_ITEMS: usize = 1 + MAX_RECENT_ROWS;
+
+// layout regions are content-area relative; the manager paints the
+// shared chrome (top status bar) over y < CONTENT_TOP, and the tab
+// bar over y >= SCREEN_H - theme.bottom_bar_h.
+const CONTINUE_CAPTION_REGION: Region =
+    Region::new(LARGE_MARGIN, CONTENT_TOP, FULL_CONTENT_W, CAPTION_H);
+const CARD_Y: u16 = CONTENT_TOP + CAPTION_H + CAPTION_GAP;
 const CARD_REGION: Region = Region::new(CARD_X, CARD_Y, CARD_W, CARD_H);
-const CARD_PROGRESS_H: u16 = 8;
-
-const ITEM_W: u16 = 280;
-const ITEM_H: u16 = 52;
-const ITEM_GAP: u16 = 14;
-const ITEM_STRIDE: u16 = ITEM_H + ITEM_GAP;
-const ITEM_X: u16 = (SCREEN_W - ITEM_W) / 2;
-const MAX_ITEMS: usize = 6;
-
-// bookmark list layout (matches Files app)
-const BM_ROW_H: u16 = 52;
-const BM_ROW_GAP: u16 = 4;
-const BM_ROW_STRIDE: u16 = BM_ROW_H + BM_ROW_GAP;
-const BM_TITLE_Y: u16 = CONTENT_TOP + TITLE_Y_OFFSET;
-const BM_HEADER_LIST_GAP: u16 = SECTION_GAP;
-const BM_STATUS_W: u16 = 144;
-const BM_STATUS_X: u16 = SCREEN_W - LARGE_MARGIN - BM_STATUS_W;
+const RECENT_CAPTION_Y: u16 = CARD_Y + CARD_H + CAPTION_GAP * 2;
+const RECENT_CAPTION_REGION: Region =
+    Region::new(LARGE_MARGIN, RECENT_CAPTION_Y, FULL_CONTENT_W, CAPTION_H);
+const FIRST_ROW_Y: u16 = RECENT_CAPTION_Y + CAPTION_H + CAPTION_GAP;
 
 const CONTENT_REGION: Region = Region::new(0, CONTENT_TOP, SCREEN_W, SCREEN_H - CONTENT_TOP);
 
-fn compute_item_regions() -> [Region; MAX_ITEMS] {
-    let item_y = CARD_Y + CARD_H + ITEM_GAP;
-    [
-        Region::new(ITEM_X, item_y, ITEM_W, ITEM_H),
-        Region::new(ITEM_X, item_y + ITEM_STRIDE, ITEM_W, ITEM_H),
-        Region::new(ITEM_X, item_y + ITEM_STRIDE * 2, ITEM_W, ITEM_H),
-        Region::new(ITEM_X, item_y + ITEM_STRIDE * 3, ITEM_W, ITEM_H),
-        Region::new(ITEM_X, item_y + ITEM_STRIDE * 4, ITEM_W, ITEM_H),
-        Region::new(ITEM_X, item_y + ITEM_STRIDE * 5, ITEM_W, ITEM_H),
-    ]
+fn row_region(i: usize) -> Region {
+    Region::new(ROW_X, FIRST_ROW_Y + i as u16 * ROW_STRIDE, ROW_W, ROW_H)
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum HomeState {
-    Menu,
-    ShowBookmarks,
+// recent list entry (filename + display title + progress placeholder).
+// progress comes from bundle headers in a follow-up; today rows show
+// only the title so the structural rewrite stays bounded.
+#[derive(Clone, Copy)]
+struct RecentRow {
+    filename: FixedStr<32>,
+    title: FixedStr<64>,
+    progress_pct: u8,
+    valid: bool,
 }
 
-enum MenuAction {
-    Continue,
-    Push(AppId),
-    OpenBookmarks,
+impl RecentRow {
+    const EMPTY: Self = Self {
+        filename: FixedStr::EMPTY,
+        title: FixedStr::EMPTY,
+        progress_pct: 0,
+        valid: false,
+    };
+
+    fn display_name(&self) -> &str {
+        if !self.title.is_empty() {
+            self.title.as_str()
+        } else {
+            self.filename.as_str()
+        }
+    }
 }
 
 pub struct HomeApp {
-    state: HomeState,
     selected: usize,
-    ui_fonts: fonts::UiFonts,
-    item_regions: [Region; MAX_ITEMS],
     item_count: usize,
+    ui_fonts: fonts::UiFonts,
 
+    // active book (the card)
     recent_book: FixedStr<32>,
     recent_title: FixedStr<64>,
     recent_author: FixedStr<64>,
     recent_progress: u8,
     recent_stats_time: u32,
     recent_cover: Option<crate::kernel::work_queue::DecodedImage>,
-    needs_load_recent: bool,
 
-    bm_entries: [BmListEntry; bookmarks::SLOTS],
-    bm_count: usize,
-    bm_selected: usize,
-    bm_scroll: usize,
-    needs_load_bookmarks: bool,
+    // recent list (3 most-recent bookmarks after the card)
+    recent_rows: [RecentRow; MAX_RECENT_ROWS],
+    recent_row_count: usize,
 
+    needs_load: bool,
     bat_pct: u8,
 }
 
@@ -108,41 +123,32 @@ impl Default for HomeApp {
 
 impl HomeApp {
     pub fn new() -> Self {
-        let uf = fonts::UiFonts::for_size(0);
         Self {
-            state: HomeState::Menu,
             selected: 0,
-            ui_fonts: uf,
-            item_regions: compute_item_regions(),
-            item_count: 5, // card + 4 menu buttons
+            item_count: 1,
+            ui_fonts: fonts::UiFonts::for_size(0),
             recent_book: FixedStr::EMPTY,
             recent_title: FixedStr::EMPTY,
             recent_author: FixedStr::EMPTY,
             recent_progress: 0,
             recent_stats_time: 0,
             recent_cover: None,
-            needs_load_recent: false,
-            bm_entries: [BmListEntry::EMPTY; bookmarks::SLOTS],
-            bm_count: 0,
-            bm_selected: 0,
-            bm_scroll: 0,
-            needs_load_bookmarks: false,
+            recent_rows: [RecentRow::EMPTY; MAX_RECENT_ROWS],
+            recent_row_count: 0,
+            needs_load: false,
             bat_pct: 0,
         }
     }
 
     pub fn set_ui_font_size(&mut self, idx: u8) {
         self.ui_fonts = fonts::UiFonts::for_size(idx);
-        self.item_regions = compute_item_regions();
     }
 
-    // Session state accessors for RTC persistence
+    // RTC session accessors (no inner state machine any more; bookmark
+    // cursor is unused but kept for binary compat until chunk N).
     #[inline]
     pub fn state_id(&self) -> u8 {
-        match self.state {
-            HomeState::Menu => 0,
-            HomeState::ShowBookmarks => 1,
-        }
+        0
     }
 
     #[inline]
@@ -152,87 +158,92 @@ impl HomeApp {
 
     #[inline]
     pub fn bm_selected(&self) -> usize {
-        self.bm_selected
+        0
     }
 
     #[inline]
     pub fn bm_scroll(&self) -> usize {
-        self.bm_scroll
+        0
     }
 
-    // set battery percentage for status display (used by session restore
-    // since on_enter is not called during restore)
     pub fn set_battery(&mut self, battery_mv: u16) {
         self.bat_pct = battery::battery_percentage(battery_mv);
     }
 
-    // restore home state from RTC session data
-    //
-    // this sets up ALL state needed to resume without calling on_enter().
-    // on_enter() would reset state=Menu and selected=0, clobbering
-    // the restored values.
     pub fn restore_state(
         &mut self,
-        state_id: u8,
+        _state_id: u8,
         selected: usize,
-        bm_selected: usize,
-        bm_scroll: usize,
+        _bm_selected: usize,
+        _bm_scroll: usize,
     ) {
-        self.state = match state_id {
-            1 => HomeState::ShowBookmarks,
-            _ => HomeState::Menu,
-        };
-        self.selected = selected;
-        self.bm_selected = bm_selected;
-        self.bm_scroll = bm_scroll;
-
-        // trigger background loads for data we need to display
-        self.needs_load_recent = true;
-        if self.state == HomeState::ShowBookmarks {
-            self.needs_load_bookmarks = true;
-        }
-        log::debug!(
-            "home: restore_state state={:?} selected={}",
-            self.state,
-            selected
-        );
+        self.selected = selected.min(MAX_ITEMS - 1);
+        self.needs_load = true;
     }
 
-    // TODO: deferred reader RECENT/stats flushes are not pushed live
-    // into an already-visible Home screen. Home may show stale
-    // recent/stats data until the next reload (resume / re-enter).
-    // This is intentional for now — see TODO-960fb375 for context.
     pub fn load_recent(&mut self, k: &mut KernelHandle<'_>) {
+        self.load_card(k);
+        self.load_recent_rows(k);
+        self.rebuild_item_count();
+    }
+
+    fn load_card(&mut self, k: &mut KernelHandle<'_>) {
         let mut buf = [0u8; 196];
-        match k.sd().read_file_start_in_dir(k.sd().data_dir(), RECENT_FILE, &mut buf) {
+        match k
+            .sd()
+            .read_file_start_in_dir(k.sd().data_dir(), RECENT_FILE, &mut buf)
+        {
             Ok((_, n)) if n > 0 => self.parse_recent(&buf[..n]),
             _ => self.recent_book = FixedStr::EMPTY,
         }
-        // load reading stats and cover thumb for the recent book
+
         if !self.recent_book.is_empty() {
             if let Some(s) = crate::apps::stats::ReadingStats::load(k, self.recent_book.as_str()) {
                 self.recent_stats_time = s.time_secs;
             } else {
                 self.recent_stats_time = 0;
             }
-            // try to load cached cover thumbnail
-            self.recent_cover = crate::apps::cover_cache::load_cover_for(
-                k,
-                self.recent_book.as_bytes(),
-            );
-            if self.recent_cover.is_some() {
-                log::debug!("home: loaded cover thumbnail for recent book");
-            }
+            self.recent_cover =
+                crate::apps::cover_cache::load_cover_for(k, self.recent_book.as_bytes());
         } else {
+            self.recent_stats_time = 0;
             self.recent_cover = None;
         }
-        self.rebuild_item_count();
-        self.needs_load_recent = false;
+    }
+
+    fn load_recent_rows(&mut self, k: &mut KernelHandle<'_>) {
+        // pull the bookmark list sorted by generation (most recent
+        // first), drop the one matching the card, take the next 3.
+        let mut all = [BmListEntry::EMPTY; bookmarks::SLOTS];
+        let n = k.bookmark_cache().load_all(&mut all);
+
+        let _ = k.ensure_dir_cache_loaded();
+
+        let mut out = 0usize;
+        self.recent_rows = [RecentRow::EMPTY; MAX_RECENT_ROWS];
+
+        for entry in all.iter().take(n) {
+            if out >= MAX_RECENT_ROWS {
+                break;
+            }
+            if entry.filename.as_str() == self.recent_book.as_str() {
+                continue;
+            }
+            let mut row = RecentRow::EMPTY;
+            row.filename = entry.filename;
+            if let Some(title) = k.dir_cache_mut().find_title(entry.filename.as_bytes()) {
+                row.title.set(title);
+            }
+            row.progress_pct = 0; // chunk I follow-up: read from bundle header
+            row.valid = true;
+            self.recent_rows[out] = row;
+            out += 1;
+        }
+        self.recent_row_count = out;
     }
 
     fn parse_recent(&mut self, data: &[u8]) {
         // format: filename\0title\0author\0progress_byte
-        // fallback: if no \0 found, treat entire data as filename (old format)
         let mut fields = data.splitn(4, |&b| b == 0);
 
         if let Some(fname) = fields.next() {
@@ -241,7 +252,6 @@ impl HomeApp {
             self.recent_book = FixedStr::EMPTY;
             return;
         }
-
         self.recent_title = fields.next().map(FixedStr::from_bytes).unwrap_or_default();
         self.recent_author = fields.next().map(FixedStr::from_bytes).unwrap_or_default();
         self.recent_progress = fields
@@ -251,8 +261,9 @@ impl HomeApp {
     }
 
     fn rebuild_item_count(&mut self) {
-        // card (item 0) is always present; items 1..5 are menu buttons
-        self.item_count = 6;
+        // card is always present (even when there's no recent book; it
+        // shows an empty state). recent rows are appended.
+        self.item_count = (1 + self.recent_row_count).min(MAX_ITEMS);
         if self.selected >= self.item_count {
             self.selected = 0;
         }
@@ -271,49 +282,22 @@ impl HomeApp {
     }
 
     fn recent_author_str(&self) -> &str {
-        if !self.recent_author.is_empty() {
-            self.recent_author.as_str()
-        } else {
-            ""
-        }
-    }
-
-    fn item_label(&self, idx: usize) -> &str {
-        match idx {
-            0 => "", // card, not drawn as button
-            1 => "Files",
-            2 => "Bookmarks",
-            3 => "Stats",
-            4 => "Settings",
-            _ => "Upload",
-        }
-    }
-
-    fn item_action(&self, idx: usize) -> MenuAction {
-        match idx {
-            0 => MenuAction::Continue,
-            1 => MenuAction::Push(AppId::Files),
-            2 => MenuAction::OpenBookmarks,
-            3 => MenuAction::Push(AppId::Stats),
-            4 => MenuAction::Push(AppId::Settings),
-            _ => MenuAction::Push(AppId::Upload),
-        }
+        self.recent_author.as_str()
     }
 
     fn selection_region(&self, idx: usize) -> Region {
         if idx == 0 {
             CARD_REGION
         } else {
-            self.item_regions[idx - 1]
+            row_region(idx - 1)
         }
     }
 
     fn move_selection(&mut self, delta: isize, ctx: &mut AppContext) {
-        let count = self.item_count;
-        if count == 0 {
+        if self.item_count == 0 {
             return;
         }
-        let new = (self.selected as isize + delta).rem_euclid(count as isize) as usize;
+        let new = (self.selected as isize + delta).rem_euclid(self.item_count as isize) as usize;
         if new != self.selected {
             ctx.mark_dirty(self.selection_region(self.selected));
             self.selected = new;
@@ -321,66 +305,42 @@ impl HomeApp {
         }
     }
 
-    fn bm_list_y(&self) -> u16 {
-        BM_TITLE_Y + self.ui_fonts.heading.line_height + BM_HEADER_LIST_GAP
-    }
-
-    fn bm_visible_lines(&self) -> usize {
-        let available = SCREEN_H.saturating_sub(self.bm_list_y());
-        let rows = (available / BM_ROW_STRIDE) as usize;
-        rows.max(1).min(bookmarks::SLOTS)
-    }
-
-    fn bm_row_region(&self, i: usize) -> Region {
-        Region::new(
-            LARGE_MARGIN,
-            self.bm_list_y() + i as u16 * BM_ROW_STRIDE,
-            FULL_CONTENT_W,
-            BM_ROW_H,
-        )
-    }
-
-    fn bm_list_region(&self) -> Region {
-        let vis = self.bm_visible_lines();
-        Region::new(
-            LARGE_MARGIN,
-            self.bm_list_y(),
-            FULL_CONTENT_W,
-            BM_ROW_STRIDE * vis as u16,
-        )
-    }
-
-    fn bm_status_region(&self) -> Region {
-        Region::new(
-            BM_STATUS_X,
-            BM_TITLE_Y,
-            BM_STATUS_W,
-            self.ui_fonts.heading.line_height,
-        )
+    /// Set the filename to open on the next Reader push.
+    fn open_book(&self, ctx: &mut AppContext) -> Transition {
+        let name = if self.selected == 0 {
+            self.recent_book.as_str()
+        } else {
+            let row = &self.recent_rows[self.selected - 1];
+            if !row.valid {
+                return Transition::None;
+            }
+            row.filename.as_str()
+        };
+        if name.is_empty() {
+            return Transition::None;
+        }
+        ctx.set_message(name.as_bytes());
+        Transition::Push(AppId::Reader)
     }
 }
 
 impl App<AppId> for HomeApp {
     fn on_enter(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
         ctx.clear_message();
-        self.state = HomeState::Menu;
         self.selected = 0;
         self.bat_pct = battery::battery_percentage(k.battery_mv());
+        self.needs_load = true;
         ctx.mark_dirty(CONTENT_REGION);
     }
 
     fn on_resume(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
-        self.state = HomeState::Menu;
         self.selected = 0;
-        self.needs_load_recent = true;
         self.bat_pct = battery::battery_percentage(k.battery_mv());
+        self.needs_load = true;
         ctx.mark_dirty(CONTENT_REGION);
     }
 
     fn on_pre_sleep(&mut self, _k: &mut KernelHandle<'_>) {
-        // drop decoded cover thumbnail so the sleep wallpaper allocator
-        // has more headroom. next on_enter/on_resume sets
-        // needs_load_recent = true and the background step reloads it.
         if let Some(cover) = self.recent_cover.take() {
             log::info!(
                 "home: pre-sleep freed ~{}KB cover thumb",
@@ -395,403 +355,173 @@ impl App<AppId> for HomeApp {
         k: &mut KernelHandle<'_>,
         _budget: BgBudget,
     ) -> BgOutcome {
-        if self.needs_load_recent {
-            let old_count = self.item_count;
-            let mut buf = [0u8; 196];
-            match k.sd().read_file_start_in_dir(k.sd().data_dir(), RECENT_FILE, &mut buf) {
-                Ok((_, n)) if n > 0 => self.parse_recent(&buf[..n]),
-                _ => self.recent_book = FixedStr::EMPTY,
-            }
-            // load reading stats for the recent book
-            if !self.recent_book.is_empty() {
-                if let Some(s) = crate::apps::stats::ReadingStats::load(k, self.recent_book.as_str()) {
-                    self.recent_stats_time = s.time_secs;
-                } else {
-                    self.recent_stats_time = 0;
-                }
-                // load cached cover thumbnail
-                self.recent_cover = crate::apps::cover_cache::load_cover_for(
-                    k,
-                    self.recent_book.as_bytes(),
-                );
-            } else {
-                self.recent_cover = None;
-            }
-            self.rebuild_item_count();
-            self.needs_load_recent = false;
-            if self.item_count != old_count {
-                ctx.request_full_redraw();
-            }
-            return BgOutcome::Progress {
-                more: self.needs_load_bookmarks,
-            };
+        if !self.needs_load {
+            return BgOutcome::Idle;
         }
-
-        if self.needs_load_bookmarks {
-            self.bm_count = k.bookmark_cache().load_all(&mut self.bm_entries);
-            // resolve titles from dir cache
-            let _ = k.ensure_dir_cache_loaded();
-            for i in 0..self.bm_count {
-                let entry = &self.bm_entries[i];
-                let fname = entry.filename.as_bytes();
-                if let Some(title) = k.dir_cache_mut().find_title(fname) {
-                    self.bm_entries[i].set_title(title);
-                } else {
-                    // inline humanize: lowercase all-upper SFN filenames
-                    humanize_bm_entry(&mut self.bm_entries[i]);
-                }
-            }
-            self.needs_load_bookmarks = false;
-            if self.state == HomeState::ShowBookmarks {
-                ctx.mark_dirty(self.bm_list_region());
-            }
-            return BgOutcome::Progress { more: false };
+        let old_count = self.item_count;
+        self.load_card(k);
+        self.load_recent_rows(k);
+        self.rebuild_item_count();
+        self.needs_load = false;
+        if self.item_count != old_count {
+            ctx.request_full_redraw();
+        } else {
+            ctx.mark_dirty(CONTENT_REGION);
         }
-
-        BgOutcome::Idle
+        BgOutcome::Progress { more: false }
     }
 
     fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {
-        match self.state {
-            HomeState::Menu => self.on_event_menu(event, ctx),
-            HomeState::ShowBookmarks => self.on_event_bookmarks(event, ctx),
+        match event {
+            ActionEvent::Press(Action::Next) | ActionEvent::Repeat(Action::Next) => {
+                self.move_selection(1, ctx);
+                Transition::None
+            }
+            ActionEvent::Press(Action::Prev) | ActionEvent::Repeat(Action::Prev) => {
+                self.move_selection(-1, ctx);
+                Transition::None
+            }
+            ActionEvent::Press(Action::Select) => self.open_book(ctx),
+            _ => Transition::None,
         }
     }
 
     fn draw(&self, strip: &mut StripBuffer) {
-        match self.state {
-            HomeState::Menu => self.draw_menu(strip),
-            HomeState::ShowBookmarks => self.draw_bookmarks(strip),
-        }
-    }
-}
-
-impl HomeApp {
-    fn on_event_menu(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {
-        match event {
-            ActionEvent::Press(Action::Next) => {
-                self.move_selection(1, ctx);
-                Transition::None
-            }
-            ActionEvent::Press(Action::Prev) => {
-                self.move_selection(-1, ctx);
-                Transition::None
-            }
-            ActionEvent::Press(Action::Select) => match self.item_action(self.selected) {
-                MenuAction::Continue => {
-                    if self.has_recent() {
-                        ctx.set_message(self.recent_book.as_bytes());
-                    }
-                    Transition::Push(AppId::Reader)
-                }
-                MenuAction::Push(app) => Transition::Push(app),
-                MenuAction::OpenBookmarks => {
-                    self.bm_selected = 0;
-                    self.bm_scroll = 0;
-                    self.needs_load_bookmarks = true;
-                    self.state = HomeState::ShowBookmarks;
-                    ctx.request_full_redraw();
-                    Transition::None
-                }
-            },
-            _ => Transition::None,
-        }
-    }
-
-    fn on_event_bookmarks(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {
-        match event {
-            ActionEvent::Press(Action::Back) | ActionEvent::LongPress(Action::Back) => {
-                self.state = HomeState::Menu;
-                ctx.request_full_redraw();
-                Transition::None
-            }
-
-            ActionEvent::Press(Action::Next) | ActionEvent::Repeat(Action::Next) => {
-                if self.bm_count > 0 {
-                    let old = self.bm_selected;
-                    let vis = self.bm_visible_lines();
-                    if self.bm_selected + 1 < self.bm_count {
-                        self.bm_selected += 1;
-                        if self.bm_selected >= self.bm_scroll + vis {
-                            self.bm_scroll = self.bm_selected + 1 - vis;
-                            ctx.mark_dirty(self.bm_list_region());
-                        } else {
-                            ctx.mark_dirty(self.bm_row_region(old - self.bm_scroll));
-                            ctx.mark_dirty(self.bm_row_region(self.bm_selected - self.bm_scroll));
-                        }
-                    } else {
-                        self.bm_selected = 0;
-                        self.bm_scroll = 0;
-                        ctx.mark_dirty(self.bm_list_region());
-                    }
-                    ctx.mark_dirty(self.bm_status_region());
-                }
-                Transition::None
-            }
-
-            ActionEvent::Press(Action::Prev) | ActionEvent::Repeat(Action::Prev) => {
-                if self.bm_count > 0 {
-                    let old = self.bm_selected;
-                    let vis = self.bm_visible_lines();
-                    if self.bm_selected > 0 {
-                        self.bm_selected -= 1;
-                        if self.bm_selected < self.bm_scroll {
-                            self.bm_scroll = self.bm_selected;
-                            ctx.mark_dirty(self.bm_list_region());
-                        } else {
-                            ctx.mark_dirty(self.bm_row_region(old - self.bm_scroll));
-                            ctx.mark_dirty(self.bm_row_region(self.bm_selected - self.bm_scroll));
-                        }
-                    } else {
-                        self.bm_selected = self.bm_count - 1;
-                        if self.bm_selected >= vis {
-                            self.bm_scroll = self.bm_selected + 1 - vis;
-                        }
-                        ctx.mark_dirty(self.bm_list_region());
-                    }
-                    ctx.mark_dirty(self.bm_status_region());
-                }
-                Transition::None
-            }
-
-            ActionEvent::Press(Action::NextJump) => {
-                if self.bm_count > 0 {
-                    let vis = self.bm_visible_lines();
-                    self.bm_selected = (self.bm_selected + vis).min(self.bm_count - 1);
-                    if self.bm_selected >= self.bm_scroll + vis {
-                        self.bm_scroll = self.bm_selected + 1 - vis;
-                    }
-                    ctx.mark_dirty(self.bm_list_region());
-                    ctx.mark_dirty(self.bm_status_region());
-                }
-                Transition::None
-            }
-
-            ActionEvent::Press(Action::PrevJump) => {
-                let vis = self.bm_visible_lines();
-                self.bm_selected = self.bm_selected.saturating_sub(vis);
-                if self.bm_selected < self.bm_scroll {
-                    self.bm_scroll = self.bm_selected;
-                }
-                ctx.mark_dirty(self.bm_list_region());
-                ctx.mark_dirty(self.bm_status_region());
-                Transition::None
-            }
-
-            ActionEvent::Press(Action::Select) => {
-                if self.bm_count > 0 && self.bm_selected < self.bm_count {
-                    let slot = &self.bm_entries[self.bm_selected];
-                    ctx.set_message(slot.filename.as_bytes());
-                    self.state = HomeState::Menu;
-                    Transition::Push(AppId::Reader)
-                } else {
-                    Transition::None
-                }
-            }
-
-            _ => Transition::None,
-        }
-    }
-}
-
-impl HomeApp {
-    fn draw_menu(&self, strip: &mut StripBuffer) {
-        use embedded_graphics::pixelcolor::BinaryColor;
-        use embedded_graphics::prelude::*;
-        use embedded_graphics::primitives::{PrimitiveStyle, Rectangle, RoundedRectangle};
-
         const R_CARD: Size = Size::new(8, 8);
-        const R_BTN: Size = Size::new(4, 4);
+        const R_ROW: Size = Size::new(4, 4);
 
-        // status bar: "plump" left, battery right
-        BitmapLabel::new(STATUS_TITLE_REGION, "plump", self.ui_fonts.body)
-            .alignment(Alignment::CenterLeft)
+        let font = self.ui_fonts.body;
+        let heading = self.ui_fonts.heading;
+
+        // section captions
+        let theme = plump_kernel::ui::Theme::default_v1();
+        let mut painter = plump_kernel::ui::Painter::new(strip, &theme);
+        SectionLabel::new(CONTINUE_CAPTION_REGION, "CONTINUE READING")
+            .draw(&mut painter, font);
+        if self.recent_row_count > 0 {
+            SectionLabel::new(RECENT_CAPTION_REGION, "RECENT").draw(&mut painter, font);
+        }
+
+        // card
+        let card_selected = self.selected == 0;
+        let (card_bg, card_fg) = if card_selected {
+            (BinaryColor::On, BinaryColor::Off)
+        } else {
+            (BinaryColor::Off, BinaryColor::On)
+        };
+        let card_rect = Rectangle::new(
+            Point::new(CARD_X as i32, CARD_Y as i32),
+            Size::new(CARD_W as u32, CARD_H as u32),
+        );
+        RoundedRectangle::with_equal_corners(card_rect, R_CARD)
+            .into_styled(PrimitiveStyle::with_fill(card_bg))
             .draw(strip)
-            .unwrap();
+            .ok();
+        RoundedRectangle::with_equal_corners(card_rect, R_CARD)
+            .into_styled(PrimitiveStyle::with_stroke(card_fg, 2))
+            .draw(strip)
+            .ok();
 
-        let mut bat_buf = BitmapDynLabel::<8>::new(STATUS_BAT_REGION, self.ui_fonts.body)
-            .alignment(Alignment::CenterRight);
-        let _ = write!(bat_buf, "{}%", self.bat_pct);
-        bat_buf.draw(strip).unwrap();
+        let inner_x = CARD_X + CARD_PAD;
+        let inner_w = CARD_W - 2 * CARD_PAD;
+        let line_h = font.line_height;
+        let heading_h = heading.line_height;
 
-        // book card (item 0) — always shown
-        {
-            let selected = self.selected == 0;
-            let (bg, fg) = if selected {
-                (BinaryColor::On, BinaryColor::Off)
+        if self.has_recent() {
+            const COVER_GAP: u16 = 16;
+            let (text_x, text_w, text_align) = if let Some(ref img) = self.recent_cover {
+                let img_x = inner_x as i32;
+                let img_y = CARD_Y as i32
+                    + CARD_PAD as i32
+                    + ((CARD_H - 2 * CARD_PAD) as i32 - img.height as i32) / 2;
+                strip.blit_1bpp(
+                    &img.data,
+                    0,
+                    img.width as usize,
+                    img.height as usize,
+                    img.stride,
+                    img_x,
+                    img_y.max(CARD_Y as i32 + CARD_PAD as i32),
+                    !card_selected,
+                );
+                let tx = inner_x + img.width + COVER_GAP;
+                let tw = (CARD_X + CARD_W - CARD_PAD).saturating_sub(tx);
+                (tx, tw, Alignment::TopLeft)
             } else {
-                (BinaryColor::Off, BinaryColor::On)
+                (inner_x, inner_w, Alignment::Center)
             };
 
-            // card background + border
-            let card_rect = Rectangle::new(
-                Point::new(CARD_X as i32, CARD_Y as i32),
-                Size::new(CARD_W as u32, CARD_H as u32),
-            );
-            RoundedRectangle::with_equal_corners(card_rect, R_CARD)
-                .into_styled(PrimitiveStyle::with_fill(bg))
-                .draw(strip)
-                .unwrap();
-            RoundedRectangle::with_equal_corners(card_rect, R_CARD)
-                .into_styled(PrimitiveStyle::with_stroke(fg, 3))
-                .draw(strip)
-                .unwrap();
+            // title
+            let title_y = CARD_Y + CARD_PAD + 16;
+            let title_region = Region::new(text_x, title_y, text_w, heading_h);
+            let title = self.recent_display_title();
+            draw_truncated(strip, heading, title_region, title, text_w, text_align, card_fg);
 
-            let inner_x = CARD_X + CARD_PAD;
-            let inner_w = CARD_W - 2 * CARD_PAD;
-            let line_h = self.ui_fonts.body.line_height;
-            let heading_h = self.ui_fonts.heading.line_height;
-
-            if self.has_recent() {
-                // layout: if we have a cover thumbnail, show it on the
-                // left with text/stats on the right; otherwise use the
-                // full-width centered text layout.
-                const COVER_GAP: u16 = 16;
-                let (text_x, text_w, text_align) = if let Some(ref img) = self.recent_cover {
-                    let img_x = inner_x as i32;
-                    let img_y = CARD_Y as i32
-                        + CARD_PAD as i32
-                        + ((CARD_H - 2 * CARD_PAD) as i32 - img.height as i32) / 2;
-                    strip.blit_1bpp(
-                        &img.data,
-                        0,
-                        img.width as usize,
-                        img.height as usize,
-                        img.stride,
-                        img_x,
-                        img_y.max(CARD_Y as i32 + CARD_PAD as i32),
-                        !selected, // invert when card is selected
-                    );
-                    let tx = inner_x + img.width + COVER_GAP;
-                    let tw = (CARD_X + CARD_W - CARD_PAD).saturating_sub(tx);
-                    (tx, tw, Alignment::TopLeft)
-                } else {
-                    (inner_x, inner_w, Alignment::Center)
-                };
-
-                // title (truncate with ellipsis if too wide)
-                let title_y = CARD_Y + CARD_PAD + 20;
-                let title_region = Region::new(text_x, title_y, text_w, heading_h);
-                let title = self.recent_display_title();
-                let title_cut = self.ui_fonts.heading.truncate_len(title, text_w);
-                if title_cut >= title.len() {
-                    self.ui_fonts
-                        .heading
-                        .draw_aligned(strip, title_region, title, text_align, fg);
-                } else {
-                    let mut tbuf = [0u8; 68]; // 64 + "…"
-                    let n = title_cut.min(64);
-                    tbuf[..n].copy_from_slice(&title.as_bytes()[..n]);
-                    // append UTF-8 for '…' (0xE2 0x80 0xA6)
-                    tbuf[n] = 0xE2;
-                    tbuf[n + 1] = 0x80;
-                    tbuf[n + 2] = 0xA6;
-                    let truncated = core::str::from_utf8(&tbuf[..n + 3]).unwrap_or(title);
-                    self.ui_fonts.heading.draw_aligned(
-                        strip,
-                        title_region,
-                        truncated,
-                        text_align,
-                        fg,
-                    );
-                }
-
-                // author (truncate with ellipsis if too wide)
-                let author = self.recent_author_str();
-                if !author.is_empty() {
-                    let author_y = title_y + heading_h + 8;
-                    let author_region = Region::new(text_x, author_y, text_w, line_h);
-                    let author_cut = self.ui_fonts.body.truncate_len(author, text_w);
-                    if author_cut >= author.len() {
-                        self.ui_fonts.body.draw_aligned(
-                            strip,
-                            author_region,
-                            author,
-                            text_align,
-                            fg,
-                        );
-                    } else {
-                        let mut abuf = [0u8; 68];
-                        let n = author_cut.min(64);
-                        abuf[..n].copy_from_slice(&author.as_bytes()[..n]);
-                        abuf[n] = 0xE2;
-                        abuf[n + 1] = 0x80;
-                        abuf[n + 2] = 0xA6;
-                        let truncated = core::str::from_utf8(&abuf[..n + 3]).unwrap_or(author);
-                        self.ui_fonts.body.draw_aligned(
-                            strip,
-                            author_region,
-                            truncated,
-                            text_align,
-                            fg,
-                        );
-                    }
-                }
-
-                // progress bar
-                let bar_y = CARD_Y + CARD_H - CARD_PAD - CARD_PROGRESS_H - line_h - 8;
-                let bar_w = text_w as u32;
-                let filled = (bar_w * self.recent_progress as u32) / 100;
-
-                let bar_rect = Rectangle::new(
-                    Point::new(text_x as i32, bar_y as i32),
-                    Size::new(bar_w, CARD_PROGRESS_H as u32),
-                );
-                RoundedRectangle::with_equal_corners(bar_rect, Size::new(3, 3))
-                    .into_styled(PrimitiveStyle::with_stroke(fg, 1))
-                    .draw(strip)
-                    .unwrap();
-
-                if filled > 0 {
-                    RoundedRectangle::with_equal_corners(
-                        Rectangle::new(
-                            Point::new(text_x as i32, bar_y as i32),
-                            Size::new(filled, CARD_PROGRESS_H as u32),
-                        ),
-                        Size::new(3, 3),
-                    )
-                    .into_styled(PrimitiveStyle::with_fill(fg))
-                    .draw(strip)
-                    .unwrap();
-                }
-
-                // stats text: "5h 23m" or "X% read" if no time stats
-                let pct_y = bar_y + CARD_PROGRESS_H + 4;
-                let pct_region = Region::new(text_x, pct_y, text_w, line_h);
-                let mut pct_buf = BitmapDynLabel::<28>::new(pct_region, self.ui_fonts.body)
-                    .alignment(text_align)
-                    .inverted(selected);
-                if self.recent_stats_time > 0 {
-                    let hours = self.recent_stats_time / 3600;
-                    let mins = (self.recent_stats_time % 3600) / 60;
-                    if hours > 0 {
-                        let _ = write!(pct_buf, "{}h {}m", hours, mins);
-                    } else {
-                        let _ = write!(pct_buf, "{}m", mins);
-                    }
-                } else {
-                    let _ = write!(pct_buf, "{}% read", self.recent_progress);
-                }
-                pct_buf.draw(strip).unwrap();
-            } else {
-                // empty state
-                let center_y = CARD_Y + (CARD_H - line_h) / 2;
-                let center_region = Region::new(inner_x, center_y, inner_w, line_h);
-                self.ui_fonts.body.draw_aligned(
-                    strip,
-                    center_region,
-                    "No book opened yet",
-                    Alignment::Center,
-                    fg,
-                );
+            // author
+            let author = self.recent_author_str();
+            if !author.is_empty() {
+                let author_y = title_y + heading_h + 6;
+                let author_region = Region::new(text_x, author_y, text_w, line_h);
+                draw_truncated(strip, font, author_region, author, text_w, text_align, card_fg);
             }
+
+            // progress bar
+            let bar_y = CARD_Y + CARD_H - CARD_PAD - CARD_PROGRESS_H - line_h - 6;
+            let bar_w = text_w as u32;
+            let filled = (bar_w * self.recent_progress as u32) / 100;
+            let bar_rect = Rectangle::new(
+                Point::new(text_x as i32, bar_y as i32),
+                Size::new(bar_w, CARD_PROGRESS_H as u32),
+            );
+            RoundedRectangle::with_equal_corners(bar_rect, Size::new(3, 3))
+                .into_styled(PrimitiveStyle::with_stroke(card_fg, 1))
+                .draw(strip)
+                .ok();
+            if filled > 0 {
+                RoundedRectangle::with_equal_corners(
+                    Rectangle::new(
+                        Point::new(text_x as i32, bar_y as i32),
+                        Size::new(filled, CARD_PROGRESS_H as u32),
+                    ),
+                    Size::new(3, 3),
+                )
+                .into_styled(PrimitiveStyle::with_fill(card_fg))
+                .draw(strip)
+                .ok();
+            }
+
+            // stats text
+            let pct_y = bar_y + CARD_PROGRESS_H + 4;
+            let pct_region = Region::new(text_x, pct_y, text_w, line_h);
+            let mut pct_buf = BitmapDynLabel::<32>::new(pct_region, font)
+                .alignment(text_align)
+                .inverted(card_selected);
+            if self.recent_stats_time > 0 {
+                let hours = self.recent_stats_time / 3600;
+                let mins = (self.recent_stats_time % 3600) / 60;
+                if hours > 0 {
+                    let _ = write!(pct_buf, "{}h {}m", hours, mins);
+                } else {
+                    let _ = write!(pct_buf, "{}m", mins);
+                }
+            } else {
+                let _ = write!(pct_buf, "{}% read", self.recent_progress);
+            }
+            pct_buf.draw(strip).ok();
+        } else {
+            let center_y = CARD_Y + (CARD_H - line_h) / 2;
+            let center = Region::new(inner_x, center_y, inner_w, line_h);
+            font.draw_aligned(strip, center, "No book opened yet", Alignment::Center, card_fg);
         }
 
-        // menu items (1..4)
-        for i in 1..self.item_count {
-            let label = self.item_label(i);
-            let region = self.item_regions[i - 1];
-            let selected = i == self.selected;
+        // recent rows
+        for i in 0..self.recent_row_count {
+            let row = &self.recent_rows[i];
+            if !row.valid {
+                continue;
+            }
+            let region = row_region(i);
+            let selected = self.selected == i + 1;
             let (bg, fg) = if selected {
                 (BinaryColor::On, BinaryColor::Off)
             } else {
@@ -802,84 +532,61 @@ impl HomeApp {
                 Point::new(region.x as i32, region.y as i32),
                 Size::new(region.w as u32, region.h as u32),
             );
-            RoundedRectangle::with_equal_corners(rect, R_BTN)
+            RoundedRectangle::with_equal_corners(rect, R_ROW)
                 .into_styled(PrimitiveStyle::with_fill(bg))
                 .draw(strip)
-                .unwrap();
-            self.ui_fonts
-                .body
-                .draw_aligned(strip, region, label, Alignment::Center, fg);
-        }
-    }
+                .ok();
 
-    fn draw_bookmarks(&self, strip: &mut StripBuffer) {
-        let header_region = Region::new(
-            LARGE_MARGIN,
-            BM_TITLE_Y,
-            HEADER_W,
-            self.ui_fonts.heading.line_height,
-        );
-        BitmapLabel::new(header_region, "Bookmarks", self.ui_fonts.heading)
-            .alignment(Alignment::CenterLeft)
-            .draw(strip)
-            .unwrap();
+            // title (left), percent (right)
+            let title_region = Region::new(
+                region.x + LARGE_MARGIN,
+                region.y,
+                region.w.saturating_sub(LARGE_MARGIN + 64),
+                region.h,
+            );
+            font.draw_aligned(
+                strip,
+                title_region,
+                row.display_name(),
+                Alignment::CenterLeft,
+                fg,
+            );
 
-        if self.bm_count > 0 {
-            let mut status = BitmapDynLabel::<20>::new(self.bm_status_region(), self.ui_fonts.body)
-                .alignment(Alignment::CenterRight);
-            let _ = write!(status, "{}/{}", self.bm_selected + 1, self.bm_count);
-            status.draw(strip).unwrap();
-        }
-
-        if self.bm_count == 0 {
-            BitmapLabel::new(self.bm_row_region(0), "No bookmarks", self.ui_fonts.body)
-                .alignment(Alignment::CenterLeft)
-                .draw(strip)
-                .unwrap();
-            return;
-        }
-
-        let vis = self.bm_visible_lines();
-        let visible = vis.min(self.bm_count.saturating_sub(self.bm_scroll));
-
-        for i in 0..vis {
-            let region = self.bm_row_region(i);
-            if i < visible {
-                let idx = self.bm_scroll + i;
-                let entry = &self.bm_entries[idx];
-                let name = entry.display_name();
-
-                BitmapLabel::new(region, name, self.ui_fonts.body)
-                    .alignment(Alignment::CenterLeft)
-                    .inverted(idx == self.bm_selected)
-                    .draw(strip)
-                    .unwrap();
-            }
+            let pct_region = Region::new(
+                region.x + region.w - 64 - LARGE_MARGIN,
+                region.y,
+                64,
+                region.h,
+            );
+            let mut pct_buf = BitmapDynLabel::<8>::new(pct_region, font)
+                .alignment(Alignment::CenterRight)
+                .inverted(selected);
+            let _ = write!(pct_buf, "{}%", row.progress_pct);
+            pct_buf.draw(strip).ok();
         }
     }
 }
 
-// humanize an all-uppercase SFN bookmark filename into the title field
-fn humanize_bm_entry(entry: &mut BmListEntry) {
-    if entry.filename.is_empty() || !entry.title.is_empty() {
+fn draw_truncated(
+    strip: &mut StripBuffer,
+    font: &fonts::bitmap::BitmapFont,
+    region: Region,
+    text: &str,
+    text_w: u16,
+    align: Alignment,
+    fg: BinaryColor,
+) {
+    let cut = font.truncate_len(text, text_w);
+    if cut >= text.len() {
+        font.draw_aligned(strip, region, text, align, fg);
         return;
     }
-    let src = entry.filename.as_bytes();
-    let all_upper = src.iter().all(|&b| !b.is_ascii_lowercase());
-    if !all_upper {
-        return;
-    }
-    let n = src.len().min(plump_kernel::drivers::storage::TITLE_CAP);
-    let dot_pos = src.iter().position(|&b| b == b'.').unwrap_or(n);
-    let buf = entry.title.buf_mut();
-    for i in 0..n {
-        buf[i] = if i == 0 {
-            src[i]
-        } else if i > dot_pos {
-            src[i].to_ascii_lowercase()
-        } else {
-            src[i].to_ascii_lowercase()
-        };
-    }
-    entry.title.set_len(n as u8);
+    let mut buf = [0u8; 68];
+    let n = cut.min(64);
+    buf[..n].copy_from_slice(&text.as_bytes()[..n]);
+    buf[n] = 0xE2;
+    buf[n + 1] = 0x80;
+    buf[n + 2] = 0xA6;
+    let truncated = core::str::from_utf8(&buf[..n + 3]).unwrap_or(text);
+    font.draw_aligned(strip, region, truncated, align, fg);
 }
