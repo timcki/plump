@@ -1,7 +1,7 @@
 // bottom tab bar: 5 evenly-spaced slots, active drawn as a filled
-// square with knockout glyph. edge-hint chevrons render at the
-// outermost side of the active slot whenever the next Left / Right
-// press would switch tabs (chunk E).
+// square with knockout glyph. chevrons (< / >) render next to the
+// active slot on every side where a neighbour tab exists, as a
+// persistent visual affordance for the physical Left / Right buttons.
 //
 // icons are drawn from the Phosphor icon font (PUA codepoints in
 // U+E0EA..U+E758). the `icon_font` parameter on `draw` is passed by
@@ -20,19 +20,14 @@ const ACTIVE_PAD: u16 = 6;
 
 pub struct TabBar {
     pub active: Tab,
-    pub edge_hint: Option<HDir>,
 }
 
 impl TabBar {
     pub const fn new(active: Tab) -> Self {
-        Self {
-            active,
-            edge_hint: None,
-        }
+        Self { active }
     }
 
-    /// `text_font`: UI font for edge-hint chevrons (ASCII < > used
-    /// today; Phosphor caret-left / caret-right available for future).
+    /// `text_font`: UI font for chevrons (ASCII `<` `>` today).
     /// `icon_font`: Phosphor font for tab slot glyphs.
     pub fn draw(&self, p: &mut Painter<'_>, text_font: &BitmapFont, icon_font: &BitmapFont) {
         let theme = *p.theme();
@@ -57,16 +52,23 @@ impl TabBar {
             self.draw_slot(p, icon_font, tab, slot);
         }
 
-        // edge hint chevrons sit just outside the active slot.
-        if let Some(dir) = self.edge_hint {
-            let active_idx = self.active.index();
-            let active_slot = Region::new(
-                bar.x + active_idx as u16 * slot_w,
-                bar.y,
-                slot_w,
-                bar.h,
-            );
-            self.draw_edge_hint(p, text_font, dir, active_slot);
+        // chevrons next to the active slot on each side where a
+        // neighbour tab exists. drawn unconditionally because every
+        // tab screen takes Left / Right as tab cycle; Library (chunk J)
+        // overrides this by drawing its own internal edge cue inside
+        // its content area.
+        let active_idx = self.active.index();
+        let active_slot = Region::new(
+            bar.x + active_idx as u16 * slot_w,
+            bar.y,
+            slot_w,
+            bar.h,
+        );
+        if self.active.left().is_some() {
+            self.draw_edge_hint(p, text_font, HDir::Left, active_slot);
+        }
+        if self.active.right().is_some() {
+            self.draw_edge_hint(p, text_font, HDir::Right, active_slot);
         }
     }
 

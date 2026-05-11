@@ -11,7 +11,7 @@ use crate::apps::settings::SettingsApp;
 use crate::apps::stats::StatsApp;
 use crate::apps::{
     App, AppContext, AppId, AppNav, AppNavSlot, BgBudget, BgOutcome, DeferredPersistenceReason,
-    Launcher, Modal, PendingSetting, Redraw, Tab, Transition,
+    HDir, HResult, Launcher, Modal, PendingSetting, Redraw, Tab, Transition,
 };
 use esp_hal::delay::Delay;
 
@@ -141,6 +141,35 @@ fn appid_to_modal(id: AppId) -> Option<Modal> {
     match id {
         AppId::Reader => Some(Modal::Reader),
         _ => None,
+    }
+}
+
+/// `Press(PrevJump)` / `Press(NextJump)` / their `Repeat` siblings
+/// translate to a horizontal navigation direction. anything else
+/// returns None and falls through to the regular event dispatch path.
+fn horizontal_from_event(ev: ActionEvent) -> Option<HDir> {
+    let action = match ev {
+        ActionEvent::Press(a) | ActionEvent::Repeat(a) => a,
+        _ => return None,
+    };
+    match action {
+        Action::PrevJump => Some(HDir::Left),
+        Action::NextJump => Some(HDir::Right),
+        _ => None,
+    }
+}
+
+/// inverse of `appid_to_tab`: which `AppId` backs each tab in the
+/// current bridge layout. used to translate `Nav::SetTab(...)` style
+/// commands back into legacy `Transition` values until chunk N
+/// retires the launcher.
+fn tab_to_appid(tab: Tab) -> AppId {
+    match tab {
+        Tab::Home => AppId::Home,
+        Tab::Library => AppId::Files,
+        Tab::Stats => AppId::Stats,
+        Tab::Settings => AppId::Settings,
+        Tab::Upload => AppId::Upload,
     }
 }
 
@@ -507,9 +536,37 @@ impl AppManager {
             return Transition::None;
         }
 
+        // chunk E: physical Left / Right (PrevJump / NextJump) cycles
+        // tabs at the edge of the current screen. only intercepted on
+        // tab screens (active slot is Tab, not Modal). reader keeps
+        // these for chapter jumps because the manager doesn't enter
+        // this branch when active is a modal.
+        if let Some(dir) = horizontal_from_event(event) {
+            if let AppNavSlot::Tab(active_tab) = self.nav.active_slot() {
+                let result = self.dispatch_horizontal(dir);
+                if let HResult::AtEdge = result {
+                    if let Some(next_tab) = match dir {
+                        HDir::Left => active_tab.left(),
+                        HDir::Right => active_tab.right(),
+                    } {
+                        return Transition::Replace(tab_to_appid(next_tab));
+                    }
+                }
+                return Transition::None;
+            }
+        }
+
         let active = self.launcher.active();
         with_app!(active, self, |app| {
             app.on_event(event, &mut self.launcher.ctx)
+        })
+    }
+
+    /// Route a horizontal navigation gesture to the currently active app.
+    fn dispatch_horizontal(&mut self, dir: HDir) -> HResult {
+        let active = self.launcher.active();
+        with_app!(active, self, |app| {
+            app.on_horizontal(dir, &mut self.launcher.ctx)
         })
     }
 

@@ -21,7 +21,7 @@ pub use top_status::TopStatus;
 
 use plump_kernel::ui::Painter;
 
-use crate::apps::{HDir, Tab};
+use crate::apps::Tab;
 use crate::fonts::bitmap::BitmapFont;
 
 /// Convenience wrapper that draws both the top status bar and the
@@ -46,13 +46,11 @@ impl Chrome {
         today_secs: u32,
         battery_pct: u8,
         active_tab: Tab,
-        edge_hint: Option<HDir>,
     ) {
         self.top.today_pages = today_pages;
         self.top.today_secs = today_secs;
         self.top.battery_pct = battery_pct;
         self.tabs.active = active_tab;
-        self.tabs.edge_hint = edge_hint;
     }
 
     /// `text_font` is used for top-status text and tab-bar edge hints;
