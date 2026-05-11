@@ -580,6 +580,12 @@ pub struct ReaderApp {
     pub(super) stats_dirty: bool,
     pub(super) stats_clock_running: bool, // false when suspended/exited
 
+    // pending day-stats deltas (chunk F). incremented alongside the
+    // per-book counters; flushed into `KernelHandle::day_stats_mut`
+    // from `flush_deferred_persistence`, then zeroed.
+    pub(super) day_pages_pending: u16,
+    pub(super) day_secs_pending: u32,
+
     // deferred persistence: debounce deadline (uptime_secs)
     pub(super) persist_next_flush_at: Option<u32>,
 }
@@ -645,6 +651,9 @@ impl ReaderApp {
             stats_last_uptime: 0,
             stats_dirty: false,
             stats_clock_running: false,
+
+            day_pages_pending: 0,
+            day_secs_pending: 0,
 
             persist_next_flush_at: None,
         }
@@ -1109,6 +1118,7 @@ impl ReaderApp {
             let delta = now.saturating_sub(self.stats_last_uptime);
             if delta > 0 && delta < 600 {
                 self.stats.time_secs = self.stats.time_secs.saturating_add(delta);
+                self.day_secs_pending = self.day_secs_pending.saturating_add(delta);
                 added_elapsed = true;
             }
             self.stats_clock_running = false;
@@ -1131,9 +1141,11 @@ impl ReaderApp {
         // ignore deltas > 10 min (user was idle / fell asleep)
         if delta < 600 {
             self.stats.time_secs = self.stats.time_secs.saturating_add(delta);
+            self.day_secs_pending = self.day_secs_pending.saturating_add(delta);
         }
         self.stats_last_uptime = now;
         self.stats.pages = self.stats.pages.saturating_add(1);
+        self.day_pages_pending = self.day_pages_pending.saturating_add(1);
         self.stats_dirty = true;
     }
 
@@ -2653,6 +2665,18 @@ impl App<AppId> for ReaderApp {
         let force = reason.is_forced();
         if force && self.stats_pause_clock() {
             self.stats_dirty = true;
+        }
+
+        // drain pending day-stats deltas (chunk F) into the kernel's
+        // shared DayStats. cheap (a couple of u16/u32 adds + rollover
+        // check); we do this every time the deferred flush runs.
+        if self.day_pages_pending > 0 || self.day_secs_pending > 0 {
+            let today = k.today_key();
+            let ds = k.day_stats_mut();
+            ds.add_pages(today, self.day_pages_pending);
+            ds.add_secs(today, self.day_secs_pending);
+            self.day_pages_pending = 0;
+            self.day_secs_pending = 0;
         }
 
         let any_dirty = self.recent_dirty || self.stats_dirty;

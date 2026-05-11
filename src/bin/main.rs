@@ -28,6 +28,7 @@ use plump::drivers::input::InputDriver;
 use plump::drivers::sdcard::SdStorage;
 use plump::drivers::strip::StripBuffer;
 use plump::kernel::BookmarkCache;
+use plump::kernel::daystats::DayStats;
 use plump::kernel::BootConsole;
 use plump::kernel::Kernel;
 use plump::kernel::dir_cache::DirCache;
@@ -47,6 +48,7 @@ static QUICK_MENU: ConstStaticCell<QuickMenu> = ConstStaticCell::new(QuickMenu::
 static BUMPS: ConstStaticCell<ButtonFeedback> = ConstStaticCell::new(ButtonFeedback::new());
 static DIR_CACHE: ConstStaticCell<DirCache> = ConstStaticCell::new(DirCache::new());
 static BM_CACHE: ConstStaticCell<BookmarkCache> = ConstStaticCell::new(BookmarkCache::new());
+static DAY_STATS: ConstStaticCell<DayStats> = ConstStaticCell::new(DayStats::EMPTY);
 // BootConsole is heap-allocated during boot and dropped after display,
 // reclaiming ~3 KB that would otherwise sit unused in .bss forever.
 
@@ -127,6 +129,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         STRIP.take(),
         DIR_CACHE.take(),
         BM_CACHE.take(),
+        DAY_STATS.take(),
         delay,
         sd_ok,
         battery_mv,

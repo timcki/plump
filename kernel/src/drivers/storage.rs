@@ -144,6 +144,23 @@ fn has_supported_ext(name: &[u8]) -> bool {
     ext_eq(name, b"TXT") || ext_eq(name, b"EPUB") || ext_eq(name, b"EPU") || ext_eq(name, b"MD")
 }
 
+/// Convert an embedded-sdmmc Timestamp into a coarse day-of-year-
+/// since-1970 key. Strictly monotonic across calendar days; not a
+/// real day count (uses 31 days/month, 372 days/year). Returns None
+/// when the timestamp is stuck at the FAT epoch (1980-01-00) which
+/// indicates the SD card has no battery-backed RTC.
+fn timestamp_to_day_key(t: embedded_sdmmc::Timestamp) -> Option<u32> {
+    // FAT epoch: year_since_1970 = 10, month / day both zero.
+    if t.year_since_1970 <= 10 && t.zero_indexed_month == 0 && t.zero_indexed_day == 0 {
+        return None;
+    }
+    Some(
+        (t.year_since_1970 as u32) * 372
+            + (t.zero_indexed_month as u32) * 31
+            + (t.zero_indexed_day as u32),
+    )
+}
+
 // build "NAME.EXT" bytes from a ShortFileName
 
 fn sfn_to_bytes(name: &embedded_sdmmc::ShortFileName, out: &mut [u8; 13]) -> u8 {
@@ -175,6 +192,18 @@ impl SdStorageInner {
             .await
             .map(|e| e.size)
             .map_err(|_| Error::new(ErrorKind::OpenFile, "file_size"))
+    }
+
+    async fn file_mtime(
+        &mut self,
+        dir: RawDirectory,
+        name: &str,
+    ) -> crate::error::Result<embedded_sdmmc::Timestamp> {
+        self.mgr
+            .find_directory_entry(dir, name)
+            .await
+            .map(|e| e.mtime)
+            .map_err(|_| Error::new(ErrorKind::OpenFile, "file_mtime"))
     }
 
     async fn read_chunk(
@@ -666,6 +695,25 @@ impl SdStorage {
             let r = guard.append(dir_h, name, data).await;
             let _ = guard.mgr.close_dir(dir_h);
             r
+        })
+    }
+
+    /// Day-of-year-since-1970 key derived from a file's FAT mtime in
+    /// `_PLUMP/`. Returns `None` when the file is missing, when mtime
+    /// is unreadable, or when the timestamp is stuck at the FAT epoch
+    /// (1980) — the case where the SD card has no battery-backed RTC.
+    ///
+    /// The key is monotonically increasing across calendar days so
+    /// callers can compare two keys for inequality to detect a
+    /// rollover without doing real calendar math.
+    pub fn file_mtime_day_key_in_plump(&self, name: &str) -> Option<u32> {
+        poll_once(async {
+            let mut guard = borrow(self).ok()?;
+            let dir = guard.data_dir;
+            let dir_h = guard.open_dir(dir).await.ok()?;
+            let ts = guard.file_mtime(dir_h, name).await.ok();
+            let _ = guard.mgr.close_dir(dir_h);
+            ts.and_then(timestamp_to_day_key)
         })
     }
 

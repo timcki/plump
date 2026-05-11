@@ -330,11 +330,12 @@ impl super::Kernel {
                 }
             }
 
-            // push live chrome state into the app layer so the new
-            // top status bar (chunk D) shows up-to-date numbers.
-            // today_pages / today_secs land in chunk F; for now zero.
+            // push live chrome state into the app layer so the top
+            // status bar shows up-to-date numbers.
             let pct = crate::drivers::battery::battery_percentage(self.cached_battery_mv);
-            app_mgr.set_chrome_state(pct, 0, 0);
+            let day_pages = self.day_stats.pages();
+            let day_secs = self.day_stats.secs_today();
+            app_mgr.set_chrome_state(pct, day_pages, day_secs);
 
             // opportunistic flush of deferred app persistence (RECENT,
             // reading stats) in safe no-redraw windows. apps own their
@@ -465,6 +466,26 @@ impl super::Kernel {
 
         if tasks::BOOKMARK_FLUSH_DUE.try_take().is_some() && self.bm_cache.is_dirty() {
             self.bm_cache.flush(&self.sd);
+        }
+
+        // flush today's reading stats opportunistically when dirty.
+        // piggybacks on the bookmark cadence so we don't add another
+        // background task; cost is one ~16-byte write per minute or so
+        // while the user is actively reading.
+        if self.day_stats.is_dirty() && self.sd_ok {
+            if let Err(e) = self.day_stats.flush(&self.sd) {
+                log::warn!("daystats flush: {}", e);
+            } else {
+                // mtime of DAYSTATS.BIN just advanced; refresh
+                // today_key so a same-session rollover is detected
+                // before the next boot.
+                if let Some(k) = self
+                    .sd
+                    .file_mtime_day_key_in_plump(super::daystats::DAYSTATS_FILE)
+                {
+                    self.today_key = k;
+                }
+            }
         }
 
         if tasks::STATUS_DUE.try_take().is_some() {

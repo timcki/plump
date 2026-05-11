@@ -11,6 +11,7 @@ pub mod bookmarks;
 pub mod bundle;
 pub mod config;
 pub mod console;
+pub mod daystats;
 pub mod dir_cache;
 pub mod handle;
 pub mod input_policy;
@@ -44,6 +45,7 @@ use esp_hal::delay::Delay;
 use crate::board::Epd;
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::strip::StripBuffer;
+use crate::kernel::daystats::DayStats;
 use crate::kernel::dir_cache::DirCache;
 use crate::ui::Theme;
 
@@ -155,6 +157,15 @@ pub struct Kernel {
 
     // design tokens shared by chrome + apps; one instance per kernel
     pub(crate) theme: Theme,
+
+    // today's reading stats (pages + secs since calendar rollover).
+    // owned static, loaded from `_PLUMP/DAYSTATS.BIN` at boot. mutated
+    // by the active reader; flushed by housekeeping when dirty.
+    pub(crate) day_stats: &'static mut DayStats,
+
+    // current day key (derived from FAT mtime of DAYSTATS.BIN). 0 when
+    // the SD card has no usable wall clock (no battery-backed RTC).
+    pub(crate) today_key: u32,
 }
 
 impl Kernel {
@@ -165,10 +176,28 @@ impl Kernel {
         strip: &'static mut StripBuffer,
         dir_cache: &'static mut DirCache,
         bm_cache: &'static mut BookmarkCache,
+        day_stats: &'static mut DayStats,
         delay: Delay,
         sd_ok: bool,
         battery_mv: u16,
     ) -> Self {
+        // load today's stats from disk and derive today's key from the
+        // file's FAT mtime. on a fresh SD or a card without an RTC, we
+        // fall back to EMPTY + today_key=0 (counters accumulate from
+        // boot, no rollover).
+        let today_key = if sd_ok {
+            sd.file_mtime_day_key_in_plump(daystats::DAYSTATS_FILE)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        *day_stats = if sd_ok {
+            DayStats::load(&sd)
+        } else {
+            DayStats::EMPTY
+        };
+        day_stats.rollover_if_new_day(today_key);
+
         Self {
             sd,
             dir_cache,
@@ -183,6 +212,8 @@ impl Kernel {
             input_policy: input_policy::InputPolicyState::new(),
             applied: AppliedSettings::new(),
             theme: Theme::default_v1(),
+            day_stats,
+            today_key,
         }
     }
 

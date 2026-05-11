@@ -7,6 +7,7 @@ use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage::{DirEntry, DirPage};
 use crate::error::{Error, Result};
 use crate::kernel::bookmarks::BookmarkCache;
+use crate::kernel::daystats::DayStats;
 use crate::kernel::dir_cache::DirCache;
 use crate::kernel::wake::uptime_secs;
 use crate::ui::Theme;
@@ -119,5 +120,26 @@ impl<'k> KernelHandle<'k> {
     #[inline]
     pub fn theme(&self) -> &Theme {
         &self.kernel.theme
+    }
+
+    /// Today's reading stats (pages + seconds since the last calendar
+    /// rollover). Chrome reads this; the active reader mutates it
+    /// during page turns and on session-time accumulation.
+    #[inline]
+    pub fn day_stats(&self) -> &DayStats {
+        &*self.kernel.day_stats
+    }
+
+    #[inline]
+    pub fn day_stats_mut(&mut self) -> &mut DayStats {
+        &mut *self.kernel.day_stats
+    }
+
+    /// Current day key (derived from `_PLUMP/DAYSTATS.BIN` mtime).
+    /// Zero when the SD card has no usable wall clock, in which case
+    /// counters accumulate from boot without ever rolling over.
+    #[inline]
+    pub fn today_key(&self) -> u32 {
+        self.kernel.today_key
     }
 }
