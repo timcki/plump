@@ -6,6 +6,7 @@
 
 use crate::apps::files::FilesApp;
 use crate::apps::home::HomeApp;
+use crate::apps::library::LibraryApp;
 use crate::apps::reader::ReaderApp;
 use crate::apps::settings::SettingsApp;
 use crate::apps::stats::StatsApp;
@@ -39,6 +40,10 @@ macro_rules! with_app {
                 let $app = &mut *$mgr.home;
                 $body
             }
+            AppId::Library => {
+                let $app = &mut *$mgr.library;
+                $body
+            }
             AppId::Files => {
                 let $app = &mut *$mgr.files;
                 $body
@@ -68,6 +73,10 @@ macro_rules! with_app_ref {
         match $id {
             AppId::Home => {
                 let $app = &*$mgr.home;
+                $body
+            }
+            AppId::Library => {
+                let $app = &*$mgr.library;
                 $body
             }
             AppId::Files => {
@@ -102,6 +111,7 @@ pub struct AppManager {
     pub launcher: &'static mut Launcher,
 
     pub home: &'static mut HomeApp,
+    pub library: &'static mut LibraryApp,
     pub files: &'static mut FilesApp,
     pub reader: &'static mut ReaderApp,
     pub settings: &'static mut SettingsApp,
@@ -124,11 +134,13 @@ pub struct AppManager {
 }
 
 /// map a (legacy) `AppId` to the `Tab` it represents in the new model,
-/// or `None` if the `AppId` is a modal (only `Reader`).
+/// or `None` if the `AppId` is a modal (only `Reader`) or has been
+/// orphaned from the tab bar (legacy `Files`, retired in chunk N).
 fn appid_to_tab(id: AppId) -> Option<Tab> {
     match id {
         AppId::Home => Some(Tab::Home),
-        AppId::Files => Some(Tab::Library),
+        AppId::Library => Some(Tab::Library),
+        AppId::Files => None,
         AppId::Stats => Some(Tab::Stats),
         AppId::Settings => Some(Tab::Settings),
         AppId::Upload => Some(Tab::Upload),
@@ -166,7 +178,7 @@ fn horizontal_from_event(ev: ActionEvent) -> Option<HDir> {
 fn tab_to_appid(tab: Tab) -> AppId {
     match tab {
         Tab::Home => AppId::Home,
-        Tab::Library => AppId::Files,
+        Tab::Library => AppId::Library,
         Tab::Stats => AppId::Stats,
         Tab::Settings => AppId::Settings,
         Tab::Upload => AppId::Upload,
@@ -198,6 +210,7 @@ impl AppManager {
     pub fn new(
         launcher: &'static mut Launcher,
         home: &'static mut HomeApp,
+        library: &'static mut LibraryApp,
         files: &'static mut FilesApp,
         reader: &'static mut ReaderApp,
         settings: &'static mut SettingsApp,
@@ -209,6 +222,7 @@ impl AppManager {
         Self {
             launcher,
             home,
+            library,
             files,
             reader,
             settings,
@@ -640,6 +654,7 @@ impl AppManager {
         let mut first_error = None;
         for &id in &[
             AppId::Home,
+            AppId::Library,
             AppId::Files,
             AppId::Reader,
             AppId::Settings,
@@ -724,6 +739,7 @@ impl AppManager {
         let mut combined = active_outcome;
         for &id in &[
             AppId::Home,
+            AppId::Library,
             AppId::Files,
             AppId::Reader,
             AppId::Settings,
@@ -804,6 +820,7 @@ impl AppManager {
         let text_alignment = ss.text_alignment;
 
         self.home.set_ui_font_size(ui_idx);
+        self.library.set_ui_font_size(ui_idx);
         self.files.set_ui_font_size(ui_idx);
         self.settings.set_ui_font_size(ui_idx);
         self.stats.set_ui_font_size(ui_idx);

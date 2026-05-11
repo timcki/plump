@@ -6,8 +6,10 @@
 // to `NavCmd<Tab, Modal>`.
 
 pub mod cover_cache;
+pub mod cover_placeholder;
 pub mod files;
 pub mod home;
+pub mod library;
 pub mod manager;
 pub mod reader;
 pub mod stats;
@@ -22,6 +24,12 @@ use crate::kernel::app::AppIdType;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppId {
     Home,
+    /// Library tab (chunk J). The flat file list lives on `Files`
+    /// until chunk N deletes it.
+    Library,
+    /// Legacy flat file list; no longer reachable from the tab bar
+    /// but kept in the enum until chunk N for binary compat with
+    /// older RTC sessions.
     Files,
     Reader,
     Settings,
