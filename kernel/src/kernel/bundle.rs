@@ -930,7 +930,7 @@ pub const PAGEIDX_FORMAT_VERSION: u8 = 2;
 // identical to v11 for chapters that fit either path; bumping
 // for safety in case rounding or buffer-boundary edge cases
 // shift any single break decision.
-pub const LAYOUT_ALGO_VERSION: u8 = 12;
+pub const LAYOUT_ALGO_VERSION: u8 = 15;
 
 pub const PAGEIDX_HDR_V2_SIZE: usize = 20;
 pub const CHAPTER_LAYOUT_DIR_SIZE: usize = 24;

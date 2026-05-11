@@ -105,26 +105,28 @@ pub struct BreakConfig {
     pub double_hyphen_demerit: u16,
     pub adjacent_loose_demerit: u16,
     pub max_items: u16,
+    /// per-line extra stretchability (pixels) added to `line_y` when
+    /// computing `r` on stretched lines. TeX's `\emergencystretch`.
+    /// Pass 1 leaves this at 0; the fallback pass sets it to a fraction
+    /// of `line_width` so previously-infeasible loose lines become
+    /// acceptable.
+    pub emergency_stretch: u16,
 }
 
 impl BreakConfig {
     pub const DEFAULT: Self = Self {
         line_width: 0, // caller fills
-        // 10000 is loose by TeX's `\pretolerance` standards but matches
-        // TeX's `\tolerance` ballpark. We don't have hyphenation or
-        // emergencystretch, so 200 leaves the breaker with no feasible
-        // interior breaks for narrow columns + chunky-glyph fonts
-        // (e.g. Atkinson Small at 464 px) — every paragraph collapses
-        // to one forced-terminal line that overflows the column. K-P
-        // still prefers tight breaks via demerits=(badness+penalty)²,
-        // so loosening tolerance does not produce visibly looser type
-        // when feasible interior breaks exist.
-        tolerance: 10000,
+        // TeX's classic `\tolerance`. Pass 1 stays tight; the fallback
+        // in `break_paragraph_with_fallback` widens tolerance and adds
+        // emergency_stretch so pathological narrow-column paragraphs
+        // still find a solution.
+        tolerance: 200,
         looseness: 0,
         line_penalty: 10,
         double_hyphen_demerit: 100,
         adjacent_loose_demerit: 100,
         max_items: 2048,
+        emergency_stretch: 0,
     };
 
     pub const fn with_line_width(mut self, w: u16) -> Self {
@@ -292,14 +294,30 @@ pub fn break_paragraph(
     Ok(())
 }
 
-/// Try once at default tolerance; retry with emergency loosening
-/// (`tolerance = 1000`, `line_penalty = 0`) when the primary pass either:
-/// 1. errored with `NoFeasibleBreaks` (e.g., URL longer than column), or
-/// 2. returned a single `Overflow` choice — the signature of "every
-///    intermediate breakpoint was rejected as too loose/tight and only
-///    the forced terminal break landed". A correctly-scaled `badness`
-///    makes this rare in normal prose, but the second trigger protects
-///    against pathological paragraphs and future tolerance tweaks.
+/// Two-pass paragraph breaker.
+///
+/// Pass 1 runs with the caller's `cfg` (default `tolerance = 200`,
+/// `emergency_stretch = 0`) — TeX-classical tight justification.
+///
+/// Pass 2 (fallback) runs with `tolerance = 10000`, `line_penalty = 0`,
+/// and `emergency_stretch = line_width / 5` (SILE's 20%lw default).
+/// The extra per-line stretch budget makes previously-infeasible loose
+/// lines acceptable, so this pass always finds a solution short of
+/// `NoFeasibleBreaks` on degenerate input.
+///
+/// Trigger for pass 2: pass 1 errored with `NoFeasibleBreaks`, or it
+/// produced a single line whose natural width exceeds `cfg.line_width`.
+/// That single-line case has two encodings depending on whether the
+/// paragraph has any shrinkable glue: `Adjustment::Overflow` when
+/// `line_z == 0` (no shrink at all) and `Adjustment::Shrink(256)` when
+/// `line_z > 0` but the forced terminal was clamped to r=-1.0. Both mean
+/// the same thing — every interior break was rejected and only the
+/// forced terminal landed — and both need pass 2 to find a multi-line
+/// solution. Comparing `line_width_used` to `cfg.line_width` catches
+/// both encodings in one check.
+///
+/// Once hyphenation lands, an intermediate pass (TeX `\tolerance` with
+/// discretionary hyphenation breakpoints) slots in between these two.
 pub fn break_paragraph_with_fallback(
     items: &[Item],
     cfg: &BreakConfig,
@@ -308,18 +326,19 @@ pub fn break_paragraph_with_fallback(
     let retry = match break_paragraph(items, cfg, out) {
         Err(BreakError::NoFeasibleBreaks) => true,
         Err(other) => return Err(other),
-        Ok(()) => out.len() == 1 && matches!(out[0].adjustment(), Adjustment::Overflow),
+        Ok(()) => out.len() == 1 && out[0].line_width_used > cfg.line_width,
     };
     if !retry {
         return Ok(());
     }
     out.clear();
-    let loose = BreakConfig {
-        tolerance: cfg.tolerance.max(1000),
+    let fallback = BreakConfig {
+        tolerance: 10_000,
         line_penalty: 0,
+        emergency_stretch: cfg.line_width / 5,
         ..*cfg
     };
-    break_paragraph(items, &loose, out)
+    break_paragraph(items, &fallback, out)
 }
 
 // ── internals ─────────────────────────────────────────────────────
@@ -397,15 +416,19 @@ fn consider_break(
     let r_q8 = if slack == 0 {
         0
     } else if slack > 0 {
-        if line_y == 0 {
-            // overfull from the wrong side; only a forced break is feasible
+        // emergency_stretch (per-line budget, pixels) is added to the
+        // line's natural stretchability. lets pass 2 of the fallback
+        // accept lines that pass 1 would reject as too loose.
+        let budget = line_y as i32 + cfg.emergency_stretch as i32;
+        if budget == 0 {
+            // unstretchable underfull line; only feasible if forced
             if !forced {
                 return;
             }
             // last line: ragged-right is fine, treat as r=0
             0
         } else {
-            (slack * Q8_ONE) / line_y as i32
+            (slack * Q8_ONE) / budget
         }
     } else {
         // slack < 0: line is too long; need to shrink
@@ -798,5 +821,111 @@ mod tests {
         // either Perfect (0) or Overflow if box is too wide. With width
         // 50 ≤ 100, it's Perfect.
         assert_eq!(out[0].adjustment(), Adjustment::Perfect);
+    }
+
+    #[test]
+    fn emergency_stretch_helps_loose_line() {
+        // 10× (box=10, glue=2 with tiny stretch=1) at line_width=40.
+        // Pass 1 (tolerance=200, emergency_stretch=0): every interior
+        // break has line_y too small to absorb the slack (badness
+        // saturates at 10000); only the forced terminal break remains,
+        // and its natural width exceeds line_width so it emits a single
+        // Overflow line.
+        let mut items = Vec::new();
+        for _ in 0..10 {
+            items.push(boxed(10));
+            items.push(glue(2, 1, 0));
+        }
+        items.extend(forced_triple());
+
+        // Pass 1 alone collapses to single Overflow.
+        let mut pass1 = Vec::new();
+        break_paragraph(&items, &cfg(40), &mut pass1).unwrap();
+        assert_eq!(pass1.len(), 1);
+        assert_eq!(pass1[0].adjustment(), Adjustment::Overflow);
+
+        // Pass-2 fallback adds emergency_stretch = line_width/5 = 8;
+        // interior breaks become acceptable and the paragraph emits
+        // multiple lines.
+        let mut out = Vec::new();
+        break_paragraph_with_fallback(&items, &cfg(40), &mut out).unwrap();
+        assert!(out.len() > 1, "expected multi-line, got {}", out.len());
+    }
+
+    #[test]
+    fn emergency_stretch_zero_is_no_op() {
+        // For a paragraph that fits comfortably at tolerance=200,
+        // explicitly setting emergency_stretch=0 must produce identical
+        // output to the default (also 0). Guards against accidentally
+        // mixing the field into the stretch budget when it's zero.
+        let mut items = Vec::new();
+        for _ in 0..5 {
+            items.push(boxed(10));
+            items.push(glue(5, 3, 1));
+        }
+        items.extend(forced_triple());
+
+        let cfg_default = cfg(60);
+        let cfg_explicit_zero = BreakConfig {
+            emergency_stretch: 0,
+            ..cfg(60)
+        };
+
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        break_paragraph(&items, &cfg_default, &mut a).unwrap();
+        break_paragraph(&items, &cfg_explicit_zero, &mut b).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fallback_fires_on_forced_clamp_shrink() {
+        // 5× (box=20, glue=2 with stretch=1, shrink=1) at line_width=40.
+        // Natural width 108 > 40. Interior breaks all reject under
+        // tolerance=200. Forced terminal: line_z > 0 so encoded as
+        // Adjustment::Shrink(256) (forced clamp), NOT Overflow. This is
+        // the exact shape of the on-device bug fixed by the natural-
+        // width trigger.
+        let mut items = Vec::new();
+        for _ in 0..5 {
+            items.push(boxed(20));
+            items.push(glue(2, 1, 1));
+        }
+        items.extend(forced_triple());
+
+        // Pass 1 alone: single line, Shrink (NOT Overflow), wider than column.
+        let mut pass1 = Vec::new();
+        break_paragraph(&items, &cfg(40), &mut pass1).unwrap();
+        assert_eq!(pass1.len(), 1);
+        assert!(matches!(pass1[0].adjustment(), Adjustment::Shrink(_)));
+        assert!(pass1[0].line_width_used > 40);
+
+        // with_fallback must fire pass 2 on natural-width overflow and
+        // produce multi-line output.
+        let mut out = Vec::new();
+        break_paragraph_with_fallback(&items, &cfg(40), &mut out).unwrap();
+        assert!(out.len() > 1, "expected multi-line, got {}", out.len());
+    }
+
+    #[test]
+    fn pass_one_used_when_feasible() {
+        // A paragraph that fits at pass 1 (tolerance=200) must produce
+        // output byte-identical to a direct break_paragraph call with
+        // the same cfg — proving the fallback didn't fire and re-do the
+        // work with line_penalty=0 + emergency_stretch>0.
+        let mut items = Vec::new();
+        for _ in 0..6 {
+            items.push(boxed(10));
+            items.push(glue(5, 3, 1));
+        }
+        items.extend(forced_triple());
+
+        let mut direct = Vec::new();
+        break_paragraph(&items, &cfg(50), &mut direct).unwrap();
+        assert!(direct.len() > 1, "test paragraph should span multiple lines");
+
+        let mut via_fallback = Vec::new();
+        break_paragraph_with_fallback(&items, &cfg(50), &mut via_fallback).unwrap();
+        assert_eq!(direct, via_fallback);
     }
 }

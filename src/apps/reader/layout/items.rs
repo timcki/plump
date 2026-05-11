@@ -263,21 +263,13 @@ pub fn build_paragraph(
 
             Token::Space { start, style, end } => {
                 let space = advance(' ', style) as u32;
-                // per-glue elasticity. TeX's cmr10 uses (space/2, space/3),
-                // matched by classical K-P implementations. We use a wider
-                // budget here because we have neither hyphenation nor
-                // \emergencystretch — without them the (space/2, space/3)
-                // window is narrower than one typical word width on narrow
-                // columns + chunky fonts (Atkinson Small at 464 px), so
-                // K-P's loose-line badness saturates against
-                // BADNESS_INFINITY and the breaker can't distinguish a
-                // loose-but-readable line from an overflow line. Stretch=
-                // space (1× natural) lets gaps double under full stretch;
-                // shrink=space/2 lets gaps halve. Standard professional
-                // typesetting range; the renderer's floor and ceiling
-                // already accommodate this.
-                let stretch = space;
-                let shrink = (space / 2).min(255) as u8;
+                // TeX cmr10's classical ratios. The breaker's pass-2
+                // fallback (`break_paragraph_with_fallback`) adds
+                // emergencystretch per line so narrow-column paragraphs
+                // that overflow this budget on pass 1 still find a
+                // solution on pass 2 without widening per-glue here.
+                let stretch = space / 2;
+                let shrink = (space / 3).min(255) as u8;
                 out.push(
                     Item::glue(
                         space.min(u16::MAX as u32) as u16,
