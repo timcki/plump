@@ -5,30 +5,18 @@
 
 use core::fmt::Write as _;
 
-use embedded_graphics::pixelcolor::BinaryColor;
-use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::PrimitiveStyle;
-
 use crate::apps::{App, AppContext, AppId, Transition};
-use crate::board::action::{Action, ActionEvent};
+use crate::board::action::ActionEvent;
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::kernel::KernelHandle;
 use crate::ui::{
-    Alignment, BUTTON_BAR_H, BitmapDynLabel, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, HEADER_W,
-    LARGE_MARGIN, Region, SECTION_GAP, StackFmt, TITLE_Y_OFFSET, wrap_next, wrap_prev,
+    Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, LARGE_MARGIN, Region,
+    StackFmt,
 };
 
 const MAX_BOOKS: usize = 20;
-
-const ROW_H: u16 = 52;
-const ROW_GAP: u16 = 4;
-const ROW_STRIDE: u16 = ROW_H + ROW_GAP;
-
-const TITLE_Y: u16 = CONTENT_TOP + TITLE_Y_OFFSET;
-const HEADING_SUMMARY_GAP: u16 = SECTION_GAP;
-const SUMMARY_LIST_GAP: u16 = SECTION_GAP;
 
 const STATS_DIR: &str = "STATS";
 
@@ -187,13 +175,15 @@ fn trim_bytes(s: &[u8]) -> &[u8] {
 pub struct StatsApp {
     books: [BookStats; MAX_BOOKS],
     book_count: usize,
-    selected: usize,
-    scroll: usize,
     loaded: bool,
     ui_fonts: fonts::UiFonts,
-    summary_y: u16,
-    list_y: u16,
-    // aggregate
+    // top 3 books by time_secs, indices into `books`.
+    top_books: [usize; 3],
+    top_count: usize,
+    // today's reading (refreshed in background_step from kernel.day_stats).
+    today_pages: u16,
+    today_secs: u32,
+    // lifetime aggregates summed from per-book stats.
     total_pages: u32,
     total_time: u32,
     total_books: u16,
@@ -208,17 +198,15 @@ impl Default for StatsApp {
 impl StatsApp {
     pub fn new() -> Self {
         let uf = fonts::UiFonts::for_size(0);
-        let summary_y = TITLE_Y + uf.heading.line_height + HEADING_SUMMARY_GAP;
-        let list_y = summary_y + uf.body.line_height + SUMMARY_LIST_GAP;
         Self {
             books: [BookStats::EMPTY; MAX_BOOKS],
             book_count: 0,
-            selected: 0,
-            scroll: 0,
             loaded: false,
             ui_fonts: uf,
-            summary_y,
-            list_y,
+            top_books: [0; 3],
+            top_count: 0,
+            today_pages: 0,
+            today_secs: 0,
             total_pages: 0,
             total_time: 0,
             total_books: 0,
@@ -227,33 +215,6 @@ impl StatsApp {
 
     pub fn set_ui_font_size(&mut self, idx: u8) {
         self.ui_fonts = fonts::UiFonts::for_size(idx);
-        self.summary_y = TITLE_Y + self.ui_fonts.heading.line_height + HEADING_SUMMARY_GAP;
-        self.list_y = self.summary_y + self.ui_fonts.body.line_height + SUMMARY_LIST_GAP;
-    }
-
-    fn visible_rows(&self) -> usize {
-        let avail = SCREEN_H.saturating_sub(self.list_y + BUTTON_BAR_H);
-        let count = (avail / ROW_STRIDE) as usize;
-        count.max(1)
-    }
-
-    fn scroll_into_view(&mut self) {
-        let vis = self.visible_rows();
-        crate::apps::widgets::list::ensure_visible(self.selected, &mut self.scroll, vis);
-    }
-
-    fn row_region(&self, vis_index: usize) -> Region {
-        Region::new(
-            LARGE_MARGIN,
-            self.list_y + vis_index as u16 * ROW_STRIDE,
-            FULL_CONTENT_W,
-            ROW_H,
-        )
-    }
-
-    fn list_region(&self) -> Region {
-        let vis = self.visible_rows() as u16;
-        Region::new(LARGE_MARGIN, self.list_y, FULL_CONTENT_W, ROW_STRIDE * vis)
     }
 
     fn load_stats(&mut self, k: &mut KernelHandle<'_>) {
@@ -261,46 +222,41 @@ impl StatsApp {
         self.total_pages = 0;
         self.total_time = 0;
         self.total_books = 0;
+        self.top_count = 0;
 
-        // ensure dir cache is loaded so we can iterate known book files
         if k.ensure_dir_cache_loaded().is_err() {
             self.loaded = true;
             return;
         }
 
-        // fetch all entries from the dir cache
         let mut entries = [crate::drivers::storage::DirEntry::EMPTY; 128];
         let page = k
             .dir_page(0, &mut entries)
             .unwrap_or(crate::drivers::storage::DirPage { total: 0, count: 0 });
 
         let mut buf = [0u8; 128];
-        for i in 0..page.count {
+        for entry in entries.iter().take(page.count) {
             if self.book_count >= MAX_BOOKS {
                 break;
             }
-            let entry = &entries[i];
             if entry.is_dir {
                 continue;
             }
             let fname = entry.name_str();
-
-            // try to load stats for this file
-            let n = match k.sd().read_chunk_in_plump_subdir(STATS_DIR, fname, 0, &mut buf) {
+            let n = match k
+                .sd()
+                .read_chunk_in_plump_subdir(STATS_DIR, fname, 0, &mut buf)
+            {
                 Ok(n) if n > 0 => n,
                 _ => continue,
             };
 
             let idx = self.book_count;
             self.books[idx] = BookStats::EMPTY;
-
-            // copy filename and display title
             self.books[idx].filename.set(fname.as_bytes());
             self.books[idx].title.set(entry.display_name().as_bytes());
-
             self.books[idx].stats = ReadingStats::parse(&buf[..n]);
 
-            // skip entries with zero stats
             if self.books[idx].stats.is_empty() {
                 continue;
             }
@@ -311,14 +267,42 @@ impl StatsApp {
             self.book_count += 1;
         }
 
+        // sort top 3 books by time_secs descending (insertion-style;
+        // book_count is small).
+        for i in 0..self.book_count {
+            let t = self.books[i].stats.time_secs;
+            // find insertion position in top_books (descending by time).
+            let mut pos = self.top_count;
+            for j in 0..self.top_count {
+                if self.books[self.top_books[j]].stats.time_secs < t {
+                    pos = j;
+                    break;
+                }
+            }
+            if pos < 3 {
+                // shift right, insert.
+                let end = self.top_count.min(2);
+                for j in (pos..end).rev() {
+                    self.top_books[j + 1] = self.top_books[j];
+                }
+                self.top_books[pos] = i;
+                if self.top_count < 3 {
+                    self.top_count += 1;
+                }
+            }
+        }
+
+        // pull today values from kernel (chunk F).
+        let ds = k.day_stats();
+        self.today_pages = ds.pages();
+        self.today_secs = ds.secs_today();
+
         self.loaded = true;
     }
 }
 
 impl App<AppId> for StatsApp {
     fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
-        self.selected = 0;
-        self.scroll = 0;
         self.loaded = false;
         ctx.mark_dirty(Region::new(
             0,
@@ -328,63 +312,9 @@ impl App<AppId> for StatsApp {
         ));
     }
 
-    fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {
-        if self.book_count == 0 {
-            return match event {
-                ActionEvent::Press(Action::Back) => Transition::Pop,
-                ActionEvent::LongPress(Action::Back) => Transition::Home,
-                _ => Transition::None,
-            };
-        }
-
-        let vis = self.visible_rows();
-
-        match event {
-            ActionEvent::Press(Action::Back) => Transition::Pop,
-            ActionEvent::LongPress(Action::Back) => Transition::Home,
-
-            ActionEvent::Press(Action::Next) => {
-                let old_selected = self.selected;
-                let old_scroll = self.scroll;
-                self.selected = wrap_next(self.selected, self.book_count);
-                if self.selected < old_selected {
-                    self.scroll = 0;
-                } else {
-                    self.scroll_into_view();
-                }
-                if self.scroll != old_scroll {
-                    ctx.mark_dirty(self.list_region());
-                } else if self.selected != old_selected {
-                    let old_vis = old_selected - old_scroll;
-                    let new_vis = self.selected - self.scroll;
-                    ctx.mark_dirty(self.row_region(old_vis));
-                    ctx.mark_dirty(self.row_region(new_vis));
-                }
-                Transition::None
-            }
-
-            ActionEvent::Press(Action::Prev) => {
-                let old_selected = self.selected;
-                let old_scroll = self.scroll;
-                self.selected = wrap_prev(self.selected, self.book_count);
-                if self.selected > old_selected {
-                    self.scroll = self.book_count.saturating_sub(vis);
-                } else {
-                    self.scroll_into_view();
-                }
-                if self.scroll != old_scroll {
-                    ctx.mark_dirty(self.list_region());
-                } else if self.selected != old_selected {
-                    let old_vis = old_selected - old_scroll;
-                    let new_vis = self.selected - self.scroll;
-                    ctx.mark_dirty(self.row_region(old_vis));
-                    ctx.mark_dirty(self.row_region(new_vis));
-                }
-                Transition::None
-            }
-
-            _ => Transition::None,
-        }
+    fn on_event(&mut self, _event: ActionEvent, _ctx: &mut AppContext) -> Transition {
+        // stats screen is a static dashboard; no cursor interaction.
+        Transition::None
     }
 
     fn background_step(
@@ -402,95 +332,168 @@ impl App<AppId> for StatsApp {
     }
 
     fn draw(&self, strip: &mut StripBuffer) {
-        // heading
-        let header_region = Region::new(
-            LARGE_MARGIN,
-            TITLE_Y,
-            HEADER_W,
-            self.ui_fonts.heading.line_height,
-        );
-        BitmapLabel::new(header_region, "Reading Stats", self.ui_fonts.heading)
+        let body = self.ui_fonts.body;
+        let heading = self.ui_fonts.heading;
+
+        // captions + metric rows, top-to-bottom.
+        let mut y = CONTENT_TOP;
+
+        // TODAY caption + two big numbers.
+        draw_caption(strip, body, y, "TODAY");
+        y += CAPTION_H + 4;
+        draw_metric_row_two(strip, heading, body, y, self.today_pages as u32, "PAGES",
+            self.today_secs, "READING");
+        y += METRIC_ROW_H + SECTION_GAP_BIG;
+
+        // LIFETIME caption + three big numbers.
+        draw_caption(strip, body, y, "LIFETIME");
+        y += CAPTION_H + 4;
+        draw_metric_row_three(strip, heading, body, y,
+            self.total_books as u32, "BOOKS",
+            self.total_pages, "PAGES",
+            self.total_time / 3600, "TOTAL");
+        y += METRIC_ROW_H + SECTION_GAP_BIG;
+
+        // MOST TIME SPENT caption + top 3 rows.
+        draw_caption(strip, body, y, "MOST TIME SPENT");
+        y += CAPTION_H + 4;
+        for i in 0..self.top_count {
+            let book_idx = self.top_books[i];
+            let book = &self.books[book_idx];
+            draw_top_book_row(strip, body, y, book.display_name(), book.stats.time_secs);
+            y += TOP_ROW_H + 4;
+        }
+
+        if !self.loaded {
+            // small "loading" hint at bottom; the chrome already shows
+            // the user we're on the Stats tab.
+            let r = Region::new(LARGE_MARGIN, y, FULL_CONTENT_W, body.line_height);
+            BitmapLabel::new(r, "Loading...", body)
+                .alignment(Alignment::CenterLeft)
+                .draw(strip)
+                .unwrap();
+        } else if self.book_count == 0 && self.today_pages == 0 {
+            let r = Region::new(LARGE_MARGIN, y + 8, FULL_CONTENT_W, body.line_height);
+            BitmapLabel::new(r, "No reading yet", body)
+                .alignment(Alignment::CenterLeft)
+                .draw(strip)
+                .unwrap();
+        }
+    }
+}
+
+// ── layout helpers ──────────────────────────────────────────────────
+
+const CAPTION_H: u16 = 14;
+const METRIC_ROW_H: u16 = 56;
+const TOP_ROW_H: u16 = 44;
+const SECTION_GAP_BIG: u16 = 14;
+
+fn draw_caption(
+    strip: &mut StripBuffer,
+    font: &'static crate::fonts::bitmap::BitmapFont,
+    y: u16,
+    text: &str,
+) {
+    let r = Region::new(LARGE_MARGIN, y, FULL_CONTENT_W, CAPTION_H);
+    BitmapLabel::new(r, text, font)
+        .alignment(Alignment::CenterLeft)
+        .draw(strip)
+        .unwrap();
+}
+
+fn draw_metric_row_two(
+    strip: &mut StripBuffer,
+    big_font: &'static crate::fonts::bitmap::BitmapFont,
+    small_font: &'static crate::fonts::bitmap::BitmapFont,
+    y: u16,
+    v1: u32,
+    l1: &str,
+    secs: u32,
+    l2: &str,
+) {
+    let col_w = FULL_CONTENT_W / 2;
+    // left: number / label.
+    let r_num1 = Region::new(LARGE_MARGIN, y, col_w, big_font.line_height);
+    let mut buf1 = BitmapDynLabel::<16>::new(r_num1, big_font).alignment(Alignment::CenterLeft);
+    let _ = write!(buf1, "{}", v1);
+    buf1.draw(strip).ok();
+    let r_lbl1 = Region::new(
+        LARGE_MARGIN,
+        y + big_font.line_height,
+        col_w,
+        small_font.line_height,
+    );
+    BitmapLabel::new(r_lbl1, l1, small_font)
+        .alignment(Alignment::CenterLeft)
+        .draw(strip)
+        .unwrap();
+
+    // right: hh:mm / label.
+    let r_num2 = Region::new(LARGE_MARGIN + col_w, y, col_w, big_font.line_height);
+    let mut buf2 = BitmapDynLabel::<16>::new(r_num2, big_font).alignment(Alignment::CenterLeft);
+    fmt_compact_duration(secs, &mut buf2);
+    buf2.draw(strip).ok();
+    let r_lbl2 = Region::new(
+        LARGE_MARGIN + col_w,
+        y + big_font.line_height,
+        col_w,
+        small_font.line_height,
+    );
+    BitmapLabel::new(r_lbl2, l2, small_font)
+        .alignment(Alignment::CenterLeft)
+        .draw(strip)
+        .unwrap();
+}
+
+fn draw_metric_row_three(
+    strip: &mut StripBuffer,
+    big_font: &'static crate::fonts::bitmap::BitmapFont,
+    small_font: &'static crate::fonts::bitmap::BitmapFont,
+    y: u16,
+    v1: u32,
+    l1: &str,
+    v2: u32,
+    l2: &str,
+    v3_h: u32,
+    l3: &str,
+) {
+    let col_w = FULL_CONTENT_W / 3;
+    let cells: [(u32, &str, bool); 3] = [(v1, l1, false), (v2, l2, false), (v3_h, l3, true)];
+    for (i, (v, lbl, hrs)) in cells.iter().enumerate() {
+        let x = LARGE_MARGIN + i as u16 * col_w;
+        let r_num = Region::new(x, y, col_w, big_font.line_height);
+        let mut buf = BitmapDynLabel::<16>::new(r_num, big_font).alignment(Alignment::CenterLeft);
+        if *hrs {
+            let _ = write!(buf, "{}h", v);
+        } else {
+            let _ = write!(buf, "{}", v);
+        }
+        buf.draw(strip).ok();
+        let r_lbl = Region::new(x, y + big_font.line_height, col_w, small_font.line_height);
+        BitmapLabel::new(r_lbl, lbl, small_font)
             .alignment(Alignment::CenterLeft)
             .draw(strip)
             .unwrap();
-
-        // summary line
-        let summary_region = Region::new(
-            LARGE_MARGIN,
-            self.summary_y,
-            FULL_CONTENT_W,
-            self.ui_fonts.body.line_height,
-        );
-
-        if !self.loaded {
-            BitmapLabel::new(summary_region, "Loading...", self.ui_fonts.body)
-                .alignment(Alignment::CenterLeft)
-                .draw(strip)
-                .unwrap();
-            return;
-        }
-
-        if self.book_count == 0 {
-            BitmapLabel::new(summary_region, "No reading stats yet", self.ui_fonts.body)
-                .alignment(Alignment::CenterLeft)
-                .draw(strip)
-                .unwrap();
-            return;
-        }
-
-        {
-            let mut summary = BitmapDynLabel::<48>::new(summary_region, self.ui_fonts.body)
-                .alignment(Alignment::CenterLeft);
-            let _ = write!(summary, "{} book", self.total_books);
-            if self.total_books != 1 {
-                let _ = write!(summary, "s");
-            }
-            let _ = write!(summary, " \u{b7} {} pages \u{b7} ", self.total_pages);
-            fmt_compact_duration(self.total_time, &mut summary);
-            summary.draw(strip).unwrap();
-        }
-
-        // per-book list
-        let vis = self.visible_rows();
-        let visible_count = vis.min(self.book_count.saturating_sub(self.scroll));
-
-        // approximate column split: left 2/3 for title, right 1/3 for stats
-        let title_w = FULL_CONTENT_W * 2 / 3;
-        let stat_w = FULL_CONTENT_W - title_w;
-
-        for vi in 0..vis {
-            let row_y = self.list_y + vi as u16 * ROW_STRIDE;
-
-            if vi < visible_count {
-                let idx = self.scroll + vi;
-                let book = &self.books[idx];
-                let selected = idx == self.selected;
-
-                // title (left side)
-                let title_region = Region::new(LARGE_MARGIN, row_y, title_w, ROW_H);
-                BitmapLabel::new(title_region, book.display_name(), self.ui_fonts.body)
-                    .alignment(Alignment::CenterLeft)
-                    .inverted(selected)
-                    .draw(strip)
-                    .unwrap();
-
-                // stats (right side): "342p · 12h 3m"
-                let stat_region = Region::new(LARGE_MARGIN + title_w, row_y, stat_w, ROW_H);
-                let mut stat_label = BitmapDynLabel::<24>::new(stat_region, self.ui_fonts.body)
-                    .alignment(Alignment::CenterRight)
-                    .inverted(selected);
-                let _ = write!(stat_label, "{}p \u{b7} ", book.stats.pages);
-                fmt_compact_duration(book.stats.time_secs, &mut stat_label);
-                stat_label.draw(strip).unwrap();
-            } else {
-                // clear empty rows
-                let region = Region::new(LARGE_MARGIN, row_y, FULL_CONTENT_W, ROW_H);
-                region
-                    .to_rect()
-                    .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
-                    .draw(strip)
-                    .unwrap();
-            }
-        }
     }
+}
+
+fn draw_top_book_row(
+    strip: &mut StripBuffer,
+    font: &'static crate::fonts::bitmap::BitmapFont,
+    y: u16,
+    title: &str,
+    secs: u32,
+) {
+    let title_w = FULL_CONTENT_W * 3 / 4;
+    let time_w = FULL_CONTENT_W - title_w;
+    let title_r = Region::new(LARGE_MARGIN, y, title_w, TOP_ROW_H);
+    BitmapLabel::new(title_r, title, font)
+        .alignment(Alignment::CenterLeft)
+        .draw(strip)
+        .unwrap();
+    let time_r = Region::new(LARGE_MARGIN + title_w, y, time_w, TOP_ROW_H);
+    let mut buf = BitmapDynLabel::<16>::new(time_r, font).alignment(Alignment::CenterRight);
+    fmt_compact_duration(secs, &mut buf);
+    buf.draw(strip).ok();
 }
