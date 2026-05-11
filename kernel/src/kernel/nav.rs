@@ -11,8 +11,6 @@
 // chunk B.1 lands the types as pure additions. later phases retire
 // `Launcher` / `Transition` and rewrite the manager around `Nav`.
 
-use super::app::AppContext;
-
 /// horizontal navigation direction (passed to `App::on_horizontal`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HDir {
@@ -65,11 +63,14 @@ pub struct NavEvent<T, M> {
     pub resumed_entered: bool,
 }
 
-/// flat navigation: one active tab, at most one modal pushed over it.
+/// flat navigation state: one active tab, at most one modal over it.
+///
+/// pure state: no embedded `AppContext` (the existing `Launcher` already
+/// owns one; chunks B.4+ retire `Launcher` and move ownership of the
+/// `AppContext` here. for now, the manager holds both side by side).
 pub struct Nav<T: Copy + Eq, M: Copy + Eq> {
     active_tab: T,
     modal: Option<M>,
-    pub ctx: AppContext,
 }
 
 impl<T: Copy + Eq, M: Copy + Eq> Nav<T, M> {
@@ -77,7 +78,6 @@ impl<T: Copy + Eq, M: Copy + Eq> Nav<T, M> {
         Self {
             active_tab: initial_tab,
             modal: None,
-            ctx: AppContext::new(),
         }
     }
 

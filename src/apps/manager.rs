@@ -10,8 +10,8 @@ use crate::apps::reader::ReaderApp;
 use crate::apps::settings::SettingsApp;
 use crate::apps::stats::StatsApp;
 use crate::apps::{
-    App, AppContext, AppId, BgBudget, BgOutcome, DeferredPersistenceReason, Launcher,
-    PendingSetting, Redraw, Transition,
+    App, AppContext, AppId, AppNav, AppNavSlot, BgBudget, BgOutcome, DeferredPersistenceReason,
+    Launcher, Modal, PendingSetting, Redraw, Tab, Transition,
 };
 use esp_hal::delay::Delay;
 
@@ -110,6 +110,52 @@ pub struct AppManager {
     pub bumps: &'static mut ButtonFeedback,
 
     pub mapper: ButtonMapper,
+
+    /// nav state mirrored from `launcher` after every mutation. chunks
+    /// C/D/E/G consume this; the underlying `Launcher` stays as the
+    /// dispatch backend until chunk N retires both it and `with_app!`.
+    pub nav: AppNav,
+}
+
+/// map a (legacy) `AppId` to the `Tab` it represents in the new model,
+/// or `None` if the `AppId` is a modal (only `Reader`).
+fn appid_to_tab(id: AppId) -> Option<Tab> {
+    match id {
+        AppId::Home => Some(Tab::Home),
+        AppId::Files => Some(Tab::Library),
+        AppId::Stats => Some(Tab::Stats),
+        AppId::Settings => Some(Tab::Settings),
+        AppId::Upload => Some(Tab::Upload),
+        AppId::Reader => None,
+    }
+}
+
+#[inline]
+fn appid_to_modal(id: AppId) -> Option<Modal> {
+    match id {
+        AppId::Reader => Some(Modal::Reader),
+        _ => None,
+    }
+}
+
+/// derive `(active_tab, optional_modal)` from the current launcher
+/// stack. used to keep `AppManager.nav` in sync after every launcher
+/// mutation.
+fn nav_state_from_launcher(launcher: &Launcher) -> (Tab, Option<Modal>) {
+    let active = launcher.active();
+    if let Some(modal) = appid_to_modal(active) {
+        let mut tab = Tab::Home;
+        let depth = launcher.depth();
+        for i in (0..depth.saturating_sub(1)).rev() {
+            if let Some(t) = appid_to_tab(launcher.stack_at(i)) {
+                tab = t;
+                break;
+            }
+        }
+        (tab, Some(modal))
+    } else {
+        (appid_to_tab(active).unwrap_or(Tab::Home), None)
+    }
 }
 
 impl AppManager {
@@ -135,7 +181,37 @@ impl AppManager {
             quick_menu,
             bumps,
             mapper,
+            nav: AppNav::new(Tab::Home),
         }
+    }
+
+    /// Re-derive `self.nav` from the launcher stack. Call after every
+    /// `launcher.apply()` or `launcher.restore_stack()`.
+    #[inline]
+    fn sync_nav_from_launcher(&mut self) {
+        let (tab, modal) = nav_state_from_launcher(self.launcher);
+        self.nav.restore(tab, modal);
+    }
+
+    /// Currently active tab in the new nav model. Chrome reads this
+    /// to highlight the right tab in the bottom bar.
+    #[inline]
+    pub fn active_tab(&self) -> Tab {
+        self.nav.active_tab()
+    }
+
+    /// Currently open modal, if any.
+    #[inline]
+    pub fn active_modal(&self) -> Option<Modal> {
+        self.nav.modal()
+    }
+
+    /// Combined view: tab or modal-over-tab. Useful for chrome
+    /// decisions ("show the chrome only when no modal is open"
+    /// happens via `App::show_chrome` on the active app, not here).
+    #[inline]
+    pub fn active_nav_slot(&self) -> AppNavSlot {
+        self.nav.active_slot()
     }
 
     #[inline]
@@ -170,7 +246,11 @@ impl AppManager {
 
     #[inline]
     pub fn apply_nav(&mut self, transition: Transition) -> Option<crate::apps::NavEvent> {
-        self.launcher.apply(transition)
+        let result = self.launcher.apply(transition);
+        if result.is_some() {
+            self.sync_nav_from_launcher();
+        }
+        result
     }
 
     pub fn load_eager_settings(&mut self, k: &mut KernelHandle<'_>) {
@@ -298,6 +378,7 @@ impl AppManager {
                 _ => AppId::Home,
             },
         );
+        self.sync_nav_from_launcher();
 
         log::debug!(
             "session: restored nav stack depth={} active={:?}",
@@ -514,6 +595,7 @@ impl AppManager {
 
     pub fn apply_transition(&mut self, transition: Transition, k: &mut KernelHandle<'_>) {
         if let Some(nav) = self.launcher.apply(transition) {
+            self.sync_nav_from_launcher();
             log::debug!("app: {:?} -> {:?}", nav.from, nav.to);
 
             if nav.from != AppId::Upload {
