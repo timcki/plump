@@ -405,14 +405,29 @@ impl QuickMenu {
             }
         }
 
-        let help = match &self.items[self.selected].kind {
-            MenuItemKind::AppCycle { .. } => "Up/Down: move  Jump: adjust  Sel: cycle  Menu: close",
-            _ => "Up/Down: move  Sel: activate  Menu: close",
-        };
-
+        // tracked uppercase hint footer matches the v1 reader mockup
+        // (mockups/reader+quicksettings.png). individual segments are
+        // drawn with explicit horizontal gaps so the spacing reads as
+        // three discrete affordances rather than one long sentence.
         let help_region = self.help_region();
         if help_region.intersects(strip.logical_window()) {
-            font.draw_aligned(strip, help_region, help, Alignment::Center, BinaryColor::On);
+            let segments: &[&str] = match &self.items[self.selected].kind {
+                MenuItemKind::AppCycle { .. } => &[
+                    "\u{2191}\u{2193} MOVE",
+                    "\u{25C0}\u{25B6} ADJUST",
+                    "OK CYCLE",
+                    "MENU CLOSE",
+                ],
+                _ => &["\u{2191}\u{2193} MOVE", "OK SELECT", "MENU CLOSE"],
+            };
+            let total_w: u16 = segments.iter().map(|s| font.measure_str(s)).sum::<u16>()
+                + (segments.len().saturating_sub(1) as u16) * 18;
+            let mut x = help_region.x as i32 + (help_region.w.saturating_sub(total_w) / 2) as i32;
+            let baseline = help_region.y as i32 + font.ascent as i32;
+            for s in segments {
+                let used = font.draw_str_fg(strip, s, BinaryColor::On, x, baseline);
+                x = used + 18;
+            }
         }
     }
 }
