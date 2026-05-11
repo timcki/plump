@@ -8,6 +8,7 @@ pub mod home;
 pub mod manager;
 pub mod reader;
 pub mod stats;
+pub mod tab;
 pub mod widgets;
 
 pub mod settings;

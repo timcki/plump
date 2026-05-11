@@ -44,6 +44,7 @@ use crate::board::Epd;
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::strip::StripBuffer;
 use crate::kernel::dir_cache::DirCache;
+use crate::ui::Theme;
 
 // default ghost-clear interval (overridden by settings once loaded)
 pub const DEFAULT_GHOST_CLEAR_EVERY: u32 = 10;
@@ -150,6 +151,9 @@ pub struct Kernel {
     // last settings values pushed to hardware; used for
     // generation-based diffing in the scheduler main loop
     pub(crate) applied: AppliedSettings,
+
+    // design tokens shared by chrome + apps; one instance per kernel
+    pub(crate) theme: Theme,
 }
 
 impl Kernel {
@@ -177,6 +181,7 @@ impl Kernel {
             red_stale: false,
             input_policy: input_policy::InputPolicyState::new(),
             applied: AppliedSettings::new(),
+            theme: Theme::default_v1(),
         }
     }
 

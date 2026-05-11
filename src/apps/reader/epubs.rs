@@ -15,6 +15,7 @@ use crate::kernel::KernelHandle;
 use crate::kernel::work_queue;
 use plump_kernel::kernel::bundle;
 use plump_kernel::kernel::bundle::{BundleFile, SectionId};
+use plump_kernel::util::hash;
 
 use crate::apps::BgOutcome;
 use super::{BgCacheState, CHAPTER_CACHE_MAX, EOCD_TAIL, EpubState, PAGE_BUF, ReaderApp, ZipIndex};
@@ -60,7 +61,7 @@ impl EpubState {
             ));
         }
         self.archive_size = epub_size;
-        self.name_hash = cache::fnv1a(name.as_bytes());
+        self.name_hash = hash::fnv1a(name.as_bytes());
         self.cache_dir = cache::dir_name_for_hash(self.name_hash);
 
         let tail_size = (epub_size as usize).min(EOCD_TAIL);

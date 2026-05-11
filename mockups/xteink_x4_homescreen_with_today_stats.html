@@ -1,0 +1,80 @@
+<style>
+@import url('https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.1/src/bold/style.css');
+@import url('https://cdn.jsdelivr.net/npm/@fontsource/atkinson-hyperlegible@5.0.0/index.css');
+.fr { padding: 1.5rem 0; display: flex; justify-content: center; }
+.dv { background: #1c1c1c; padding: 7px; border-radius: 22px; }
+.sc { background: #f6f4ee; color: #181818; width: 360px; height: 600px; border-radius: 14px; display: flex; flex-direction: column; padding: 16px 16px 12px; font-family: 'Atkinson Hyperlegible', system-ui, sans-serif; box-sizing: border-box; }
+.st { display: flex; justify-content: space-between; align-items: center; font-size: 11px; opacity: 0.65; padding: 0 2px 11px; }
+.kw { font-size: 10px; letter-spacing: 0.22em; opacity: 0.5; margin: 4px 2px 8px; text-transform: uppercase; font-weight: 700; }
+.cv { background: #181818; flex-shrink: 0; position: relative; border-radius: 1px; }
+.cv.lt { background: #d8d2bd; }
+.cv::after { content: ''; position: absolute; background: #f6f4ee; }
+.cv.lt::after { background: #181818; }
+.b1::after { width: 30%; aspect-ratio: 1; border-radius: 50%; top: 28%; left: 35%; }
+.b2::after { width: 14%; height: 60%; top: 20%; left: 43%; }
+.b3::after { width: 50%; height: 6%; top: 28%; left: 25%; }
+.b4::after { width: 36%; aspect-ratio: 1; border-radius: 50%; background: transparent !important; border: 1.5px solid #f6f4ee; top: 32%; left: 32%; }
+.b4.lt::after { border-color: #181818; }
+.cn { display: flex; gap: 12px; border: 1px solid #181818; border-radius: 7px; padding: 11px; margin-bottom: 13px; }
+.cw { display: flex; flex-direction: column; flex: 1; min-width: 0; justify-content: center; }
+.ct { font-size: 14.5px; font-weight: 700; margin: 0; line-height: 1.2; }
+.ca { font-size: 11.5px; opacity: 0.65; margin: 2px 0 9px; }
+.br { height: 2px; background: rgba(0,0,0,0.18); border-radius: 1px; overflow: hidden; }
+.br > b { display: block; height: 100%; background: #181818; }
+.cm { display: flex; justify-content: space-between; align-items: center; margin-top: 5px; font-size: 10.5px; opacity: 0.65; }
+.rr { padding: 7px 2px; border-bottom: 1px solid rgba(0,0,0,0.1); display: flex; gap: 11px; align-items: center; }
+.rtxt { flex: 1; min-width: 0; }
+.rt { font-size: 12.5px; font-weight: 700; margin: 0; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ra { font-size: 10.5px; opacity: 0.65; margin: 1px 0 0; }
+.rp { font-size: 10.5px; opacity: 0.65; padding-left: 8px; }
+.tb { margin-top: auto; display: flex; justify-content: space-around; align-items: center; padding-top: 11px; border-top: 1px solid rgba(0,0,0,0.18); }
+.tab { padding: 7px 10px; border-radius: 6px; font-size: 18px; line-height: 0; color: #181818; }
+.tab.on { background: #181818; color: #f6f4ee; }
+</style>
+
+<h2 class="sr-only">Refined Xteink X4 homescreen with today's reading stats — 47 pages and 1 hour 12 minutes — in the top-left status slot, replacing the page name placeholder.</h2>
+
+<div class="fr">
+  <div class="dv"><div class="sc">
+    <div class="st">
+      <span>today · 47 pages · 1h 12m</span>
+      <span>87%</span>
+    </div>
+    
+    <div class="kw">Continue reading</div>
+    <div class="cn">
+      <div class="cv b1" style="width:60px;height:90px"></div>
+      <div class="cw">
+        <p class="ct">Stories of Your Life and Others</p>
+        <p class="ca">Ted Chiang</p>
+        <div class="br"><b style="width:38%"></b></div>
+        <div class="cm"><span>chapter 5 of 8</span><span>9h 32m</span></div>
+      </div>
+    </div>
+    
+    <div class="kw">Recent</div>
+    <div class="rr">
+      <div class="cv b2" style="width:42px;height:63px"></div>
+      <div class="rtxt"><p class="rt">Pachinko</p><p class="ra">Min Jin Lee</p></div>
+      <span class="rp">62%</span>
+    </div>
+    <div class="rr">
+      <div class="cv b3 lt" style="width:42px;height:63px"></div>
+      <div class="rtxt"><p class="rt">The MANIAC</p><p class="ra">Benjamín Labatut</p></div>
+      <span class="rp">100%</span>
+    </div>
+    <div class="rr" style="border-bottom:none">
+      <div class="cv b4" style="width:42px;height:63px"></div>
+      <div class="rtxt"><p class="rt">Foundation</p><p class="ra">Isaac Asimov</p></div>
+      <span class="rp">100%</span>
+    </div>
+    
+    <div class="tb">
+      <span class="tab on" title="Home"><i class="ph-bold ph-house" aria-hidden="true"></i></span>
+      <span class="tab" title="Library"><i class="ph-bold ph-books" aria-hidden="true"></i></span>
+      <span class="tab" title="Stats"><i class="ph-bold ph-chart-bar" aria-hidden="true"></i></span>
+      <span class="tab" title="Settings"><i class="ph-bold ph-gear-six" aria-hidden="true"></i></span>
+      <span class="tab" title="Upload"><i class="ph-bold ph-cloud-arrow-up" aria-hidden="true"></i></span>
+    </div>
+  </div></div>
+</div>

@@ -9,15 +9,7 @@
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage::TITLE_CAP;
 use crate::util::FixedStr;
-// FNV-1a hash with ASCII case folding, used for bookmark filename lookups.
-pub fn fnv1a_icase(data: &[u8]) -> u32 {
-    let mut h: u32 = 0x811c_9dc5;
-    for &b in data {
-        h ^= b.to_ascii_lowercase() as u32;
-        h = h.wrapping_mul(0x0100_0193);
-    }
-    h
-}
+use crate::util::hash::fnv1a_icase;
 
 // little-endian helpers for binary record encoding
 #[inline]

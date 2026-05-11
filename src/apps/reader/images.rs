@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use crate::kernel::work_queue::DecodedImage;
+use plump_kernel::util::hash;
 use smol_epub::cache;
 use smol_epub::epub;
 use smol_epub::html_strip::{IMG_HEADER_LEN, IMG_REF, MARKER};
@@ -107,7 +108,7 @@ impl ReaderApp {
 
         let dir_buf = self.epub.cache_dir;
         let dir = cache::dir_name_str(&dir_buf);
-        let img_name = img_cache_name(cache::fnv1a(full_path.as_bytes()));
+        let img_name = img_cache_name(hash::fnv1a(full_path.as_bytes()));
         let img_file = img_cache_str(&img_name);
 
         // inline images are capped to a fraction of the text area so
@@ -379,7 +380,7 @@ impl ReaderApp {
                 }
             };
 
-            let path_hash = cache::fnv1a(full_path.as_bytes());
+            let path_hash = hash::fnv1a(full_path.as_bytes());
             let img_name = img_cache_name(path_hash);
             let img_file = img_cache_str(&img_name);
 
@@ -498,7 +499,7 @@ impl ReaderApp {
                     }
                 };
 
-                let path_hash = cache::fnv1a(full_path.as_bytes());
+                let path_hash = hash::fnv1a(full_path.as_bytes());
                 let img_name = img_cache_name(path_hash);
                 let img_file = img_cache_str(&img_name);
                 let resume = (offset + payload_end) as u32;
@@ -1137,7 +1138,7 @@ impl<'a> super::layout::pipeline::ImageHeightHint for ChapterImagePeek<'a> {
         let mut path_buf = [0u8; 512];
         let plen = epub::resolve_path(self.ch_dir, src_str, &mut path_buf);
         let full_path = core::str::from_utf8(&path_buf[..plen]).ok()?;
-        let key = cache::fnv1a(full_path.as_bytes());
+        let key = hash::fnv1a(full_path.as_bytes());
         if let Some(h) = self.lookup(key) {
             return Some(h);
         }

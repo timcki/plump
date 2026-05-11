@@ -18,10 +18,9 @@
 
 use alloc::vec::Vec;
 
-use smol_epub::cache;
-
 use plump_kernel::kernel::bundle;
 use plump_kernel::kernel::bundle::{BundleError, BundleFile, SectionId};
+use plump_kernel::util::hash;
 
 use crate::kernel::KernelHandle;
 use crate::kernel::work_queue::DecodedImage;
@@ -40,7 +39,7 @@ pub fn save_cover_thumb_for(
     filename: &[u8],
     img: &DecodedImage,
 ) -> crate::error::Result<()> {
-    let name_hash = cache::fnv1a(filename);
+    let name_hash = hash::fnv1a(filename);
     save_cover_thumb(k, name_hash, img)
 }
 
@@ -197,12 +196,12 @@ pub fn has_cover_thumb(k: &mut KernelHandle<'_>, name_hash: u32) -> bool {
 
 /// Load a cover thumbnail by book filename.
 pub fn load_cover_for(k: &mut KernelHandle<'_>, filename: &[u8]) -> Option<DecodedImage> {
-    let name_hash = cache::fnv1a(filename);
+    let name_hash = hash::fnv1a(filename);
     load_cover_thumb(k, name_hash)
 }
 
 /// Check whether a cover thumbnail exists by book filename.
 pub fn has_cover_for(k: &mut KernelHandle<'_>, filename: &[u8]) -> bool {
-    let name_hash = cache::fnv1a(filename);
+    let name_hash = hash::fnv1a(filename);
     has_cover_thumb(k, name_hash)
 }

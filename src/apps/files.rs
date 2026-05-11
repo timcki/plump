@@ -21,6 +21,7 @@ use crate::ui::{
     Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, HEADER_W, LARGE_MARGIN,
     Region, SECTION_GAP, TITLE_Y_OFFSET,
 };
+use plump_kernel::util::hash;
 use smol_epub::cache;
 use smol_epub::epub::{self, EpubMeta, EpubSpine};
 use smol_epub::zip::ZipIndex;
@@ -355,17 +356,17 @@ impl App<AppId> for FilesApp {
             if let Some(entry) = self.selected_entry() {
                 if !entry.is_dir {
                     let name = entry.name_str();
-                    let hash = cache::fnv1a(name.as_bytes());
+                    let name_hash = hash::fnv1a(name.as_bytes());
                     log::debug!("files: deleting cache for {}", name);
 
                     // delete bundle (best effort)
-                    match plump_kernel::kernel::bundle::delete(k.sd(), hash) {
+                    match plump_kernel::kernel::bundle::delete(k.sd(), name_hash) {
                         Ok(()) => log::debug!("files: bundle deleted for {}", name),
                         Err(e) => log::warn!("files: bundle delete failed: {}", e),
                     }
 
                     // legacy `.DAT` still may exist on older SD cards; best-effort
-                    let cf = cache::cache_filename(hash);
+                    let cf = cache::cache_filename(name_hash);
                     let cf_str = cache::cache_filename_str(&cf);
                     let _ = k.sd().delete_in_plump(cf_str);
                 }

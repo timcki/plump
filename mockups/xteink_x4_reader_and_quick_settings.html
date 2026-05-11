@@ -1,0 +1,122 @@
+<style>
+@import url('https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.1/src/bold/style.css');
+@import url('https://cdn.jsdelivr.net/npm/@fontsource/atkinson-hyperlegible@5.0.0/index.css');
+@import url('https://fonts.googleapis.com/css2?family=Lora:wght@400;500;600&display=swap');
+
+.fr { padding: 1.5rem 0; display: flex; justify-content: center; gap: 28px; flex-wrap: wrap; }
+.un { display: flex; flex-direction: column; align-items: center; gap: 9px; }
+.lab { font-size: 13px; color: var(--color-text-primary); font-weight: 500; margin: 0; }
+.dv { background: #1c1c1c; padding: 7px; border-radius: 22px; }
+.sc { background: #f6f4ee; color: #181818; width: 340px; height: 567px; border-radius: 14px; display: flex; flex-direction: column; padding: 15px 18px 11px; font-family: 'Atkinson Hyperlegible', system-ui, sans-serif; box-sizing: border-box; position: relative; overflow: hidden; }
+
+/* reader */
+.rd-st { display: flex; justify-content: space-between; align-items: center; font-size: 10px; opacity: 0.6; padding: 0 0 11px; }
+.rd-bd { flex: 1; font-family: 'Lora', Georgia, serif; font-size: 13.5px; line-height: 1.58; text-align: justify; hyphens: auto; color: #181818; overflow: hidden; }
+.rd-bd p { margin: 0 0 0.7em; }
+.rd-bd p:last-child { margin-bottom: 0; }
+.rd-ft { display: flex; justify-content: space-between; align-items: flex-end; padding-top: 11px; border-top: 1px solid rgba(0,0,0,0.18); margin-top: 9px; font-size: 10px; font-family: 'Atkinson Hyperlegible', sans-serif; }
+.rd-ft .tit { max-width: 75%; }
+.rd-ft .tit > p { margin: 0 0 5px; opacity: 0.75; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rd-ft .tit > div { height: 1.5px; background: rgba(0,0,0,0.18); border-radius: 1px; overflow: hidden; }
+.rd-ft .tit > div > b { display: block; height: 100%; background: #181818; width: 45%; }
+.rd-ft .pg { opacity: 0.75; font-variant-numeric: tabular-nums; padding-bottom: 1px; }
+
+/* overlay */
+.ov { position: absolute; left: 14px; right: 14px; bottom: 14px; background: #f6f4ee; border: 1px solid #181818; border-radius: 10px; padding: 11px 11px 9px; box-shadow: 0 1px 0 #181818, 0 -1px 0 #181818; }
+.ov-gr { border: 1px solid rgba(0,0,0,0.25); border-radius: 7px; overflow: hidden; margin-bottom: 8px; }
+.ov-gr:last-of-type { margin-bottom: 6px; }
+.ov-rw { display: flex; justify-content: space-between; align-items: center; padding: 7px 11px; font-size: 11.5px; border-bottom: 1px solid rgba(0,0,0,0.1); }
+.ov-rw:last-child { border-bottom: none; }
+.ov-rw.on { background: #181818; color: #f6f4ee; }
+.ov-rw .v { opacity: 0.65; font-size: 10.5px; }
+.ov-rw.on .v { opacity: 0.85; }
+.ov-rw .a { opacity: 0.5; font-size: 12px; }
+.ov-rw.on .a { opacity: 0.9; }
+.ov-rw i { font-size: 12px; opacity: 0.7; }
+.ov-rw.on i { opacity: 0.95; }
+.ov-rw .lbl { display: flex; align-items: center; gap: 7px; }
+.ov-hn { display: flex; justify-content: center; gap: 14px; font-size: 9px; letter-spacing: 0.16em; opacity: 0.55; text-transform: uppercase; font-weight: 700; padding-top: 3px; }
+</style>
+
+<h2 class="sr-only">Two Xteink X4 mockups: the reader view with serif body text in cream-on-dark, and the same reader with the quick-settings modal overlaid showing grouped reading actions, display controls, and system shortcuts.</h2>
+
+<div class="fr">
+
+  <div class="un">
+    <p class="lab">Reader</p>
+    <div class="dv"><div class="sc">
+      <div class="rd-st"><span>today · 47 pages · 1h 12m</span><span>87%</span></div>
+      <div class="rd-bd">
+        <p>The signals reached us in fragments — never the whole transmission, always the residue. We had grown accustomed to incomplete messages, to filling the gaps with our own assumptions, but this one resisted our usual methods of interpretation.</p>
+        <p>Maya argued that we were applying the wrong framework entirely. What if the gaps were not errors of transmission but elements of the message itself? What if silence carried as much meaning as sound? She had been reading the linguists again, late into the night, marking passages with the small wooden tabs her grandmother had made.</p>
+        <p>I disagreed, but only on principle. There was something to her theory, even if she could not yet articulate why. The patterns of absence had a structure we had not anticipated. They repeated. They clustered. They behaved, in short, like a language — one in which what was missing carried more weight than what remained.</p>
+        <p>It was late October when we began the second analysis.</p>
+      </div>
+      <div class="rd-ft">
+        <div class="tit">
+          <p>Stories of Your Life and Others</p>
+          <div><b></b></div>
+        </div>
+        <span class="pg">198 / 440</span>
+      </div>
+    </div></div>
+  </div>
+
+  <div class="un">
+    <p class="lab">Quick settings</p>
+    <div class="dv"><div class="sc">
+      <div class="rd-st"><span>today · 47 pages · 1h 12m</span><span>87%</span></div>
+      <div class="rd-bd">
+        <p>The signals reached us in fragments — never the whole transmission, always the residue. We had grown accustomed to incomplete messages, to filling the gaps with our own assumptions, but this one resisted our usual methods of interpretation.</p>
+        <p>Maya argued that we were applying the wrong framework entirely. What if the gaps were not errors of transmission but elements of the message itself? What if silence carried as much meaning as sound? She had been reading the linguists again, late into the night, marking passages with the small wooden tabs her grandmother had made.</p>
+        <p>I disagreed, but only on principle. There was something to her theory, even if she could not yet articulate why. The patterns of absence had a structure we had not anticipated. They repeated. They clustered. They behaved, in short, like a language — one in which what was missing carried more weight than what remained.</p>
+        <p>It was late October when we began the second analysis.</p>
+      </div>
+      <div class="rd-ft">
+        <div class="tit">
+          <p>Stories of Your Life and Others</p>
+          <div><b></b></div>
+        </div>
+        <span class="pg">198 / 440</span>
+      </div>
+
+      <div class="ov">
+        <div class="ov-gr">
+          <div class="ov-rw on">
+            <span class="lbl"><i class="ph-bold ph-bookmark-simple" aria-hidden="true"></i>Bookmark this page</span>
+            <span class="a"></span>
+          </div>
+          <div class="ov-rw">
+            <span class="lbl"><i class="ph-bold ph-list-bullets" aria-hidden="true"></i>Contents</span>
+            <span class="a">→</span>
+          </div>
+          <div class="ov-rw">
+            <span class="lbl"><i class="ph-bold ph-bookmarks" aria-hidden="true"></i>Bookmarks · 3</span>
+            <span class="a">→</span>
+          </div>
+        </div>
+        <div class="ov-gr">
+          <div class="ov-rw">
+            <span>Text size</span>
+            <span class="v">medium</span>
+          </div>
+          <div class="ov-rw">
+            <span>Line spacing</span>
+            <span class="v">1.4</span>
+          </div>
+        </div>
+        <div class="ov-gr">
+          <div class="ov-rw">
+            <span class="lbl"><i class="ph-bold ph-eraser" aria-hidden="true"></i>Clear ghosting</span>
+          </div>
+          <div class="ov-rw">
+            <span class="lbl"><i class="ph-bold ph-house" aria-hidden="true"></i>Go home</span>
+            <span class="a">→</span>
+          </div>
+        </div>
+        <div class="ov-hn"><span>↑↓ move</span><span>OK select</span><span>Menu close</span></div>
+      </div>
+    </div></div>
+  </div>
+
+</div>

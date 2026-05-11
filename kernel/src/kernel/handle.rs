@@ -9,6 +9,7 @@ use crate::error::{Error, Result};
 use crate::kernel::bookmarks::BookmarkCache;
 use crate::kernel::dir_cache::DirCache;
 use crate::kernel::wake::uptime_secs;
+use crate::ui::Theme;
 
 // synchronous API surface for apps
 //
@@ -110,5 +111,13 @@ impl<'k> KernelHandle<'k> {
     #[inline]
     pub fn dir_cache_mut(&mut self) -> &mut DirCache {
         &mut *self.kernel.dir_cache
+    }
+
+    /// Borrow the shared design tokens. Chrome widgets and any app
+    /// that needs panel radii, margins, or chrome bar heights should
+    /// thread this reference through rather than redeclaring constants.
+    #[inline]
+    pub fn theme(&self) -> &Theme {
+        &self.kernel.theme
     }
 }
