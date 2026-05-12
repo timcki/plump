@@ -14,7 +14,6 @@ use esp_hal::timer::timg::TimerGroup;
 use log::info;
 
 use plump::apps::Launcher;
-use plump::apps::files::FilesApp;
 use plump::apps::home::HomeApp;
 use plump::apps::library::LibraryApp;
 use plump::apps::manager::AppManager;
@@ -55,7 +54,6 @@ static DAY_STATS: ConstStaticCell<DayStats> = ConstStaticCell::new(DayStats::EMP
 
 static HOME: StaticCell<HomeApp> = StaticCell::new();
 static LIBRARY: StaticCell<LibraryApp> = StaticCell::new();
-static FILES: StaticCell<FilesApp> = StaticCell::new();
 static SETTINGS: StaticCell<SettingsApp> = StaticCell::new();
 static STATS: StaticCell<StatsApp> = StaticCell::new();
 
@@ -141,7 +139,6 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         LAUNCHER.take(),
         HOME.init(HomeApp::new()),
         LIBRARY.init(LibraryApp::new()),
-        FILES.init(FilesApp::new()),
         READER.take(),
         SETTINGS.init(SettingsApp::new()),
         STATS.init(StatsApp::new()),

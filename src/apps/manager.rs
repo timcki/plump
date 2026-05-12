@@ -4,7 +4,6 @@
 // loading indicator is drawn between app content and overlays so it
 // sits on top of page content but under quick menu and button bumps
 
-use crate::apps::files::FilesApp;
 use crate::apps::home::HomeApp;
 use crate::apps::library::LibraryApp;
 use crate::apps::reader::ReaderApp;
@@ -44,10 +43,6 @@ macro_rules! with_app {
                 let $app = &mut *$mgr.library;
                 $body
             }
-            AppId::Files => {
-                let $app = &mut *$mgr.files;
-                $body
-            }
             AppId::Reader => {
                 let $app = &mut *$mgr.reader;
                 $body
@@ -79,10 +74,6 @@ macro_rules! with_app_ref {
                 let $app = &*$mgr.library;
                 $body
             }
-            AppId::Files => {
-                let $app = &*$mgr.files;
-                $body
-            }
             AppId::Reader => {
                 let $app = &*$mgr.reader;
                 $body
@@ -112,7 +103,6 @@ pub struct AppManager {
 
     pub home: &'static mut HomeApp,
     pub library: &'static mut LibraryApp,
-    pub files: &'static mut FilesApp,
     pub reader: &'static mut ReaderApp,
     pub settings: &'static mut SettingsApp,
     pub stats: &'static mut StatsApp,
@@ -140,7 +130,6 @@ fn appid_to_tab(id: AppId) -> Option<Tab> {
     match id {
         AppId::Home => Some(Tab::Home),
         AppId::Library => Some(Tab::Library),
-        AppId::Files => None,
         AppId::Stats => Some(Tab::Stats),
         AppId::Settings => Some(Tab::Settings),
         AppId::Upload => Some(Tab::Upload),
@@ -211,7 +200,6 @@ impl AppManager {
         launcher: &'static mut Launcher,
         home: &'static mut HomeApp,
         library: &'static mut LibraryApp,
-        files: &'static mut FilesApp,
         reader: &'static mut ReaderApp,
         settings: &'static mut SettingsApp,
         stats: &'static mut StatsApp,
@@ -223,7 +211,6 @@ impl AppManager {
             launcher,
             home,
             library,
-            files,
             reader,
             settings,
             stats,
@@ -372,10 +359,10 @@ impl AppManager {
         session.reader_byte_offset = self.reader.byte_offset();
         session.reader_font_size = self.reader.font_size_idx();
 
-        // save files state
-        session.files_scroll = self.files.scroll() as u16;
-        session.files_selected = self.files.selected() as u8;
-        session.files_total = self.files.total() as u16;
+        // (legacy `files_*` fields are now reserved padding — Files
+        // app was removed in chunk N; the struct fields stay to keep
+        // the on-RTC layout stable for old wake images that still
+        // decode to this struct.)
 
         // save home state
         session.home_state = self.home.state_id();
@@ -423,7 +410,7 @@ impl AppManager {
             &session.nav_stack,
             |id| match id {
                 0 => AppId::Home,
-                1 => AppId::Files,
+                1 => AppId::Library,
                 2 => AppId::Reader,
                 3 => AppId::Settings,
                 4 => AppId::Stats,
@@ -450,14 +437,7 @@ impl AppManager {
         // battery percentage for status display
         self.home.set_battery(k.battery_mv());
 
-        // restore files state if in stack
-        if self.launcher.contains(AppId::Files) {
-            self.files.restore_state(
-                session.files_scroll as usize,
-                session.files_selected as usize,
-                session.files_total as usize,
-            );
-        }
+        // (no Files restore — app was removed in chunk N)
 
         // restore reader state if active or in stack
         if self.launcher.active() == AppId::Reader || self.launcher.contains(AppId::Reader) {
@@ -655,7 +635,6 @@ impl AppManager {
         for &id in &[
             AppId::Home,
             AppId::Library,
-            AppId::Files,
             AppId::Reader,
             AppId::Settings,
             AppId::Stats,
@@ -740,7 +719,6 @@ impl AppManager {
         for &id in &[
             AppId::Home,
             AppId::Library,
-            AppId::Files,
             AppId::Reader,
             AppId::Settings,
             AppId::Stats,
@@ -821,7 +799,6 @@ impl AppManager {
 
         self.home.set_ui_font_size(ui_idx);
         self.library.set_ui_font_size(ui_idx);
-        self.files.set_ui_font_size(ui_idx);
         self.settings.set_ui_font_size(ui_idx);
         self.stats.set_ui_font_size(ui_idx);
         // set the reader font family before the size so apply_font_metrics
