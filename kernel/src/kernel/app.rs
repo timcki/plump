@@ -162,6 +162,29 @@ impl DeferredPersistenceReason {
     }
 }
 
+/// Whether and when the scheduler should run a 4-level grayscale AA
+/// pass on top of the BW image.
+///
+/// AA renders glyph edges with 4 levels of grey via the SSD1677's
+/// dual-plane BW + RED RAM and a custom waveform LUT. The pass costs
+/// roughly +300 ms of waveform time per fire, so the *when* matters as
+/// much as the *whether*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GrayscaleMode {
+    /// No AA. The BW image is the final image.
+    #[default]
+    Disabled,
+    /// Fire the grayscale pass immediately after every partial DU /
+    /// post-GC refresh. Best for screens with rare, deliberate redraws
+    /// (Reader page turns) where the latency hides naturally.
+    Immediate,
+    /// Hold the grayscale pass until the screen has been redraw-idle
+    /// for `DEFERRED_GRAYSCALE_DELAY`. Best for screens with frequent
+    /// navigation (Home) where firing on every keypress would feel
+    /// sluggish.
+    Deferred,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transition<Id> {
     None,
@@ -661,7 +684,10 @@ pub trait AppLayer {
     fn set_chrome_state(&mut self, _battery_pct: u8, _today_pages: u16, _today_secs: u32) {}
 
     fn ghost_clear_every(&self) -> u32;
-    fn wants_grayscale(&self) -> bool;
+    /// Decide whether to run the grayscale AA pass for the current
+    /// frame and, if so, whether to fire it immediately or defer it
+    /// to the next redraw-idle window. See `GrayscaleMode`.
+    fn grayscale_mode(&self) -> GrayscaleMode;
     fn wifi_config(&self) -> &WifiConfig;
 
     // boot-time init: load settings, populate caches, enter first app

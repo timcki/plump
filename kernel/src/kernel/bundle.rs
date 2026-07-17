@@ -601,11 +601,34 @@ pub const RAW_FMT_NONE: u8 = 0;
 pub const RAW_FMT_JPEG: u8 = 1;
 pub const RAW_FMT_PNG: u8 = 2;
 
-// cover variant kinds
-pub const COVER_KIND_TINY: u8 = 0; // 48x64 file-browser row icon
-pub const COVER_KIND_SMALL: u8 = 1; // 120x160 grid/picker
-pub const COVER_KIND_CARD: u8 = 2; // 200x260 home recent card
-pub const COVER_KIND_DETAIL: u8 = 3; // 320x400 book info screen
+// cover variant kinds. on-disk byte = discriminant.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoverKind {
+    Tiny = 0,    // file-browser row icon
+    Small = 1,   // grid / picker
+    Card = 2,    // home recent card
+    Detail = 3,  // book info screen
+    Mini = 4,    // home recent-row thumb (64x96)
+}
+
+impl CoverKind {
+    #[inline]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Tiny),
+            1 => Some(Self::Small),
+            2 => Some(Self::Card),
+            3 => Some(Self::Detail),
+            4 => Some(Self::Mini),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct CoversHeader {
@@ -642,7 +665,7 @@ impl CoversHeader {
 
 #[derive(Clone, Copy)]
 pub struct CoverVariant {
-    pub kind: u8,
+    pub kind: CoverKind,
     pub width: u16,
     pub height: u16,
     pub stride: u16,
@@ -652,7 +675,7 @@ pub struct CoverVariant {
 
 impl CoverVariant {
     pub const EMPTY: Self = Self {
-        kind: 0,
+        kind: CoverKind::Tiny,
         width: 0,
         height: 0,
         stride: 0,
@@ -660,12 +683,15 @@ impl CoverVariant {
         data_size: 0,
     };
 
+    /// Decode a variant entry. Returns None on malformed buffer OR
+    /// unknown `kind` byte (forward-compat policy: unknown variants
+    /// are skipped by the caller rather than silently mistyped).
     pub fn decode(buf: &[u8]) -> Option<Self> {
         if buf.len() < COVER_VARIANT_SIZE {
             return None;
         }
         Some(Self {
-            kind: buf[0],
+            kind: CoverKind::from_u8(buf[0])?,
             // buf[1] pad
             width: r_u16(buf, 2),
             height: r_u16(buf, 4),
@@ -677,7 +703,7 @@ impl CoverVariant {
 
     pub fn encode(&self) -> [u8; COVER_VARIANT_SIZE] {
         let mut out = [0u8; COVER_VARIANT_SIZE];
-        out[0] = self.kind;
+        out[0] = self.kind.as_u8();
         // out[1] pad
         w_u16(&mut out, 2, self.width);
         w_u16(&mut out, 4, self.height);
@@ -1966,6 +1992,49 @@ mod tests {
         w_u16(&mut buf, OFF_VERSION, 2);
         w_u16(&mut buf, OFF_HEADER_SIZE, HEADER_SIZE as u16);
         assert!(BundleHeader::decode(&buf).is_none());
+    }
+
+    #[test]
+    fn cover_kind_round_trip() {
+        for k in [
+            CoverKind::Tiny,
+            CoverKind::Small,
+            CoverKind::Card,
+            CoverKind::Detail,
+            CoverKind::Mini,
+        ] {
+            assert_eq!(CoverKind::from_u8(k.as_u8()), Some(k));
+        }
+        assert_eq!(CoverKind::from_u8(255), None);
+    }
+
+    #[test]
+    fn cover_variant_decode_skips_unknown_kind() {
+        // unknown kind byte -> decode returns None so the caller can
+        // skip the variant rather than misinterpret its dimensions.
+        let mut buf = [0u8; COVER_VARIANT_SIZE];
+        buf[0] = 99;
+        assert!(CoverVariant::decode(&buf).is_none());
+    }
+
+    #[test]
+    fn cover_variant_round_trip() {
+        let v = CoverVariant {
+            kind: CoverKind::Mini,
+            width: 64,
+            height: 96,
+            stride: 8,
+            data_offset: 12 + 32,
+            data_size: 768,
+        };
+        let bytes = v.encode();
+        let back = CoverVariant::decode(&bytes).expect("decode");
+        assert_eq!(back.kind, CoverKind::Mini);
+        assert_eq!(back.width, 64);
+        assert_eq!(back.height, 96);
+        assert_eq!(back.stride, 8);
+        assert_eq!(back.data_offset, 44);
+        assert_eq!(back.data_size, 768);
     }
 }
 

@@ -39,11 +39,19 @@ const CARD_PROGRESS_H: u16 = 5;
 
 // recent list.
 const MAX_RECENT_ROWS: usize = 3;
-const ROW_H: u16 = 56;
+const ROW_H: u16 = 104;
 const ROW_GAP: u16 = 4;
 const ROW_STRIDE: u16 = ROW_H + ROW_GAP;
 const ROW_X: u16 = LARGE_MARGIN;
 const ROW_W: u16 = FULL_CONTENT_W;
+
+// mini-thumb cover at the left of each recent row. matches
+// `cover_cache::MINI_THUMB_*`; padding sits inside the row rect so the
+// cover blits cleanly against the selection background.
+const ROW_COVER_W: u16 = 64;
+const ROW_COVER_H: u16 = 96;
+const ROW_COVER_PAD: u16 = 4;
+const ROW_TEXT_INDENT: u16 = ROW_COVER_W + 12;
 
 // 1 card + N rows.
 const MAX_ITEMS: usize = 1 + MAX_RECENT_ROWS;
@@ -110,6 +118,7 @@ pub struct HomeApp {
     // recent list (3 most-recent bookmarks after the card)
     recent_rows: [RecentRow; MAX_RECENT_ROWS],
     recent_row_count: usize,
+    recent_row_covers: [Option<crate::kernel::work_queue::DecodedImage>; MAX_RECENT_ROWS],
 
     needs_load: bool,
     bat_pct: u8,
@@ -135,6 +144,7 @@ impl HomeApp {
             recent_cover: None,
             recent_rows: [RecentRow::EMPTY; MAX_RECENT_ROWS],
             recent_row_count: 0,
+            recent_row_covers: [const { None }; MAX_RECENT_ROWS],
             needs_load: false,
             bat_pct: 0,
         }
@@ -203,8 +213,17 @@ impl HomeApp {
             } else {
                 self.recent_stats_time = 0;
             }
-            self.recent_cover =
-                crate::apps::cover_cache::load_cover_for(k, self.recent_book.as_bytes());
+            // discard oversized covers from legacy single-variant bundles
+            // (200x240) -- the reader re-decodes both variants at proper
+            // size on next open. without this guard the old image would
+            // overflow the card by ~88 px vertical.
+            const CARD_INNER_H: u16 = CARD_H - 2 * CARD_PAD;
+            self.recent_cover = crate::apps::cover_cache::load_cover_variant_for(
+                k,
+                self.recent_book.as_bytes(),
+                plump_kernel::kernel::bundle::CoverKind::Card,
+            )
+            .filter(|img| img.height <= CARD_INNER_H);
         } else {
             self.recent_stats_time = 0;
             self.recent_cover = None;
@@ -221,6 +240,9 @@ impl HomeApp {
 
         let mut out = 0usize;
         self.recent_rows = [RecentRow::EMPTY; MAX_RECENT_ROWS];
+        // drop any previously-loaded covers before re-populating;
+        // load_cover_variant_for needs a free heap window.
+        self.recent_row_covers = [const { None }; MAX_RECENT_ROWS];
 
         for entry in all.iter().take(n) {
             if out >= MAX_RECENT_ROWS {
@@ -237,6 +259,11 @@ impl HomeApp {
             row.progress_pct = 0; // chunk I follow-up: read from bundle header
             row.valid = true;
             self.recent_rows[out] = row;
+            self.recent_row_covers[out] = crate::apps::cover_cache::load_cover_variant_for(
+                k,
+                entry.filename.as_bytes(),
+                plump_kernel::kernel::bundle::CoverKind::Mini,
+            );
             out += 1;
         }
         self.recent_row_count = out;
@@ -343,8 +370,20 @@ impl App<AppId> for HomeApp {
     fn on_pre_sleep(&mut self, _k: &mut KernelHandle<'_>) {
         if let Some(cover) = self.recent_cover.take() {
             log::info!(
-                "home: pre-sleep freed ~{}KB cover thumb",
+                "home: pre-sleep freed ~{}KB card cover",
                 cover.data.capacity() / 1024
+            );
+        }
+        let mut freed_bytes = 0usize;
+        for slot in self.recent_row_covers.iter_mut() {
+            if let Some(cover) = slot.take() {
+                freed_bytes += cover.data.capacity();
+            }
+        }
+        if freed_bytes > 0 {
+            log::info!(
+                "home: pre-sleep freed ~{}B mini-thumbs",
+                freed_bytes,
             );
         }
     }
@@ -537,11 +576,46 @@ impl App<AppId> for HomeApp {
                 .draw(strip)
                 .ok();
 
-            // title (left), percent (right)
+            // mini-thumb cover on the left. covers stored by
+            // `cover_cache::save_cover_variants` are 1-bit packed at
+            // `MINI_THUMB_W x MINI_THUMB_H`; invert the bit when the
+            // row is selected so the dark cover renders against the
+            // inverted row background.
+            let cover_x = region.x + ROW_COVER_PAD;
+            let cover_y = region.y + ROW_COVER_PAD;
+            if let Some(ref img) = self.recent_row_covers[i] {
+                strip.blit_1bpp(
+                    &img.data,
+                    0,
+                    img.width as usize,
+                    img.height as usize,
+                    img.stride,
+                    cover_x as i32,
+                    cover_y as i32,
+                    !selected,
+                );
+            } else {
+                // empty slot: stroke the box so the row layout reads as
+                // intentional and not "missing cover".
+                let cover_rect = Rectangle::new(
+                    Point::new(cover_x as i32, cover_y as i32),
+                    Size::new(ROW_COVER_W as u32, ROW_COVER_H as u32),
+                );
+                cover_rect
+                    .into_styled(PrimitiveStyle::with_stroke(fg, 1))
+                    .draw(strip)
+                    .ok();
+            }
+
+            // title region shifts right by the cover indent so text
+            // never collides with the thumb.
+            let text_left = region.x + ROW_COVER_PAD + ROW_TEXT_INDENT;
             let title_region = Region::new(
-                region.x + LARGE_MARGIN,
+                text_left,
                 region.y,
-                region.w.saturating_sub(LARGE_MARGIN + 64),
+                region
+                    .w
+                    .saturating_sub(ROW_COVER_PAD + ROW_TEXT_INDENT + 64 + LARGE_MARGIN),
                 region.h,
             );
             font.draw_aligned(

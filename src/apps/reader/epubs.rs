@@ -650,7 +650,8 @@ impl ReaderApp {
     /// `bg_cache_step_sync`); the Covers section requires `PidxDir`
     /// as its predecessor and that's only allocated by `finish_cache`.
     pub(super) fn generate_cover_thumb(&mut self, k: &mut KernelHandle<'_>) {
-        use crate::apps::cover_cache;
+        use crate::apps::cover_cache::{self, CoverVariantBlob};
+        use plump_kernel::kernel::bundle::CoverKind;
         use smol_epub::epub::CoverMediaType;
 
         if !self.epub.meta.has_cover() {
@@ -658,8 +659,13 @@ impl ReaderApp {
         }
 
         let name_hash = self.epub.name_hash;
-        if cover_cache::has_cover_thumb(k, name_hash) {
-            log::info!("epub: cover thumb already cached");
+        // migration: skip only when both variants exist. legacy bundles
+        // with only the oversized Card from the single-variant era
+        // re-decode here on next reader open.
+        if cover_cache::has_cover_variant(k, name_hash, CoverKind::Mini)
+            && cover_cache::has_cover_variant(k, name_hash, CoverKind::Card)
+        {
+            log::info!("epub: cover thumbs already cached");
             return;
         }
 
@@ -711,32 +717,66 @@ impl ReaderApp {
             self.epub.ch_cache = Vec::new();
         }
 
-        let result = super::images::decode_image_streaming(
+        // decode card-thumb first, then mini-thumb. each call runs the
+        // smol-epub greyscale-pass downscaling at the requested cap,
+        // so each output is independently well-dithered (re-dithering
+        // or downscaling a 1-bit image post-decode would break the
+        // Floyd-Steinberg pattern).
+        let card = match super::images::decode_image_streaming(
             k,
             epub_name,
             &entry,
             is_jpeg,
-            cover_cache::COVER_THUMB_MAX_W,
-            cover_cache::COVER_THUMB_MAX_H,
+            cover_cache::CARD_THUMB_W,
+            cover_cache::CARD_THUMB_H,
+        ) {
+            Ok(img) => img,
+            Err(e) => {
+                log::warn!("epub: card-thumb decode failed: {}", e);
+                return;
+            }
+        };
+        log::info!(
+            "epub: decoded card-thumb {}x{} ({} bytes 1-bit)",
+            card.width,
+            card.height,
+            card.data.len(),
         );
 
-        match result {
-            Ok(img) => {
-                log::info!(
-                    "epub: decoded cover thumb {}x{} ({} bytes)",
-                    img.width,
-                    img.height,
-                    img.data.len(),
-                );
-                if let Err(e) = cover_cache::save_cover_thumb(k, name_hash, &img) {
-                    log::warn!("epub: cover thumb save failed: {}", e);
-                } else {
-                    log::info!("epub: cover thumb cached");
-                }
-            }
+        let mini = match super::images::decode_image_streaming(
+            k,
+            epub_name,
+            &entry,
+            is_jpeg,
+            cover_cache::MINI_THUMB_W,
+            cover_cache::MINI_THUMB_H,
+        ) {
+            Ok(img) => img,
             Err(e) => {
-                log::warn!("epub: cover thumb decode failed: {}", e);
+                log::warn!("epub: mini-thumb decode failed: {}", e);
+                return;
             }
+        };
+        log::info!(
+            "epub: decoded mini-thumb {}x{} ({} bytes 1-bit)",
+            mini.width,
+            mini.height,
+            mini.data.len(),
+        );
+
+        let blobs = [
+            CoverVariantBlob {
+                kind: CoverKind::Card,
+                image: &card,
+            },
+            CoverVariantBlob {
+                kind: CoverKind::Mini,
+                image: &mini,
+            },
+        ];
+        match cover_cache::save_cover_variants(k, name_hash, &blobs) {
+            Ok(()) => log::info!("epub: cover thumbs cached (card + mini)"),
+            Err(e) => log::warn!("epub: cover thumbs save failed: {}", e),
         }
     }
 

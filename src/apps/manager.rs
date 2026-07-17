@@ -970,10 +970,27 @@ impl AppLayer for AppManager {
         AppManager::ghost_clear_every(self)
     }
 
-    fn wants_grayscale(&self) -> bool {
-        self.launcher.active() == AppId::Reader
-            && !self.quick_menu.open
-            && self.reader.wants_grayscale()
+    fn grayscale_mode(&self) -> crate::kernel::app::GrayscaleMode {
+        use crate::kernel::app::GrayscaleMode;
+        if self.quick_menu.open {
+            return GrayscaleMode::Disabled;
+        }
+        match self.launcher.active() {
+            // reader page turns are deliberate + spaced; firing AA
+            // back-to-back with the partial DU hides the latency well.
+            AppId::Reader => {
+                if self.reader.wants_grayscale() {
+                    GrayscaleMode::Immediate
+                } else {
+                    GrayscaleMode::Disabled
+                }
+            }
+            // home has frequent up/down navigation; defer AA so each
+            // keypress stays snappy and the final settled view picks
+            // up the AA pass.
+            AppId::Home => GrayscaleMode::Deferred,
+            _ => GrayscaleMode::Disabled,
+        }
     }
 
     fn wifi_config(&self) -> &WifiConfig {

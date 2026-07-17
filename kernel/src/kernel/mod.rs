@@ -147,6 +147,13 @@ pub struct Kernel {
     // phase3_sync (rapid navigation); next partial uses inv_red
     pub(crate) red_stale: bool,
 
+    // armed by the render path when the active app uses
+    // `GrayscaleMode::Deferred`. the main loop fires the AA pass once
+    // this instant has passed AND no new redraw is pending. cleared on
+    // every render (re-armed if the new frame still wants Deferred),
+    // on sleep, and when `text_aa` is toggled off.
+    pub(crate) aa_deferred_at: Option<embassy_time::Instant>,
+
     // power-button policy state machine; resolves raw power events
     // into semantic inputs (MenuTap) or sleep requests
     pub(crate) input_policy: input_policy::InputPolicyState,
@@ -209,6 +216,7 @@ impl Kernel {
             cached_battery_mv: battery_mv,
             partial_refreshes: 0,
             red_stale: false,
+            aa_deferred_at: None,
             input_policy: input_policy::InputPolicyState::new(),
             applied: AppliedSettings::new(),
             theme: Theme::default_v1(),

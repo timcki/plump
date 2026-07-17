@@ -15,10 +15,16 @@
 // idle current from ~150 uA to ~10 uA
 
 use embassy_futures::select::{Either, select};
-use embassy_time::{Duration, Ticker, with_timeout};
+use embassy_time::{Duration, Instant, Ticker, with_timeout};
 use log::{debug, info};
 
-use super::app::{AppLayer, Redraw, Transition};
+use super::app::{AppLayer, GrayscaleMode, Redraw, Transition};
+
+/// Idle window before a `GrayscaleMode::Deferred` AA pass fires. Sized
+/// to feel "settled" without making the user wait noticeably: shorter
+/// than a normal reading pause, longer than a single keypress
+/// repeat-rate.
+const DEFERRED_GRAYSCALE_DELAY: Duration = Duration::from_millis(800);
 use super::input_policy::{ResolvedInput, SemanticInput};
 use crate::drivers::battery;
 use crate::drivers::input::Event;
@@ -83,7 +89,6 @@ impl super::Kernel {
     // if waking from deep sleep with valid RTC session, restore it
     pub async fn boot<A: AppLayer>(&mut self, app_mgr: &mut A) {
         use super::rtc_session::RtcSession;
-        use embassy_time::Instant;
 
         let boot_start = Instant::now();
 
@@ -356,6 +361,24 @@ impl super::Kernel {
                     continue;
                 }
             }
+
+            // deferred grayscale fire: when the active app uses
+            // `GrayscaleMode::Deferred` the previous render armed
+            // `aa_deferred_at`. fire the AA pass once the idle window
+            // has elapsed and the screen is still settled (no pending
+            // redraw, AA setting still on, no power-down in progress).
+            // tick granularity is `TICK_MS` so the fire-latency is at
+            // most ~10 ms past the armed instant.
+            if let Some(at) = self.aa_deferred_at {
+                if !app_mgr.system_settings().text_aa
+                    || !matches!(app_mgr.grayscale_mode(), GrayscaleMode::Deferred)
+                {
+                    self.aa_deferred_at = None;
+                } else if Instant::now() >= at && !app_mgr.has_redraw() {
+                    self.aa_deferred_at = None;
+                    self.fire_deferred_grayscale(app_mgr).await;
+                }
+            }
         }
     }
 
@@ -510,7 +533,6 @@ impl super::Kernel {
     // returns true if power-long-press arrived during the waveform and
     // the caller should enter sleep
     async fn render<A: AppLayer>(&mut self, app_mgr: &mut A, redraw: Redraw) -> bool {
-        use embassy_time::Instant;
         crate::perf_begin!(_render_t0);
 
         #[cfg(feature = "perf")]
@@ -611,33 +633,49 @@ impl super::Kernel {
                             app_mgr.ctx_mut().mark_dirty(r);
                             self.red_stale = true;
                             self.partial_refreshes += 1;
+                            // a fresh redraw is queued — cancel any
+                            // pending deferred-AA so we don't fire it
+                            // on stale content.
+                            self.aa_deferred_at = None;
                         } else {
                             self.partial_refreshes += 1;
 
-                            if app_mgr.system_settings().text_aa
-                                && app_mgr.wants_grayscale()
-                                && !app_mgr.has_redraw()
-                            {
-                                // grayscale AA: skip phase3_sync (gray overwrites
-                                // both RAMs) and skip post-gray restore (next page
-                                // turn uses inv_red to resync)
-                                let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                                if self.epd.grayscale_pass(self.strip, &rs, &draw).await.is_err() {
-                                    log::warn!("render: grayscale_pass timed out, forcing full GC next frame");
-                                    // post-wait BW restore was skipped; next partial would
-                                    // see stale BW delta. force a full GC on the next refresh
-                                    self.partial_refreshes = app_mgr.ghost_clear_every();
-                                }
-                                self.red_stale = true;
+                            let aa_enabled = app_mgr.system_settings().text_aa;
+                            let mode = if aa_enabled {
+                                app_mgr.grayscale_mode()
                             } else {
-                                let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                                self.epd.partial_phase3_sync(self.strip, &rs, &draw);
-                                // don't clear red_stale here: phase3_sync only
-                                // covers the dirty region, so RED RAM outside it
-                                // may still be desynchronised (e.g. after a
-                                // grayscale pass). only full GC clears red_stale.
-                                if self.epd.power_off_async().await.is_err() {
-                                    log::warn!("render: power_off_async timed out after partial DU");
+                                GrayscaleMode::Disabled
+                            };
+                            match mode {
+                                GrayscaleMode::Immediate => {
+                                    // grayscale AA: skip phase3_sync (gray overwrites
+                                    // both RAMs) and skip post-gray restore (next page
+                                    // turn uses inv_red to resync)
+                                    let draw = |s: &mut StripBuffer| app_mgr.draw(s);
+                                    if self.epd.grayscale_pass(self.strip, &rs, &draw).await.is_err() {
+                                        log::warn!("render: grayscale_pass timed out, forcing full GC next frame");
+                                        // post-wait BW restore was skipped; next partial would
+                                        // see stale BW delta. force a full GC on the next refresh
+                                        self.partial_refreshes = app_mgr.ghost_clear_every();
+                                    }
+                                    self.red_stale = true;
+                                    self.aa_deferred_at = None;
+                                }
+                                GrayscaleMode::Deferred | GrayscaleMode::Disabled => {
+                                    let draw = |s: &mut StripBuffer| app_mgr.draw(s);
+                                    self.epd.partial_phase3_sync(self.strip, &rs, &draw);
+                                    // don't clear red_stale here: phase3_sync only
+                                    // covers the dirty region, so RED RAM outside it
+                                    // may still be desynchronised (e.g. after a
+                                    // grayscale pass). only full GC clears red_stale.
+                                    if self.epd.power_off_async().await.is_err() {
+                                        log::warn!("render: power_off_async timed out after partial DU");
+                                    }
+                                    self.aa_deferred_at = if matches!(mode, GrayscaleMode::Deferred) {
+                                        Some(Instant::now() + DEFERRED_GRAYSCALE_DELAY)
+                                    } else {
+                                        None
+                                    };
                                 }
                             }
                         }
@@ -694,29 +732,42 @@ impl super::Kernel {
                 self.red_stale = false;
 
                 // After a full GC refresh the panel is left in plain BW.
-                // re-apply grayscale AA for reader text; next partial
-                // will use inv_red to resync both RAM planes
-                if app_mgr.system_settings().text_aa
-                    && app_mgr.wants_grayscale()
-                    && !app_mgr.has_redraw()
-                    && deferred.is_none()
-                {
-                    let rs = crate::drivers::ssd1677::RenderState {
-                        px: 0,
-                        py: 0,
-                        pw: crate::drivers::ssd1677::WIDTH,
-                        ph: crate::drivers::ssd1677::HEIGHT,
-                        left_mask: 0,
-                        right_mask: 0,
-                    };
-                    let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                    if self.epd.grayscale_pass(self.strip, &rs, &draw).await.is_err() {
-                        log::warn!(
-                            "render: post-GC grayscale_pass timed out, forcing full GC next frame"
-                        );
-                        self.partial_refreshes = app_mgr.ghost_clear_every();
+                // re-apply grayscale AA per the current `GrayscaleMode`
+                // (or arm the deferred timer). next partial will use
+                // inv_red to resync both RAM planes when the gray pass
+                // does fire.
+                let aa_enabled = app_mgr.system_settings().text_aa;
+                let mode = if aa_enabled && !app_mgr.has_redraw() && deferred.is_none() {
+                    app_mgr.grayscale_mode()
+                } else {
+                    GrayscaleMode::Disabled
+                };
+                match mode {
+                    GrayscaleMode::Immediate => {
+                        let rs = crate::drivers::ssd1677::RenderState {
+                            px: 0,
+                            py: 0,
+                            pw: crate::drivers::ssd1677::WIDTH,
+                            ph: crate::drivers::ssd1677::HEIGHT,
+                            left_mask: 0,
+                            right_mask: 0,
+                        };
+                        let draw = |s: &mut StripBuffer| app_mgr.draw(s);
+                        if self.epd.grayscale_pass(self.strip, &rs, &draw).await.is_err() {
+                            log::warn!(
+                                "render: post-GC grayscale_pass timed out, forcing full GC next frame"
+                            );
+                            self.partial_refreshes = app_mgr.ghost_clear_every();
+                        }
+                        self.red_stale = true;
+                        self.aa_deferred_at = None;
                     }
-                    self.red_stale = true;
+                    GrayscaleMode::Deferred => {
+                        self.aa_deferred_at = Some(Instant::now() + DEFERRED_GRAYSCALE_DELAY);
+                    }
+                    GrayscaleMode::Disabled => {
+                        self.aa_deferred_at = None;
+                    }
                 }
 
                 if let Some(action) = deferred {
@@ -740,6 +791,38 @@ impl super::Kernel {
         );
 
         sleep_requested
+    }
+
+    // run a full-screen grayscale_pass on top of an already-rendered
+    // BW image. fires only from the main loop after the deferred-AA
+    // timer expires; the EPD is powered off coming in (last partial DU
+    // called power_off_async), grayscale_pass's `0xCF` waveform clocks
+    // power back on internally and powers off again at the end.
+    async fn fire_deferred_grayscale<A: AppLayer>(&mut self, app_mgr: &mut A) {
+        let rs = crate::drivers::ssd1677::RenderState {
+            px: 0,
+            py: 0,
+            pw: crate::drivers::ssd1677::WIDTH,
+            ph: crate::drivers::ssd1677::HEIGHT,
+            left_mask: 0,
+            right_mask: 0,
+        };
+        let draw = |s: &mut StripBuffer| app_mgr.draw(s);
+        let t0 = Instant::now();
+        if self.epd.grayscale_pass(self.strip, &rs, &draw).await.is_err() {
+            log::warn!(
+                "render: deferred grayscale_pass timed out, forcing full GC next frame"
+            );
+            self.partial_refreshes = app_mgr.ghost_clear_every();
+        }
+        // BW restore inside grayscale_pass leaves BW RAM in sync with
+        // the just-drawn image, but RED RAM now holds the gray plane.
+        // mark stale so the next partial DU compensates with inv_red.
+        self.red_stale = true;
+        debug!(
+            "render: deferred grayscale_pass complete ({}ms)",
+            t0.elapsed().as_millis()
+        );
     }
 
     // collect input and run background work while EPD is busy refreshing
@@ -830,9 +913,12 @@ impl super::Kernel {
     // the SD copy is the reliable fallback (~20ms extra).
     async fn sleep_with_session<A: AppLayer>(&mut self, app_mgr: &mut A, reason: &str) {
         use super::rtc_session::RtcSession;
-        use embassy_time::Instant;
 
         let sleep_start = Instant::now();
+
+        // about to deep-sleep — cancel any pending grayscale-AA fire so
+        // it doesn't run with stale state on wake.
+        self.aa_deferred_at = None;
 
         // save active app state (reader position) to bookmark cache
         // before collecting session, so bookmarks stay in sync
@@ -891,8 +977,7 @@ impl super::Kernel {
     //
     // uses a custom sleep config that keeps RTC FAST memory powered
     // so session state survives the sleep cycle (~1-2µA extra)
-    async fn enter_sleep(&mut self, reason: &str, sleep_start: embassy_time::Instant) {
-        use embassy_time::Instant;
+    async fn enter_sleep(&mut self, reason: &str, sleep_start: Instant) {
         use embedded_graphics::mono_font::MonoTextStyle;
         use embedded_graphics::mono_font::ascii::FONT_9X18;
         use embedded_graphics::pixelcolor::BinaryColor;

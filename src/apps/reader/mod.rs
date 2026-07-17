@@ -1545,8 +1545,11 @@ impl ReaderApp {
             return false;
         }
 
-        self.loading_cover =
-            crate::apps::cover_cache::load_cover_for(k, self.filename.as_bytes());
+        self.loading_cover = crate::apps::cover_cache::load_cover_variant_for(
+            k,
+            self.filename.as_bytes(),
+            plump_kernel::kernel::bundle::CoverKind::Card,
+        );
 
         if let Some(ref img) = self.loading_cover {
             log::debug!(
