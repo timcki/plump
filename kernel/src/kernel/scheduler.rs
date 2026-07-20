@@ -562,7 +562,25 @@ impl super::Kernel {
                 let ghost_clear_every = app_mgr.ghost_clear_every();
 
                 if self.partial_refreshes < ghost_clear_every {
-                    let r = r.align8();
+                    // red_stale means RED RAM is desynchronised somewhere
+                    // on screen (grayscale pass, or a skipped phase3).
+                    // expand this refresh to the full screen so the
+                    // inv_red re-drive plus phase3_sync below cover
+                    // everything and the flag can clear. a region-limited
+                    // recovery leaves red_stale set forever, forcing a
+                    // visible full re-drive of every dirty region until
+                    // the next GC (e.g. each home selection move).
+                    let entered_stale = self.red_stale;
+                    let r = if entered_stale {
+                        crate::ui::Region::new(
+                            0,
+                            0,
+                            crate::board::SCREEN_W,
+                            crate::board::SCREEN_H,
+                        )
+                    } else {
+                        r.align8()
+                    };
 
                     let t_write = Instant::now();
                     let rs = {
@@ -664,10 +682,15 @@ impl super::Kernel {
                                 GrayscaleMode::Deferred | GrayscaleMode::Disabled => {
                                     let draw = |s: &mut StripBuffer| app_mgr.draw(s);
                                     self.epd.partial_phase3_sync(self.strip, &rs, &draw);
-                                    // don't clear red_stale here: phase3_sync only
-                                    // covers the dirty region, so RED RAM outside it
-                                    // may still be desynchronised (e.g. after a
-                                    // grayscale pass). only full GC clears red_stale.
+                                    // clear red_stale only when this frame was
+                                    // expanded to the full screen: then phase1's
+                                    // inv_red re-drive plus this phase3_sync have
+                                    // resynchronised RED RAM everywhere. for
+                                    // region-limited frames RED outside the
+                                    // region may still be desynchronised.
+                                    if entered_stale {
+                                        self.red_stale = false;
+                                    }
                                     if self.epd.power_off_async().await.is_err() {
                                         log::warn!("render: power_off_async timed out after partial DU");
                                     }
@@ -814,11 +837,18 @@ impl super::Kernel {
                 "render: deferred grayscale_pass timed out, forcing full GC next frame"
             );
             self.partial_refreshes = app_mgr.ghost_clear_every();
+            self.red_stale = true;
+            return;
         }
         // BW restore inside grayscale_pass leaves BW RAM in sync with
-        // the just-drawn image, but RED RAM now holds the gray plane.
-        // mark stale so the next partial DU compensates with inv_red.
-        self.red_stale = true;
+        // the just-drawn image, but RED RAM holds the gray plane.
+        // resync RED here (cheap RAM write, we are idle) so the next
+        // partial stays a minimal delta; leaving it stale would force
+        // an inv_red re-drive of the whole screen on the next input.
+        // leftover gray at AA edge pixels under unchanged content is
+        // invisible and gets re-grayed on the next deferred pass.
+        self.epd.partial_phase3_sync(self.strip, &rs, &draw);
+        self.red_stale = false;
         debug!(
             "render: deferred grayscale_pass complete ({}ms)",
             t0.elapsed().as_millis()
