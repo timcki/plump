@@ -551,9 +551,11 @@ impl App<AppId> for HomeApp {
             if !row.valid {
                 continue;
             }
+            let mut pct = crate::ui::stack_fmt::StackFmt::<8>::new();
+            let _ = write!(pct, "{}%", row.progress_pct);
             BookRow::new(row_region(i), row.display_name())
                 .cover(self.recent_row_covers[i].as_ref())
-                .progress_pct(row.progress_pct)
+                .trailing(pct.as_str())
                 .selected(self.selected == i + 1)
                 .draw(strip, font);
         }

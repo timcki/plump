@@ -1400,6 +1400,63 @@ pub fn read_header(sd: &SdStorage, name_hash: u32) -> Option<BundleHeader> {
     BundleHeader::decode(&buf)
 }
 
+/// sum the cached per-chapter page counts from the PidxDir section.
+/// the on-disk `LayoutIdxHeader.total_pages` field is never stamped
+/// with a real value, so the chapter dir entries are the source of
+/// truth. returns None when the bundle or its page index is missing
+/// or invalid; Some(0) when the index exists but no chapter has been
+/// laid out yet. the count reflects whatever font/layout the index
+/// was last built for, so treat it as approximate after a reader
+/// settings change, and as a lower bound while a book is still being
+/// indexed in the background.
+pub fn cached_total_pages(sd: &SdStorage, name_hash: u32) -> Option<u32> {
+    let hdr = read_header(sd, name_hash)?;
+    if !hdr.has_flag(FLAG_PAGEIDX_READY) {
+        return None;
+    }
+    let dir = hdr.section(SectionId::PidxDir)?;
+    if dir.size < PAGEIDX_HDR_V2_SIZE as u32 {
+        return None;
+    }
+
+    // validate the PIDX stamp (magic + format) before trusting the
+    // entries; a mismatched key still yields a usable approximation
+    let mut hbuf = [0u8; PAGEIDX_HDR_V2_SIZE];
+    let n = read_at(sd, name_hash, dir.offset, &mut hbuf).ok()?;
+    if n < PAGEIDX_HDR_V2_SIZE {
+        return None;
+    }
+    LayoutIdxHeader::decode(&hbuf)?;
+
+    let avail = (dir.size as usize - PAGEIDX_HDR_V2_SIZE) / CHAPTER_LAYOUT_DIR_SIZE;
+    let n_entries = (hdr.spine_count as usize).min(avail);
+
+    // read the chapter dir in small batches to bound the stack buffer
+    const BATCH: usize = 20;
+    let mut buf = [0u8; BATCH * CHAPTER_LAYOUT_DIR_SIZE];
+    let mut total = 0u32;
+    let mut i = 0usize;
+    while i < n_entries {
+        let batch = (n_entries - i).min(BATCH);
+        let bytes = batch * CHAPTER_LAYOUT_DIR_SIZE;
+        let off = dir.offset
+            + PAGEIDX_HDR_V2_SIZE as u32
+            + (i * CHAPTER_LAYOUT_DIR_SIZE) as u32;
+        let n = read_at(sd, name_hash, off, &mut buf[..bytes]).ok()?;
+        if n < bytes {
+            return None;
+        }
+        for j in 0..batch {
+            let rec = &buf[j * CHAPTER_LAYOUT_DIR_SIZE..(j + 1) * CHAPTER_LAYOUT_DIR_SIZE];
+            if let Some(d) = ChapterLayoutDir::decode(rec) {
+                total = total.saturating_add(d.page_count as u32);
+            }
+        }
+        i += batch;
+    }
+    Some(total)
+}
+
 /// write just the 256-byte header to offset 0 (creates the file if
 /// missing). use this for frequent header-only updates (bookmark,
 /// stats, progress).

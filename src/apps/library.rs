@@ -52,6 +52,9 @@ pub struct LibraryApp {
     page: usize,
     entries: [Option<DirEntry>; ROWS_PER_PAGE],
     covers: [Option<DecodedImage>; ROWS_PER_PAGE],
+    // cached page count per row from the book's layout index; 0 =
+    // unknown (never opened, or not indexed yet)
+    pages: [u32; ROWS_PER_PAGE],
     page_count: usize,
     total: usize,
     ui_fonts: fonts::UiFonts,
@@ -71,6 +74,7 @@ impl LibraryApp {
             page: 0,
             entries: [const { None }; ROWS_PER_PAGE],
             covers: [const { None }; ROWS_PER_PAGE],
+            pages: [0; ROWS_PER_PAGE],
             page_count: 0,
             total: 0,
             ui_fonts: fonts::UiFonts::for_size(0),
@@ -93,6 +97,7 @@ impl LibraryApp {
         // drop old covers before loading new ones so
         // load_cover_variant_for has a free heap window
         self.covers = [const { None }; ROWS_PER_PAGE];
+        self.pages = [0; ROWS_PER_PAGE];
         self.page_count = 0;
         self.total = 0;
 
@@ -111,6 +116,10 @@ impl LibraryApp {
                 entry.name.as_bytes(),
                 plump_kernel::kernel::bundle::CoverKind::Mini,
             );
+            let name_hash = plump_kernel::util::hash::fnv1a(entry.name.as_bytes());
+            self.pages[i] =
+                plump_kernel::kernel::bundle::cached_total_pages(k.sd(), name_hash)
+                    .unwrap_or(0);
             self.entries[i] = Some(*entry);
         }
         if self.selected >= self.page_count {
@@ -240,8 +249,21 @@ impl App<AppId> for LibraryApp {
             let Some(entry) = self.entries[i].as_ref() else {
                 continue;
             };
+            // page count from the cached layout index; hidden until
+            // the book has been opened and indexed at least once
+            let mut pages = crate::ui::stack_fmt::StackFmt::<16>::new();
+            match self.pages[i] {
+                0 => {}
+                1 => {
+                    let _ = write!(pages, "1 page");
+                }
+                n => {
+                    let _ = write!(pages, "{} pages", n);
+                }
+            }
             BookRow::new(row_region(i), entry.display_name())
                 .cover(self.covers[i].as_ref())
+                .trailing(pages.as_str())
                 .selected(self.selected == i)
                 .draw(strip, font);
         }

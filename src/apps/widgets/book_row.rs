@@ -1,15 +1,13 @@
 // book list row: rounded background with inverted selection, 64x96
-// mini-thumb cover on the left, title next to it, optional progress
-// percent on the right. shared by the home RECENT list and the
-// library list so both screens render identically.
-
-use core::fmt::Write as _;
+// mini-thumb cover on the left, title next to it, optional trailing
+// text on the right ("42%" on home, "312 pages" in the library).
+// shared by the home RECENT list and the library list so both
+// screens render identically.
 
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle, RoundedRectangle};
 
-use crate::apps::widgets::BitmapDynLabel;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::bitmap::BitmapFont;
 use crate::kernel::work_queue::DecodedImage;
@@ -25,15 +23,15 @@ pub const BOOK_ROW_COVER_H: u16 = 96;
 const COVER_PAD: u16 = 4;
 const TEXT_INDENT: u16 = BOOK_ROW_COVER_W + 12;
 
-// width reserved on the right for the trailing percent label
-const TRAILING_W: u16 = 64;
+// gap between the title and the trailing text
+const TRAILING_GAP: u16 = 8;
 const CORNER: Size = Size::new(4, 4);
 
 pub struct BookRow<'a> {
     region: Region,
     title: &'a str,
     cover: Option<&'a DecodedImage>,
-    progress_pct: Option<u8>,
+    trailing: Option<&'a str>,
     selected: bool,
 }
 
@@ -43,7 +41,7 @@ impl<'a> BookRow<'a> {
             region,
             title,
             cover: None,
-            progress_pct: None,
+            trailing: None,
             selected: false,
         }
     }
@@ -53,8 +51,12 @@ impl<'a> BookRow<'a> {
         self
     }
 
-    pub fn progress_pct(mut self, pct: u8) -> Self {
-        self.progress_pct = Some(pct);
+    /// Right-aligned text after the title (progress percent, page
+    /// count). Empty strings are treated as absent.
+    pub fn trailing(mut self, text: &'a str) -> Self {
+        if !text.is_empty() {
+            self.trailing = Some(text);
+        }
         self
     }
 
@@ -108,11 +110,12 @@ impl<'a> BookRow<'a> {
             .ok();
         }
 
-        // title shifts right past the cover; the trailing percent
-        // (when shown) reserves width on the right so text never
-        // collides with either neighbour.
-        let trailing = if self.progress_pct.is_some() {
-            TRAILING_W + LARGE_MARGIN
+        // title shifts right past the cover; the trailing text (when
+        // shown) reserves its measured width on the right so the two
+        // never collide.
+        let trailing_w = self.trailing.map(|t| font.measure_str(t)).unwrap_or(0);
+        let reserve = if trailing_w > 0 {
+            trailing_w + LARGE_MARGIN + TRAILING_GAP
         } else {
             LARGE_MARGIN
         };
@@ -120,23 +123,19 @@ impl<'a> BookRow<'a> {
         let title_region = Region::new(
             text_left,
             region.y,
-            region.w.saturating_sub(COVER_PAD + TEXT_INDENT + trailing),
+            region.w.saturating_sub(COVER_PAD + TEXT_INDENT + reserve),
             region.h,
         );
         font.draw_aligned(strip, title_region, self.title, Alignment::CenterLeft, fg);
 
-        if let Some(pct) = self.progress_pct {
-            let pct_region = Region::new(
-                region.x + region.w - TRAILING_W - LARGE_MARGIN,
+        if let Some(text) = self.trailing {
+            let trailing_region = Region::new(
+                region.x + region.w.saturating_sub(trailing_w + LARGE_MARGIN),
                 region.y,
-                TRAILING_W,
+                trailing_w,
                 region.h,
             );
-            let mut pct_buf = BitmapDynLabel::<8>::new(pct_region, font)
-                .alignment(Alignment::CenterRight)
-                .inverted(self.selected);
-            let _ = write!(pct_buf, "{}%", pct);
-            pct_buf.draw(strip).ok();
+            font.draw_aligned(strip, trailing_region, text, Alignment::CenterRight, fg);
         }
     }
 }
