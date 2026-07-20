@@ -153,6 +153,7 @@ fn apply_widow_orphan(
         return;
     }
     let half = (max_lines as usize) / 2;
+    let cap = max_lines as usize;
 
     for p in 1..pages.len() {
         let prev = pages[p - 1];
@@ -162,6 +163,14 @@ fn apply_widow_orphan(
 
         if prev.line_count as usize <= half + 1 {
             continue; // previous page already short; don't shrink further
+        }
+
+        // never grow the current page past capacity: the renderer
+        // draws line i at text_y + i * line_h, so an overfull page
+        // prints its extra line over the footer chrome. single-pass
+        // adjustment cannot cascade the overflow forward, so skip.
+        if cur.line_count as usize >= cap {
+            continue;
         }
 
         // Skip if either side touches an image block (image atomicity wins).
@@ -1035,5 +1044,28 @@ mod tests {
                 && p1.line_count > 0),
             "widow detected after pagination",
         );
+    }
+
+    #[test]
+    fn widow_orphan_never_overfills_page() {
+        // 13 lines, max_lines=6 -> pages of 6 + 6 + 1. line 6 (first of
+        // page 1) is a paragraph end while line 5 is not: widow shape,
+        // but page 1 is already at capacity so the fix must not fire.
+        let mut lines = Vec::new();
+        for i in 0..13 {
+            lines.push(line(i * 10, i * 10 + 5, 0));
+        }
+        lines[6].flags |= LineLayout::FLAG_PARAGRAPH_END;
+        let img = vec![0u8; lines.len()];
+        let mut pages = Vec::new();
+        paginate(&lines, 6, &img, &mut pages).unwrap();
+        for (i, p) in pages.iter().enumerate() {
+            assert!(
+                p.line_count <= 6,
+                "page {} overfull: {} lines > cap 6",
+                i,
+                p.line_count,
+            );
+        }
     }
 }

@@ -272,6 +272,13 @@ impl StripBuffer {
         if w == 0 || h == 0 || offset + stride * h > bitmaps.len() {
             return;
         }
+        // gray passes refresh only AA glyph pixels (blit_2bpp). 1bpp
+        // content writes BW polarity, which the gray LUT would read as
+        // a drive-gray state; skipping leaves both planes at {0,0} =
+        // no change, so the panel keeps the BW-refresh image.
+        if self.gray_mode != GrayMode::Bw {
+            return;
+        }
         match self.rotation {
             Rotation::Deg270 => self.blit_1bpp_270(bitmaps, offset, w, h, stride, gx, gy, black),
             _ => self.blit_1bpp_generic(bitmaps, offset, w, h, stride, gx, gy, black),
@@ -363,7 +370,9 @@ impl StripBuffer {
     ///
     /// Pixel values: 0=white, 1=light gray, 2=dark gray, 3=black.
     /// `black` controls polarity in Bw mode (true=black text, false=white text).
-    /// In gray modes, `black` is ignored — gray planes always set bits.
+    /// In gray modes, white text (`black == false`) is skipped entirely:
+    /// the gray LUT states drive pixels darkward, which would erase
+    /// white-on-dark glyphs. Skipping leaves them at {0,0} = no change.
     ///
     /// Behaviour depends on `self.gray_mode`:
     ///   Bw:       any non-zero → set/clear bit per `black` (buffer starts 0xFF)
@@ -384,6 +393,9 @@ impl StripBuffer {
         black: bool,
     ) {
         if w == 0 || h == 0 || offset + stride * h > bitmaps.len() {
+            return;
+        }
+        if self.gray_mode != GrayMode::Bw && !black {
             return;
         }
         match self.rotation {
@@ -597,6 +609,10 @@ impl DrawTarget for StripBuffer {
     where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
+        // BW-polarity path; a no-op during gray passes (see blit_1bpp)
+        if self.gray_mode != GrayMode::Bw {
+            return Ok(());
+        }
         let size = self.size();
         let log_w = size.width as i32;
         let log_h = size.height as i32;
@@ -613,6 +629,10 @@ impl DrawTarget for StripBuffer {
     }
 
     fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
+        // BW-polarity path; a no-op during gray passes (see blit_1bpp)
+        if self.gray_mode != GrayMode::Bw {
+            return Ok(());
+        }
         let size = self.size();
         let sw = size.width as u16;
         let sh = size.height as u16;
@@ -654,6 +674,10 @@ impl DrawTarget for StripBuffer {
     where
         I: IntoIterator<Item = Self::Color>,
     {
+        // BW-polarity path; a no-op during gray passes (see blit_1bpp)
+        if self.gray_mode != GrayMode::Bw {
+            return Ok(());
+        }
         let w = area.size.width as i32;
         if w == 0 {
             return Ok(());

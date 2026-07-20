@@ -956,7 +956,13 @@ pub const PAGEIDX_FORMAT_VERSION: u8 = 2;
 // identical to v11 for chapters that fit either path; bumping
 // for safety in case rounding or buffer-boundary edge cases
 // shift any single break decision.
-pub const LAYOUT_ALGO_VERSION: u8 = 15;
+//
+// v16 caps the widow/orphan adjustment at page capacity: demoting
+// a line onto an already-full page produced max_lines + 1 pages
+// whose last line rendered over the reader footer chrome. cached
+// v15 layouts may contain such overfull pages, so they must
+// re-typeset.
+pub const LAYOUT_ALGO_VERSION: u8 = 16;
 
 pub const PAGEIDX_HDR_V2_SIZE: usize = 20;
 pub const CHAPTER_LAYOUT_DIR_SIZE: usize = 24;
