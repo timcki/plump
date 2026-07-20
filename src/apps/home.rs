@@ -14,6 +14,7 @@ use embedded_graphics::primitives::{PrimitiveStyle, Rectangle, RoundedRectangle}
 
 use plump_kernel::util::FixedStr;
 
+use crate::apps::widgets::{BOOK_ROW_H, BookRow};
 use crate::apps::{App, AppContext, AppId, BgBudget, BgOutcome, RECENT_FILE, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
@@ -37,21 +38,13 @@ const CARD_H: u16 = 180;
 const CARD_PAD: u16 = 14;
 const CARD_PROGRESS_H: u16 = 5;
 
-// recent list.
+// recent list. row geometry (height, cover, indents) lives in the
+// shared BookRow widget, which the library list reuses.
 const MAX_RECENT_ROWS: usize = 3;
-const ROW_H: u16 = 104;
 const ROW_GAP: u16 = 4;
-const ROW_STRIDE: u16 = ROW_H + ROW_GAP;
+const ROW_STRIDE: u16 = BOOK_ROW_H + ROW_GAP;
 const ROW_X: u16 = LARGE_MARGIN;
 const ROW_W: u16 = FULL_CONTENT_W;
-
-// mini-thumb cover at the left of each recent row. matches
-// `cover_cache::MINI_THUMB_*`; padding sits inside the row rect so the
-// cover blits cleanly against the selection background.
-const ROW_COVER_W: u16 = 64;
-const ROW_COVER_H: u16 = 96;
-const ROW_COVER_PAD: u16 = 4;
-const ROW_TEXT_INDENT: u16 = ROW_COVER_W + 12;
 
 // 1 card + N rows.
 const MAX_ITEMS: usize = 1 + MAX_RECENT_ROWS;
@@ -71,7 +64,7 @@ const FIRST_ROW_Y: u16 = RECENT_CAPTION_Y + CAPTION_H + CAPTION_GAP;
 const CONTENT_REGION: Region = Region::new(0, CONTENT_TOP, SCREEN_W, SCREEN_H - CONTENT_TOP);
 
 fn row_region(i: usize) -> Region {
-    Region::new(ROW_X, FIRST_ROW_Y + i as u16 * ROW_STRIDE, ROW_W, ROW_H)
+    Region::new(ROW_X, FIRST_ROW_Y + i as u16 * ROW_STRIDE, ROW_W, BOOK_ROW_H)
 }
 
 // recent list entry (filename + display title + progress placeholder).
@@ -427,7 +420,6 @@ impl App<AppId> for HomeApp {
 
     fn draw(&self, strip: &mut StripBuffer) {
         const R_CARD: Size = Size::new(8, 8);
-        const R_ROW: Size = Size::new(4, 4);
 
         let font = self.ui_fonts.body;
         let heading = self.ui_fonts.heading;
@@ -559,84 +551,11 @@ impl App<AppId> for HomeApp {
             if !row.valid {
                 continue;
             }
-            let region = row_region(i);
-            let selected = self.selected == i + 1;
-            let (bg, fg) = if selected {
-                (BinaryColor::On, BinaryColor::Off)
-            } else {
-                (BinaryColor::Off, BinaryColor::On)
-            };
-
-            let rect = Rectangle::new(
-                Point::new(region.x as i32, region.y as i32),
-                Size::new(region.w as u32, region.h as u32),
-            );
-            RoundedRectangle::with_equal_corners(rect, R_ROW)
-                .into_styled(PrimitiveStyle::with_fill(bg))
-                .draw(strip)
-                .ok();
-
-            // mini-thumb cover on the left. covers stored by
-            // `cover_cache::save_cover_variants` are 1-bit packed at
-            // `MINI_THUMB_W x MINI_THUMB_H`; invert the bit when the
-            // row is selected so the dark cover renders against the
-            // inverted row background.
-            let cover_x = region.x + ROW_COVER_PAD;
-            let cover_y = region.y + ROW_COVER_PAD;
-            if let Some(ref img) = self.recent_row_covers[i] {
-                strip.blit_1bpp(
-                    &img.data,
-                    0,
-                    img.width as usize,
-                    img.height as usize,
-                    img.stride,
-                    cover_x as i32,
-                    cover_y as i32,
-                    !selected,
-                );
-            } else {
-                // empty slot: stroke the box so the row layout reads as
-                // intentional and not "missing cover".
-                let cover_rect = Rectangle::new(
-                    Point::new(cover_x as i32, cover_y as i32),
-                    Size::new(ROW_COVER_W as u32, ROW_COVER_H as u32),
-                );
-                cover_rect
-                    .into_styled(PrimitiveStyle::with_stroke(fg, 1))
-                    .draw(strip)
-                    .ok();
-            }
-
-            // title region shifts right by the cover indent so text
-            // never collides with the thumb.
-            let text_left = region.x + ROW_COVER_PAD + ROW_TEXT_INDENT;
-            let title_region = Region::new(
-                text_left,
-                region.y,
-                region
-                    .w
-                    .saturating_sub(ROW_COVER_PAD + ROW_TEXT_INDENT + 64 + LARGE_MARGIN),
-                region.h,
-            );
-            font.draw_aligned(
-                strip,
-                title_region,
-                row.display_name(),
-                Alignment::CenterLeft,
-                fg,
-            );
-
-            let pct_region = Region::new(
-                region.x + region.w - 64 - LARGE_MARGIN,
-                region.y,
-                64,
-                region.h,
-            );
-            let mut pct_buf = BitmapDynLabel::<8>::new(pct_region, font)
-                .alignment(Alignment::CenterRight)
-                .inverted(selected);
-            let _ = write!(pct_buf, "{}%", row.progress_pct);
-            pct_buf.draw(strip).ok();
+            BookRow::new(row_region(i), row.display_name())
+                .cover(self.recent_row_covers[i].as_ref())
+                .progress_pct(row.progress_pct)
+                .selected(self.selected == i + 1)
+                .draw(strip, font);
         }
     }
 }
