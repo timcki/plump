@@ -979,9 +979,24 @@ impl ReaderApp {
             return;
         }
 
+        // save_title appends to TITLES.BIN, so a blind save on every
+        // open grows the file without bound. skip when the mapping is
+        // already current (dir cache mirrors TITLES.BIN + humanized
+        // fallbacks; a humanized entry won't match a real title, so
+        // first-time saves still go through).
+        let _ = k.ensure_dir_cache_loaded();
+        if k.dir_cache_mut().find_title(self.filename.as_bytes()) == Some(self.title.as_bytes()) {
+            return;
+        }
+
         if let Err(e) = k.sd().save_title(self.filename.as_str(), self.title.as_str()) {
             log::warn!("epub: failed to save title mapping: {}", e);
+            return;
         }
+        // keep the RAM cache in sync so home / library rows pick the
+        // new title up this session and repeat opens skip the save
+        k.dir_cache_mut()
+            .update_title(self.filename.as_bytes(), self.title.as_bytes());
     }
 
     fn load_toc(&mut self, k: &mut KernelHandle<'_>) {

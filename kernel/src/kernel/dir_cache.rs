@@ -45,15 +45,57 @@ impl DirCache {
     }
 
     fn load_titles(&mut self, sd: &SdStorage) {
-        let mut buf = [0u8; 4096];
-        let n = match sd.read_file_start_in_dir(sd.data_dir(), TITLES_FILE, &mut buf) {
-            Ok((_, n)) => n,
-            Err(_) => return,
-        };
+        // TITLES.BIN is append-only, so it can exceed any single read
+        // buffer (historic builds appended a line on every book open).
+        // stream the whole file in chunks, carrying partial lines
+        // across chunk boundaries; later lines overwrite earlier ones.
+        const READ_CAP: u32 = 256 * 1024; // sanity bound for corrupt files
+        let mut buf = [0u8; 2048];
+        // save_title caps lines at 128 bytes; anything longer is
+        // foreign data and gets discarded via the poisoned flag
+        let mut carry = [0u8; 160];
+        let mut carry_len = 0usize;
+        let mut poisoned = false;
+        let mut offset = 0u32;
 
-        for line in buf[..n].split(|&b| b == b'\n') {
-            if !line.is_empty() {
-                self.apply_title_line(line);
+        while offset < READ_CAP {
+            let n = match sd.read_chunk_in_plump(TITLES_FILE, offset, &mut buf) {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            if n == 0 {
+                break;
+            }
+            offset += n as u32;
+
+            let mut chunk = &buf[..n];
+            while let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+                let (part, rest) = chunk.split_at(pos);
+                if poisoned {
+                    poisoned = false;
+                } else if carry_len > 0 {
+                    if carry_len + part.len() <= carry.len() {
+                        carry[carry_len..carry_len + part.len()].copy_from_slice(part);
+                        let line_len = carry_len + part.len();
+                        self.apply_title_line(&carry[..line_len]);
+                    }
+                } else if !part.is_empty() {
+                    self.apply_title_line(part);
+                }
+                carry_len = 0;
+                chunk = &rest[1..];
+            }
+
+            if poisoned {
+                continue;
+            }
+            if carry_len + chunk.len() <= carry.len() {
+                carry[carry_len..carry_len + chunk.len()].copy_from_slice(chunk);
+                carry_len += chunk.len();
+            } else {
+                // oversized line: drop bytes until the next newline
+                carry_len = 0;
+                poisoned = true;
             }
         }
     }
@@ -130,6 +172,20 @@ impl DirCache {
     pub fn set_entry_title(&mut self, index: usize, title: &[u8]) {
         if index < self.count {
             self.entries[index].set_title(title);
+        }
+    }
+
+    // update the in-RAM title for a filename (case-insensitive), so a
+    // freshly saved title shows without an invalidate + SD reload
+    pub fn update_title(&mut self, filename: &[u8], title: &[u8]) {
+        let Ok(name) = core::str::from_utf8(filename) else {
+            return;
+        };
+        if let Some(entry) = self.entries[..self.count]
+            .iter_mut()
+            .find(|e| e.name_str().eq_ignore_ascii_case(name))
+        {
+            entry.set_title(title);
         }
     }
 }
