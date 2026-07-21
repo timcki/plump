@@ -9,7 +9,6 @@ use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
-use esp_hal::ram;
 use esp_hal::timer::timg::TimerGroup;
 use log::info;
 
@@ -63,15 +62,38 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
     paint_stack();
-    // 108 KB main DRAM heap; leaves ~56 KB for stack
-    esp_alloc::heap_allocator!(size: 110_592);
-    // reclaim ~64 KB from 2nd-stage bootloader; net heap ~172 KB
-    esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64_000);
+    // single contiguous heap (~173 KB): pinned stack top .. end of the
+    // RAM reclaimed from the 2nd-stage bootloader. symbols come from
+    // ld/stack-plump.x; the linker asserts the layout at build time
+    unsafe extern "C" {
+        static mut _heap_start: u8;
+        static mut _heap_end: u8;
+    }
+    let heap_start = &raw mut _heap_start;
+    let heap_len = (&raw const _heap_end) as usize - heap_start as usize;
+    unsafe {
+        esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
+            heap_start,
+            heap_len,
+            esp_alloc::MemoryCapability::Internal.into(),
+        ));
+    }
 
     let mut console = alloc::boxed::Box::new(BootConsole::new());
     console.push("plump 0.1.0");
     console.push("esp32c3 rv32imc 160mhz");
-    console.push("heap: 172K (108K + 64K reclaimed)");
+    log::info!(
+        "heap: {}K contiguous tlsf @{:#010x}..{:#010x}",
+        heap_len / 1024,
+        heap_start as usize,
+        (&raw const _heap_end) as usize,
+    );
+    let mut heap_line = plump::ui::StackFmt::<32>::new();
+    let _ = core::fmt::Write::write_fmt(
+        &mut heap_line,
+        format_args!("heap: {}K contiguous (tlsf)", heap_len / 1024),
+    );
+    console.push(heap_line.as_str());
 
     info!("booting...");
 

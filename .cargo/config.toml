@@ -22,6 +22,11 @@ runner = "espflash flash --monitor --chip esp32c3"
 # instrumentation cost. Build without `--features perf` for zero-overhead.
 ESP_LOG="warn,plump_kernel::kernel::scheduler=info,plump_kernel::kernel::sleep_image=info"
 
+# heap allocator algorithm: TLSF (via rlsf) instead of the default
+# first-fit linked list; O(1) alloc and far better resistance to the
+# fragmentation that starved large image-decode allocations
+ESP_ALLOC_CONFIG_HEAP_ALGORITHM="TLSF"
+
 [build]
 rustflags = [
   "-C", "force-frame-pointers",

@@ -97,6 +97,15 @@ impl<'k> KernelHandle<'k> {
         k.dir_cache.ensure_loaded(&k.sd)
     }
 
+    /// Largest single allocation the heap can satisfy right now,
+    /// found by binary-searching probe allocations (freed
+    /// immediately; each probe is O(1) under TLSF). 1 KB resolution.
+    /// Decoders should size big transient buffers against this
+    /// instead of asking for a fixed worst case.
+    pub fn largest_free_block(&self) -> usize {
+        largest_free_block()
+    }
+
     // direct cache accessors
 
     #[inline]
@@ -142,4 +151,29 @@ impl<'k> KernelHandle<'k> {
     pub fn today_key(&self) -> u32 {
         self.kernel.today_key
     }
+}
+
+/// See [`KernelHandle::largest_free_block`].
+pub fn largest_free_block() -> usize {
+    use core::alloc::Layout;
+
+    let mut lo = 0usize;
+    let mut hi = esp_alloc::HEAP.free();
+    // probe allocations are transient and single-threaded (apps run on
+    // the cooperative executor; ISRs never allocate), so alloc+dealloc
+    // pairs cannot race another allocation mid-probe
+    while hi.saturating_sub(lo) > 1024 {
+        let mid = lo + (hi - lo).div_ceil(2);
+        let Ok(layout) = Layout::from_size_align(mid, 4) else {
+            break;
+        };
+        let ptr = unsafe { alloc::alloc::alloc(layout) };
+        if ptr.is_null() {
+            hi = mid - 1;
+        } else {
+            unsafe { alloc::alloc::dealloc(ptr, layout) };
+            lo = mid;
+        }
+    }
+    lo
 }

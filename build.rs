@@ -1,6 +1,16 @@
 fn main() {
     linker_be_nice();
-    println!("cargo:rustc-link-arg=-Tlinkall.x");
+    // vendored linker chain: ld/linkall.x is passed by absolute path so
+    // it wins over esp-hal's generated linkall.x unconditionally. it
+    // pulls esp-hal fragments by name (resolved from esp-hal's OUT_DIR
+    // via -L) except the stack, which comes from the uniquely named
+    // ld/stack-plump.x: a pinned-size stack placed after .bss so the
+    // rest of DRAM + dram2 forms one contiguous heap. the ld/ search
+    // path only serves the uniquely named vendored fragments.
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    println!("cargo:rustc-link-search={manifest}/ld");
+    println!("cargo:rerun-if-changed=ld");
+    println!("cargo:rustc-link-arg=-T{manifest}/ld/linkall.x");
     generate_bitmap_fonts();
 }
 
