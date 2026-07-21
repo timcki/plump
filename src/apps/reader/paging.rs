@@ -21,6 +21,21 @@ use super::{
     DEFAULT_IMG_H, INDENT_PX, LINES_PER_PAGE, LineSpan, MAX_PAGES, NO_PREFETCH, PAGE_BUF,
     PendingPositionChange, ReaderApp, State, decode_utf8_char, inline_img_max_h,
 };
+use crate::kernel::work_queue;
+
+/// How `preindex_all_pages` ended. `RetryLater` means K-P hit an
+/// allocation failure while an image decode was in flight; the caller
+/// keeps `State::NeedIndex` and re-runs after the worker frees its
+/// buffers, so the chapter still gets K-P layout instead of greedy.
+pub(super) enum PreindexOutcome {
+    Done,
+    RetryLater,
+}
+
+/// Consecutive OOM waits before typeset stops waiting on the worker
+/// and starts shedding memory itself (livelock guard; each wait is one
+/// background step, normally bounded by <= 2 queued decode jobs).
+const TYPESET_OOM_WAIT_CAP: u8 = 16;
 
 impl ReaderApp {
     pub(super) fn wrap_lines_counted(&mut self, n: usize) -> usize {
@@ -417,7 +432,7 @@ impl ReaderApp {
         Ok(())
     }
 
-    pub(super) fn preindex_all_pages(&mut self, k: &mut KernelHandle<'_>) {
+    pub(super) fn preindex_all_pages(&mut self, k: &mut KernelHandle<'_>) -> PreindexOutcome {
         plump_kernel::perf_begin!(_pi_t0);
 
         // Empty ch_cache no longer bypasses K-P: `run_kp_typeset` falls
@@ -443,6 +458,7 @@ impl ReaderApp {
         {
             if !loaded.lines.is_empty() && !loaded.pages.is_empty() {
                 self.adopt_loaded_chapter(loaded);
+                self.typeset_oom_waits = 0;
                 plump_kernel::perf_event!(
                     "reader",
                     "preindex src=bundle pages={} lines={} elapsed_ms={}",
@@ -450,7 +466,7 @@ impl ReaderApp {
                     self.pg.chapter_lines.len(),
                     _pi_t0.elapsed().as_millis()
                 );
-                return;
+                return PreindexOutcome::Done;
             }
             // legacy cache without lines: ignore, fall through to typeset
         }
@@ -459,6 +475,7 @@ impl ReaderApp {
         self.pg.clear_kp_layout();
         match self.run_kp_typeset(k) {
             Ok(()) => {
+                self.typeset_oom_waits = 0;
                 let _ = self.save_kp_to_pidx(k, &key, ch, spine_len, name_hash);
                 plump_kernel::perf_event!(
                     "reader",
@@ -467,12 +484,62 @@ impl ReaderApp {
                     self.pg.chapter_lines.len(),
                     _pi_t0.elapsed().as_millis()
                 );
-                return;
+                return PreindexOutcome::Done;
+            }
+            Err(TypesetError::OutOfMemory) => {
+                // memory-governor escalation. step 1: an in-flight image
+                // decode holds its band buffer only until it completes,
+                // so wait for the worker instead of degrading the layout
+                if !work_queue::is_idle() && self.typeset_oom_waits < TYPESET_OOM_WAIT_CAP {
+                    self.typeset_oom_waits += 1;
+                    log::info!(
+                        "reader: typeset OOM ch{}, waiting for decode (wait {})",
+                        ch,
+                        self.typeset_oom_waits,
+                    );
+                    return PreindexOutcome::RetryLater;
+                }
+                // step 2: shed the chapter cache; run_kp_typeset falls
+                // back to streaming the chapter from the bundle on SD
+                if !self.epub.ch_cache.is_empty() {
+                    log::info!(
+                        "reader: typeset OOM ch{}, shedding {}K ch_cache and streaming",
+                        ch,
+                        self.epub.ch_cache.len() / 1024,
+                    );
+                    self.epub.ch_cache = Vec::new();
+                    self.pg.clear_kp_layout();
+                    match self.run_kp_typeset(k) {
+                        Ok(()) => {
+                            self.typeset_oom_waits = 0;
+                            let _ = self.save_kp_to_pidx(k, &key, ch, spine_len, name_hash);
+                            plump_kernel::perf_event!(
+                                "reader",
+                                "preindex src=kp-stream pages={} lines={} elapsed_ms={}",
+                                self.pg.kp_pages.len(),
+                                self.pg.chapter_lines.len(),
+                                _pi_t0.elapsed().as_millis()
+                            );
+                            return PreindexOutcome::Done;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "reader: K-P typeset failed ch{}: {:?}; greedy fallback",
+                                ch,
+                                e,
+                            );
+                        }
+                    }
+                } else {
+                    // step 3: nothing left to wait for or shed
+                    log::warn!("reader: typeset OOM ch{} unrecoverable; greedy fallback", ch);
+                }
             }
             Err(e) => {
                 log::warn!("reader: K-P typeset failed ch{}: {:?}; greedy fallback", ch, e);
             }
         }
+        self.typeset_oom_waits = 0;
 
         // 3. greedy fallback (no PIDX save — algo=2 is reserved for K-P).
         self.greedy_preindex_compute(k);
@@ -482,6 +549,7 @@ impl ReaderApp {
             self.pg.total_pages,
             _pi_t0.elapsed().as_millis()
         );
+        PreindexOutcome::Done
     }
 
     /// Adopt a `LoadedChapter` from PIDX into `pg`. Populates K-P

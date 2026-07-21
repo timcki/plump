@@ -79,6 +79,11 @@ pub enum TypesetError {
     /// All-empty chapter (e.g. only markers). Caller should emit an
     /// empty page rather than failing.
     EmptyChapter,
+    /// Growing the line buffers failed; typeset transients share the
+    /// heap with image-decode bands, so this must surface as a clean
+    /// error (caller falls back to the greedy pager) instead of the
+    /// infallible-alloc panic path.
+    OutOfMemory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,6 +160,7 @@ impl LayoutPipeline {
             let src = read_image_src(scanner, meta.image, &mut src_buf);
             let image_lines = image_lines_for(meta.image, budget, src, hint);
             let lines_before = out_lines.len();
+            try_reserve_out(out_lines, out_image_blocks, image_lines as usize + 1)?;
             convert::append_image_block(&meta, image_lines, &mut self.page_break_pending, out_lines);
             // parallel image_block_lines: stamp `image_lines` at the
             // origin slot, 0 for fillers
@@ -189,6 +195,7 @@ impl LayoutPipeline {
             Ok(()) => {
                 kp_choice_count = self.choices.len();
                 used_fallback = false;
+                try_reserve_out(out_lines, out_image_blocks, self.choices.len())?;
                 convert::append_lines(
                     &self.items,
                     &self.choices,
@@ -202,6 +209,8 @@ impl LayoutPipeline {
                 self.fallback_count = self.fallback_count.saturating_add(1);
                 kp_choice_count = 0;
                 used_fallback = true;
+                // worst case one line per item, plus the trailing flush
+                try_reserve_out(out_lines, out_image_blocks, self.items.len() + 1)?;
                 convert::append_greedy_fallback(
                     &self.items,
                     &meta,
@@ -341,6 +350,22 @@ fn check_cap(out_lines: &Vec<LineLayout>) -> Result<(), TypesetError> {
     } else {
         Ok(())
     }
+}
+
+// reserve room for one paragraph's worth of output in both parallel
+// vectors before appending, so the append loops never take Vec's
+// infallible growth path
+fn try_reserve_out(
+    out_lines: &mut Vec<LineLayout>,
+    out_image_blocks: &mut Vec<u8>,
+    additional: usize,
+) -> Result<(), TypesetError> {
+    if out_lines.try_reserve(additional).is_err()
+        || out_image_blocks.try_reserve(additional).is_err()
+    {
+        return Err(TypesetError::OutOfMemory);
+    }
+    Ok(())
 }
 
 fn ensure_parallel(out_image_blocks: &mut Vec<u8>, target_len: usize) {

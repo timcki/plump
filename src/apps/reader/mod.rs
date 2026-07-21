@@ -543,6 +543,11 @@ pub struct ReaderApp {
 
     pub(super) is_epub: bool,
     pub(super) goto_last_page: bool,
+    // consecutive typeset OOM waits on the decode worker; see the
+    // memory-governor escalation in preindex_all_pages. retry_ch pins
+    // the wait to a chapter so navigation during a wait re-indexes
+    pub(super) typeset_oom_waits: u8,
+    typeset_retry_ch: u16,
     pub(super) restore_offset: Option<u32>,
     pub(super) restore_page_hint: Option<usize>,
     pub(super) recent_dirty: bool,
@@ -619,6 +624,8 @@ impl ReaderApp {
 
             is_epub: false,
             goto_last_page: false,
+            typeset_oom_waits: 0,
+            typeset_retry_ch: 0,
             restore_offset: None,
             restore_page_hint: None,
             recent_dirty: false,
@@ -2271,7 +2278,16 @@ impl App<AppId> for ReaderApp {
                 let want_last = self.goto_last_page;
                 self.goto_last_page = false;
 
-                self.epub_index_chapter();
+                // a typeset OOM retry re-enters this arm with the chapter
+                // already indexed and ch_cache loaded; re-running
+                // epub_index_chapter would free ch_cache and force a full
+                // SD re-read per wait step
+                let retrying = self.typeset_oom_waits > 0
+                    && self.typeset_retry_ch == self.epub.chapter;
+                if !retrying {
+                    self.typeset_oom_waits = 0;
+                    self.epub_index_chapter();
+                }
 
                 if self.is_epub {
                     // try_cache_chapter is best-effort: it can return false
@@ -2280,8 +2296,23 @@ impl App<AppId> for ReaderApp {
                     // state (otherwise has_kp_layout() stays true with
                     // stale data) and fall back to bundle-streamed greedy
                     // when ch_cache is empty.
-                    self.epub.try_cache_chapter(k);
-                    self.preindex_all_pages(k);
+                    if !retrying {
+                        self.epub.try_cache_chapter(k);
+                    }
+                    if matches!(
+                        self.preindex_all_pages(k),
+                        paging::PreindexOutcome::RetryLater
+                    ) {
+                        // typeset is waiting on the decode worker to free
+                        // its buffers. drain a finished result now (frees
+                        // memory and persists the image), stay in
+                        // NeedIndex, and let the scheduler wake us on the
+                        // next worker completion
+                        self.goto_last_page = want_last;
+                        self.typeset_retry_ch = self.epub.chapter;
+                        let _ = self.epub_recv_image_result(k);
+                        return BgOutcome::WaitingExternal;
+                    }
                 }
 
                 if want_last {
