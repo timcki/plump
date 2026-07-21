@@ -26,6 +26,14 @@ use crate::kernel::KernelHandle;
 
 use super::{LayoutKey, LineLayout, MAX_LINES_PER_CHAPTER, PageLayout};
 
+// records stream through one stack buffer in whole-record chunks:
+// staging the full raw arrays next to the decoded vectors needed
+// ~54 KB of transient heap, which made the cache-hit path itself OOM
+// under memory pressure and silently fall back to a full re-typeset
+const PIDX_CHUNK_RECORDS: usize = 128;
+const PIDX_CHUNK_BYTES: usize = PIDX_CHUNK_RECORDS * bundle::PAGE_RECORD_SIZE;
+const _: () = assert!(bundle::PAGE_RECORD_SIZE == bundle::LINE_RECORD_SIZE);
+
 /// fully-decoded layout for one chapter.
 pub struct LoadedChapter {
     pub pages: Vec<PageLayout>,
@@ -100,25 +108,28 @@ pub fn load_layoutidx(
     if pages_end > data.size {
         return None;
     }
-    let mut pages_raw = Vec::new();
-    pages_raw.try_reserve_exact(pages_bytes).ok()?;
-    pages_raw.resize(pages_bytes, 0);
-    let n = bundle::read_at(
-        k.sd(),
-        name_hash,
-        data.offset + dir_entry.pages_offset,
-        &mut pages_raw,
-    )
-    .ok()?;
-    if n < pages_bytes {
-        return None;
-    }
+    let mut chunk = [0u8; PIDX_CHUNK_BYTES];
+
     let mut pages = Vec::new();
     pages.try_reserve_exact(page_count).ok()?;
-    for i in 0..page_count {
-        let off = i * bundle::PAGE_RECORD_SIZE;
-        let rec = bundle::PageRecord::decode(&pages_raw[off..off + bundle::PAGE_RECORD_SIZE])?;
-        pages.push(PageLayout::from_record(&rec));
+    let mut done = 0usize;
+    while done < page_count {
+        let take = (page_count - done).min(PIDX_CHUNK_RECORDS);
+        let want = take * bundle::PAGE_RECORD_SIZE;
+        let n = bundle::read_at(
+            k.sd(),
+            name_hash,
+            data.offset + dir_entry.pages_offset + (done * bundle::PAGE_RECORD_SIZE) as u32,
+            &mut chunk[..want],
+        )
+        .ok()?;
+        if n < want {
+            return None;
+        }
+        for rec in chunk[..want].chunks_exact(bundle::PAGE_RECORD_SIZE) {
+            pages.push(PageLayout::from_record(&bundle::PageRecord::decode(rec)?));
+        }
+        done += take;
     }
 
     // lines array (may be empty)
@@ -129,24 +140,25 @@ pub fn load_layoutidx(
         if lines_end > data.size {
             return None;
         }
-        let mut lines_raw = Vec::new();
-        lines_raw.try_reserve_exact(lines_bytes).ok()?;
-        lines_raw.resize(lines_bytes, 0);
-        let n = bundle::read_at(
-            k.sd(),
-            name_hash,
-            data.offset + dir_entry.lines_offset,
-            &mut lines_raw,
-        )
-        .ok()?;
-        if n < lines_bytes {
-            return None;
-        }
         lines.try_reserve_exact(line_count).ok()?;
-        for i in 0..line_count {
-            let off = i * bundle::LINE_RECORD_SIZE;
-            let rec = bundle::LineRecord::decode(&lines_raw[off..off + bundle::LINE_RECORD_SIZE])?;
-            lines.push(LineLayout::from_record(&rec));
+        let mut done = 0usize;
+        while done < line_count {
+            let take = (line_count - done).min(PIDX_CHUNK_RECORDS);
+            let want = take * bundle::LINE_RECORD_SIZE;
+            let n = bundle::read_at(
+                k.sd(),
+                name_hash,
+                data.offset + dir_entry.lines_offset + (done * bundle::LINE_RECORD_SIZE) as u32,
+                &mut chunk[..want],
+            )
+            .ok()?;
+            if n < want {
+                return None;
+            }
+            for rec in chunk[..want].chunks_exact(bundle::LINE_RECORD_SIZE) {
+                lines.push(LineLayout::from_record(&bundle::LineRecord::decode(rec)?));
+            }
+            done += take;
         }
     }
 
@@ -220,7 +232,6 @@ pub fn save_layoutidx(
         pages,
         lines,
         pages_bytes,
-        lines_bytes,
         chapter_bytes,
     )?;
 
@@ -326,16 +337,10 @@ fn append_chapter_records(
     pages: &[PageLayout],
     lines: &[LineLayout],
     pages_bytes: usize,
-    lines_bytes: usize,
     chapter_bytes: u32,
 ) -> crate::error::Result<(u32, u32)> {
     let existing = bf.section(SectionId::PidxData);
     let base_size = existing.map(|r| r.size).unwrap_or(0);
-
-    // pre-stage the bytes so any allocation failure happens before we
-    // touch the file
-    let pages_buf = encode_pages(pages, pages_bytes)?;
-    let lines_buf = encode_lines(lines, lines_bytes)?;
 
     let mut data = if existing.is_some() {
         bf.grow_tail(SectionId::PidxData, chapter_bytes)
@@ -345,50 +350,43 @@ fn append_chapter_records(
             ?
     };
 
+    // records stream through a stack chunk instead of staging full
+    // encoded copies on the heap. a write error mid-stream leaves the
+    // chapter dir entry unwritten, so a torn save stays invisible to
+    // the loader (same crash consistency as the staged version)
+    let mut chunk = [0u8; PIDX_CHUNK_BYTES];
+
     let pages_rel = base_size;
-    if !pages_buf.is_empty() {
-        data.write_at(pages_rel, &pages_buf)?;
+    let mut rel = pages_rel;
+    for group in pages.chunks(PIDX_CHUNK_RECORDS) {
+        let mut len = 0;
+        for p in group {
+            chunk[len..len + bundle::PAGE_RECORD_SIZE].copy_from_slice(&p.to_record().encode());
+            len += bundle::PAGE_RECORD_SIZE;
+        }
+        data.write_at(rel, &chunk[..len])?;
+        rel += len as u32;
     }
 
-    let lines_rel = if lines_buf.is_empty() {
+    let lines_rel = if lines.is_empty() {
         0
     } else {
-        let rel = pages_rel + pages_bytes as u32;
-        data.write_at(rel, &lines_buf)?;
-        rel
+        let start = pages_rel + pages_bytes as u32;
+        let mut rel = start;
+        for group in lines.chunks(PIDX_CHUNK_RECORDS) {
+            let mut len = 0;
+            for l in group {
+                chunk[len..len + bundle::LINE_RECORD_SIZE]
+                    .copy_from_slice(&l.to_record().encode());
+                len += bundle::LINE_RECORD_SIZE;
+            }
+            data.write_at(rel, &chunk[..len])?;
+            rel += len as u32;
+        }
+        start
     };
 
     Ok((pages_rel, lines_rel))
-}
-
-fn encode_pages(pages: &[PageLayout], pages_bytes: usize) -> crate::error::Result<Vec<u8>> {
-    if pages_bytes == 0 {
-        return Ok(Vec::new());
-    }
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(pages_bytes)
-        .map_err(|_| Error::new(ErrorKind::OutOfMemory, "save_layoutidx: pages buf"))?;
-    buf.resize(pages_bytes, 0);
-    for (i, p) in pages.iter().enumerate() {
-        let off = i * bundle::PAGE_RECORD_SIZE;
-        buf[off..off + bundle::PAGE_RECORD_SIZE].copy_from_slice(&p.to_record().encode());
-    }
-    Ok(buf)
-}
-
-fn encode_lines(lines: &[LineLayout], lines_bytes: usize) -> crate::error::Result<Vec<u8>> {
-    if lines_bytes == 0 {
-        return Ok(Vec::new());
-    }
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(lines_bytes)
-        .map_err(|_| Error::new(ErrorKind::OutOfMemory, "save_layoutidx: lines buf"))?;
-    buf.resize(lines_bytes, 0);
-    for (i, l) in lines.iter().enumerate() {
-        let off = i * bundle::LINE_RECORD_SIZE;
-        buf[off..off + bundle::LINE_RECORD_SIZE].copy_from_slice(&l.to_record().encode());
-    }
-    Ok(buf)
 }
 
 /// Open the bundle for write, deleting and rebuilding the header on

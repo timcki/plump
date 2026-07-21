@@ -557,9 +557,13 @@ impl ReaderApp {
     /// mirrors the page-start offsets into the legacy navigation
     /// arrays.
     fn adopt_loaded_chapter(&mut self, loaded: super::layout::cache::LoadedChapter) {
-        let n = loaded.pages.len().min(MAX_PAGES);
         self.pg.clear_kp_layout();
-        self.pg.kp_pages.extend_from_slice(&loaded.pages[..n]);
+        // move rather than copy; avoids double residency of the page
+        // table during adoption (load already enforces the caps via
+        // fits_in_caps, the truncate is a belt-and-braces guard)
+        let mut pages = loaded.pages;
+        pages.truncate(MAX_PAGES);
+        self.pg.kp_pages = pages;
         self.pg.chapter_lines = loaded.lines;
         // recompute image_block_lines from the line table by counting
         // consecutive FLAG_IMAGE entries starting at each origin
@@ -584,6 +588,7 @@ impl ReaderApp {
             }
         }
 
+        let n = self.pg.kp_pages.len();
         for i in 0..n {
             self.pg.offsets[i] = self.pg.kp_pages[i].start_byte;
         }
