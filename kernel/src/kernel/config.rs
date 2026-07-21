@@ -4,6 +4,7 @@
 // the SettingsApp in apps/ provides the UI for editing them
 
 pub const SETTINGS_FILE: &str = "SETTINGS.TXT";
+pub const SETTINGS_BUF_CAP: usize = 768;
 
 // default sleep timeout in minutes
 pub const DEFAULT_SLEEP_TIMEOUT: u16 = 10;

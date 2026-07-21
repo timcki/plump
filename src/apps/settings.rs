@@ -143,7 +143,7 @@ impl SettingsApp {
     }
 
     fn load(&mut self, k: &mut KernelHandle<'_>) {
-        let mut buf = [0u8; 512];
+        let mut buf = [0u8; config::SETTINGS_BUF_CAP];
 
         self.settings = SystemSettings::defaults();
         self.wifi = WifiConfig::empty();
@@ -164,7 +164,7 @@ impl SettingsApp {
     }
 
     fn save(&self, k: &mut KernelHandle<'_>) -> bool {
-        let mut buf = [0u8; 512];
+        let mut buf = [0u8; config::SETTINGS_BUF_CAP];
         let len = self.settings.write_txt(&self.wifi, &mut buf);
         match k.sd().write_file_in_dir(k.sd().data_dir(), config::SETTINGS_FILE, &buf[..len]) {
             Ok(_) => {

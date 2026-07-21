@@ -1,17 +1,21 @@
 // wifi upload server: HTTP file upload + mDNS (plump.local)
 
+mod dhcp;
+
 use alloc::string::String;
 use core::fmt::Write as FmtWrite;
+use core::future::pending;
 
-use embassy_futures::select::{Either, Either3, select, select3};
-use embassy_net::IpListenEndpoint;
-use embassy_net::Ipv4Address;
+use embassy_futures::select::{Either, Either3, Either4, select, select3, select4};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
-use embassy_time::{Duration, Timer};
+use embassy_net::{IpListenEndpoint, Ipv4Address, Ipv4Cidr, StaticConfigV4};
+use embassy_time::{Duration, Instant, Timer, with_deadline};
 use embedded_io_async::Write as AsyncWrite;
 use esp_hal::delay::Delay;
-use esp_radio::wifi::{ClientConfig, Config, ModeConfig};
+use esp_radio::wifi::{
+    AccessPointConfig, AuthMethod, ClientConfig, Config, ModeConfig, WifiDevice, WifiEvent,
+};
 use log::{debug, info, warn};
 
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
@@ -76,6 +80,16 @@ const ACCEPT_RETRY_MS: u64 = 200;
 
 const SOCKET_CLOSE_DELAY_MS: u64 = 10;
 
+const STATION_DEADLINE_SECS: u64 = 8;
+const FALLBACK_SSID: &str = "PLUMP-X4";
+const FALLBACK_PASSWORD: &str = "plumpbooks";
+const FALLBACK_IP: [u8; 4] = dhcp::SERVER_IP;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NetworkExit {
+    Back,
+}
+
 /// Cursor-based DNS packet writer.  Appends bytes, u16, u32 without
 /// hardcoded offsets — if the hostname length changes, all downstream
 /// fields shift automatically.
@@ -139,25 +153,49 @@ impl<'a> UploadScreen<'a> {
     /// Render lines with optional footer (partial refresh).
     async fn show(&mut self, lines: &[&str], footer: Option<&str>) {
         render_screen(
-            self.epd, self.strip, self.delay,
-            self.heading, self.body, lines, footer, self.bumps, false,
-        ).await;
+            self.epd,
+            self.strip,
+            self.delay,
+            self.heading,
+            self.body,
+            lines,
+            footer,
+            self.bumps,
+            false,
+        )
+        .await;
     }
 
     /// Render lines with optional footer (full refresh).
     async fn show_full(&mut self, lines: &[&str], footer: Option<&str>) {
         render_screen(
-            self.epd, self.strip, self.delay,
-            self.heading, self.body, lines, footer, self.bumps, true,
-        ).await;
+            self.epd,
+            self.strip,
+            self.delay,
+            self.heading,
+            self.body,
+            lines,
+            footer,
+            self.bumps,
+            true,
+        )
+        .await;
     }
 
     /// Show error message and wait for BACK button.
     async fn show_error(&mut self, msg: &str) {
         render_screen(
-            self.epd, self.strip, self.delay,
-            self.heading, self.body, &[msg], Some("Press BACK to exit"), self.bumps, false,
-        ).await;
+            self.epd,
+            self.strip,
+            self.delay,
+            self.heading,
+            self.body,
+            &[msg],
+            Some("Press BACK to exit"),
+            self.bumps,
+            false,
+        )
+        .await;
         drain_until_back().await;
     }
 }
@@ -185,6 +223,59 @@ enum ServerEvent {
     DeleteFailed,
 }
 
+/// Ensures a cancelled upload never leaks an open FAT handle.
+struct UploadFileGuard<'a> {
+    file: Option<storage::OpenFile>,
+    sd: &'a SdStorage,
+    name: FileName,
+    committed: bool,
+}
+
+impl<'a> UploadFileGuard<'a> {
+    fn new(file: storage::OpenFile, sd: &'a SdStorage, name: FileName) -> Self {
+        Self {
+            file: Some(file),
+            sd,
+            name,
+            committed: false,
+        }
+    }
+
+    fn write(&self, data: &[u8]) -> crate::error::Result<()> {
+        self.file
+            .as_ref()
+            .expect("upload file already closed")
+            .write(self.sd, data)
+    }
+
+    fn finish(mut self) -> crate::error::Result<()> {
+        let result = self
+            .file
+            .take()
+            .expect("upload file already closed")
+            .close(self.sd);
+        if result.is_ok() {
+            self.committed = true;
+        }
+        result
+    }
+}
+
+impl Drop for UploadFileGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = file.close(self.sd);
+        }
+        if !self.committed {
+            if let Err(e) = self.sd.delete_file(self.name.as_str()) {
+                warn!("upload: failed to remove incomplete '{}': {}", self.name, e);
+            } else {
+                info!("upload: removed incomplete '{}'", self.name);
+            }
+        }
+    }
+}
+
 pub async fn run_upload_mode(
     wifi: esp_hal::peripherals::WIFI<'static>,
     epd: &mut Epd,
@@ -196,32 +287,6 @@ pub async fn run_upload_mode(
     wifi_cfg: &WifiConfig,
 ) {
     let mut screen = UploadScreen::new(epd, strip, delay, ui_font_size_idx, bumps);
-
-    if !wifi_cfg.has_credentials() {
-        screen.show(
-            &[
-                "No WiFi credentials!",
-                "Set wifi_ssid in",
-                // TODO: show actual data_dir name (_PLUMP or legacy _PULP)
-                "_PLUMP/SETTINGS.TXT",
-            ],
-            Some("Press BACK to exit"),
-        ).await;
-        drain_until_back().await;
-        return;
-    }
-
-    let ssid = wifi_cfg.ssid();
-    let password = wifi_cfg.password();
-
-    {
-        let mut msg_buf = [0u8; 64];
-        let msg_len = stack_fmt(&mut msg_buf, |w| {
-            let _ = write!(w, "Connecting to '{}'...", ssid);
-        });
-        let msg = core::str::from_utf8(&msg_buf[..msg_len]).unwrap_or("Connecting...");
-        screen.show_full(&[msg], None).await;
-    }
 
     let radio = match esp_radio::init() {
         Ok(r) => r,
@@ -241,90 +306,217 @@ pub async fn run_upload_mode(
         }
     };
 
-    let client_cfg = ClientConfig::default()
-        .with_ssid(String::from(ssid))
-        .with_password(String::from(password));
-
-    if let Err(e) = wifi_ctrl.set_config(&ModeConfig::Client(client_cfg)) {
-        info!("upload: set_config failed: {:?}", e);
-        screen.show_error("WiFi config error!").await;
-        return;
-    }
-
-    if let Err(e) = wifi_ctrl.start_async().await {
-        info!("upload: start failed: {:?}", e);
-        screen.show_error("WiFi start failed!").await;
-        return;
-    }
-
-    info!("upload: wifi started, connecting to '{}'", ssid);
-
-    if let Err(e) = wifi_ctrl.connect_async().await {
-        info!("upload: connect failed: {:?}", e);
-        screen.show_error("Connection failed!").await;
-        return;
-    }
-
-    info!("upload: connected to '{}'", ssid);
-
-    let net_config = embassy_net::Config::dhcpv4(Default::default());
     let seed = {
         let rng = esp_hal::rng::Rng::new();
         (rng.random() as u64) << 32 | rng.random() as u64
     };
 
-    let mut resources = embassy_net::StackResources::<4>::new();
-    let (stack, mut runner) = embassy_net::new(interfaces.sta, net_config, &mut resources, seed);
+    let mut station_started = false;
+    let mut exit_requested = false;
 
-    let got_ip = match select(
-        runner.run(),
-        select(stack.wait_config_up(), drain_until_back()),
-    )
-    .await
-    {
-        Either::Second(Either::First(_)) => true,
-        Either::Second(Either::Second(_)) => false,
-        _ => unreachable!(),
-    };
+    if wifi_cfg.has_credentials() {
+        let ssid = wifi_cfg.ssid();
+        let mut msg_buf = [0u8; 64];
+        let msg_len = stack_fmt(&mut msg_buf, |w| {
+            let _ = write!(w, "Connecting to '{}'...", ssid);
+        });
+        let message = core::str::from_utf8(&msg_buf[..msg_len]).unwrap_or("Connecting...");
+        screen.show_full(&[message], Some("BACK cancels")).await;
 
-    if !got_ip {
-        info!("upload: user exited during DHCP");
+        let client_cfg = ClientConfig::default()
+            .with_ssid(String::from(ssid))
+            .with_password(String::from(wifi_cfg.password()));
+
+        match wifi_ctrl.set_config(&ModeConfig::Client(client_cfg)) {
+            Ok(()) => match wifi_ctrl.start_async().await {
+                Ok(()) => station_started = true,
+                Err(e) => warn!("upload: station start failed, falling back: {:?}", e),
+            },
+            Err(e) => warn!("upload: station config failed, falling back: {:?}", e),
+        }
+
+        if station_started {
+            let deadline = Instant::now() + Duration::from_secs(STATION_DEADLINE_SECS);
+            info!(
+                "upload: trying configured WiFi '{}' for {}s",
+                ssid, STATION_DEADLINE_SECS
+            );
+            let connected = match select(
+                with_deadline(deadline, wifi_ctrl.connect_async()),
+                drain_until_back(),
+            )
+            .await
+            {
+                Either::First(Ok(Ok(()))) => true,
+                Either::First(Ok(Err(e))) => {
+                    warn!("upload: station association failed, falling back: {:?}", e);
+                    false
+                }
+                Either::First(Err(_)) => {
+                    warn!("upload: station association timed out, falling back");
+                    false
+                }
+                Either::Second(()) => {
+                    exit_requested = true;
+                    false
+                }
+            };
+
+            if connected && !exit_requested {
+                let mut resources = embassy_net::StackResources::<4>::new();
+                let net_config = embassy_net::Config::dhcpv4(Default::default());
+                let (stack, mut runner) =
+                    embassy_net::new(interfaces.sta, net_config, &mut resources, seed);
+
+                let got_ip = match select3(
+                    runner.run(),
+                    with_deadline(deadline, stack.wait_config_up()),
+                    drain_until_back(),
+                )
+                .await
+                {
+                    Either3::First(never) => match never {},
+                    Either3::Second(Ok(())) => true,
+                    Either3::Second(Err(_)) => {
+                        warn!("upload: station DHCP timed out, falling back");
+                        false
+                    }
+                    Either3::Third(()) => {
+                        exit_requested = true;
+                        false
+                    }
+                };
+
+                if got_ip && !exit_requested {
+                    let ip = stack
+                        .config_v4()
+                        .map(|cfg| cfg.address.address().octets())
+                        .unwrap_or([0, 0, 0, 0]);
+                    show_server_ready(&mut screen, ip).await;
+                    info!("upload: connected to '{}'", ssid);
+
+                    match select(
+                        wifi_ctrl.wait_for_event(WifiEvent::StaDisconnected),
+                        serve_network(stack, &mut runner, sd, ip, None),
+                    )
+                    .await
+                    {
+                        Either::First(()) => {
+                            warn!("upload: configured WiFi disconnected, falling back");
+                        }
+                        Either::Second(NetworkExit::Back) => exit_requested = true,
+                    }
+                }
+            }
+        }
+    } else {
+        info!("upload: no configured WiFi, starting fallback AP");
+    }
+
+    if station_started {
+        let _ = wifi_ctrl.stop_async().await;
+    }
+    if exit_requested {
+        info!("upload: user exited during station setup/session");
         return;
     }
 
-    let ip_octets: [u8; 4] = if let Some(cfg) = stack.config_v4() {
-        cfg.address.address().octets()
-    } else {
-        [0, 0, 0, 0]
-    };
+    let ap_config = AccessPointConfig::default()
+        .with_ssid(String::from(FALLBACK_SSID))
+        .with_auth_method(AuthMethod::Wpa2Personal)
+        .with_password(String::from(FALLBACK_PASSWORD))
+        .with_max_connections(1);
+    if let Err(e) = wifi_ctrl.set_config(&ModeConfig::AccessPoint(ap_config)) {
+        warn!("upload: fallback AP config failed: {:?}", e);
+        screen.show_error("Fallback WiFi failed!").await;
+        return;
+    }
+    if let Err(e) = wifi_ctrl.start_async().await {
+        warn!("upload: fallback AP start failed: {:?}", e);
+        screen.show_error("Fallback WiFi failed!").await;
+        return;
+    }
 
-    let mut ip_buf = [0u8; 48];
-    let ip_len = stack_fmt(&mut ip_buf, |w| {
-        let _ = write!(
-            w,
-            "({}.{}.{}.{})",
-            ip_octets[0], ip_octets[1], ip_octets[2], ip_octets[3]
-        );
+    let net_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
+        address: Ipv4Cidr::new(
+            Ipv4Address::new(
+                FALLBACK_IP[0],
+                FALLBACK_IP[1],
+                FALLBACK_IP[2],
+                FALLBACK_IP[3],
+            ),
+            24,
+        ),
+        gateway: None,
+        dns_servers: Default::default(),
     });
-    let ip_str = core::str::from_utf8(&ip_buf[..ip_len]).unwrap_or("???");
+    let mut resources = embassy_net::StackResources::<4>::new();
+    let (stack, mut runner) = embassy_net::new(interfaces.ap, net_config, &mut resources, seed);
+
+    let mut dhcp_rx_meta = [PacketMetadata::EMPTY; 2];
+    let mut dhcp_rx_buf = [0u8; 1200];
+    let mut dhcp_tx_meta = [PacketMetadata::EMPTY; 2];
+    let mut dhcp_tx_buf = [0u8; 1200];
+    let mut dhcp_socket = UdpSocket::new(
+        stack,
+        &mut dhcp_rx_meta,
+        &mut dhcp_rx_buf,
+        &mut dhcp_tx_meta,
+        &mut dhcp_tx_buf,
+    );
+    if !dhcp::bind(&mut dhcp_socket) {
+        warn!("upload: DHCP server bind failed");
+        screen.show_error("Fallback DHCP failed!").await;
+        let _ = wifi_ctrl.stop_async().await;
+        return;
+    }
 
     info!(
-        "upload: serving at http://plump.local/  ({})",
-        core::str::from_utf8(&ip_buf[1..ip_len.saturating_sub(1)]).unwrap_or("?")
+        "upload: fallback AP '{}' ready at 192.168.4.1",
+        FALLBACK_SSID
+    );
+    screen
+        .show_full(
+            &[
+                "Join WiFi: PLUMP-X4",
+                "Password: plumpbooks",
+                "http://192.168.4.1",
+            ],
+            Some("Press BACK to exit"),
+        )
+        .await;
+    let _ = serve_network(stack, &mut runner, sd, FALLBACK_IP, Some(&mut dhcp_socket)).await;
+    let _ = wifi_ctrl.stop_async().await;
+    info!("upload: exiting, WiFi stopped");
+}
+
+async fn show_server_ready(screen: &mut UploadScreen<'_>, ip: [u8; 4]) {
+    let mut ip_buf = [0u8; 48];
+    let ip_len = stack_fmt(&mut ip_buf, |w| {
+        let _ = write!(w, "({}.{}.{}.{})", ip[0], ip[1], ip[2], ip[3]);
+    });
+    let ip_str = core::str::from_utf8(&ip_buf[..ip_len]).unwrap_or("???");
+    info!(
+        "upload: serving at http://plump.local/ ({}.{}.{}.{})",
+        ip[0], ip[1], ip[2], ip[3]
     );
     log_heap("server ready");
+    screen
+        .show(&["http://plump.local/", ip_str], Some("Press BACK to exit"))
+        .await;
+}
 
-    screen.show(
-        &["http://plump.local/", ip_str],
-        Some("Press BACK to exit"),
-    ).await;
-
+async fn serve_network<'stack, 'device>(
+    stack: embassy_net::Stack<'stack>,
+    runner: &mut embassy_net::Runner<'stack, WifiDevice<'device>>,
+    sd: &SdStorage,
+    ip: [u8; 4],
+    mut dhcp_socket: Option<&mut UdpSocket<'_>>,
+) -> NetworkExit {
     let _ = stack.join_multicast_group(Ipv4Address::new(224, 0, 0, 251));
 
     let mut rx_buf = [0u8; TCP_RX_BUF_SIZE];
     let mut tx_buf = [0u8; TCP_TX_BUF_SIZE];
-
-    // Persistent mDNS UDP socket — created once before the loop
     let mut mdns_rx_meta = [PacketMetadata::EMPTY; 2];
     let mut mdns_rx_buf = [0u8; 512];
     let mut mdns_tx_meta = [PacketMetadata::EMPTY; 2];
@@ -341,38 +533,35 @@ pub async fn run_upload_mode(
     loop {
         match select(
             runner.run(),
-            select3(
+            select4(
                 serve_one_request(stack, &mut rx_buf, &mut tx_buf, sd),
-                mdns_handle_one(&mut mdns_socket, ip_octets),
+                mdns_handle_one(&mut mdns_socket, ip),
+                dhcp_handle_one(&mut dhcp_socket),
                 drain_until_back(),
             ),
         )
         .await
         {
-            Either::Second(Either3::First(event)) => {
-                match event {
-                    ServerEvent::Uploaded { name } => {
-                        info!("upload: file saved as '{}'", name);
-                    }
-                    ServerEvent::UploadFailed => {
-                        warn!("upload: file upload failed");
-                    }
-                    ServerEvent::Deleted { name } => {
-                        info!("upload: deleted '{}'", name);
-                    }
-                    ServerEvent::DeleteFailed => {
-                        warn!("upload: file delete failed");
-                    }
-                    ServerEvent::Nothing => {}
-                }
-            }
-            Either::Second(Either3::Second(())) => continue,
-            Either::Second(Either3::Third(())) => break,
-            _ => unreachable!(),
+            Either::First(never) => match never {},
+            Either::Second(Either4::First(event)) => match event {
+                ServerEvent::Uploaded { name } => info!("upload: file saved as '{}'", name),
+                ServerEvent::UploadFailed => warn!("upload: file upload failed"),
+                ServerEvent::Deleted { name } => info!("upload: deleted '{}'", name),
+                ServerEvent::DeleteFailed => warn!("upload: file delete failed"),
+                ServerEvent::Nothing => {}
+            },
+            Either::Second(Either4::Second(())) | Either::Second(Either4::Third(())) => {}
+            Either::Second(Either4::Fourth(())) => return NetworkExit::Back,
         }
     }
+}
 
-    info!("upload: exiting, tearing down WiFi");
+async fn dhcp_handle_one(socket: &mut Option<&mut UdpSocket<'_>>) {
+    if let Some(socket) = socket.as_deref_mut() {
+        dhcp::handle_one(socket).await;
+    } else {
+        pending::<()>().await;
+    }
 }
 
 async fn serve_one_request(
@@ -659,6 +848,7 @@ where
 
     // open file once for the entire upload (create/truncate)
     let file = sd.create_file(name_str).map_err(|_| "create failed")?;
+    let file = UploadFileGuard::new(file, sd, file_name);
 
     // holdback last end_marker.len() bytes to detect boundary spanning two reads
 
@@ -667,7 +857,7 @@ where
     let result = loop {
         if let Some(pos) = find_subsequence(&work[..filled], end_marker) {
             if pos > 0 {
-                if let Err(_) = file.write(sd, &work[..pos]) {
+                if file.write(&work[..pos]).is_err() {
                     break Err("write failed");
                 }
                 total_written += pos as u32;
@@ -678,7 +868,7 @@ where
 
         if filled > end_marker.len() {
             let safe = filled - end_marker.len();
-            if let Err(_) = file.write(sd, &work[..safe]) {
+            if file.write(&work[..safe]).is_err() {
                 break Err("write failed");
             }
             total_written += safe as u32;
@@ -693,19 +883,16 @@ where
             .map_err(|_| "read error during upload")?;
         if n == 0 {
             if filled > 0 {
-                let _ = file.write(sd, &work[..filled]);
+                let _ = file.write(&work[..filled]);
             }
-            // close before returning error so the handle is not leaked
-            let _ = file.close(sd);
             return Err("upload incomplete");
         }
         filled += n;
     };
 
-    // always close — whether write loop succeeded or failed
-    let _ = file.close(sd);
-    log_heap("upload done");
     result?;
+    file.finish().map_err(|_| "close failed")?;
+    log_heap("upload done");
     Ok(file_name)
 }
 
@@ -964,18 +1151,18 @@ fn is_mdns_query_for_plump(pkt: &[u8]) -> bool {
 
 fn build_mdns_response(buf: &mut [u8], ip: [u8; 4]) -> usize {
     let mut w = DnsBuf::new(buf);
-    w.put_u16(0x0000);       // transaction ID
-    w.put_u16(0x8400);       // flags: response, authoritative
-    w.put_u16(0x0000);       // QDCOUNT
-    w.put_u16(0x0001);       // ANCOUNT
-    w.put_u16(0x0000);       // NSCOUNT
-    w.put_u16(0x0000);       // ARCOUNT
-    w.put(&HOSTNAME_WIRE);   // name
-    w.put_u16(0x0001);       // TYPE A
-    w.put_u16(0x8001);       // CLASS IN, cache-flush
-    w.put_u32(120);          // TTL 120s
-    w.put_u16(0x0004);       // RDLENGTH
-    w.put(&ip);              // RDATA (IPv4 address)
+    w.put_u16(0x0000); // transaction ID
+    w.put_u16(0x8400); // flags: response, authoritative
+    w.put_u16(0x0000); // QDCOUNT
+    w.put_u16(0x0001); // ANCOUNT
+    w.put_u16(0x0000); // NSCOUNT
+    w.put_u16(0x0000); // ARCOUNT
+    w.put(&HOSTNAME_WIRE); // name
+    w.put_u16(0x0001); // TYPE A
+    w.put_u16(0x8001); // CLASS IN, cache-flush
+    w.put_u32(120); // TTL 120s
+    w.put_u16(0x0004); // RDLENGTH
+    w.put(&ip); // RDATA (IPv4 address)
     w.len()
 }
 
@@ -1023,10 +1210,6 @@ async fn render_screen(
     let footer_region = Region::new(BODY_X, FOOTER_Y, BODY_W, body_h);
 
     let draw = |s: &mut StripBuffer| {
-        use embedded_graphics::pixelcolor::BinaryColor;
-        use embedded_graphics::prelude::*;
-        use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
-
         BitmapLabel::new(heading_region, "Upload", heading)
             .alignment(Alignment::CenterLeft)
             .draw(s)
@@ -1039,29 +1222,6 @@ async fn render_screen(
             let y = body_start_y + (i as u16) * body_stride;
             let region = Region::new(BODY_X, y, BODY_W, body_h);
             BitmapLabel::new(region, line, body)
-                .alignment(Alignment::Center)
-                .draw(s)
-                .unwrap();
-        }
-
-        // QR placeholder square below the connection info. real QR
-        // encoder is a follow-up; for now we draw a labelled box so
-        // the layout matches the mockup intent (mockup also shows the
-        // QR centred below the host name).
-        let qr_size: u16 = 160;
-        let qr_x = (SCREEN_W - qr_size) / 2;
-        let qr_y = body_start_y + (lines.len() as u16) * body_stride + 12;
-        if qr_y + qr_size < FOOTER_Y.saturating_sub(8) {
-            let qr_rect = Rectangle::new(
-                Point::new(qr_x as i32, qr_y as i32),
-                Size::new(qr_size as u32, qr_size as u32),
-            );
-            qr_rect
-                .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 2))
-                .draw(s)
-                .ok();
-            let qr_label = Region::new(qr_x, qr_y + qr_size / 2 - body_h / 2, qr_size, body_h);
-            BitmapLabel::new(qr_label, "QR coming", body)
                 .alignment(Alignment::Center)
                 .draw(s)
                 .unwrap();
