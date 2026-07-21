@@ -61,6 +61,24 @@ pub fn free_stack_bytes() -> usize {
 }
 
 pub fn stack_high_water_mark() -> usize {
+    stack_hwm_detail().hwm
+}
+
+/// Result of a full canary scan of the stack region.
+///
+/// `hwm` is the classic high-water mark: distance from the stack top to
+/// the lowest non-canary word. `intact_above` counts canary bytes that
+/// survive above that lowest break; a genuinely deep call chain leaves
+/// (almost) none, while a stray write deep into the stack leaves a
+/// large intact span and means `hwm` overstates real usage.
+#[derive(Clone, Copy, Default)]
+pub struct StackHwmDetail {
+    pub hwm: usize,
+    pub break_addr: usize,
+    pub intact_above: usize,
+}
+
+pub fn stack_hwm_detail() -> StackHwmDetail {
     #[cfg(target_arch = "riscv32")]
     {
         unsafe extern "C" {
@@ -71,23 +89,36 @@ pub fn stack_high_water_mark() -> usize {
         let top = (&raw const _stack_start_cpu0) as usize;
 
         let scan_bottom = bottom + STACK_GUARD_SKIP;
-
         let start = (scan_bottom + 3) & !3;
 
         let mut addr = start;
+        let mut break_addr = 0usize;
+        let mut intact_above = 0usize;
         while addr + 4 <= top {
             let val = unsafe { core::ptr::read_volatile(addr as *const u32) };
             if val != STACK_PAINT_WORD {
-                break;
+                if break_addr == 0 {
+                    break_addr = addr;
+                }
+            } else if break_addr != 0 {
+                intact_above += 4;
             }
             addr += 4;
         }
 
-        top.saturating_sub(addr)
+        StackHwmDetail {
+            hwm: if break_addr == 0 {
+                0
+            } else {
+                top.saturating_sub(break_addr)
+            },
+            break_addr,
+            intact_above,
+        }
     }
 
     #[cfg(not(target_arch = "riscv32"))]
     {
-        0
+        StackHwmDetail::default()
     }
 }

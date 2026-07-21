@@ -31,7 +31,7 @@ use crate::drivers::input::Event;
 use crate::drivers::strip::StripBuffer;
 use crate::kernel::tasks;
 
-use crate::ui::{free_stack_bytes, stack_high_water_mark};
+use crate::ui::free_stack_bytes;
 
 use super::timing;
 
@@ -1180,6 +1180,7 @@ impl super::Kernel {
         let uptime = super::uptime_secs();
         let mins = (uptime / 60) % 60;
         let hrs = uptime / 3600;
+        let hwm = crate::ui::stack_hwm_detail();
 
         info!(
             "stats: heap {}/{}K peak {}K | stack free {}K hwm {}K | bat {}% {}.{}V | up {}:{:02} | SD:{}",
@@ -1187,7 +1188,7 @@ impl super::Kernel {
             stats.size / 1024,
             stats.max_usage / 1024,
             free_stack_bytes() / 1024,
-            stack_high_water_mark() / 1024,
+            hwm.hwm / 1024,
             bat_pct,
             self.cached_battery_mv / 1000,
             (self.cached_battery_mv % 1000) / 100,
@@ -1195,5 +1196,33 @@ impl super::Kernel {
             mins,
             if self.sd_ok { "ok" } else { "--" },
         );
+
+        // one extra line each time the water mark grows: a real deep
+        // call chain leaves no intact canary above the lowest break,
+        // while a large intact span means a stray write is inflating
+        // the reading (see the stack spike investigation)
+        static LAST_HWM: critical_section::Mutex<core::cell::Cell<usize>> =
+            critical_section::Mutex::new(core::cell::Cell::new(0));
+        let grew = critical_section::with(|cs| {
+            let last = LAST_HWM.borrow(cs);
+            let grew = hwm.hwm > last.get();
+            if grew {
+                last.set(hwm.hwm);
+            }
+            grew
+        });
+        if grew {
+            info!(
+                "stack: hwm {}B break@{:#010x} intact-above {}B{}",
+                hwm.hwm,
+                hwm.break_addr,
+                hwm.intact_above,
+                if hwm.intact_above > 4096 {
+                    " (stray write suspected)"
+                } else {
+                    ""
+                },
+            );
+        }
     }
 }

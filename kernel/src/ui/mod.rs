@@ -16,7 +16,10 @@ pub use layout::{
 };
 pub use painter::Painter;
 pub use stack_fmt::{StackFmt, stack_fmt};
-pub use statusbar::{BAR_HEIGHT, free_stack_bytes, paint_stack, stack_high_water_mark};
+pub use statusbar::{
+    BAR_HEIGHT, StackHwmDetail, free_stack_bytes, paint_stack, stack_high_water_mark,
+    stack_hwm_detail,
+};
 pub use theme::Theme;
 pub use widget::{
     Alignment, LoadingIndicator, ProgressBar, Region, wrap_next, wrap_prev,
