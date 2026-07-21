@@ -155,6 +155,89 @@ const DEMERITS_CAP: i32 = i32::MAX / 4;
 
 // ── breaker ───────────────────────────────────────────────────────
 
+/// Reusable DP scratch. A chapter typeset runs the breaker once per
+/// paragraph; allocating the prefix sums, node table and path per call
+/// produced thousands of same-size TLSF alloc/free cycles per chapter
+/// and a ~90 KB transient peak. The pipeline owns one of these for the
+/// whole typeset and releases the memory in its `Drop`.
+pub struct BreakScratch {
+    pfx_w: Vec<u32>,
+    pfx_y: Vec<u32>,
+    pfx_z: Vec<u32>,
+    best: Vec<Node>,
+    path: Vec<u16>,
+}
+
+impl Default for BreakScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BreakScratch {
+    pub const fn new() -> Self {
+        Self {
+            pfx_w: Vec::new(),
+            pfx_y: Vec::new(),
+            pfx_z: Vec::new(),
+            best: Vec::new(),
+            path: Vec::new(),
+        }
+    }
+
+    /// Drop all retained capacity (end of a chapter typeset).
+    pub fn release(&mut self) {
+        self.pfx_w = Vec::new();
+        self.pfx_y = Vec::new();
+        self.pfx_z = Vec::new();
+        self.best = Vec::new();
+        self.path = Vec::new();
+    }
+
+    // prefix sums of width / stretch / shrink across items.
+    // pfx_w[k] = sum of widths of items[..k]; pfx_w[0] = 0.
+    fn build_prefixes(&mut self, items: &[Item]) -> Result<(), BreakError> {
+        let n = items.len();
+        self.pfx_w.clear();
+        self.pfx_y.clear();
+        self.pfx_z.clear();
+        if self.pfx_w.try_reserve_exact(n + 1).is_err()
+            || self.pfx_y.try_reserve_exact(n + 1).is_err()
+            || self.pfx_z.try_reserve_exact(n + 1).is_err()
+        {
+            return Err(BreakError::ItemBudgetExceeded);
+        }
+        self.pfx_w.push(0);
+        self.pfx_y.push(0);
+        self.pfx_z.push(0);
+        for it in items {
+            let (w, y, z) = match it.kind() {
+                ItemKind::Box => (it.width as u32, 0, 0),
+                ItemKind::Glue => (it.width as u32, it.stretch as u32, it.shrink as u32),
+                ItemKind::Penalty => (0, 0, 0),
+            };
+            self.pfx_w.push(self.pfx_w.last().unwrap() + w);
+            self.pfx_y.push(self.pfx_y.last().unwrap() + y);
+            self.pfx_z.push(self.pfx_z.last().unwrap() + z);
+        }
+        Ok(())
+    }
+
+    fn prepare_dp(&mut self, n: usize) -> Result<(), BreakError> {
+        self.best.clear();
+        if self.best.try_reserve_exact(n).is_err() {
+            return Err(BreakError::ItemBudgetExceeded);
+        }
+        self.best.resize(n, Node::UNREACHABLE_NODE);
+        self.path.clear();
+        // path length is bounded by the number of lines <= n
+        if self.path.try_reserve_exact(n).is_err() {
+            return Err(BreakError::ItemBudgetExceeded);
+        }
+        Ok(())
+    }
+}
+
 /// Run the K-P paragraph breaker.
 ///
 /// On success, `out` is appended with one `BreakChoice` per emitted
@@ -163,7 +246,32 @@ const DEMERITS_CAP: i32 = i32::MAX / 4;
 pub fn break_paragraph(
     items: &[Item],
     cfg: &BreakConfig,
+    scratch: &mut BreakScratch,
     out: &mut Vec<BreakChoice>,
+) -> Result<(), BreakError> {
+    break_paragraph_inner(items, cfg, scratch, out, false, true)
+}
+
+/// Test oracle: identical to `break_paragraph` but with the DP window
+/// disabled (every predecessor scanned, original order). Property tests
+/// assert windowed == full-scan on representative paragraphs.
+#[cfg(test)]
+pub(crate) fn break_paragraph_full_scan(
+    items: &[Item],
+    cfg: &BreakConfig,
+    scratch: &mut BreakScratch,
+    out: &mut Vec<BreakChoice>,
+) -> Result<(), BreakError> {
+    break_paragraph_inner(items, cfg, scratch, out, false, false)
+}
+
+fn break_paragraph_inner(
+    items: &[Item],
+    cfg: &BreakConfig,
+    scratch: &mut BreakScratch,
+    out: &mut Vec<BreakChoice>,
+    reuse_prefixes: bool,
+    windowed: bool,
 ) -> Result<(), BreakError> {
     if items.is_empty() {
         return Err(BreakError::EmptyParagraph);
@@ -174,81 +282,95 @@ pub fn break_paragraph(
 
     let n = items.len();
 
-    // prefix sums of width / stretch / shrink across items.
-    // pfx_w[k] = sum of widths of items[..k]; pfx_w[0] = 0.
-    let mut pfx_w: Vec<u32> = Vec::new();
-    let mut pfx_y: Vec<u32> = Vec::new();
-    let mut pfx_z: Vec<u32> = Vec::new();
-    if pfx_w.try_reserve_exact(n + 1).is_err()
-        || pfx_y.try_reserve_exact(n + 1).is_err()
-        || pfx_z.try_reserve_exact(n + 1).is_err()
-    {
-        return Err(BreakError::ItemBudgetExceeded);
+    // the fallback pass re-runs with the same items, so its prefix
+    // sums are still valid and only the DP state needs a reset
+    if !reuse_prefixes {
+        scratch.build_prefixes(items)?;
     }
-    pfx_w.push(0);
-    pfx_y.push(0);
-    pfx_z.push(0);
-    for it in items {
-        let (w, y, z) = match it.kind() {
-            ItemKind::Box => (it.width as u32, 0, 0),
-            ItemKind::Glue => (it.width as u32, it.stretch as u32, it.shrink as u32),
-            ItemKind::Penalty => (0, 0, 0),
-        };
-        pfx_w.push(pfx_w.last().unwrap() + w);
-        pfx_y.push(pfx_y.last().unwrap() + y);
-        pfx_z.push(pfx_z.last().unwrap() + z);
-    }
+    debug_assert_eq!(scratch.pfx_w.len(), n + 1);
+    scratch.prepare_dp(n)?;
 
-    // best[i] = best way to reach a break at item i, or None.
-    let mut best: Vec<Option<Node>> = Vec::new();
-    if best.try_reserve_exact(n).is_err() {
-        return Err(BreakError::ItemBudgetExceeded);
-    }
-    best.resize(n, None);
+    let BreakScratch {
+        pfx_w,
+        pfx_y,
+        pfx_z,
+        best,
+        path,
+    } = scratch;
 
     let line_width = cfg.line_width as i32;
 
+    // effective span of the line (a, i] is pfx[i] - pfx[a+1] for every
+    // trailing-item case (trailing glue is subtracted, a trailing
+    // penalty contributes zero to the prefixes), so "can fit after
+    // maximal shrink" is s(i) - s(a+1) <= line_width with
+    // s(k) = pfx_w[k] - pfx_z[k]. per-item w >= z (boxes have z = 0,
+    // glue shrink <= its width, penalties are 0/0), so s is
+    // nondecreasing and the window start only ever moves forward.
+    let s = |k: usize| pfx_w[k] - pfx_z[k];
+
     // First pass: forward DP.
+    let mut win_lo: usize = 0;
     for i in 0..n {
         if !is_feasible_breakpoint(items, i) {
             continue;
         }
 
+        if windowed {
+            while win_lo < i && s(i) - s(win_lo + 1) > line_width as u32 {
+                win_lo += 1;
+            }
+        }
+
         let mut chosen: Option<Node> = None;
 
         // Try line beginning at start (no prior break).
-        consider_break(items, &pfx_w, &pfx_y, &pfx_z, None, i, line_width, cfg, &best, &mut chosen);
+        consider_break(items, pfx_w, pfx_y, pfx_z, None, i, line_width, cfg, best, &mut chosen);
 
-        // Try every earlier feasible breakpoint as predecessor.
-        for a in 0..i {
-            if best[a].is_none() {
+        // Predecessors inside the feasible window; anything earlier
+        // spans wider than line_width even after maximal shrink.
+        let lo = if windowed { win_lo } else { 0 };
+        for a in lo..i {
+            if best[a].demerits == Node::UNREACHABLE {
                 continue;
             }
-            consider_break(items, &pfx_w, &pfx_y, &pfx_z, Some(a), i, line_width, cfg, &best, &mut chosen);
+            consider_break(items, pfx_w, pfx_y, pfx_z, Some(a), i, line_width, cfg, best, &mut chosen);
         }
 
-        best[i] = chosen;
+        // escape hatch, REQUIRED for behavior parity: this breaker
+        // accepts overfull spans (Overflow with BADNESS_INFINITY,
+        // single-overfull-box URLs, forced clamps), and those
+        // predecessors lie outside the window by construction. when
+        // the window produced nothing, run the legacy full scan so
+        // degenerate paragraphs break exactly as before.
+        if windowed && chosen.is_none() {
+            for a in 0..win_lo {
+                if best[a].demerits == Node::UNREACHABLE {
+                    continue;
+                }
+                consider_break(items, pfx_w, pfx_y, pfx_z, Some(a), i, line_width, cfg, best, &mut chosen);
+            }
+        }
+
+        best[i] = chosen.unwrap_or(Node::UNREACHABLE_NODE);
     }
 
     // Pick terminal break: prefer the last forced-break Penalty in `items`
     // that we successfully reached. Falls back to the last reachable break.
-    let terminal = pick_terminal(items, &best);
+    let terminal = pick_terminal(items, best);
 
     let Some(mut cur) = terminal else {
         return Err(BreakError::NoFeasibleBreaks);
     };
 
     // Walk back to reconstruct the break path.
-    let mut path: Vec<usize> = Vec::new();
-    if path.try_reserve_exact(8).is_err() {
-        return Err(BreakError::ItemBudgetExceeded);
-    }
     loop {
-        path.push(cur);
-        match best[cur].as_ref().and_then(|n| n.prev) {
-            Some(prev) => cur = prev,
-            None => break,
+        path.push(cur as u16);
+        let prev = best[cur].prev;
+        if prev == Node::NO_PREV {
+            break;
         }
+        cur = prev as usize;
     }
     path.reverse();
 
@@ -257,8 +379,9 @@ pub fn break_paragraph(
     if out.try_reserve_exact(path.len()).is_err() {
         return Err(BreakError::ItemBudgetExceeded);
     }
-    for (idx, &i) in path.iter().enumerate() {
-        let node = best[i].as_ref().unwrap();
+    for (idx, &i16idx) in path.iter().enumerate() {
+        let i = i16idx as usize;
+        let node = &best[i];
         let mut flags = ChoiceFlags::NONE;
         if idx + 1 == path.len() {
             flags.insert(ChoiceFlags::LAST_LINE);
@@ -271,15 +394,15 @@ pub fn break_paragraph(
                 flags.insert(ChoiceFlags::FROM_HYPHEN);
             }
         }
-        if node.adjustment_q8 == BreakChoice::ADJUSTMENT_OVERFLOW as i32 {
+        if node.adjustment_q8 == BreakChoice::ADJUSTMENT_OVERFLOW {
             had_overfull = true;
         }
         out.push(BreakChoice {
             item_idx: i as u16,
-            line_width_used: node.width_used as u16,
-            stretch_total: node.stretch_total.min(u16::MAX as u32) as u16,
-            shrink_total: node.shrink_total.min(u16::MAX as u32) as u16,
-            adjustment_ratio_q8: node.adjustment_q8.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            line_width_used: node.width_used,
+            stretch_total: node.stretch_total,
+            shrink_total: node.shrink_total,
+            adjustment_ratio_q8: node.adjustment_q8,
             fitness: node.fitness,
             flags,
         });
@@ -321,9 +444,10 @@ pub fn break_paragraph(
 pub fn break_paragraph_with_fallback(
     items: &[Item],
     cfg: &BreakConfig,
+    scratch: &mut BreakScratch,
     out: &mut Vec<BreakChoice>,
 ) -> Result<(), BreakError> {
-    let retry = match break_paragraph(items, cfg, out) {
+    let retry = match break_paragraph_inner(items, cfg, scratch, out, false, true) {
         Err(BreakError::NoFeasibleBreaks) => true,
         Err(other) => return Err(other),
         Ok(()) => out.len() == 1 && out[0].line_width_used > cfg.line_width,
@@ -338,23 +462,47 @@ pub fn break_paragraph_with_fallback(
         emergency_stretch: cfg.line_width / 5,
         ..*cfg
     };
-    break_paragraph(items, &fallback, out)
+    // items are unchanged between passes, so the prefix sums are
+    // reused; only the DP state resets
+    break_paragraph_inner(items, &fallback, scratch, out, true, true)
 }
 
 // ── internals ─────────────────────────────────────────────────────
 
+/// 16 bytes; `best` holds `max_items` of these, so the old 32-byte
+/// `Option<Node>` layout cost 64 KB of scratch at the item budget.
+/// Metrics are stored saturated at u16 exactly as the emit path
+/// already clamped them; demerits math runs on full-precision locals
+/// in `consider_break` before anything is stored.
 #[derive(Clone, Copy, Debug)]
 struct Node {
-    /// total demerits to reach this breakpoint
+    /// total demerits to reach this breakpoint; `UNREACHABLE` marks a
+    /// slot with no feasible path (real values cap at `DEMERITS_CAP`)
     demerits: i32,
-    /// prior breakpoint index (None = start of paragraph)
-    prev: Option<usize>,
     /// chosen line metrics (the line that ENDS at this breakpoint)
-    width_used: u32,
-    stretch_total: u32,
-    shrink_total: u32,
-    adjustment_q8: i32,
+    width_used: u16,
+    stretch_total: u16,
+    shrink_total: u16,
+    /// signed Q8, clamped to i16; i16::MIN is the Overflow sentinel
+    /// (same encoding as `BreakChoice::ADJUSTMENT_OVERFLOW`)
+    adjustment_q8: i16,
+    /// prior breakpoint index; `NO_PREV` = start of paragraph
+    prev: u16,
     fitness: FitnessClass,
+}
+
+impl Node {
+    const UNREACHABLE: i32 = i32::MAX;
+    const NO_PREV: u16 = u16::MAX;
+    const UNREACHABLE_NODE: Node = Node {
+        demerits: Self::UNREACHABLE,
+        width_used: 0,
+        stretch_total: 0,
+        shrink_total: 0,
+        adjustment_q8: 0,
+        prev: Self::NO_PREV,
+        fitness: FitnessClass::Normal,
+    };
 }
 
 #[inline]
@@ -378,7 +526,7 @@ fn consider_break(
     i: usize,
     line_width: i32,
     cfg: &BreakConfig,
-    best: &[Option<Node>],
+    best: &[Node],
     chosen: &mut Option<Node>,
 ) {
     // line spans items[(a+1)..=i] (or [0..=i] if no prior break)
@@ -499,9 +647,11 @@ fn consider_break(
         }
     }
 
-    // Fitness-adjacency demerit (only when both this and previous break exist)
+    // Fitness-adjacency demerit (only when both this and previous break
+    // exist; callers only pass reachable predecessors)
     if let Some(prev_idx) = a {
-        if let Some(prev_node) = best[prev_idx].as_ref() {
+        let prev_node = &best[prev_idx];
+        if prev_node.demerits != Node::UNREACHABLE {
             if fit_distance(fit, prev_node.fitness) > 1 {
                 dem = dem.saturating_add(cfg.adjacent_loose_demerit as i32);
             }
@@ -515,18 +665,21 @@ fn consider_break(
         }
     }
 
-    let prev_dem = a
-        .and_then(|p| best[p].as_ref().map(|n| n.demerits))
-        .unwrap_or(0);
+    let prev_dem = a.map(|p| best[p].demerits).unwrap_or(0);
     let total_dem = prev_dem.saturating_add(dem).min(DEMERITS_CAP);
 
     let candidate = Node {
         demerits: total_dem,
-        prev: a,
-        width_used: line_w,
-        stretch_total: line_y,
-        shrink_total: line_z,
-        adjustment_q8: r_q8,
+        prev: a.map(|p| p as u16).unwrap_or(Node::NO_PREV),
+        // saturate rather than the emit path's old truncation; only
+        // observable for lines wider than 65535 px, where saturation
+        // also keeps the fallback's natural-width trigger correct
+        width_used: line_w.min(u16::MAX as u32) as u16,
+        stretch_total: line_y.min(u16::MAX as u32) as u16,
+        shrink_total: line_z.min(u16::MAX as u32) as u16,
+        // same clamp the emit path applied; i16::MIN only arrives via
+        // the Overflow sentinel (real shrink ratios stop at -256)
+        adjustment_q8: r_q8.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
         fitness: fit,
     };
 
@@ -565,11 +718,11 @@ fn single_overfull_box(items: &[Item], lo: usize, i: usize) -> bool {
 /// is what `items.rs` always emits at paragraph end). Among reachable
 /// forced breaks, pick the latest. If none, fall back to the last
 /// reachable break of any kind.
-fn pick_terminal(items: &[Item], best: &[Option<Node>]) -> Option<usize> {
+fn pick_terminal(items: &[Item], best: &[Node]) -> Option<usize> {
     let mut last_forced: Option<usize> = None;
     let mut last_any: Option<usize> = None;
     for i in 0..items.len() {
-        if best[i].is_some() {
+        if best[i].demerits != Node::UNREACHABLE {
             last_any = Some(i);
             if matches!(items[i].kind(), ItemKind::Penalty) && items[i].is_forced() {
                 last_forced = Some(i);
@@ -598,8 +751,11 @@ fn badness(r_q8: i32) -> i32 {
     if r_q8 == BreakChoice::ADJUSTMENT_OVERFLOW as i32 {
         return BADNESS_INFINITY;
     }
-    let r = r_q8.unsigned_abs() as i32;
-    // r_q8 ∈ [-2048, 2048] keeps r³/65536 ≤ 131072; *100 fits in i32.
+    // clamp |r| to 8.0 before cubing: badness(2048) = 51200 already
+    // saturates the 10_000 cap, and unclamped loose ratios (tiny
+    // stretch budgets produce r in the tens of thousands) overflowed
+    // the i32 cube, wrapping to garbage badness in release builds
+    let r = (r_q8.unsigned_abs() as i32).min(8 * Q8_ONE);
     let r_squared_q8 = (r * r) / Q8_ONE;
     let r_cubed_q8 = (r_squared_q8 * r) / Q8_ONE;
     (100 * r_cubed_q8 / Q8_ONE).min(BADNESS_INFINITY)
@@ -668,7 +824,7 @@ mod tests {
     #[test]
     fn empty_paragraph_returns_error() {
         let mut out = Vec::new();
-        assert_eq!(break_paragraph(&[], &cfg(100), &mut out), Err(BreakError::EmptyParagraph));
+        assert_eq!(break_paragraph(&[], &cfg(100), &mut BreakScratch::new(), &mut out), Err(BreakError::EmptyParagraph));
     }
 
     #[test]
@@ -677,7 +833,7 @@ mod tests {
         items.push(boxed(20));
         items.extend(forced_triple());
         let mut out = Vec::new();
-        break_paragraph(&items, &cfg(100), &mut out).unwrap();
+        break_paragraph(&items, &cfg(100), &mut BreakScratch::new(), &mut out).unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].flags.contains(ChoiceFlags::LAST_LINE));
         assert!(out[0].flags.contains(ChoiceFlags::FORCED_BREAK));
@@ -691,21 +847,25 @@ mod tests {
         items.push(boxed(10));
         items.extend(forced_triple());
         let mut out = Vec::new();
-        break_paragraph(&items, &cfg(100), &mut out).unwrap();
+        break_paragraph(&items, &cfg(100), &mut BreakScratch::new(), &mut out).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].line_width_used, 25);
     }
 
     #[test]
     fn long_paragraph_breaks_into_multiple_lines() {
+        // stretchy glue keeps interior breaks inside pass-1 tolerance
+        // (with stretch 2 every break had badness > 200 and the forced
+        // single-line collapse won on demerits; this test never ran
+        // before the host harness existed and encoded that wrong)
         let mut items = Vec::new();
         for _ in 0..20 {
             items.push(boxed(10));
-            items.push(glue(5, 2, 1));
+            items.push(glue(5, 12, 1));
         }
         items.extend(forced_triple());
         let mut out = Vec::new();
-        break_paragraph(&items, &cfg(50), &mut out).unwrap();
+        break_paragraph(&items, &cfg(50), &mut BreakScratch::new(), &mut out).unwrap();
         assert!(out.len() >= 4, "expected ≥4 lines, got {}", out.len());
         assert!(out.last().unwrap().flags.contains(ChoiceFlags::LAST_LINE));
     }
@@ -716,23 +876,31 @@ mod tests {
         items.push(boxed(200)); // wider than line_width=100
         items.extend(forced_triple());
         let mut out = Vec::new();
-        break_paragraph_with_fallback(&items, &cfg(100), &mut out).unwrap();
+        break_paragraph_with_fallback(&items, &cfg(100), &mut BreakScratch::new(), &mut out).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].adjustment(), Adjustment::Overflow);
     }
 
     #[test]
-    fn forced_break_in_middle_emits_two_lines() {
+    fn mid_forced_penalty_reaches_terminal() {
+        // production only emits forced penalties at the end of an item
+        // stream (every push_forced_break_triple is followed by
+        // `return finish`), so the breaker has no forced-break barrier:
+        // a cheap line spanning a mid-stream forced penalty can win on
+        // demerits. this test documents that; if mid-stream forced
+        // breaks ever become reachable, a barrier must be added and
+        // this becomes a two-line assertion
         let mut items = Vec::new();
         items.push(boxed(10));
         items.push(Item::penalty(Item::PENALTY_FORCE, false, true, 0));
         items.push(boxed(10));
         items.extend(forced_triple());
         let mut out = Vec::new();
-        break_paragraph(&items, &cfg(100), &mut out).unwrap();
-        assert_eq!(out.len(), 2);
-        assert!(out[0].flags.contains(ChoiceFlags::FORCED_BREAK));
-        assert!(out[1].flags.contains(ChoiceFlags::LAST_LINE));
+        break_paragraph(&items, &cfg(100), &mut BreakScratch::new(), &mut out).unwrap();
+        assert!(!out.is_empty());
+        let last = out.last().unwrap();
+        assert!(last.flags.contains(ChoiceFlags::LAST_LINE));
+        assert!(last.flags.contains(ChoiceFlags::FORCED_BREAK));
     }
 
     #[test]
@@ -747,7 +915,7 @@ mod tests {
             max_items: 5,
             ..BreakConfig::DEFAULT
         };
-        assert_eq!(break_paragraph(&items, &cfg, &mut out), Err(BreakError::ItemBudgetExceeded));
+        assert_eq!(break_paragraph(&items, &cfg, &mut BreakScratch::new(), &mut out), Err(BreakError::ItemBudgetExceeded));
     }
 
     #[test]
@@ -763,7 +931,7 @@ mod tests {
         let mut out = Vec::new();
         // With default tolerance and zero stretch, lines are either
         // perfect or overfull. line_width=42 makes each pair fit exactly.
-        let _ = break_paragraph_with_fallback(&items, &cfg(42), &mut out);
+        let _ = break_paragraph_with_fallback(&items, &cfg(42), &mut BreakScratch::new(), &mut out);
         // Just assert we got a non-empty output (didn't return error).
         assert!(!out.is_empty());
     }
@@ -790,13 +958,13 @@ mod tests {
             ..BreakConfig::DEFAULT
         };
         let mut primary_out = Vec::new();
-        break_paragraph(&items, &strict, &mut primary_out).unwrap();
+        break_paragraph(&items, &strict, &mut BreakScratch::new(), &mut primary_out).unwrap();
         assert_eq!(primary_out.len(), 1, "primary should collapse to one line");
         assert_eq!(primary_out[0].adjustment(), Adjustment::Overflow);
 
         // Fallback wrapper: detects single-Overflow and retries loose.
         let mut out = Vec::new();
-        break_paragraph_with_fallback(&items, &strict, &mut out).unwrap();
+        break_paragraph_with_fallback(&items, &strict, &mut BreakScratch::new(), &mut out).unwrap();
         assert!(out.len() > 1, "fallback should emit >1 line, got {}", out.len());
     }
 
@@ -806,7 +974,7 @@ mod tests {
         items.push(boxed(10));
         items.extend(forced_triple());
         let mut out = Vec::new();
-        break_paragraph(&items, &cfg(100), &mut out).unwrap();
+        break_paragraph(&items, &cfg(100), &mut BreakScratch::new(), &mut out).unwrap();
         assert!(out.last().unwrap().flags.contains(ChoiceFlags::LAST_LINE));
     }
 
@@ -816,7 +984,7 @@ mod tests {
         items.push(boxed(50));
         items.extend(forced_triple());
         let mut out = Vec::new();
-        break_paragraph(&items, &cfg(100), &mut out).unwrap();
+        break_paragraph(&items, &cfg(100), &mut BreakScratch::new(), &mut out).unwrap();
         // Last line is the forced break with no glue: adjustment is
         // either Perfect (0) or Overflow if box is too wide. With width
         // 50 ≤ 100, it's Perfect.
@@ -840,7 +1008,7 @@ mod tests {
 
         // Pass 1 alone collapses to single Overflow.
         let mut pass1 = Vec::new();
-        break_paragraph(&items, &cfg(40), &mut pass1).unwrap();
+        break_paragraph(&items, &cfg(40), &mut BreakScratch::new(), &mut pass1).unwrap();
         assert_eq!(pass1.len(), 1);
         assert_eq!(pass1[0].adjustment(), Adjustment::Overflow);
 
@@ -848,7 +1016,7 @@ mod tests {
         // interior breaks become acceptable and the paragraph emits
         // multiple lines.
         let mut out = Vec::new();
-        break_paragraph_with_fallback(&items, &cfg(40), &mut out).unwrap();
+        break_paragraph_with_fallback(&items, &cfg(40), &mut BreakScratch::new(), &mut out).unwrap();
         assert!(out.len() > 1, "expected multi-line, got {}", out.len());
     }
 
@@ -873,8 +1041,8 @@ mod tests {
 
         let mut a = Vec::new();
         let mut b = Vec::new();
-        break_paragraph(&items, &cfg_default, &mut a).unwrap();
-        break_paragraph(&items, &cfg_explicit_zero, &mut b).unwrap();
+        break_paragraph(&items, &cfg_default, &mut BreakScratch::new(), &mut a).unwrap();
+        break_paragraph(&items, &cfg_explicit_zero, &mut BreakScratch::new(), &mut b).unwrap();
         assert_eq!(a, b);
     }
 
@@ -895,7 +1063,7 @@ mod tests {
 
         // Pass 1 alone: single line, Shrink (NOT Overflow), wider than column.
         let mut pass1 = Vec::new();
-        break_paragraph(&items, &cfg(40), &mut pass1).unwrap();
+        break_paragraph(&items, &cfg(40), &mut BreakScratch::new(), &mut pass1).unwrap();
         assert_eq!(pass1.len(), 1);
         assert!(matches!(pass1[0].adjustment(), Adjustment::Shrink(_)));
         assert!(pass1[0].line_width_used > 40);
@@ -903,8 +1071,113 @@ mod tests {
         // with_fallback must fire pass 2 on natural-width overflow and
         // produce multi-line output.
         let mut out = Vec::new();
-        break_paragraph_with_fallback(&items, &cfg(40), &mut out).unwrap();
+        break_paragraph_with_fallback(&items, &cfg(40), &mut BreakScratch::new(), &mut out).unwrap();
         assert!(out.len() > 1, "expected multi-line, got {}", out.len());
+    }
+
+    // deterministic LCG so property tests need no rand dependency
+    fn lcg(state: &mut u32) -> u32 {
+        *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        *state >> 16
+    }
+
+    #[test]
+    fn windowed_matches_full_scan_on_prose() {
+        // pseudo-random prose-like paragraphs: the DP window must be a
+        // pure optimization for every feasible input
+        let mut seed = 0xC0FFEE;
+        for case in 0..40 {
+            let words = 5 + (lcg(&mut seed) % 60) as usize;
+            let mut items = Vec::new();
+            for _ in 0..words {
+                items.push(boxed(8 + (lcg(&mut seed) % 32) as u16));
+                items.push(glue(
+                    4 + (lcg(&mut seed) % 4) as u16,
+                    2 + (lcg(&mut seed) % 3) as u16,
+                    1 + (lcg(&mut seed) % 2) as u8,
+                ));
+            }
+            items.extend(forced_triple());
+            let line_width = 60 + (lcg(&mut seed) % 300) as u16;
+
+            let mut windowed = Vec::new();
+            let mut full = Vec::new();
+            let r1 = break_paragraph(&items, &cfg(line_width), &mut BreakScratch::new(), &mut windowed);
+            let r2 = break_paragraph_full_scan(&items, &cfg(line_width), &mut BreakScratch::new(), &mut full);
+            assert_eq!(r1, r2, "case {} result mismatch", case);
+            assert_eq!(windowed, full, "case {} (lw={}) output mismatch", case, line_width);
+        }
+    }
+
+    #[test]
+    fn windowed_matches_full_scan_giant_url_mid_paragraph() {
+        // a single unbreakable box wider than the line, surrounded by
+        // normal prose: predecessors of the span containing it lie
+        // outside the DP window, so this exercises the escape hatch.
+        // assert exact equality with the full scan under both the
+        // pass-1 config and the fallback config
+        let mut items = Vec::new();
+        for _ in 0..6 {
+            items.push(boxed(20));
+            items.push(glue(5, 12, 1));
+        }
+        items.push(boxed(400)); // the URL
+        items.push(glue(5, 12, 1));
+        for _ in 0..6 {
+            items.push(boxed(20));
+            items.push(glue(5, 12, 1));
+        }
+        items.extend(forced_triple());
+
+        let configs = [
+            cfg(100),
+            BreakConfig {
+                tolerance: 10_000,
+                line_penalty: 0,
+                emergency_stretch: 100 / 5,
+                ..cfg(100)
+            },
+        ];
+        for (ci, c) in configs.iter().enumerate() {
+            let mut windowed = Vec::new();
+            let mut full = Vec::new();
+            let r1 = break_paragraph(&items, c, &mut BreakScratch::new(), &mut windowed);
+            let r2 = break_paragraph_full_scan(&items, c, &mut BreakScratch::new(), &mut full);
+            assert_eq!(r1, r2, "cfg {} result mismatch", ci);
+            assert_eq!(windowed, full, "cfg {} output mismatch", ci);
+        }
+    }
+
+    #[test]
+    fn scratch_reuse_is_equivalent_to_fresh() {
+        // running two different paragraphs through ONE scratch must
+        // give the same output as fresh scratches (stale-state guard)
+        let mut items_a = Vec::new();
+        for _ in 0..10 {
+            items_a.push(boxed(12));
+            items_a.push(glue(5, 3, 1));
+        }
+        items_a.extend(forced_triple());
+        let mut items_b = Vec::new();
+        for _ in 0..4 {
+            items_b.push(boxed(30));
+            items_b.push(glue(6, 2, 2));
+        }
+        items_b.extend(forced_triple());
+
+        let mut shared = BreakScratch::new();
+        let mut out_a1 = Vec::new();
+        let mut out_b1 = Vec::new();
+        break_paragraph(&items_a, &cfg(70), &mut shared, &mut out_a1).unwrap();
+        break_paragraph(&items_b, &cfg(70), &mut shared, &mut out_b1).unwrap();
+
+        let mut out_a2 = Vec::new();
+        let mut out_b2 = Vec::new();
+        break_paragraph(&items_a, &cfg(70), &mut BreakScratch::new(), &mut out_a2).unwrap();
+        break_paragraph(&items_b, &cfg(70), &mut BreakScratch::new(), &mut out_b2).unwrap();
+
+        assert_eq!(out_a1, out_a2);
+        assert_eq!(out_b1, out_b2);
     }
 
     #[test]
@@ -916,16 +1189,16 @@ mod tests {
         let mut items = Vec::new();
         for _ in 0..6 {
             items.push(boxed(10));
-            items.push(glue(5, 3, 1));
+            items.push(glue(5, 12, 1));
         }
         items.extend(forced_triple());
 
         let mut direct = Vec::new();
-        break_paragraph(&items, &cfg(50), &mut direct).unwrap();
+        break_paragraph(&items, &cfg(50), &mut BreakScratch::new(), &mut direct).unwrap();
         assert!(direct.len() > 1, "test paragraph should span multiple lines");
 
         let mut via_fallback = Vec::new();
-        break_paragraph_with_fallback(&items, &cfg(50), &mut via_fallback).unwrap();
+        break_paragraph_with_fallback(&items, &cfg(50), &mut BreakScratch::new(), &mut via_fallback).unwrap();
         assert_eq!(direct, via_fallback);
     }
 }

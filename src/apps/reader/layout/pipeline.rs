@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 
 use crate::fonts::{FontSet, Style};
 
-use super::breaker::{break_paragraph_with_fallback, BreakChoice, BreakConfig};
+use super::breaker::{break_paragraph_with_fallback, BreakChoice, BreakConfig, BreakScratch};
 use super::items::{self, Item, ParagraphEnd, ParagraphMeta};
 use super::paginate::convert;
 use super::scan::{ImageRef, MarkupScanner, TextStyle};
@@ -98,6 +98,9 @@ pub enum StepOutcome {
 pub struct LayoutPipeline {
     pub items: Vec<Item>,
     pub choices: Vec<BreakChoice>,
+    /// reusable K-P DP scratch; allocated once per chapter typeset
+    /// instead of per paragraph
+    scratch: BreakScratch,
     /// number of paragraphs that fell back to greedy this run
     pub fallback_count: u32,
     /// number of paragraphs processed this run
@@ -113,6 +116,7 @@ impl LayoutPipeline {
         Self {
             items: Vec::new(),
             choices: Vec::new(),
+            scratch: BreakScratch::new(),
             fallback_count: 0,
             paragraphs: 0,
             images: 0,
@@ -191,7 +195,7 @@ impl LayoutPipeline {
         let lines_before = out_lines.len();
         let used_fallback;
         let kp_choice_count;
-        match break_paragraph_with_fallback(&self.items, &cfg, &mut self.choices) {
+        match break_paragraph_with_fallback(&self.items, &cfg, &mut self.scratch, &mut self.choices) {
             Ok(()) => {
                 kp_choice_count = self.choices.len();
                 used_fallback = false;
@@ -254,6 +258,7 @@ impl Drop for LayoutPipeline {
         self.items.shrink_to_fit();
         self.choices.clear();
         self.choices.shrink_to_fit();
+        self.scratch.release();
     }
 }
 

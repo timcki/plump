@@ -588,7 +588,7 @@ pub mod convert {
                 ..BreakConfig::DEFAULT
             };
             let mut choices = Vec::new();
-            break_paragraph(&items, &cfg, &mut choices).unwrap();
+            break_paragraph(&items, &cfg, &mut BreakScratch::new(), &mut choices).unwrap();
 
             let mut out = Vec::new();
             let mut pending = false;
@@ -607,7 +607,7 @@ pub mod convert {
                 ..BreakConfig::DEFAULT
             };
             let mut choices = Vec::new();
-            break_paragraph(&items, &cfg, &mut choices).unwrap();
+            break_paragraph(&items, &cfg, &mut BreakScratch::new(), &mut choices).unwrap();
 
             let mut out = Vec::new();
             let mut pending = true;
@@ -634,7 +634,7 @@ pub mod convert {
                 ..BreakConfig::DEFAULT
             };
             let mut choices = Vec::new();
-            break_paragraph(&items, &cfg, &mut choices).unwrap();
+            break_paragraph(&items, &cfg, &mut BreakScratch::new(), &mut choices).unwrap();
 
             let mut out = Vec::new();
             let mut pending = false;
@@ -660,7 +660,7 @@ pub mod convert {
                 ..BreakConfig::DEFAULT
             };
             let mut choices = Vec::new();
-            break_paragraph(&items, &cfg, &mut choices).unwrap();
+            break_paragraph(&items, &cfg, &mut BreakScratch::new(), &mut choices).unwrap();
 
             let mut out = Vec::new();
             let mut pending = false;
@@ -692,7 +692,7 @@ pub mod convert {
                 ..BreakConfig::DEFAULT
             };
             let mut choices = Vec::new();
-            break_paragraph(&items, &cfg, &mut choices).unwrap();
+            break_paragraph(&items, &cfg, &mut BreakScratch::new(), &mut choices).unwrap();
 
             let mut out = Vec::new();
             let mut pending = false;
@@ -729,7 +729,7 @@ pub mod convert {
                 ..BreakConfig::DEFAULT
             };
             let mut choices = Vec::new();
-            break_paragraph(&items, &cfg, &mut choices).unwrap();
+            break_paragraph(&items, &cfg, &mut BreakScratch::new(), &mut choices).unwrap();
 
             let mut out = Vec::new();
             let mut pending = false;
@@ -762,7 +762,7 @@ pub mod convert {
                 ..BreakConfig::DEFAULT
             };
             let mut choices = Vec::new();
-            break_paragraph(&items, &cfg, &mut choices).unwrap();
+            break_paragraph(&items, &cfg, &mut BreakScratch::new(), &mut choices).unwrap();
 
             let mut out = Vec::new();
             let mut pending = false;
