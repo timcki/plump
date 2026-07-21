@@ -487,15 +487,16 @@ impl super::Kernel {
             self.sd_ok = self.sd.probe_ok();
         }
 
-        if tasks::BOOKMARK_FLUSH_DUE.try_take().is_some() && self.bm_cache.is_dirty() {
+        let flush_due = tasks::BOOKMARK_FLUSH_DUE.try_take().is_some();
+        if flush_due && self.bm_cache.is_dirty() {
             self.bm_cache.flush(&self.sd);
         }
 
-        // flush today's reading stats opportunistically when dirty.
-        // piggybacks on the bookmark cadence so we don't add another
-        // background task; cost is one ~16-byte write per minute or so
-        // while the user is actively reading.
-        if self.day_stats.is_dirty() && self.sd_ok {
+        // flush today's reading stats on the bookmark cadence; an
+        // ungated check here would run an SD write plus a FAT mtime
+        // lookup on every page turn's keypress-to-render path (each
+        // add_pages/add_secs sets the dirty bit)
+        if flush_due && self.day_stats.is_dirty() && self.sd_ok {
             if let Err(e) = self.day_stats.flush(&self.sd) {
                 log::warn!("daystats flush: {}", e);
             } else {
@@ -953,6 +954,14 @@ impl super::Kernel {
         // save active app state (reader position) to bookmark cache
         // before collecting session, so bookmarks stay in sync
         app_mgr.save_active_state(&mut *self.bm_cache);
+
+        // day-stats only flushes on the 30s bookmark cadence now, so
+        // up to 30s of reading stats would be lost without this
+        if self.day_stats.is_dirty() && self.sd_ok {
+            if let Err(e) = self.day_stats.flush(&self.sd) {
+                log::warn!("sleep: daystats flush: {}", e);
+            }
+        }
 
         // force flush deferred app persistence (RECENT, reading stats)
         // before deep sleep so no dirty state is lost

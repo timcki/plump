@@ -90,7 +90,7 @@ impl ReaderApp {
                     let s = span.start as usize;
                     let dump_max = (s + (span.len as usize).min(40)).min(self.pg.buf_len);
                     let dump = &self.pg.buf[s..dump_max];
-                    log::info!(
+                    log::debug!(
                         "KPDIAG rd ch_li={} pg={} pg_li={} len={} m_w={} avail={} gaps={} flags=0x{:02x} extra=0x{:02x} bytes={:?}",
                         page_first_line + i,
                         self.pg.page,
@@ -720,7 +720,7 @@ impl ReaderApp {
         // tiny (~1-2 px) but the renderer draws at ~8-12 px, K-P will
         // measure lines ~6x narrower than reality, fail tolerance on
         // every interior break, and collapse paragraphs to one line.
-        log::info!(
+        log::debug!(
             "KPDIAG fonts size_idx={} text_w={} line_h={} ascent={} adv_A_reg={} adv_A_bold={} adv_a_reg={} adv_M_reg={} adv_i_reg={} adv_space_reg={} adv_space_bold={} adv_period_reg={} adv_emdash_reg={} adv_apos_reg={} adv_smartapos_reg={}",
             self.book_font_size_idx,
             self.text_w,

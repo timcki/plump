@@ -240,6 +240,21 @@ impl BitmapFont {
         if text.is_empty() {
             return;
         }
+        // skip strips this region cannot touch; the draw callback runs
+        // once per 40-row strip, so without this every label re-measures
+        // and re-resolves all glyphs ~12x per refresh. inflate vertically
+        // by one line height: alignment can place text outside a region
+        // shorter than the font
+        let lh = self.line_height as u16;
+        let band = Region::new(
+            region.x,
+            region.y.saturating_sub(lh),
+            region.w,
+            region.h.saturating_add(2 * lh),
+        );
+        if !band.intersects(strip.logical_window()) {
+            return;
+        }
         let text_w = self.measure_str(text) as u32;
         let text_h = self.line_height as u32;
         let top_left = alignment.position(region, Size::new(text_w, text_h));

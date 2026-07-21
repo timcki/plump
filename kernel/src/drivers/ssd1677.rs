@@ -14,7 +14,7 @@ use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
 use esp_hal::delay::Delay;
 
-use super::strip::{GrayMode, STRIP_COUNT, StripBuffer};
+use super::strip::{GrayMode, StripBuffer};
 
 pub const WIDTH: u16 = 800;
 pub const HEIGHT: u16 = 480;
@@ -341,6 +341,11 @@ where
         self.send_command(cmd::BORDER_WAVEFORM);
         self.send_data(&[0x01]);
 
+        // entry mode never changes after init; sending it per RAM-area
+        // setup cost two SPI transactions per strip per plane
+        self.send_command(cmd::DATA_ENTRY_MODE);
+        self.send_data(&[0x01]);
+
         self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
 
         self.init_done = true;
@@ -382,12 +387,10 @@ where
         })
     }
 
-    // gates wired in reverse; Y flipped, X inc / Y dec
+    // gates wired in reverse; Y flipped, X inc / Y dec.
+    // DATA_ENTRY_MODE is programmed once in init_display
     fn set_partial_ram_area(&mut self, x: u16, y: u16, w: u16, h: u16) {
         let y_flipped = HEIGHT - y - h;
-
-        self.send_command(cmd::DATA_ENTRY_MODE);
-        self.send_data(&[0x01]);
 
         self.send_command(cmd::SET_RAM_X_RANGE);
         self.send_data(&[
@@ -605,17 +608,9 @@ where
 
         delay.delay_millis(1);
 
-        for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
-            self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
-            self.send_command(ram_cmd);
-            delay.delay_millis(1);
-
-            for i in 0..STRIP_COUNT {
-                strip.begin_strip(self.rotation, i);
-                draw(strip);
-                self.send_data(strip.data());
-            }
-        }
+        // render each strip once and send it to both RAMs; running the
+        // draw callback per plane doubled the CPU side of every full GC
+        self.write_region_strips_dual(strip, 0, 0, WIDTH, HEIGHT, draw, 0, 0);
     }
 
     /// Start a full GC refresh.

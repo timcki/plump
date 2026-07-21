@@ -3018,6 +3018,12 @@ impl App<AppId> for ReaderApp {
                     }
                 }
             } else {
+                // strips are 40px-wide vertical columns in logical space
+                // (portrait via 270deg rotation), so lines are culled by
+                // their x extent, not by row
+                let lw = strip.logical_window();
+                let win_l = lw.x as i32;
+                let win_r = lw.x as i32 + lw.w as i32;
                 let mut img_rendered = false;
                 for i in 0..self.pg.line_count {
                     let span = &self.pg.lines[i];
@@ -3218,6 +3224,18 @@ impl App<AppId> for ReaderApp {
                     };
                     let mut gap_idx: i32 = 0;
 
+                    // skip lines that end left of this strip. natural and
+                    // shrunk lines are bounded by their measured width;
+                    // stretched lines span the whole column and always
+                    // overlap. the early break in the walk below handles
+                    // strips left of the line start
+                    if extra_per_gap <= 0
+                        && remainder <= 0
+                        && win_l > cx + self.pg.line_measures[i].width as i32 + 8
+                    {
+                        continue;
+                    }
+
                     // Track style by accumulated flags (matches K-P's
                     // `fonts::Style::from_flags` resolver) so nested
                     // markup (e.g. `<b><i>x</i></b>`) draws under the
@@ -3244,6 +3262,13 @@ impl App<AppId> for ReaderApp {
 
                     let mut j = 0usize;
                     while j < line.len() {
+                        // pen passed the strip's right edge; nothing further
+                        // on this line can touch it. active underline/strike
+                        // strokes flush below with the current cx (the strip
+                        // clips them to its window)
+                        if cx >= win_r + 8 {
+                            break;
+                        }
                         let b = line[j];
                         if b == MARKER && j + 1 < line.len() {
                             match line[j + 1] {

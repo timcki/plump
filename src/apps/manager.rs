@@ -952,7 +952,15 @@ impl AppLayer for AppManager {
         self.chrome.top.battery_pct = battery_pct;
         self.chrome.top.today_pages = today_pages;
         self.chrome.top.today_secs = today_secs;
-        if prev_pct != battery_pct || prev_pages != today_pages || prev_secs != today_secs {
+        // only invalidate when the active app actually shows the bar;
+        // in the reader (chrome hidden) the day-stat drain changes
+        // today_secs after every page turn, and an unconditional mark
+        // fired a ~400ms DU partial repainting identical book pixels
+        let active = self.launcher.active();
+        let show_top = with_app_ref!(active, self, |app| app.show_top_status());
+        if show_top
+            && (prev_pct != battery_pct || prev_pages != today_pages || prev_secs != today_secs)
+        {
             // chrome top bar changed; queue a coalesced redraw so the
             // next paintable window picks it up. width spans the full
             // bar; height is the top chrome region.

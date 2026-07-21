@@ -565,22 +565,30 @@ impl StripBuffer {
         let first_mask: u8 = 0xFF >> (lx0 & 7);
         let last_mask: u8 = 0xFF << (7 - ((lx1 - 1) & 7));
 
-        let (fill, edge_op): (u8, fn(&mut u8, u8)) = if black {
-            (0x00, |b, m| *b &= !m)
-        } else {
-            (0xFF, |b, m| *b |= m)
-        };
-
-        for ly in ly0..ly1 {
-            let row = ly * rb;
-            if first_byte == last_byte {
-                edge_op(&mut self.buf[row + first_byte], first_mask & last_mask);
-            } else {
-                edge_op(&mut self.buf[row + first_byte], first_mask);
-                for b in first_byte + 1..last_byte {
-                    self.buf[row + b] = fill;
+        // duplicated per polarity so the edge ops inline (a shared fn
+        // pointer defeated devirtualization) and the interior uses a
+        // word-wise slice fill instead of per-byte checked stores
+        if black {
+            for ly in ly0..ly1 {
+                let row = ly * rb;
+                if first_byte == last_byte {
+                    self.buf[row + first_byte] &= !(first_mask & last_mask);
+                } else {
+                    self.buf[row + first_byte] &= !first_mask;
+                    self.buf[row + first_byte + 1..row + last_byte].fill(0x00);
+                    self.buf[row + last_byte] &= !last_mask;
                 }
-                edge_op(&mut self.buf[row + last_byte], last_mask);
+            }
+        } else {
+            for ly in ly0..ly1 {
+                let row = ly * rb;
+                if first_byte == last_byte {
+                    self.buf[row + first_byte] |= first_mask & last_mask;
+                } else {
+                    self.buf[row + first_byte] |= first_mask;
+                    self.buf[row + first_byte + 1..row + last_byte].fill(0xFF);
+                    self.buf[row + last_byte] |= last_mask;
+                }
             }
         }
     }
