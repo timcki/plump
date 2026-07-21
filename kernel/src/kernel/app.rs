@@ -313,6 +313,17 @@ impl AppContext {
         }
     }
 
+    /// Instant at which a pending coalesced redraw becomes render-ready,
+    /// if one is armed. None when nothing is pending or the redraw is
+    /// already renderable (the scheduler renders it before parking, so
+    /// only a future coalesce window needs a timed wake).
+    pub fn next_render_deadline(&self) -> Option<Instant> {
+        match self.redraw {
+            Redraw::Partial(_) if !self.immediate => self.coalesce_until,
+            _ => None,
+        }
+    }
+
     pub fn take_redraw(&mut self) -> Redraw {
         let r = self.redraw;
         self.redraw = Redraw::None;

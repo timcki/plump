@@ -14,8 +14,8 @@
 // sd_card_sleep sends cmd0 before deep sleep to reduce sd card
 // idle current from ~150 uA to ~10 uA
 
-use embassy_futures::select::{Either, select};
-use embassy_time::{Duration, Instant, Ticker, with_timeout};
+use embassy_futures::select::{Either, Either3, Either4, select, select3, select4};
+use embassy_time::{Duration, Instant, Timer};
 use log::{debug, info};
 
 use super::app::{AppLayer, GrayscaleMode, Redraw, Transition};
@@ -238,15 +238,16 @@ impl super::Kernel {
         );
     }
 
-    // event-driven main loop; never returns
+    // deadline-driven main loop; never returns
     //
-    // two genuine async suspension points in steady state:
-    //   1. select(INPUT_EVENTS.receive(), work_ticker.next())
+    // steady-state suspension points:
+    //   1. the park select at the bottom (input / worker result /
+    //      earliest deadline); truly idle, the loop wakes at most
+    //      every STATUS_INTERVAL_SECS for the stats log
     //   2. EPD busy pin wait inside render()
+    //   3. yield_now between background steps (executor fairness)
     // everything between them is synchronous function calls
     pub async fn run<A: AppLayer>(&mut self, app_mgr: &mut A) -> ! {
-        let mut work_ticker = Ticker::every(Duration::from_millis(timing::TICK_MS));
-
         // re-arm from here rather than Kernel::new so the initial
         // housekeeping delay counts from UI-ready, not from before the
         // multi-second boot sequence
@@ -259,23 +260,29 @@ impl super::Kernel {
                 continue;
             }
 
-            // async point 1: wait for input or tick
-            let hw_event = match select(tasks::INPUT_EVENTS.receive(), work_ticker.next()).await {
-                Either::First(ev) => Some(ev),
-                Either::Second(_) => None,
-            };
-
-            if let Some(ev) = hw_event {
+            // drain queued input; a burst of keypresses coalesces into
+            // one pass over the loop body instead of one render each
+            while let Ok(ev) = tasks::INPUT_EVENTS.try_receive() {
                 if matches!(ev, Event::LongPress(_)) {
                     debug!("scheduler: received {:?}", ev);
                 }
                 if self.handle_input(ev, app_mgr) {
                     self.sleep_with_session(app_mgr, "power held").await;
-                    continue;
+                }
+                if app_mgr.needs_special_mode() {
+                    break;
                 }
             }
 
             if app_mgr.needs_special_mode() {
+                continue;
+            }
+
+            // idle sleep by deadline (checked only here, never during a
+            // waveform)
+            if self.idle_deadline().is_some_and(|d| Instant::now() >= d) {
+                self.sleep_with_session(app_mgr, "idle timeout").await;
+                self.last_activity = Instant::now();
                 continue;
             }
 
@@ -295,9 +302,13 @@ impl super::Kernel {
             //
             // background steps are bounded and sync; between steps we
             // poll for input so the user can interrupt long-running
-            // multi-step operations (e.g. chapter caching)
+            // multi-step operations (e.g. chapter caching). the
+            // yield_now lets input_task/worker_task actually run during
+            // a long Progress chain; without an await point they starve
+            // on the cooperative executor
+            let mut outcome;
             'bg: loop {
-                let outcome = {
+                outcome = {
                     let mut handle = self.handle();
                     app_mgr.run_background_step(&mut handle, super::app::BgBudget::new())
                 };
@@ -315,7 +326,10 @@ impl super::Kernel {
                 }
 
                 match outcome {
-                    super::app::BgOutcome::Progress { more: true } => continue 'bg,
+                    super::app::BgOutcome::Progress { more: true } => {
+                        embassy_futures::yield_now().await;
+                        continue 'bg;
+                    }
                     _ => break 'bg,
                 }
             }
@@ -324,10 +338,7 @@ impl super::Kernel {
                 continue;
             }
 
-            if self.poll_housekeeping() {
-                self.sleep_with_session(app_mgr, "idle timeout").await;
-                continue;
-            }
+            self.run_due_housekeeping();
 
             // generation-based settings propagation: only re-apply
             // hardware state when the app layer signals a change
@@ -374,8 +385,8 @@ impl super::Kernel {
             // `aa_deferred_at`. fire the AA pass once the idle window
             // has elapsed and the screen is still settled (no pending
             // redraw, AA setting still on, no power-down in progress).
-            // tick granularity is `TICK_MS` so the fire-latency is at
-            // most ~10 ms past the armed instant.
+            // the park below wakes at the armed instant, so fire
+            // latency is near zero.
             if let Some(at) = self.aa_deferred_at {
                 if !app_mgr.system_settings().text_aa
                     || !matches!(app_mgr.grayscale_mode(), GrayscaleMode::Deferred)
@@ -384,6 +395,62 @@ impl super::Kernel {
                 } else if Instant::now() >= at && !app_mgr.has_redraw() {
                     self.aa_deferred_at = None;
                     self.fire_deferred_grayscale(app_mgr).await;
+                }
+            }
+
+            // re-run the loop instead of parking when work is already
+            // pending: an interrupted Progress chain (sleep/special
+            // exit above) or a redraw made ready by a deferred action
+            // applied during the render's waveform
+            if matches!(outcome, super::app::BgOutcome::Progress { more: true })
+                || app_mgr.ctx_mut().render_ready()
+            {
+                continue;
+            }
+
+            // park until input, a worker result (only while the app
+            // layer is waiting on one), or the earliest deadline. the
+            // status-log cadence bounds the park at STATUS_INTERVAL_SECS,
+            // which doubles as the backstop for the worker's silent
+            // stale-generation skip (no result is posted for those)
+            let mut deadline = self
+                .hk
+                .status_at
+                .min(self.hk.sd_check_at)
+                .min(self.hk.bm_flush_at);
+            if let Some(d) = self.idle_deadline() {
+                deadline = deadline.min(d);
+            }
+            if let Some(d) = app_mgr.ctx_mut().next_render_deadline() {
+                deadline = deadline.min(d);
+            }
+            if let Some(d) = self.aa_deferred_at {
+                deadline = deadline.min(d);
+            }
+
+            if matches!(outcome, super::app::BgOutcome::WaitingExternal) {
+                match select3(
+                    tasks::INPUT_EVENTS.receive(),
+                    crate::kernel::work_queue::result_ready(),
+                    Timer::at(deadline),
+                )
+                .await
+                {
+                    Either3::First(ev) => {
+                        if self.handle_input(ev, app_mgr) {
+                            self.sleep_with_session(app_mgr, "power held").await;
+                        }
+                    }
+                    Either3::Second(()) | Either3::Third(()) => {}
+                }
+            } else {
+                match select(tasks::INPUT_EVENTS.receive(), Timer::at(deadline)).await {
+                    Either::First(ev) => {
+                        if self.handle_input(ev, app_mgr) {
+                            self.sleep_with_session(app_mgr, "power held").await;
+                        }
+                    }
+                    Either::Second(()) => {}
                 }
             }
         }
@@ -543,11 +610,6 @@ impl super::Kernel {
             .then(|| self.last_activity + Duration::from_secs(self.idle_timeout_mins as u64 * 60))
     }
 
-    // returns true if idle sleep is due
-    fn poll_housekeeping(&mut self) -> bool {
-        self.run_due_housekeeping();
-        self.idle_deadline().is_some_and(|d| Instant::now() >= d)
-    }
 
     // partial refreshes use DU waveform (~400 ms); after ghost_clear_every
     // partials, a full GC refresh (~1.6 s) clears ghosting
@@ -881,13 +943,14 @@ impl super::Kernel {
     //
     // during the DU/GC waveform the EPD charge pump drives pixels;
     // no SPI commands are sent, so the bus is free for SD I/O.
-    // is_busy() is a sync GPIO read; no epd borrow is held across
-    // any .await point, so self is fully available for handle() etc.
+    // is_busy() is a sync GPIO read; the busy-pin borrow inside the
+    // park selects ends before resolve_input/handle() runs (NLL).
     //
     // background work runs as bounded sync steps via
-    // run_background_step; between steps we poll for input via
-    // with_timeout. the TICK_MS timeout ensures is_busy is
-    // re-checked regularly even when no input arrives.
+    // run_background_step; while it reports Progress the steps run
+    // back-to-back (yield between them for executor fairness). once
+    // the app is out of work, park on the busy-pin edge instead of
+    // polling, so waveform completion wakes us immediately.
     //
     // first deferred action wins; hold reset prevents the held
     // button from re-firing LongPress/Repeat for the waveform
@@ -899,6 +962,12 @@ impl super::Kernel {
         &mut self,
         app_mgr: &mut A,
     ) -> (Option<DeferredAction<A::Id>>, bool) {
+        // matches the driver's own wait_busy_async timeout; without a
+        // timed arm in the parks, a stuck-high busy pin would park the
+        // whole loop forever
+        const WAVEFORM_GUARD: Duration = Duration::from_secs(5);
+        let guard_at = Instant::now() + WAVEFORM_GUARD;
+
         let mut deferred: Option<DeferredAction<A::Id>> = None;
         let mut sleep_requested = false;
 
@@ -906,23 +975,54 @@ impl super::Kernel {
             if !self.epd.is_busy() {
                 break;
             }
-
-            // run one bounded background step, then poll for input
-            {
-                let mut handle = self.handle();
-                app_mgr.run_background_step(&mut handle, super::app::BgBudget::new());
+            if Instant::now() >= guard_at {
+                log::error!("busy_wait: waveform guard timeout (busy pin stuck high)");
+                break;
             }
 
-            // check for input; tick timeout ensures busy loop doesn't spin
-            // too tightly when no input and no background work remain
-            let ev = match with_timeout(
-                Duration::from_millis(timing::TICK_MS),
-                tasks::INPUT_EVENTS.receive(),
-            )
-            .await
-            {
-                Ok(ev) => Some(ev),
-                Err(_) => None,
+            // run one bounded background step, then poll for input
+            let outcome = {
+                let mut handle = self.handle();
+                app_mgr.run_background_step(&mut handle, super::app::BgBudget::new())
+            };
+
+            let ev = if let Ok(ev) = tasks::INPUT_EVENTS.try_receive() {
+                Some(ev)
+            } else {
+                match outcome {
+                    super::app::BgOutcome::Progress { more: true } => {
+                        // more work queued; just let other tasks run
+                        embassy_futures::yield_now().await;
+                        None
+                    }
+                    super::app::BgOutcome::WaitingExternal => {
+                        let busy = self.epd.busy_pin();
+                        match select4(
+                            busy.wait_for_low(),
+                            tasks::INPUT_EVENTS.receive(),
+                            crate::kernel::work_queue::result_ready(),
+                            Timer::at(guard_at),
+                        )
+                        .await
+                        {
+                            Either4::Second(ev) => Some(ev),
+                            _ => None,
+                        }
+                    }
+                    _ => {
+                        let busy = self.epd.busy_pin();
+                        match select3(
+                            busy.wait_for_low(),
+                            tasks::INPUT_EVENTS.receive(),
+                            Timer::at(guard_at),
+                        )
+                        .await
+                        {
+                            Either3::Second(ev) => Some(ev),
+                            _ => None,
+                        }
+                    }
+                }
             };
 
             if let Some(hw_event) = ev {

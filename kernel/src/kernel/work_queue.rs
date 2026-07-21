@@ -6,7 +6,7 @@
 // generation-based cancellation: bump generation and drain() to
 // discard stale work; no explicit cancel signal needed
 //
-// channel capacity 1 for natural back-pressure; worker drops input
+// channel capacity 2 for natural back-pressure; worker drops input
 // buffers before sending results so peak heap is bounded
 
 extern crate alloc;
@@ -179,6 +179,16 @@ pub fn submit(generation: u16, task: WorkTask) -> bool {
 #[inline]
 pub fn try_recv() -> Option<WorkResult> {
     WORK_OUT.try_receive().ok()
+}
+
+/// Resolves when a result is waiting in the output channel without
+/// consuming it (level-triggered). The scheduler arms this only while
+/// the app layer reported `BgOutcome::WaitingExternal`; armed while
+/// idle, a stale-generation result nobody consumes would keep the
+/// select permanently ready. Single-waker safe: the main loop is the
+/// only async awaiter of WORK_OUT (the worker sends, apps try_recv).
+pub fn result_ready() -> impl core::future::Future<Output = ()> + 'static {
+    WORK_OUT.ready_to_receive()
 }
 
 pub fn drain() {

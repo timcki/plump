@@ -4,10 +4,6 @@
 // coalescing, and housekeeping. some of these may
 // may become runtime-configurable in the future
 
-// main scheduler tick interval (ms)
-// controls how often the event loop wakes to check for work
-pub const TICK_MS: u64 = 10;
-
 // input task poll intervals (ms)
 // fast rate used during active input; slow rate when idle to save power
 pub const INPUT_TICK_FAST_MS: u64 = 10;
