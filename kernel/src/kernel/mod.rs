@@ -93,7 +93,9 @@ impl AppliedSettings {
                 self.sleep_timeout,
                 ss.sleep_timeout
             );
-            tasks::set_idle_timeout(ss.sleep_timeout);
+            // the scheduler mirrors this into idle_timeout_mins after
+            // sync; the idle deadline re-derives from last_activity so
+            // a same-value write cannot restart the countdown
             self.sleep_timeout = ss.sleep_timeout;
         }
 
@@ -122,8 +124,8 @@ impl AppliedSettings {
     }
 
     /// Snapshot current settings without diffing; used at boot when
-    /// the initial `set_idle_timeout` / `set_sunlight_mode` have
-    /// already been called and we just need to record what was applied.
+    /// the initial idle-timeout / `set_sunlight_mode` values have
+    /// already been applied and we just need to record them.
     pub fn init_from(&mut self, generation: u32, ss: &config::SystemSettings) {
         self.generation = generation;
         self.sleep_timeout = ss.sleep_timeout;
@@ -173,6 +175,39 @@ pub struct Kernel {
     // current day key (derived from FAT mtime of DAYSTATS.BIN). 0 when
     // the SD card has no usable wall clock (no battery-backed RTC).
     pub(crate) today_key: u32,
+
+    // housekeeping deadlines, re-armed as now + interval when due (no
+    // ticker catch-up bursts after a long EPD waveform)
+    pub(crate) hk: HousekeepingDeadlines,
+
+    // instant of the last received input event (plus special-mode
+    // exit); the idle-sleep deadline derives from it on demand
+    pub(crate) last_activity: embassy_time::Instant,
+
+    // mirrored from applied.sleep_timeout; 0 disables idle sleep
+    pub(crate) idle_timeout_mins: u16,
+}
+
+pub(crate) struct HousekeepingDeadlines {
+    pub status_at: embassy_time::Instant,
+    pub sd_check_at: embassy_time::Instant,
+    pub bm_flush_at: embassy_time::Instant,
+}
+
+impl HousekeepingDeadlines {
+    // initial delay lets boot settle; the bookmark flush keeps its 2s
+    // stagger off the SD check so the two never coincide
+    pub fn starting_now() -> Self {
+        let now = embassy_time::Instant::now();
+        let initial = embassy_time::Duration::from_secs(timing::HOUSEKEEPING_INITIAL_DELAY_SECS);
+        Self {
+            status_at: now + initial,
+            sd_check_at: now + initial,
+            bm_flush_at: now
+                + initial
+                + embassy_time::Duration::from_secs(timing::BOOKMARK_FLUSH_STAGGER_SECS),
+        }
+    }
 }
 
 impl Kernel {
@@ -222,6 +257,9 @@ impl Kernel {
             theme: Theme::default_v1(),
             day_stats,
             today_key,
+            hk: HousekeepingDeadlines::starting_now(),
+            last_activity: embassy_time::Instant::now(),
+            idle_timeout_mins: 0,
         }
     }
 

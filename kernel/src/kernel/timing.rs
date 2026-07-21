@@ -51,6 +51,5 @@ pub const HOUSEKEEPING_INITIAL_DELAY_SECS: u64 = 5;
 // batch multiple rapid dirty marks into a single refresh
 pub const COALESCE_WINDOW_MS: u64 = 50;
 
-// battery read interval in input task ticks
-// ticks * 10 ms = seconds between battery reads
-pub const BATTERY_INTERVAL_TICKS: u32 = 3000;
+// battery read interval (seconds)
+pub const BATTERY_INTERVAL_SECS: u64 = 30;

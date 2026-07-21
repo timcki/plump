@@ -173,7 +173,7 @@ impl super::Kernel {
 
         // apply initial settings to hardware and record them so the
         // generation-based check in run() starts from a known baseline
-        tasks::set_idle_timeout(app_mgr.system_settings().sleep_timeout);
+        self.idle_timeout_mins = app_mgr.system_settings().sleep_timeout;
         self.epd
             .set_sunlight_mode(app_mgr.system_settings().sunlight_fix);
         self.applied
@@ -246,6 +246,12 @@ impl super::Kernel {
     // everything between them is synchronous function calls
     pub async fn run<A: AppLayer>(&mut self, app_mgr: &mut A) -> ! {
         let mut work_ticker = Ticker::every(Duration::from_millis(timing::TICK_MS));
+
+        // re-arm from here rather than Kernel::new so the initial
+        // housekeeping delay counts from UI-ready, not from before the
+        // multi-second boot sequence
+        self.hk = super::HousekeepingDeadlines::starting_now();
+        self.last_activity = Instant::now();
 
         loop {
             if app_mgr.needs_special_mode() {
@@ -333,6 +339,7 @@ impl super::Kernel {
                 if swap_changed {
                     app_mgr.on_swap_buttons_changed(self.applied.swap_buttons);
                 }
+                self.idle_timeout_mins = self.applied.sleep_timeout;
             }
 
             // push live chrome state into the app layer so the top
@@ -391,6 +398,9 @@ impl super::Kernel {
 
         app_mgr.apply_transition(Transition::Pop, &mut self.handle());
         app_mgr.request_full_redraw();
+        // a long special mode (wifi upload) must not be followed by an
+        // immediate idle sleep computed from pre-upload activity
+        self.last_activity = Instant::now();
     }
 
     /// Shared helper: run a hardware event through the input policy and
@@ -453,7 +463,7 @@ impl super::Kernel {
 
     // returns true if caller should call enter_sleep
     fn handle_input<A: AppLayer>(&mut self, hw_event: Event, app_mgr: &mut A) -> bool {
-        let _ = tasks::IDLE_SLEEP_DUE.try_take();
+        self.last_activity = Instant::now();
 
         match self.resolve_input(hw_event, app_mgr, false) {
             InputResult::Sleep => true,
@@ -477,55 +487,66 @@ impl super::Kernel {
         }
     }
 
-    // shared housekeeping body: battery, sd probe, bookmark flush, stats
-    fn poll_housekeeping_inner(&mut self) {
+    // shared housekeeping body: battery, sd probe, bookmark flush,
+    // stats. deadlines re-arm as now + interval so a 1.6s GC waveform
+    // cannot queue catch-up runs
+    fn run_due_housekeeping(&mut self) {
         if let Some(mv) = tasks::BATTERY_MV.try_take() {
             self.cached_battery_mv = mv;
         }
 
-        if tasks::SD_CHECK_DUE.try_take().is_some() {
+        let now = Instant::now();
+
+        if now >= self.hk.sd_check_at {
+            self.hk.sd_check_at = now + Duration::from_secs(timing::SD_CHECK_INTERVAL_SECS);
             self.sd_ok = self.sd.probe_ok();
         }
 
-        let flush_due = tasks::BOOKMARK_FLUSH_DUE.try_take().is_some();
-        if flush_due && self.bm_cache.is_dirty() {
-            self.bm_cache.flush(&self.sd);
-        }
+        if now >= self.hk.bm_flush_at {
+            self.hk.bm_flush_at = now + Duration::from_secs(timing::BOOKMARK_FLUSH_INTERVAL_SECS);
+            if self.bm_cache.is_dirty() {
+                self.bm_cache.flush(&self.sd);
+            }
 
-        // flush today's reading stats on the bookmark cadence; an
-        // ungated check here would run an SD write plus a FAT mtime
-        // lookup on every page turn's keypress-to-render path (each
-        // add_pages/add_secs sets the dirty bit)
-        if flush_due && self.day_stats.is_dirty() && self.sd_ok {
-            if let Err(e) = self.day_stats.flush(&self.sd) {
-                log::warn!("daystats flush: {}", e);
-            } else {
-                // mtime of DAYSTATS.BIN just advanced; refresh
-                // today_key so a same-session rollover is detected
-                // before the next boot.
-                if let Some(k) = self
-                    .sd
-                    .file_mtime_day_key_in_plump(super::daystats::DAYSTATS_FILE)
-                {
-                    self.today_key = k;
+            // flush today's reading stats on the bookmark cadence; an
+            // ungated check here would run an SD write plus a FAT mtime
+            // lookup on every page turn's keypress-to-render path (each
+            // add_pages/add_secs sets the dirty bit)
+            if self.day_stats.is_dirty() && self.sd_ok {
+                if let Err(e) = self.day_stats.flush(&self.sd) {
+                    log::warn!("daystats flush: {}", e);
+                } else {
+                    // mtime of DAYSTATS.BIN just advanced; refresh
+                    // today_key so a same-session rollover is detected
+                    // before the next boot.
+                    if let Some(k) = self
+                        .sd
+                        .file_mtime_day_key_in_plump(super::daystats::DAYSTATS_FILE)
+                    {
+                        self.today_key = k;
+                    }
                 }
             }
         }
 
-        if tasks::STATUS_DUE.try_take().is_some() {
+        if now >= self.hk.status_at {
+            self.hk.status_at = now + Duration::from_secs(timing::STATUS_INTERVAL_SECS);
             self.log_stats();
         }
     }
 
-    // returns true if idle sleep is due
-    fn poll_housekeeping(&mut self) -> bool {
-        self.poll_housekeeping_inner();
-        tasks::IDLE_SLEEP_DUE.try_take().is_some()
+    // deadline for idle sleep, None when disabled. re-derived from
+    // last_activity on demand, so re-applying an unchanged timeout
+    // value cannot restart the countdown
+    fn idle_deadline(&self) -> Option<Instant> {
+        (self.idle_timeout_mins > 0)
+            .then(|| self.last_activity + Duration::from_secs(self.idle_timeout_mins as u64 * 60))
     }
 
-    // housekeeping without idle-sleep check; never sleep mid-refresh
-    fn poll_housekeeping_waveform(&mut self) {
-        self.poll_housekeeping_inner();
+    // returns true if idle sleep is due
+    fn poll_housekeeping(&mut self) -> bool {
+        self.run_due_housekeeping();
+        self.idle_deadline().is_some_and(|d| Instant::now() >= d)
     }
 
     // partial refreshes use DU waveform (~400 ms); after ghost_clear_every
@@ -905,7 +926,7 @@ impl super::Kernel {
             };
 
             if let Some(hw_event) = ev {
-                let _ = tasks::IDLE_SLEEP_DUE.try_take();
+                self.last_activity = Instant::now();
                 let suppress = app_mgr.suppress_deferred_input();
 
                 match self.resolve_input(hw_event, app_mgr, suppress) {
@@ -931,7 +952,10 @@ impl super::Kernel {
                 }
             }
 
-            self.poll_housekeeping_waveform();
+            // SD I/O is legal here: the charge pump is driving pixels
+            // with no SPI traffic. idle sleep is never taken mid-waveform
+            // (the deadline check lives in the main loop only)
+            self.run_due_housekeeping();
         }
 
         (deferred, sleep_requested)

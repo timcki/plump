@@ -202,12 +202,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     spawner
         .spawn(tasks::input_task(input))
         .expect("spawn input_task");
-    spawner
-        .spawn(tasks::housekeeping_task())
-        .expect("spawn housekeeping_task");
-    spawner
-        .spawn(tasks::idle_timeout_task())
-        .expect("spawn idle_timeout_task");
+    // housekeeping and idle sleep run on Instant deadlines inside the
+    // scheduler main loop; no dedicated tasks
     spawner
         .spawn(work_queue::worker_task())
         .expect("spawn worker_task");
