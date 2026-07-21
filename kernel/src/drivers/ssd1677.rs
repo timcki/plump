@@ -224,9 +224,24 @@ where
             self.send_command(cmd::WRITE_RAM_BW);
             self.send_data(strip.data());
 
+            // invert in place for the RED plane and send it as one DMA
+            // transfer; safe because this strip's contents are dead
+            // after the RED send (the next iteration's begin_window
+            // refills the buffer). replaces ~62 64-byte transactions
+            // with per-byte row math per strip
+            for b in strip.data_mut().iter_mut() {
+                *b = !*b;
+            }
+            if needs_mask && row_bytes > 0 {
+                // inversion flipped the edge mask bits; re-apply them
+                for row in strip.data_mut().chunks_mut(row_bytes) {
+                    row[0] |= left_mask;
+                    row[row.len() - 1] |= right_mask;
+                }
+            }
             self.set_partial_ram_area(px, y, pw, rows);
             self.send_command(cmd::WRITE_RAM_RED);
-            self.send_data_inverted(strip.data(), left_mask, right_mask, row_bytes);
+            self.send_data(strip.data());
 
             y += rows;
         }
@@ -445,39 +460,6 @@ where
     fn send_data(&mut self, data: &[u8]) {
         let _ = self.dc.set_high();
         let _ = self.spi.write(data);
-    }
-
-    // send data with each byte inverted, re-applying edge masks
-    // uses a small batch buffer to amortize SPI call overhead
-    fn send_data_inverted(&mut self, data: &[u8], left_mask: u8, right_mask: u8, row_bytes: usize) {
-        const BATCH_SIZE: usize = 64;
-        let mut batch = [0u8; BATCH_SIZE];
-
-        let _ = self.dc.set_high();
-
-        let mut offset = 0;
-        while offset < data.len() {
-            let chunk_len = (data.len() - offset).min(BATCH_SIZE);
-            for i in 0..chunk_len {
-                let byte_in_row = if row_bytes > 0 {
-                    (offset + i) % row_bytes
-                } else {
-                    0
-                };
-                let mut inverted = !data[offset + i];
-
-                // Re-apply edge masks (inversion flipped them)
-                if byte_in_row == 0 {
-                    inverted |= left_mask;
-                }
-                if row_bytes > 0 && byte_in_row == row_bytes - 1 {
-                    inverted |= right_mask;
-                }
-                batch[i] = inverted;
-            }
-            let _ = self.spi.write(&batch[..chunk_len]);
-            offset += chunk_len;
-        }
     }
 
     #[allow(clippy::too_many_arguments)]

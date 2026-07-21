@@ -303,29 +303,42 @@ impl StripBuffer {
             None => return,
         };
 
+        // hottest loop in the firmware. per destination byte we
+        // accumulate up to 8 source pixels into one mask and apply it
+        // with a single read-modify-write; the source index walks by
+        // += stride (the bounds check blocks the compiler from doing
+        // this strength reduction itself), and the destination row is
+        // borrowed once per column instead of bounds-checked per pixel
         for x in c.x0..c.x1 {
-            let src_byte_idx = x / 8;
             let src_bit = 1u8 << (7 - (x & 7));
+            let mut src_idx = offset + c.y0 * stride + x / 8;
             let dst_row_base = (c.base_buf_y - x) * c.rb;
+            let row = &mut self.buf[dst_row_base..dst_row_base + c.rb];
 
-            if black {
-                for y in c.y0..c.y1 {
-                    if bitmaps[offset + y * stride + src_byte_idx] & src_bit != 0 {
-                        let buf_x = (gy + y as i32 - c.wx) as usize;
-                        let byte_col = buf_x / 8;
-                        let inv_mask = !(1u8 << (7 - (buf_x & 7)));
-                        self.buf[dst_row_base + byte_col] &= inv_mask;
+            let mut buf_x = (gy + c.y0 as i32 - c.wx) as usize;
+            let mut y = c.y0;
+            while y < c.y1 {
+                let bit0 = buf_x & 7;
+                let byte_col = buf_x >> 3;
+                // consecutive glyph rows land in consecutive bits of
+                // the same destination byte
+                let group = (8 - bit0).min(c.y1 - y);
+                let mut acc: u8 = 0;
+                for k in 0..group {
+                    if bitmaps[src_idx] & src_bit != 0 {
+                        acc |= 0x80 >> (bit0 + k);
+                    }
+                    src_idx += stride;
+                }
+                if acc != 0 {
+                    if black {
+                        row[byte_col] &= !acc;
+                    } else {
+                        row[byte_col] |= acc;
                     }
                 }
-            } else {
-                for y in c.y0..c.y1 {
-                    if bitmaps[offset + y * stride + src_byte_idx] & src_bit != 0 {
-                        let buf_x = (gy + y as i32 - c.wx) as usize;
-                        let byte_col = buf_x / 8;
-                        let mask = 1u8 << (7 - (buf_x & 7));
-                        self.buf[dst_row_base + byte_col] |= mask;
-                    }
-                }
+                buf_x += group;
+                y += group;
             }
         }
     }
@@ -423,67 +436,69 @@ impl StripBuffer {
         };
 
         let data = &bitmaps[offset..];
-        let gray_mode = self.gray_mode;
 
-        for x in c.x0..c.x1 {
-            let src_byte_col = x / 4;
-            let src_shift = 6 - (x & 3) * 2;
-            let dst_row_base = (c.base_buf_y - x) * c.rb;
+        // shared clip walk with the mode match hoisted out of the
+        // column loop: each arm gets a specialized loop pair. the
+        // source index walks by += stride (strength reduction the
+        // bounds check otherwise blocks); val == 0 never draws in any
+        // mode, so the skip lives in the shared shell
+        macro_rules! walk {
+            (|$val:ident, $idx:ident, $mask:ident| $body:block) => {
+                for x in c.x0..c.x1 {
+                    let src_byte_col = x / 4;
+                    let src_shift = 6 - (x & 3) * 2;
+                    let dst_row_base = (c.base_buf_y - x) * c.rb;
+                    let mut src_idx = c.y0 * stride + src_byte_col;
+                    let mut buf_x = (gy + c.y0 as i32 - c.wx) as usize;
+                    for _y in c.y0..c.y1 {
+                        let $val = (data[src_idx] >> src_shift) & 0x03;
+                        if $val != 0 {
+                            let (col, $mask) = bit_pos(buf_x);
+                            let $idx = dst_row_base + col;
+                            $body
+                        }
+                        src_idx += stride;
+                        buf_x += 1;
+                    }
+                }
+            };
+        }
 
-            match gray_mode {
-                GrayMode::Bw => {
-                    if black {
-                        for y in c.y0..c.y1 {
-                            let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
-                            if val != 0 {
-                                let (col, mask) = bit_pos((gy + y as i32 - c.wx) as usize);
-                                self.buf[dst_row_base + col] &= !mask;
-                            }
-                        }
-                    } else {
-                        for y in c.y0..c.y1 {
-                            let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
-                            if val != 0 {
-                                let (col, mask) = bit_pos((gy + y as i32 - c.wx) as usize);
-                                self.buf[dst_row_base + col] |= mask;
-                            }
-                        }
-                    }
+        match self.gray_mode {
+            GrayMode::Bw => {
+                if black {
+                    walk!(|val, idx, mask| {
+                        self.buf[idx] &= !mask;
+                    });
+                } else {
+                    walk!(|val, idx, mask| {
+                        self.buf[idx] |= mask;
+                    });
                 }
-                GrayMode::GrayLsb => {
-                    for y in c.y0..c.y1 {
-                        let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
-                        if val >= 2 {
-                            let (col, mask) = bit_pos((gy + y as i32 - c.wx) as usize);
-                            self.buf[dst_row_base + col] |= mask;
-                        }
+            }
+            GrayMode::GrayLsb => {
+                walk!(|val, idx, mask| {
+                    if val >= 2 {
+                        self.buf[idx] |= mask;
                     }
-                }
-                GrayMode::GrayMsb => {
-                    for y in c.y0..c.y1 {
-                        let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
-                        if val == 1 || val == 2 {
-                            let (col, mask) = bit_pos((gy + y as i32 - c.wx) as usize);
-                            self.buf[dst_row_base + col] |= mask;
-                        }
+                });
+            }
+            GrayMode::GrayMsb => {
+                walk!(|val, idx, mask| {
+                    if val == 1 || val == 2 {
+                        self.buf[idx] |= mask;
                     }
-                }
-                GrayMode::GrayDual => {
-                    for y in c.y0..c.y1 {
-                        let val = (data[y * stride + src_byte_col] >> src_shift) & 0x03;
-                        if val == 0 {
-                            continue;
-                        }
-                        let (col, mask) = bit_pos((gy + y as i32 - c.wx) as usize);
-                        let idx = dst_row_base + col;
-                        if val >= 2 {
-                            self.buf[idx] |= mask;
-                        }
-                        if val <= 2 {
-                            self.gray_buf[idx] |= mask;
-                        }
+                });
+            }
+            GrayMode::GrayDual => {
+                walk!(|val, idx, mask| {
+                    if val >= 2 {
+                        self.buf[idx] |= mask;
                     }
-                }
+                    if val <= 2 {
+                        self.gray_buf[idx] |= mask;
+                    }
+                });
             }
         }
     }
