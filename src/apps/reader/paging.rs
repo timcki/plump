@@ -453,22 +453,37 @@ impl ReaderApp {
         );
 
         // 1. cache hit (algo=2 with line records): adopt directly.
+        // pages come back empty when they were built at a different
+        // line_h / max_lines; the line table is still valid, so
+        // rebuild image fillers and re-paginate in RAM instead of
+        // re-typesetting.
         if let Some(loaded) =
             super::layout::cache::load_layoutidx(k, name_hash, ch, spine_len, &key)
         {
-            if !loaded.lines.is_empty() && !loaded.pages.is_empty() {
-                self.adopt_loaded_chapter(loaded);
-                self.typeset_oom_waits = 0;
-                plump_kernel::perf_event!(
-                    "reader",
-                    "preindex src=bundle pages={} lines={} elapsed_ms={}",
-                    self.pg.total_pages,
-                    self.pg.chapter_lines.len(),
-                    _pi_t0.elapsed().as_millis()
-                );
-                return PreindexOutcome::Done;
+            if !loaded.lines.is_empty() {
+                // perf-only label; the macro is a no-op without the
+                // perf feature, hence the underscore
+                let (adopted, _src) = if !loaded.pages.is_empty() {
+                    self.adopt_loaded_chapter(loaded);
+                    (true, "bundle")
+                } else {
+                    (self.adopt_lines_repaginate(loaded), "repaginate")
+                };
+                if adopted {
+                    self.typeset_oom_waits = 0;
+                    plump_kernel::perf_event!(
+                        "reader",
+                        "preindex src={} pages={} lines={} elapsed_ms={}",
+                        _src,
+                        self.pg.total_pages,
+                        self.pg.chapter_lines.len(),
+                        _pi_t0.elapsed().as_millis()
+                    );
+                    return PreindexOutcome::Done;
+                }
             }
-            // legacy cache without lines: ignore, fall through to typeset
+            // legacy cache without lines (or a failed re-pagination):
+            // ignore, fall through to typeset
         }
 
         // 2. K-P typeset (primary path).
@@ -594,6 +609,99 @@ impl ReaderApp {
         }
         self.pg.total_pages = n.max(1);
         self.pg.fully_indexed = true;
+    }
+
+    /// Adopt a lines-only `LoadedChapter` whose page table was built
+    /// at a different line_h / max_lines: rebuild each image block's
+    /// filler count from the reserved height stored on its origin
+    /// line (extra byte, 4 px units), re-run pagination at the
+    /// current metrics, and publish. Returns false when the rebuilt
+    /// table would exceed the per-chapter caps, an allocation fails,
+    /// or pagination errors; the caller falls back to a full typeset.
+    fn adopt_lines_repaginate(
+        &mut self,
+        loaded: super::layout::cache::LoadedChapter,
+    ) -> bool {
+        use super::layout::{LineLayout, MAX_LINES_PER_CHAPTER, PageLayout};
+
+        let line_h = self.font_line_h.max(1) as u32;
+        let src = loaded.lines;
+        let mut lines: Vec<LineLayout> = Vec::new();
+        let mut blocks: Vec<u8> = Vec::new();
+        if lines.try_reserve(src.len()).is_err() || blocks.try_reserve(src.len()).is_err() {
+            return false;
+        }
+
+        let mut i = 0usize;
+        while i < src.len() {
+            let l = src[i];
+            if l.is_image() {
+                // origin + its stored filler run (filler = zero-byte
+                // IMAGE line, same shape adopt_loaded_chapter counts)
+                let mut old_block = 1usize;
+                while i + old_block < src.len()
+                    && src[i + old_block].is_image()
+                    && src[i + old_block].start_byte == 0
+                    && src[i + old_block].end_byte == 0
+                {
+                    old_block += 1;
+                }
+                // reserved height rides the origin's extra byte in
+                // 4 px units; 0 = unknown, keep the stored count
+                let stored_h = (l.extra as u32) * 4;
+                let new_block = if stored_h > 0 {
+                    stored_h.div_ceil(line_h).clamp(1, u8::MAX as u32) as usize
+                } else {
+                    old_block
+                };
+                if lines.len() + new_block > MAX_LINES_PER_CHAPTER {
+                    return false;
+                }
+                if lines.try_reserve(new_block).is_err()
+                    || blocks.try_reserve(new_block).is_err()
+                {
+                    return false;
+                }
+                lines.push(l);
+                blocks.push(new_block.min(u8::MAX as usize) as u8);
+                for _ in 1..new_block {
+                    lines.push(LineLayout {
+                        start_byte: 0,
+                        end_byte: 0,
+                        flags: LineLayout::FLAG_IMAGE,
+                        indent: 0,
+                        align: LineLayout::ALIGN_DEFAULT,
+                        extra: 0,
+                    });
+                    blocks.push(0);
+                }
+                i += old_block;
+            } else {
+                lines.push(l);
+                blocks.push(0);
+                i += 1;
+            }
+        }
+
+        let mut pages: Vec<PageLayout> = Vec::new();
+        if super::layout::paginate::paginate(&lines, self.max_lines, &blocks, &mut pages)
+            .is_err()
+        {
+            return false;
+        }
+
+        self.pg.clear_kp_layout();
+        pages.truncate(MAX_PAGES);
+        self.pg.kp_pages = pages;
+        self.pg.chapter_lines = lines;
+        self.pg.image_block_lines = blocks;
+        let n = self.pg.kp_pages.len();
+        for i in 0..n {
+            self.pg.offsets[i] = self.pg.kp_pages[i].start_byte;
+        }
+        self.pg.total_pages = n.max(1);
+        self.pg.fully_indexed = true;
+        true
     }
 
     /// Persist K-P typeset output to the bundle's PIDX section.

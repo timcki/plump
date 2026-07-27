@@ -44,9 +44,13 @@ pub struct LoadedChapter {
 }
 
 /// load cached layout for `ch` if it exists and the on-disk key
-/// matches. returns `None` when the bundle is missing, PIDX is
-/// not ready, the format/key doesn't match, the chapter has no
-/// records yet, or any read fails.
+/// matches the typeset inputs. returns `None` when the bundle is
+/// missing, PIDX is not ready, the typeset key doesn't match, the
+/// chapter has no records yet, or any read fails.
+///
+/// when the stored pages were built at a different line_h/max_lines
+/// (spacing changed since the save), `pages` comes back EMPTY and
+/// only `lines` is populated; the caller re-paginates in RAM.
 pub fn load_layoutidx(
     k: &mut KernelHandle<'_>,
     name_hash: u32,
@@ -75,7 +79,7 @@ pub fn load_layoutidx(
         return None;
     }
     let lhdr = bundle::LayoutIdxHeader::decode(&hdr_buf)?;
-    if !key.matches_header(&lhdr) {
+    if !key.lines_match(&lhdr) {
         return None;
     }
 
@@ -94,13 +98,19 @@ pub fn load_layoutidx(
     if dir_entry.page_count == 0 {
         return None;
     }
+    // pages validity is per chapter (see ChapterLayoutDir): compare
+    // against the metrics this chapter's pages were built at, not the
+    // global header, which can lag after a spacing change
+    let pages_valid =
+        dir_entry.pages_line_h == key.line_h && dir_entry.pages_max_lines == key.max_lines;
     let page_count = dir_entry.page_count as usize;
     let line_count = dir_entry.line_count as usize;
     if !super::fits_in_caps(page_count, line_count) {
         return None;
     }
 
-    // pages array lives inside PidxData at `dir_entry.pages_offset`
+    // pages array lives inside PidxData at `dir_entry.pages_offset`;
+    // skipped entirely when built at a stale line_h / max_lines
     let pages_bytes = page_count * bundle::PAGE_RECORD_SIZE;
     let pages_end = dir_entry
         .pages_offset
@@ -111,25 +121,27 @@ pub fn load_layoutidx(
     let mut chunk = [0u8; PIDX_CHUNK_BYTES];
 
     let mut pages = Vec::new();
-    pages.try_reserve_exact(page_count).ok()?;
-    let mut done = 0usize;
-    while done < page_count {
-        let take = (page_count - done).min(PIDX_CHUNK_RECORDS);
-        let want = take * bundle::PAGE_RECORD_SIZE;
-        let n = bundle::read_at(
-            k.sd(),
-            name_hash,
-            data.offset + dir_entry.pages_offset + (done * bundle::PAGE_RECORD_SIZE) as u32,
-            &mut chunk[..want],
-        )
-        .ok()?;
-        if n < want {
-            return None;
+    if pages_valid {
+        pages.try_reserve_exact(page_count).ok()?;
+        let mut done = 0usize;
+        while done < page_count {
+            let take = (page_count - done).min(PIDX_CHUNK_RECORDS);
+            let want = take * bundle::PAGE_RECORD_SIZE;
+            let n = bundle::read_at(
+                k.sd(),
+                name_hash,
+                data.offset + dir_entry.pages_offset + (done * bundle::PAGE_RECORD_SIZE) as u32,
+                &mut chunk[..want],
+            )
+            .ok()?;
+            if n < want {
+                return None;
+            }
+            for rec in chunk[..want].chunks_exact(bundle::PAGE_RECORD_SIZE) {
+                pages.push(PageLayout::from_record(&bundle::PageRecord::decode(rec)?));
+            }
+            done += take;
         }
-        for rec in chunk[..want].chunks_exact(bundle::PAGE_RECORD_SIZE) {
-            pages.push(PageLayout::from_record(&bundle::PageRecord::decode(rec)?));
-        }
-        done += take;
     }
 
     // lines array (may be empty)
@@ -244,6 +256,8 @@ pub fn save_layoutidx(
         pages_offset: pages_rel,
         lines_offset: lines_rel,
         byte_size,
+        pages_line_h: key.line_h,
+        pages_max_lines: key.max_lines,
         _reserved: 0,
     };
     let entry_rel = bundle::PAGEIDX_HDR_V2_SIZE as u32
@@ -308,8 +322,12 @@ fn read_pidx_stamp(
     if n < bundle::PAGEIDX_HDR_V2_SIZE {
         return Ok(false);
     }
+    // typeset-fields comparison: a spacing-only change must not reset
+    // the dir (that would throw away every chapter's line table). the
+    // header keeps advertising the line_h/max_lines the PAGES were
+    // built at; loads re-paginate chapters whose pages don't match.
     match bundle::LayoutIdxHeader::decode(&buf) {
-        Some(lhdr) => Ok(key.matches_header(&lhdr)),
+        Some(lhdr) => Ok(key.lines_match(&lhdr)),
         None => Ok(false),
     }
 }

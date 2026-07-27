@@ -962,7 +962,13 @@ pub const PAGEIDX_FORMAT_VERSION: u8 = 2;
 // whose last line rendered over the reader footer chrome. cached
 // v15 layouts may contain such overfull pages, so they must
 // re-typeset.
-pub const LAYOUT_ALGO_VERSION: u8 = 16;
+//
+// v17 stores the reserved image height (4 px units) in the origin
+// image line's `extra` byte so a line-spacing change can rebuild
+// filler counts and re-paginate the cached line table instead of
+// re-typesetting. v16 records carry extra=0 there, which v17 reads
+// as "height unknown"; bumping so filler data is always present.
+pub const LAYOUT_ALGO_VERSION: u8 = 17;
 
 pub const PAGEIDX_HDR_V2_SIZE: usize = 20;
 pub const CHAPTER_LAYOUT_DIR_SIZE: usize = 24;
@@ -1046,14 +1052,23 @@ impl LayoutIdxHeader {
 }
 
 // ChapterLayoutDir byte layout (24 bytes):
-//   0..2   chapter_index  u16
-//   2..4   page_count     u16
-//   4..6   line_count     u16
-//   6..8   flags          u16
-//   8..12  pages_offset   u32  (within pageidx section)
-//   12..16 lines_offset   u32  (within pageidx section; 0 when no lines)
-//   16..20 byte_size      u32  (chapter content byte size at layout time)
-//   20..24 _reserved      u32
+//   0..2   chapter_index    u16
+//   2..4   page_count       u16
+//   4..6   line_count       u16
+//   6..8   flags            u16
+//   8..12  pages_offset     u32  (within pageidx section)
+//   12..16 lines_offset     u32  (within pageidx section; 0 when no lines)
+//   16..20 byte_size        u32  (chapter content byte size at layout time)
+//   20..22 pages_line_h     u16  (line_h this chapter's PAGES were built at)
+//   22..23 pages_max_lines  u8   (max_lines ditto)
+//   23..24 _reserved        u8
+//
+// pages_line_h / pages_max_lines are PER CHAPTER because the global
+// LayoutIdxHeader can only advertise one spacing: after a spacing
+// change, chapters typeset later save pages at the new metrics while
+// untouched chapters keep pages at the old ones. the loader compares
+// against the dir entry, never the header, so stale pages are always
+// re-paginated from the (spacing-independent) line table.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChapterLayoutDir {
@@ -1064,7 +1079,9 @@ pub struct ChapterLayoutDir {
     pub pages_offset: u32,
     pub lines_offset: u32,
     pub byte_size: u32,
-    pub _reserved: u32,
+    pub pages_line_h: u16,
+    pub pages_max_lines: u8,
+    pub _reserved: u8,
 }
 
 impl ChapterLayoutDir {
@@ -1076,6 +1093,8 @@ impl ChapterLayoutDir {
         pages_offset: 0,
         lines_offset: 0,
         byte_size: 0,
+        pages_line_h: 0,
+        pages_max_lines: 0,
         _reserved: 0,
     };
 
@@ -1091,7 +1110,9 @@ impl ChapterLayoutDir {
             pages_offset: r_u32(buf, 8),
             lines_offset: r_u32(buf, 12),
             byte_size: r_u32(buf, 16),
-            _reserved: r_u32(buf, 20),
+            pages_line_h: r_u16(buf, 20),
+            pages_max_lines: buf[22],
+            _reserved: buf[23],
         })
     }
 
@@ -1104,7 +1125,9 @@ impl ChapterLayoutDir {
         w_u32(&mut out, 8, self.pages_offset);
         w_u32(&mut out, 12, self.lines_offset);
         w_u32(&mut out, 16, self.byte_size);
-        w_u32(&mut out, 20, self._reserved);
+        w_u16(&mut out, 20, self.pages_line_h);
+        out[22] = self.pages_max_lines;
+        out[23] = self._reserved;
         out
     }
 }
@@ -1877,7 +1900,9 @@ mod tests {
             pages_offset: 0x1111_2222,
             lines_offset: 0x3333_4444,
             byte_size: 0x5555_6666,
-            _reserved: 0x7777_8888,
+            pages_line_h: 0x7777,
+            pages_max_lines: 0x88,
+            _reserved: 0x99,
         };
         let bytes = d.encode();
         let back = ChapterLayoutDir::decode(&bytes).unwrap();

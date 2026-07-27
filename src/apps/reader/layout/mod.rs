@@ -44,10 +44,16 @@ use plump_kernel::kernel::bundle;
 /// chapters that would exceed this fall back to greedy wrapping.
 pub const MAX_LINES_PER_CHAPTER: usize = 4096;
 
-/// cache key for the persisted layout. any field changing
-/// invalidates the cache and forces a re-layout. text_alignment is
-/// intentionally NOT keyed: line breaks are alignment-independent,
-/// so toggling left/justify must not re-typeset.
+/// cache key for the persisted layout. the typeset fields (versions,
+/// font, family, content format, text width) gate the LINE table:
+/// any of them changing moves the break points, so the cache is
+/// discarded and the chapter re-typesets. `line_h` / `max_lines`
+/// only gate the PAGE table: breaks are spacing-independent, so a
+/// spacing or page-capacity change keeps the lines and re-paginates
+/// in RAM (`lines_match` gates the header; the loader compares the
+/// spacing fields against the per-chapter dir entry). text_alignment
+/// is intentionally not keyed at all: line breaks are alignment-
+/// independent, so toggling left/justify must not re-typeset.
 ///
 /// `font_family` is the reader font's `to_idx()` value (0=Bookerly,
 /// 1=Atkinson). it must be keyed because Atkinson and Bookerly have
@@ -88,17 +94,17 @@ impl LayoutKey {
         }
     }
 
-    /// true when an on-disk header matches every field of this key.
-    pub fn matches_header(&self, h: &bundle::LayoutIdxHeader) -> bool {
+    /// true when the on-disk LINE table is reusable: every typeset
+    /// input matches. spacing fields are deliberately excluded.
+    pub fn lines_match(&self, h: &bundle::LayoutIdxHeader) -> bool {
         h.format_version == self.format_version
             && h.algo_version == self.algo_version
             && h.font_idx == self.font_idx
             && h.font_family == self.font_family
             && h.content_fmt == self.content_fmt
             && h.text_w == self.text_w
-            && h.line_h == self.line_h
-            && h.max_lines == self.max_lines
     }
+
 
     /// build a header with this key's dimensions and the given
     /// `total_pages`. flags default to 0.
@@ -172,6 +178,9 @@ impl PageLayout {
 /// `extra` byte layout (algo_version >= 2): per-gap justification spare in px.
 ///   bit 7    sign (1 = shrink, 0 = stretch)
 ///   bits 0-6 magnitude in px-per-gap (cap 127)
+/// on image ORIGIN lines (algo_version >= 17) `extra` instead holds
+/// the reserved block height in 4 px units (0 = unknown); the
+/// renderer never justifies image lines, so the slot is free.
 ///
 /// `align` values mirror `LineSpan::ALIGN_*`: 0 = default (honor user setting),
 /// 1 = left, 2 = center, 3 = right.

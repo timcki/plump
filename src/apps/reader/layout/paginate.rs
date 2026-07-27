@@ -422,9 +422,14 @@ pub mod convert {
     /// fillers) for an image whose alt text and path live at the
     /// stored byte offsets in the chapter buffer. The caller already
     /// has the `ImageRef` from `ParagraphMeta::image`.
+    ///
+    /// `reserved_h` is the pixel height the block reserves; it rides
+    /// the origin's `extra` byte in 4 px units so a later spacing
+    /// change can rebuild the filler count without re-typesetting.
     pub fn append_image_block(
         meta: &ParagraphMeta,
         image_lines: u8,
+        reserved_h: u16,
         page_break_pending: &mut bool,
         out: &mut Vec<LineLayout>,
     ) -> Option<()> {
@@ -444,7 +449,7 @@ pub mod convert {
             flags,
             indent: img.alt_len,
             align: LineLayout::ALIGN_DEFAULT,
-            extra: 0,
+            extra: reserved_h.div_ceil(4).min(u8::MAX as u16) as u8,
         });
         // filler lines (start/end zero; renderer treats len==0 + IMAGE flag as filler)
         for _ in 1..image_lines {

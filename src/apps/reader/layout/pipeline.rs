@@ -162,10 +162,16 @@ impl LayoutPipeline {
             // path_len is u8 by the IMG_REF format, so 256 always fits.
             let mut src_buf = [0u8; 256];
             let src = read_image_src(scanner, meta.image, &mut src_buf);
-            let image_lines = image_lines_for(meta.image, budget, src, hint);
+            let (image_lines, reserved_h) = image_lines_for(meta.image, budget, src, hint);
             let lines_before = out_lines.len();
             try_reserve_out(out_lines, out_image_blocks, image_lines as usize + 1)?;
-            convert::append_image_block(&meta, image_lines, &mut self.page_break_pending, out_lines);
+            convert::append_image_block(
+                &meta,
+                image_lines,
+                reserved_h,
+                &mut self.page_break_pending,
+                out_lines,
+            );
             // parallel image_block_lines: stamp `image_lines` at the
             // origin slot, 0 for fillers
             ensure_parallel(out_image_blocks, lines_before);
@@ -277,7 +283,9 @@ fn text_style_to_font_style(style: TextStyle) -> Style {
     Style::from_flags(style.bold, style.italic, style.heading, style.hlevel)
 }
 
-/// Number of LineLayouts to reserve for an image block.
+/// Number of LineLayouts to reserve for an image block, plus the
+/// reserved pixel height it was derived from (persisted on the origin
+/// line so a spacing change can recompute the count).
 ///
 /// The reservation must match what `decode_page_images` will blit, or
 /// the renderer ends up vertically centring a small bitmap inside an
@@ -290,11 +298,11 @@ fn image_lines_for(
     budget: ImageBudget,
     src: &[u8],
     hint: &mut dyn ImageHeightHint,
-) -> u8 {
+) -> (u8, u16) {
     let lh = budget.line_h.max(1);
     let reserved = reserved_image_height(image, budget, src, hint);
     let lines = reserved.div_ceil(lh);
-    lines.clamp(1, u8::MAX as u16) as u8
+    (lines.clamp(1, u8::MAX as u16) as u8, reserved)
 }
 
 /// Read the `<img src="...">` bytes for `image` into `dst` and return
@@ -422,7 +430,7 @@ mod tests {
     fn image_lines_for_applies_decoder_scale() {
         // 1600×2400 source into a 400×288 box: sw=4, sh=9, scale=9,
         // reserved = 2400/9 = 266 px → ceil(266/22) = 13 lines.
-        let lines = image_lines_for(
+        let (lines, _) = image_lines_for(
             Some(image(1600, 2400)),
             budget(400, 288, 22),
             b"",
@@ -435,7 +443,7 @@ mod tests {
     fn image_lines_for_uses_default_when_no_hint() {
         // No attribute hints AND no peek hint: fall back to
         // DEFAULT_IMG_H=350, clamped to inline_cap=288 → 14 lines.
-        let lines = image_lines_for(
+        let (lines, _) = image_lines_for(
             Some(image(0, 0)),
             budget(400, 288, 22),
             b"",
@@ -449,7 +457,7 @@ mod tests {
     fn image_lines_for_height_only_hint_clamps_to_cap() {
         // width omitted, height = 2000, no peek hint: with no scale
         // info, clamp attr_h to inline_cap=200 → ceil(200/22) = 10.
-        let lines = image_lines_for(
+        let (lines, _) = image_lines_for(
             Some(image(0, 2000)),
             budget(400, 200, 22),
             b"",
@@ -462,7 +470,7 @@ mod tests {
     fn image_lines_for_small_image_fits_natural_size() {
         // 100×80 source, no downscale needed (sw=1, sh=1, scale=1):
         // reserved = 80 px → ceil(80/22) = 4 lines.
-        let lines = image_lines_for(
+        let (lines, _) = image_lines_for(
             Some(image(100, 80)),
             budget(400, 288, 22),
             b"",
@@ -475,7 +483,7 @@ mod tests {
     fn image_lines_for_clamps_to_u8_max() {
         // Pathological reservation: even after the cap, line_h=1 would
         // yield more than 255 lines; the clamp keeps it in u8.
-        let lines = image_lines_for(
+        let (lines, _) = image_lines_for(
             Some(image(0, u16::MAX)),
             budget(400, u16::MAX, 1),
             b"",
@@ -489,7 +497,7 @@ mod tests {
         // attr_w == attr_h == 0, hint says 120 px. Cap=288, line_h=22
         // → ceil(120/22) = 6 lines. No DEFAULT_IMG_H over-reservation.
         let mut hint = FixedHint(120);
-        let lines = image_lines_for(
+        let (lines, _) = image_lines_for(
             Some(image(0, 0)),
             budget(400, 288, 22),
             b"cover.jpg",
@@ -503,7 +511,7 @@ mod tests {
         // Hint reports a height larger than the inline cap; the result
         // is clamped so a single inline image can't dominate the page.
         let mut hint = FixedHint(500);
-        let lines = image_lines_for(
+        let (lines, _) = image_lines_for(
             Some(image(0, 0)),
             budget(400, 200, 22),
             b"x",
@@ -518,7 +526,7 @@ mod tests {
         // a single line, otherwise the image atomicity rule would
         // pack the bitmap into a 0-line slot.
         let mut hint = FixedHint(5);
-        let lines = image_lines_for(
+        let (lines, _) = image_lines_for(
             Some(image(0, 0)),
             budget(400, 288, 22),
             b"x",
@@ -538,7 +546,7 @@ mod tests {
                 None
             }
         }
-        let lines = image_lines_for(
+        let (lines, _) = image_lines_for(
             Some(image(0, 0)),
             budget(400, 288, 22),
             b"x",
@@ -552,7 +560,7 @@ mod tests {
     fn image_lines_for_with_both_attrs_skips_hint() {
         // Fast path: when both attrs are present the hint is never
         // consulted, even if it would panic.
-        let lines = image_lines_for(
+        let (lines, _) = image_lines_for(
             Some(image(1600, 2400)),
             budget(400, 288, 22),
             b"x",

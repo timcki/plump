@@ -585,9 +585,14 @@ pub struct ReaderApp {
 
     pub(super) book_font_size_idx: u8,
     pub(super) reader_font: ReaderFont,
-    // a layout input (font, spacing, margins, chrome) changed via a
-    // setter while suspended; on_resume must re-index the chapter
-    pub(super) layout_stale: bool,
+    // layout inputs changed via a setter while suspended; on_resume
+    // must re-index the chapter. typeset_stale means the line breaks
+    // moved (font, family, text width) and the persisted layout must
+    // be invalidated; pagination_stale means only line_h / max_lines
+    // changed, so the cached line table survives and the chapter
+    // just re-paginates
+    pub(super) typeset_stale: bool,
+    pub(super) pagination_stale: bool,
 
     pub(super) chrome_font: Option<&'static BitmapFont>,
     pub(super) qa_buf: [QuickAction; QA_MAX],
@@ -661,7 +666,8 @@ impl ReaderApp {
 
             book_font_size_idx: 0,
             reader_font: ReaderFont::Bookerly,
-            layout_stale: false,
+            typeset_stale: false,
+            pagination_stale: false,
 
             chrome_font: None,
 
@@ -682,28 +688,38 @@ impl ReaderApp {
 
     // 0 = XSmall, 1 = Small, 2 = Medium, 3 = Large, 4 = XLarge
     pub fn set_book_font_size(&mut self, idx: u8) {
-        self.layout_stale |= idx != self.book_font_size_idx;
+        self.typeset_stale |= idx != self.book_font_size_idx;
         self.book_font_size_idx = idx;
         self.apply_font_metrics();
         self.rebuild_quick_actions();
     }
 
     pub fn set_reader_font(&mut self, font: ReaderFont) {
-        self.layout_stale |= font != self.reader_font;
+        self.typeset_stale |= font != self.reader_font;
         self.reader_font = font;
         self.apply_font_metrics();
         self.rebuild_quick_actions();
     }
 
     pub fn set_reading_theme(&mut self, idx: u8) {
-        self.layout_stale |= idx != self.reading_theme_idx;
+        if idx != self.reading_theme_idx {
+            let old = crate::kernel::config::ReadingTheme::from_idx(self.reading_theme_idx);
+            let new = crate::kernel::config::ReadingTheme::from_idx(idx);
+            // margin_h moves text_w so the breaks change; margin_v
+            // only changes the page capacity
+            if new.margin_h != old.margin_h {
+                self.typeset_stale = true;
+            } else if new.margin_v != old.margin_v {
+                self.pagination_stale = true;
+            }
+        }
         self.reading_theme_idx = idx;
         self.apply_theme_layout();
         self.apply_font_metrics();
     }
 
     pub fn set_line_spacing(&mut self, idx: u8) {
-        self.layout_stale |= idx != self.line_spacing_idx;
+        self.pagination_stale |= idx != self.line_spacing_idx;
         self.line_spacing_idx = idx;
         self.apply_font_metrics();
     }
@@ -717,7 +733,8 @@ impl ReaderApp {
     pub fn set_show_chrome(&mut self, show: bool) {
         if self.show_chrome != show {
             self.show_chrome = show;
-            self.layout_stale = true;
+            // text_area_h changes max_lines only; text_w is untouched
+            self.pagination_stale = true;
             self.apply_theme_layout();
             self.apply_font_metrics();
         }
@@ -1471,7 +1488,8 @@ impl ReaderApp {
         self.rebuild_quick_actions();
         self.apply_theme_layout();
         self.reset_paging();
-        self.layout_stale = false;
+        self.typeset_stale = false;
+        self.pagination_stale = false;
         self.epub.ch_cache = Vec::new();
         self.file_size = 0;
         self.error = None;
@@ -1867,7 +1885,8 @@ impl App<AppId> for ReaderApp {
         self.rebuild_quick_actions();
         self.apply_theme_layout();
         self.reset_paging();
-        self.layout_stale = false;
+        self.typeset_stale = false;
+        self.pagination_stale = false;
         self.epub.ch_cache = Vec::new();
         self.file_size = 0;
         self.epub.chapter = 0;
@@ -2012,17 +2031,36 @@ impl App<AppId> for ReaderApp {
         self.apply_theme_layout();
         self.apply_font_metrics();
 
-        // the propagate_fonts setters flag layout_stale when any layout
-        // input (font, spacing, margins, chrome) changed while we were
-        // suspended; the in-RAM page tables are keyed to the old metrics
-        if self.layout_stale {
-            self.layout_stale = false;
+        // the propagate_fonts setters flag staleness when a layout
+        // input changed while we were suspended; the in-RAM page
+        // tables are keyed to the old metrics. states before
+        // NeedIndex have no page tables yet and finish the open with
+        // the new metrics on their own, so only re-index once the
+        // pipeline has reached (or passed) indexing.
+        let layout_changed = self.typeset_stale || self.pagination_stale;
+        let typeset_changed = self.typeset_stale;
+        self.typeset_stale = false;
+        self.pagination_stale = false;
+        if layout_changed
+            && matches!(
+                self.state,
+                State::NeedIndex | State::NeedPage | State::Ready | State::ShowToc
+            )
+        {
+            // keep the reading position across the re-layout: NeedPage
+            // maps the byte offset back to a page once re-indexed
+            if self.restore_offset.is_none()
+                && matches!(self.state, State::Ready | State::ShowToc)
+            {
+                self.restore_offset = Some(self.byte_offset());
+                self.restore_page_hint = Some(self.pg.page);
+            }
             self.reset_paging();
-            // invalidate any persisted layout: the saved index is keyed
-            // to the old metrics and would mismatch on load anyway; the
-            // new key carries the live dimensions so subsequent saves
-            // match.
-            if self.is_epub {
+            // invalidate the persisted layout only when the breaks
+            // moved (font, family, text width): a spacing-only change
+            // keeps the cached line table and preindex re-paginates it
+            // in RAM instead of re-typesetting.
+            if typeset_changed && self.is_epub {
                 let new_key = layout::LayoutKey::current(
                     self.book_font_size_idx,
                     self.reader_font.to_idx(),
