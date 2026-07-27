@@ -1,7 +1,7 @@
 // screen: typestate refresh interface over the SSD1677 driver
 //
 // owns the EPD driver, the strip buffer, and all display-plane state
-// (red_stale, partial counter). a refresh is a linear session:
+// (stale region, partial counter). a refresh is a linear session:
 //
 //   begin_partial / begin_full  ->  Wave<'_, M>   (waveform running)
 //   wave.settle() / wave.wait() ->  Settled<'_, M>
@@ -28,10 +28,19 @@ pub struct Screen {
     strip: &'static mut StripBuffer,
     delay: Delay,
 
-    // RED RAM out of sync with BW somewhere on screen (grayscale pass
-    // or a skipped phase 3); the next partial expands to full screen
-    // and re-drives every pixel via inv_red
-    red_stale: bool,
+    // bounding box of the area whose panel content is not represented
+    // by the RAM planes: intermediate gray left by an AA pass, or the
+    // pre-waveform content left by a skipped phase 3. a DU delta
+    // against those planes would compute from an image the panel is
+    // not showing, so a partial overlapping this box re-drives its own
+    // region via inv_red instead
+    stale: Option<Region>,
+
+    // bounding box of the area driven to plain BW since the last AA
+    // pass. only this area needs (and may take) gray pulses: the gray
+    // LUT lightens pixels the BW waveform just drove black, so pulsing
+    // an area that already carries its gray drives it further off
+    fresh: Option<Region>,
 
     // partial refreshes since the last full GC; the scheduler promotes
     // to a full clear once this reaches ghost_clear_every
@@ -48,7 +57,10 @@ pub struct Gc;
 pub struct Wave<'s, M> {
     screen: &'s mut Screen,
     rs: RenderState,
-    entered_stale: bool,
+    // logical counterpart of `rs`: the area this session drives, used
+    // for stale-region bookkeeping
+    region: Region,
+    hard_redrive: bool,
     _mode: PhantomData<M>,
 }
 
@@ -56,7 +68,8 @@ pub struct Wave<'s, M> {
 pub struct Settled<'s, M> {
     screen: &'s mut Screen,
     rs: RenderState,
-    entered_stale: bool,
+    region: Region,
+    hard_redrive: bool,
     _mode: PhantomData<M>,
 }
 
@@ -77,13 +90,16 @@ const FULL_RS: RenderState = RenderState {
     right_mask: 0,
 };
 
+const FULL_REGION: Region = Region::new(0, 0, SCREEN_W, SCREEN_H);
+
 impl Screen {
     pub fn new(epd: Epd, strip: &'static mut StripBuffer, delay: Delay) -> Self {
         Self {
             epd,
             strip,
             delay,
-            red_stale: false,
+            stale: None,
+            fresh: None,
             partials: 0,
         }
     }
@@ -94,8 +110,40 @@ impl Screen {
     }
 
     #[inline]
-    pub fn red_stale(&self) -> bool {
-        self.red_stale
+    pub fn stale_region(&self) -> Option<Region> {
+        self.stale
+    }
+
+    // grow the stale box to cover `r`
+    fn mark_stale(&mut self, r: Region) {
+        self.stale = Some(match self.stale {
+            Some(s) => s.union(r),
+            None => r,
+        });
+    }
+
+    // an inv_red pass over `r` re-drove every pixel it covers and
+    // rewrote both planes there, so the box clears once `r` swallows
+    // it. a partial overlap leaves the box alone: it is a bounding
+    // box, not a pixel set, and shrinking it by guesswork would strand
+    // gray outside the next delta DU
+    fn clear_stale_within(&mut self, r: Region) {
+        if self.stale.is_some_and(|s| r.contains(s)) {
+            self.stale = None;
+        }
+    }
+
+    fn mark_fresh(&mut self, r: Region) {
+        self.fresh = Some(match self.fresh {
+            Some(f) => f.union(r),
+            None => r,
+        });
+    }
+
+    fn clear_fresh_within(&mut self, r: Region) {
+        if self.fresh.is_some_and(|f| r.contains(f)) {
+            self.fresh = None;
+        }
     }
 
     /// Force the next partial request to promote to a full GC.
@@ -137,9 +185,12 @@ impl Screen {
 
     /// Write BW RAM for `region` and kick the DU waveform.
     ///
-    /// When RED RAM is stale the region silently expands to the full
-    /// screen and the write re-drives every pixel via inv_red; the
-    /// caller never tracks plane state.
+    /// When the region overlaps panel area the RAM planes no longer
+    /// describe (gray from an AA pass, a skipped phase 3), the write
+    /// goes through inv_red so the waveform re-drives every pixel it
+    /// covers from a known state instead of computing a delta against
+    /// a stale plane. Recovery stays scoped to the requested region;
+    /// the caller never tracks plane state.
     pub fn begin_partial<F>(
         &mut self,
         region: Region,
@@ -152,14 +203,10 @@ impl Screen {
             return Err(PartialRejected::NeedsFull);
         }
 
-        let entered_stale = self.red_stale;
-        let r = if entered_stale {
-            Region::new(0, 0, SCREEN_W, SCREEN_H)
-        } else {
-            region.align8()
-        };
+        let r = region.align8();
+        let hard_redrive = self.stale.is_some_and(|s| s.intersects(r));
 
-        let rs = if entered_stale {
+        let rs = if hard_redrive {
             self.epd.partial_phase1_bw_inv_red(
                 self.strip,
                 r.x,
@@ -177,11 +224,13 @@ impl Screen {
 
         self.epd.partial_start_du(&rs);
         self.partials = self.partials.saturating_add(1);
+        self.mark_fresh(r);
 
         Ok(Wave {
             screen: self,
             rs,
-            entered_stale,
+            region: r,
+            hard_redrive,
             _mode: PhantomData,
         })
     }
@@ -193,10 +242,12 @@ impl Screen {
     {
         self.epd.write_full_frame(self.strip, &mut self.delay, draw);
         self.epd.start_full_update();
+        self.fresh = Some(FULL_REGION);
         Wave {
             screen: self,
             rs: FULL_RS,
-            entered_stale: false,
+            region: FULL_REGION,
+            hard_redrive: true,
             _mode: PhantomData,
         }
     }
@@ -225,31 +276,54 @@ impl Screen {
         Ok(())
     }
 
-    /// Full-screen grayscale AA pass. Leaves both RAM planes holding
-    /// gray data, so `red_stale` is set; on timeout the next partial
-    /// request additionally promotes to a full GC.
+    /// Full-screen grayscale AA pass. Leaves the panel holding gray
+    /// levels the RAM planes cannot express, so the whole screen is
+    /// marked stale; on timeout the next partial request additionally
+    /// promotes to a full GC.
     pub async fn grayscale_full<F>(&mut self, draw: &F) -> Result<(), TimeoutError>
     where
         F: Fn(&mut StripBuffer),
     {
         let res = self.epd.grayscale_pass(self.strip, &FULL_RS, draw).await;
-        self.red_stale = true;
+        self.mark_stale(FULL_REGION);
+        self.fresh = None;
         if res.is_err() {
             self.force_ghost_clear();
         }
         res
     }
 
-    /// Rewrite RED RAM with current content over the whole screen (no
-    /// waveform), clearing `red_stale`. Used right after a deferred
-    /// grayscale pass while the device is idle; BW RAM is already
-    /// correct there because `grayscale_pass` restores it.
-    pub fn resync_red_full<F>(&mut self, draw: &F)
+    /// Grayscale AA pass over everything driven to plain BW since the
+    /// last pass. Used by the deferred fire: a full-screen pass would
+    /// re-pulse areas that already carry their gray and drive them
+    /// off level, while areas nobody redrew still show the AA the
+    /// previous pass gave them. No-op when nothing was refreshed.
+    pub async fn grayscale_fresh<F>(&mut self, draw: &F) -> Result<(), TimeoutError>
     where
         F: Fn(&mut StripBuffer),
     {
-        self.epd.partial_phase3_sync(self.strip, &FULL_RS, draw);
-        self.red_stale = false;
+        let Some(region) = self.fresh else {
+            return Ok(());
+        };
+        // snap outward so the physical window carries no edge masks:
+        // masked bits land in both planes, which the gray LUT reads as
+        // a drive-dark state
+        let region = region.align8_xy();
+        let Some(rs) = self
+            .epd
+            .region_state(region.x, region.y, region.w, region.h)
+        else {
+            self.fresh = None;
+            return Ok(());
+        };
+
+        let res = self.epd.grayscale_pass(self.strip, &rs, draw).await;
+        self.fresh = None;
+        self.mark_stale(region);
+        if res.is_err() {
+            self.force_ghost_clear();
+        }
+        res
     }
 }
 
@@ -258,6 +332,13 @@ impl<'s, M> Wave<'s, M> {
     #[inline]
     pub fn is_busy(&mut self) -> bool {
         self.screen.epd.is_busy()
+    }
+
+    /// True when this session re-drives every pixel in its region
+    /// (inv_red recovery or a full GC) rather than a DU delta.
+    #[inline]
+    pub fn hard_redrive(&self) -> bool {
+        self.hard_redrive
     }
 
     /// Resolves when the busy pin goes low. Unlike [`Wave::wait`] this
@@ -273,7 +354,8 @@ impl<'s, M> Wave<'s, M> {
         Settled {
             screen: self.screen,
             rs: self.rs,
-            entered_stale: self.entered_stale,
+            region: self.region,
+            hard_redrive: self.hard_redrive,
             _mode: PhantomData,
         }
     }
@@ -296,45 +378,49 @@ impl Settled<'_, Du> {
     {
         let s = self.screen;
         s.epd.partial_phase3_sync(s.strip, &self.rs, draw);
-        // a full-screen inv_red re-drive plus this sync has resynced
-        // RED everywhere; region-limited frames may still be stale
-        // outside the region
-        if self.entered_stale {
-            s.red_stale = false;
+        // the panel now matches both planes across this region; if the
+        // re-drive swallowed the stale box, nothing is outstanding
+        if self.hard_redrive {
+            s.clear_stale_within(self.region);
         }
     }
 
-    /// Skip phase 3 (content changed mid-waveform); RED RAM is now
-    /// desynchronised and the next partial recovers via inv_red.
+    /// Skip phase 3 (content changed mid-waveform); RED RAM keeps the
+    /// pre-waveform image while the panel shows the new one, so the
+    /// region needs an inv_red re-drive before any delta DU.
     pub fn abandon(self) {
-        self.screen.red_stale = true;
+        let region = self.region;
+        self.screen.mark_stale(region);
     }
 
     /// Grayscale AA pass over this refresh's region instead of phase 3.
-    /// After the pass, both RAM planes are restored to BW content
-    /// (`grayscale_pass` rewrites BW, RED is resynced here), so
-    /// `red_stale` clears and later small marks stay small partials
-    /// instead of full-screen inv_red re-drives. On timeout both
-    /// restores are skipped: RED is marked stale and the next partial
-    /// request promotes to a full GC.
+    ///
+    /// The gray LUT states are short relative pulses that lighten
+    /// pixels the BW frame just drove black, and `{0,0}` is literally
+    /// "no change", so the pass leaves the panel holding intermediate
+    /// levels neither RAM plane can express. The region is therefore
+    /// marked stale: the next partial touching it re-drives from black
+    /// via inv_red, which is the starting state the pulses assume.
+    /// Clearing the mark instead (RED := BW) makes the following DU
+    /// skip those pixels and the next pass stack another pulse on an
+    /// already-gray pixel, washing the AA ramp out over a few turns.
+    /// On timeout the pass is additionally promoted to a full GC.
     pub async fn grayscale<F>(self, draw: &F) -> Result<(), TimeoutError>
     where
         F: Fn(&mut StripBuffer),
     {
         let s = self.screen;
         let res = s.epd.grayscale_pass(s.strip, &self.rs, draw).await;
-        match res {
-            Ok(()) => {
-                // outside rs RED was already in sync (a bw partial
-                // requires !red_stale, an inv_red one covers the full
-                // screen), so a region restore resyncs everything
-                s.epd.partial_phase3_sync(s.strip, &self.rs, draw);
-                s.red_stale = false;
-            }
-            Err(_) => {
-                s.red_stale = true;
-                s.force_ghost_clear();
-            }
+        // the DU that preceded this pass re-drove the region when it
+        // took the inv_red path, so retire the old box before marking
+        // the fresh gray; otherwise the box only ever grows
+        if self.hard_redrive {
+            s.clear_stale_within(self.region);
+        }
+        s.mark_stale(self.region);
+        s.clear_fresh_within(self.region);
+        if res.is_err() {
+            s.force_ghost_clear();
         }
         res
     }
@@ -347,6 +433,6 @@ impl Settled<'_, Gc> {
         let s = self.screen;
         s.epd.finish_full_update();
         s.partials = 0;
-        s.red_stale = false;
+        s.stale = None;
     }
 }

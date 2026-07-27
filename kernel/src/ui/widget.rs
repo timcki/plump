@@ -43,6 +43,21 @@ impl Region {
         }
     }
 
+    /// Round both axes outward to multiples of 8. The panel windows on
+    /// byte boundaries in physical coordinates, and rotation swaps the
+    /// axes, so snapping both is what guarantees an unmasked window
+    /// whatever the rotation.
+    pub fn align8_xy(self) -> Self {
+        let ax = (self.x / 8) * 8;
+        let ay = (self.y / 8) * 8;
+        Self {
+            x: ax,
+            y: ay,
+            w: (self.w + (self.x - ax)).div_ceil(8) * 8,
+            h: (self.h + (self.y - ay)).div_ceil(8) * 8,
+        }
+    }
+
     pub fn union(self, other: Region) -> Self {
         let x1 = self.x.min(other.x);
         let y1 = self.y.min(other.y);
@@ -61,6 +76,17 @@ impl Region {
             && self.x + self.w > other.x
             && self.y < other.y + other.h
             && self.y + self.h > other.y
+    }
+
+    /// True when `other` lies entirely inside `self`; an empty `other`
+    /// is contained by anything.
+    pub fn contains(self, other: Region) -> bool {
+        other.w == 0
+            || other.h == 0
+            || (other.x >= self.x
+                && other.y >= self.y
+                && other.x + other.w <= self.x + self.w
+                && other.y + other.h <= self.y + self.h)
     }
 }
 

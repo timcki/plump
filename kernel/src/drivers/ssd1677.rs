@@ -595,6 +595,13 @@ where
         self.initial_refresh
     }
 
+    /// Physical window for a logical region, for callers that drive a
+    /// waveform over an area they did not just write (the deferred AA
+    /// pass over everything refreshed since the last one).
+    pub fn region_state(&self, x: u16, y: u16, w: u16, h: u16) -> Option<RenderState> {
+        self.align_partial_region(x, y, w, h)
+    }
+
     /// Power off analog drivers after each partial refresh to prevent
     /// sunlight-induced fading on white-bezel X4 models.
     pub fn set_sunlight_mode(&mut self, enabled: bool) {

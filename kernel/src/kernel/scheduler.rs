@@ -656,9 +656,9 @@ impl super::Kernel {
             if let Redraw::Partial(r) = redraw {
                 if screen.partials_since_clear() < app_mgr.ghost_clear_every() {
                     // begin_partial picks bw vs inv_red from its own
-                    // plane state and silently expands to the full
-                    // screen when RED RAM is stale
-                    let entered_stale = screen.red_stale();
+                    // plane state: a region overlapping gray left by an
+                    // AA pass is re-driven, everything else is a delta
+                    let stale = screen.stale_region();
                     let t_write = Instant::now();
                     let wave = {
                         let draw = |s: &mut StripBuffer| app_mgr.draw(s);
@@ -673,8 +673,11 @@ impl super::Kernel {
                             }
                             let write_ms = t_write.elapsed().as_millis();
                             debug!(
-                                "render: partial phase1 region={:?} red_stale={} ({}ms)",
-                                r, entered_stale, write_ms
+                                "render: partial phase1 region={:?} redrive={} stale={:?} ({}ms)",
+                                r,
+                                wave.hard_redrive(),
+                                stale,
+                                write_ms
                             );
                             let t_wave = Instant::now();
                             let (deferred, sleep) = svc.wave_window(&mut wave, app_mgr).await;
@@ -721,9 +724,11 @@ impl super::Kernel {
                                 };
                                 match mode {
                                     GrayscaleMode::Immediate => {
-                                        // grayscale AA replaces phase 3 (gray
-                                        // overwrites both RAMs); the next page
-                                        // turn resyncs via inv_red
+                                        // grayscale AA replaces phase 3; the
+                                        // region stays marked stale so the next
+                                        // partial touching it re-drives via
+                                        // inv_red, which is the black starting
+                                        // state the gray pulses assume
                                         let draw = |s: &mut StripBuffer| app_mgr.draw(s);
                                         if settled.grayscale(&draw).await.is_err() {
                                             log::warn!("render: grayscale_pass timed out, forcing full GC next frame");
@@ -789,9 +794,9 @@ impl super::Kernel {
 
                 // after a full GC refresh the panel is left in plain BW.
                 // re-apply grayscale AA per the current `GrayscaleMode`
-                // (or arm the deferred timer). next partial will use
-                // inv_red to resync both RAM planes when the gray pass
-                // does fire.
+                // (or arm the deferred timer). the pass marks the screen
+                // stale, so later partials re-drive the area they touch
+                // via inv_red.
                 let aa_enabled = app_mgr.system_settings().text_aa;
                 let mode = if aa_enabled && !app_mgr.has_redraw() && deferred.is_none() {
                     app_mgr.grayscale_mode()
@@ -805,11 +810,6 @@ impl super::Kernel {
                             log::warn!(
                                 "render: post-GC grayscale_pass timed out, forcing full GC next frame"
                             );
-                        } else {
-                            // resync RED so red_stale clears; without it
-                            // every later mark expands to a full-screen
-                            // inv_red re-drive
-                            screen.resync_red_full(&draw);
                         }
                         svc.aa_deferred_at = None;
                     }
@@ -844,27 +844,24 @@ impl super::Kernel {
         sleep_requested
     }
 
-    // run a full-screen grayscale_pass on top of an already-rendered
-    // BW image. fires only from the main loop after the deferred-AA
-    // timer expires; panel power is normally still latched on from the
-    // last partial DU, so the pass skips the booster start entirely.
+    // run a grayscale_pass over everything refreshed since the last
+    // one, on top of an already-rendered BW image. fires only from the
+    // main loop after the deferred-AA timer expires; panel power is
+    // normally still latched on from the last partial DU, so the pass
+    // skips the booster start entirely.
     async fn fire_deferred_grayscale<A: AppLayer>(&mut self, app_mgr: &mut A) {
         let draw = |s: &mut StripBuffer| app_mgr.draw(s);
         let t0 = Instant::now();
-        if self.screen.grayscale_full(&draw).await.is_err() {
+        if self.screen.grayscale_fresh(&draw).await.is_err() {
             log::warn!(
                 "render: deferred grayscale_pass timed out, forcing full GC next frame"
             );
             return;
         }
-        // BW restore inside grayscale_pass leaves BW RAM in sync with
-        // the just-drawn image, but RED RAM holds the gray plane.
-        // resync RED here (cheap RAM write, we are idle) so the next
-        // partial stays a minimal delta; leaving it stale would force
-        // an inv_red re-drive of the whole screen on the next input.
-        // leftover gray at AA edge pixels under unchanged content is
-        // invisible and gets re-grayed on the next deferred pass.
-        self.screen.resync_red_full(&draw);
+        // the screen is now marked stale: the panel holds gray levels
+        // the RAM planes cannot express, so the next partial re-drives
+        // the region it touches instead of computing a delta. recovery
+        // is scoped to that region, so a small mark stays small
         debug!(
             "render: deferred grayscale_pass complete ({}ms)",
             t0.elapsed().as_millis()
