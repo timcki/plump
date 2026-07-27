@@ -320,14 +320,19 @@ where
             strip.begin_window(self.rotation, px, y, pw, rows);
             draw(strip);
 
+            // the BW paths park out-of-region bits at 1 in both planes so
+            // the DU sees no delta. the gray LUT's neutral state is {0,0}
+            // instead, so here the same bits must be cleared: leaving them
+            // set hands the byte-alignment slop a gray waveform, which
+            // shows up as a driven band along the edge of the region
             if needs_mask && row_bytes > 0 {
                 for row in strip.data_mut().chunks_mut(row_bytes) {
-                    row[0] |= left_mask;
-                    row[row.len() - 1] |= right_mask;
+                    row[0] &= !left_mask;
+                    row[row.len() - 1] &= !right_mask;
                 }
                 for row in strip.gray_data_mut().chunks_mut(row_bytes) {
-                    row[0] |= left_mask;
-                    row[row.len() - 1] |= right_mask;
+                    row[0] &= !left_mask;
+                    row[row.len() - 1] &= !right_mask;
                 }
             }
 
@@ -787,6 +792,7 @@ where
         F: Fn(&mut StripBuffer),
     {
         // single draw pass fills both LSB (buf) and MSB (gray_buf) planes
+        crate::perf_begin!(_t0);
         strip.set_gray_mode(GrayMode::GrayDual);
         self.write_region_strips_gray_dual(
             strip,
@@ -799,9 +805,22 @@ where
             rs.right_mask,
         );
         strip.set_gray_mode(GrayMode::Bw);
+        crate::perf_event!(
+            "render",
+            "gray write_ms={} px={} py={} pw={} ph={} lmask={} rmask={}",
+            _t0.elapsed().as_millis(),
+            rs.px,
+            rs.py,
+            rs.pw,
+            rs.ph,
+            rs.left_mask,
+            rs.right_mask
+        );
 
+        crate::perf_begin!(_t1);
         self.start_grayscale_refresh(rs);
         self.wait_busy_async("grayscale_refresh").await?;
+        crate::perf_event!("render", "gray wave_ms={}", _t1.elapsed().as_millis());
 
         // restore BW RAM with correct content so subsequent partial
         // DU refreshes compute correct pixel deltas. the physical

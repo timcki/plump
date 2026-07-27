@@ -672,12 +672,10 @@ impl super::Kernel {
                                 actual_mode = "partial";
                             }
                             let write_ms = t_write.elapsed().as_millis();
+                            let redrive = wave.hard_redrive();
                             debug!(
                                 "render: partial phase1 region={:?} redrive={} stale={:?} ({}ms)",
-                                r,
-                                wave.hard_redrive(),
-                                stale,
-                                write_ms
+                                r, redrive, stale, write_ms
                             );
                             let t_wave = Instant::now();
                             let (deferred, sleep) = svc.wave_window(&mut wave, app_mgr).await;
@@ -694,9 +692,10 @@ impl super::Kernel {
                             );
                             crate::perf_event!(
                                 "render",
-                                "partial write_ms={} wave_ms={} region_x={} region_y={} region_w={} region_h={}",
+                                "partial write_ms={} wave_ms={} redrive={} region_x={} region_y={} region_w={} region_h={}",
                                 write_ms,
                                 wave_ms,
+                                redrive,
                                 r.x,
                                 r.y,
                                 r.w,

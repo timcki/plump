@@ -389,10 +389,15 @@ impl StripBuffer {
     ///
     /// Behaviour depends on `self.gray_mode`:
     ///   Bw:       any non-zero → set/clear bit per `black` (buffer starts 0xFF)
-    ///   GrayLsb:  val >= 2     → set bit in buf   (buffer starts 0x00)
+    ///   GrayLsb:  val == 2     → set bit in buf   (buffer starts 0x00)
     ///   GrayMsb:  val 1 or 2   → set bit in buf   (buffer starts 0x00)
-    ///   GrayDual: val >= 2     → set bit in buf (LSB plane)
+    ///   GrayDual: val == 2     → set bit in buf (LSB plane)
     ///             val 1 or 2   → set bit in gray_buf (MSB plane)
+    ///
+    /// Only partial coverage takes a plane bit. val 3 (solid) and val 0
+    /// (empty) both land on {0,0}, the LUT's no-change state, so the
+    /// pass lightens glyph edges and leaves the body and the page at
+    /// whatever the BW frame drove them to.
     #[allow(clippy::too_many_arguments)]
     pub fn blit_2bpp(
         &mut self,
@@ -478,7 +483,7 @@ impl StripBuffer {
             }
             GrayMode::GrayLsb => {
                 walk!(|val, idx, mask| {
-                    if val >= 2 {
+                    if val == 2 {
                         self.buf[idx] |= mask;
                     }
                 });
@@ -492,7 +497,11 @@ impl StripBuffer {
             }
             GrayMode::GrayDual => {
                 walk!(|val, idx, mask| {
-                    if val >= 2 {
+                    // val 3 is solid ink: the BW frame already drove it
+                    // black, so it must land on {0,0} = no change. giving
+                    // it a plane bit hands it a gray waveform and every
+                    // pass lightens the body of the glyph
+                    if val == 2 {
                         self.buf[idx] |= mask;
                     }
                     if val <= 2 {
@@ -537,7 +546,10 @@ impl StripBuffer {
                         continue;
                     }
                     let (px, py) = self.to_physical(lx as u16, ly as u16);
-                    if val >= 2 {
+                    // val 3 stays {0,0}: solid ink keeps the black the
+                    // BW frame drove, the gray LUT only touches partial
+                    // coverage
+                    if val == 2 {
                         self.set_pixel_physical(px, py, false);
                     }
                     if val <= 2 {
@@ -546,7 +558,7 @@ impl StripBuffer {
                 } else {
                     let should_draw = match self.gray_mode {
                         GrayMode::Bw => val != 0,
-                        GrayMode::GrayLsb => val >= 2,
+                        GrayMode::GrayLsb => val == 2,
                         GrayMode::GrayMsb => val == 1 || val == 2,
                         GrayMode::GrayDual => unreachable!(),
                     };
