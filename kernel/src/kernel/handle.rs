@@ -14,21 +14,23 @@ use crate::ui::Theme;
 
 // synchronous API surface for apps
 //
-// borrows the Kernel for the duration of an app lifecycle method;
-// no SPI, no generics, no driver types visible to apps
+// borrows the kernel's services half for the duration of an app
+// lifecycle method; no SPI, no generics, no driver types visible to
+// apps. the screen half stays free, so background work can run
+// through a handle while a waveform session holds the display
 pub struct KernelHandle<'k> {
-    pub(crate) kernel: &'k mut super::Kernel,
+    pub(crate) svc: &'k mut super::Services,
 }
 
 impl<'k> KernelHandle<'k> {
-    pub(crate) fn new(kernel: &'k mut super::Kernel) -> Self {
-        Self { kernel }
+    pub(crate) fn new(svc: &'k mut super::Services) -> Self {
+        Self { svc }
     }
 
     /// Direct access to the SD storage for file I/O.
     #[inline]
     pub fn sd(&self) -> &SdStorage {
-        &self.kernel.sd
+        &self.svc.sd
     }
 
     // smol-epub sync reader bridge
@@ -66,20 +68,20 @@ impl<'k> KernelHandle<'k> {
     }
 
     pub fn dir_page(&mut self, offset: usize, buf: &mut [DirEntry]) -> Result<DirPage> {
-        let k = &mut *self.kernel;
+        let k = &mut *self.svc;
         k.dir_cache.ensure_loaded(&k.sd)?;
         Ok(k.dir_cache.page(offset, buf))
     }
 
     pub fn invalidate_dir_cache(&mut self) {
-        self.kernel.dir_cache.invalidate();
+        self.svc.dir_cache.invalidate();
     }
 
     // system info (sync, no I/O)
 
     #[inline]
     pub fn battery_mv(&self) -> u16 {
-        self.kernel.cached_battery_mv
+        self.svc.cached_battery_mv
     }
 
     #[inline]
@@ -89,11 +91,11 @@ impl<'k> KernelHandle<'k> {
 
     #[inline]
     pub fn sd_ok(&self) -> bool {
-        self.kernel.sd_ok
+        self.svc.sd_ok
     }
 
     pub fn ensure_dir_cache_loaded(&mut self) -> Result<()> {
-        let k = &mut *self.kernel;
+        let k = &mut *self.svc;
         k.dir_cache.ensure_loaded(&k.sd)
     }
 
@@ -110,17 +112,17 @@ impl<'k> KernelHandle<'k> {
 
     #[inline]
     pub fn bookmark_cache(&self) -> &BookmarkCache {
-        &*self.kernel.bm_cache
+        &*self.svc.bm_cache
     }
 
     #[inline]
     pub fn bookmark_cache_mut(&mut self) -> &mut BookmarkCache {
-        &mut *self.kernel.bm_cache
+        &mut *self.svc.bm_cache
     }
 
     #[inline]
     pub fn dir_cache_mut(&mut self) -> &mut DirCache {
-        &mut *self.kernel.dir_cache
+        &mut *self.svc.dir_cache
     }
 
     /// Borrow the shared design tokens. Chrome widgets and any app
@@ -128,7 +130,7 @@ impl<'k> KernelHandle<'k> {
     /// thread this reference through rather than redeclaring constants.
     #[inline]
     pub fn theme(&self) -> &Theme {
-        &self.kernel.theme
+        &self.svc.theme
     }
 
     /// Today's reading stats (pages + seconds since the last calendar
@@ -136,12 +138,12 @@ impl<'k> KernelHandle<'k> {
     /// during page turns and on session-time accumulation.
     #[inline]
     pub fn day_stats(&self) -> &DayStats {
-        &*self.kernel.day_stats
+        &*self.svc.day_stats
     }
 
     #[inline]
     pub fn day_stats_mut(&mut self) -> &mut DayStats {
-        &mut *self.kernel.day_stats
+        &mut *self.svc.day_stats
     }
 
     /// Current day key (derived from `_PLUMP/DAYSTATS.BIN` mtime).
@@ -149,7 +151,7 @@ impl<'k> KernelHandle<'k> {
     /// counters accumulate from boot without ever rolling over.
     #[inline]
     pub fn today_key(&self) -> u32 {
-        self.kernel.today_key
+        self.svc.today_key
     }
 }
 

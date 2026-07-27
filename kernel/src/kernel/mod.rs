@@ -18,6 +18,7 @@ pub mod input_policy;
 pub mod nav;
 pub mod rtc_session;
 pub mod scheduler;
+pub mod screen;
 pub mod sleep_image;
 pub mod tasks;
 pub mod timing;
@@ -38,6 +39,7 @@ pub use bookmarks::BookmarkCache;
 pub use console::BootConsole;
 pub use handle::KernelHandle;
 pub use input_policy::SemanticInput;
+pub use screen::Screen;
 pub use wake::uptime_secs;
 
 use esp_hal::delay::Delay;
@@ -83,7 +85,7 @@ impl AppliedSettings {
         &mut self,
         generation: u32,
         ss: &config::SystemSettings,
-        epd: &mut crate::board::Epd,
+        screen: &mut Screen,
     ) -> bool {
         let mut swap_changed = false;
 
@@ -105,7 +107,7 @@ impl AppliedSettings {
                 self.sunlight_fix,
                 ss.sunlight_fix
             );
-            epd.set_sunlight_mode(ss.sunlight_fix);
+            screen.set_sunlight_mode(ss.sunlight_fix);
             self.sunlight_fix = ss.sunlight_fix;
         }
 
@@ -134,20 +136,23 @@ impl AppliedSettings {
     }
 }
 
+// split so the scheduler can borrow both halves disjointly: a Wave
+// (screen.rs) holds the screen half for the duration of a waveform
+// while background work runs through a KernelHandle over the services
+// half. the SPI bus-sharing invariant falls out of the borrow checker
 pub struct Kernel {
+    pub(crate) screen: Screen,
+    pub(crate) svc: Services,
+}
+
+// everything the app-facing KernelHandle and background/housekeeping
+// paths need; no display hardware in here
+pub struct Services {
     pub(crate) sd: SdStorage,
     pub(crate) dir_cache: &'static mut DirCache,
     pub(crate) bm_cache: &'static mut BookmarkCache,
-    pub(crate) epd: Epd,
-    pub(crate) strip: &'static mut StripBuffer,
-    pub(crate) delay: Delay,
     pub(crate) sd_ok: bool,
     pub(crate) cached_battery_mv: u16,
-    pub(crate) partial_refreshes: u32,
-
-    // true when RED RAM is out of sync with BW after a skipped
-    // phase3_sync (rapid navigation); next partial uses inv_red
-    pub(crate) red_stale: bool,
 
     // armed by the render path when the active app uses
     // `GrayscaleMode::Deferred`. the main loop fires the AA pass once
@@ -241,46 +246,40 @@ impl Kernel {
         day_stats.rollover_if_new_day(today_key);
 
         Self {
-            sd,
-            dir_cache,
-            bm_cache,
-            epd,
-            strip,
-            delay,
-            sd_ok,
-            cached_battery_mv: battery_mv,
-            partial_refreshes: 0,
-            red_stale: false,
-            aa_deferred_at: None,
-            input_policy: input_policy::InputPolicyState::new(),
-            applied: AppliedSettings::new(),
-            theme: Theme::default_v1(),
-            day_stats,
-            today_key,
-            hk: HousekeepingDeadlines::starting_now(),
-            last_activity: embassy_time::Instant::now(),
-            idle_timeout_mins: 0,
+            screen: Screen::new(epd, strip, delay),
+            svc: Services {
+                sd,
+                dir_cache,
+                bm_cache,
+                sd_ok,
+                cached_battery_mv: battery_mv,
+                aa_deferred_at: None,
+                input_policy: input_policy::InputPolicyState::new(),
+                applied: AppliedSettings::new(),
+                theme: Theme::default_v1(),
+                day_stats,
+                today_key,
+                hk: HousekeepingDeadlines::starting_now(),
+                last_activity: embassy_time::Instant::now(),
+                idle_timeout_mins: 0,
+            },
         }
     }
 
     #[inline]
     pub fn handle(&mut self) -> KernelHandle<'_> {
-        KernelHandle::new(self)
+        self.svc.handle()
     }
 
     #[inline]
     pub fn set_battery_mv(&mut self, mv: u16) {
-        self.cached_battery_mv = mv;
+        self.svc.cached_battery_mv = mv;
     }
+}
 
+impl Services {
     #[inline]
-    pub fn reset_partial_count(&mut self) {
-        self.partial_refreshes = 0;
-        self.red_stale = false;
-    }
-
-    #[inline]
-    pub fn bump_partial_count(&mut self) {
-        self.partial_refreshes += 1;
+    pub fn handle(&mut self) -> KernelHandle<'_> {
+        KernelHandle::new(self)
     }
 }

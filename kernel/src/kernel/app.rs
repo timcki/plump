@@ -14,9 +14,7 @@
 // app-side, but the protocol is kernel-side
 
 use embassy_time::Instant;
-use esp_hal::delay::Delay;
 
-use crate::board::Epd;
 use crate::board::action::ActionEvent;
 use crate::drivers::input::Event;
 use crate::drivers::sdcard::SdStorage;
@@ -747,17 +745,10 @@ pub trait AppLayer {
     }
 
     // run the special mode; scheduler calls this when
-    // needs_special_mode() returns true. hardware resources are
+    // needs_special_mode() returns true. the screen half and SD are
     // passed from the kernel since special modes drive the EPD
     // and SD directly (e.g. wifi upload mode).
-    async fn run_special_mode(
-        &mut self,
-        _epd: &mut Epd,
-        _strip: &mut StripBuffer,
-        _delay: &mut Delay,
-        _sd: &SdStorage,
-    ) {
-    }
+    async fn run_special_mode(&mut self, _screen: &mut super::Screen, _sd: &SdStorage) {}
 
     // true when deferred input during EPD refresh should be
     // suppressed (e.g. quick menu overlay is open)

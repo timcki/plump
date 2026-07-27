@@ -12,19 +12,19 @@ use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{IpListenEndpoint, Ipv4Address, Ipv4Cidr, StaticConfigV4};
 use embassy_time::{Duration, Instant, Timer, with_deadline};
 use embedded_io_async::Write as AsyncWrite;
-use esp_hal::delay::Delay;
 use esp_radio::wifi::{
     AccessPointConfig, AuthMethod, ClientConfig, Config, ModeConfig, WifiDevice, WifiEvent,
 };
 use log::{debug, info, warn};
 
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
-use crate::board::{Epd, SCREEN_H, SCREEN_W};
+use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::fonts::bitmap::BitmapFont;
+use crate::kernel::Screen;
 use crate::kernel::config::WifiConfig;
 use crate::kernel::tasks;
 use crate::ui::{
@@ -124,26 +124,16 @@ impl<'a> DnsBuf<'a> {
 
 /// Bundles rendering resources so screen helpers don't need 6+ parameters.
 struct UploadScreen<'a> {
-    epd: &'a mut Epd,
-    strip: &'a mut StripBuffer,
-    delay: &'a mut Delay,
+    screen: &'a mut Screen,
     heading: &'static BitmapFont,
     body: &'static BitmapFont,
     bumps: &'a ButtonFeedback,
 }
 
 impl<'a> UploadScreen<'a> {
-    fn new(
-        epd: &'a mut Epd,
-        strip: &'a mut StripBuffer,
-        delay: &'a mut Delay,
-        ui_font_size_idx: u8,
-        bumps: &'a ButtonFeedback,
-    ) -> Self {
+    fn new(screen: &'a mut Screen, ui_font_size_idx: u8, bumps: &'a ButtonFeedback) -> Self {
         Self {
-            epd,
-            strip,
-            delay,
+            screen,
             heading: fonts::ui_heading_font(ui_font_size_idx),
             body: fonts::chrome_font(),
             bumps,
@@ -153,9 +143,7 @@ impl<'a> UploadScreen<'a> {
     /// Render lines with optional footer (partial refresh).
     async fn show(&mut self, lines: &[&str], footer: Option<&str>) {
         render_screen(
-            self.epd,
-            self.strip,
-            self.delay,
+            self.screen,
             self.heading,
             self.body,
             lines,
@@ -169,9 +157,7 @@ impl<'a> UploadScreen<'a> {
     /// Render lines with optional footer (full refresh).
     async fn show_full(&mut self, lines: &[&str], footer: Option<&str>) {
         render_screen(
-            self.epd,
-            self.strip,
-            self.delay,
+            self.screen,
             self.heading,
             self.body,
             lines,
@@ -185,9 +171,7 @@ impl<'a> UploadScreen<'a> {
     /// Show error message and wait for BACK button.
     async fn show_error(&mut self, msg: &str) {
         render_screen(
-            self.epd,
-            self.strip,
-            self.delay,
+            self.screen,
             self.heading,
             self.body,
             &[msg],
@@ -278,15 +262,13 @@ impl Drop for UploadFileGuard<'_> {
 
 pub async fn run_upload_mode(
     wifi: esp_hal::peripherals::WIFI<'static>,
-    epd: &mut Epd,
-    strip: &mut StripBuffer,
-    delay: &mut Delay,
+    screen: &mut Screen,
     sd: &SdStorage,
     ui_font_size_idx: u8,
     bumps: &ButtonFeedback,
     wifi_cfg: &WifiConfig,
 ) {
-    let mut screen = UploadScreen::new(epd, strip, delay, ui_font_size_idx, bumps);
+    let mut screen = UploadScreen::new(screen, ui_font_size_idx, bumps);
 
     let radio = match esp_radio::init() {
         Ok(r) => r,
@@ -1181,9 +1163,7 @@ async fn drain_until_back() {
 }
 
 async fn render_screen(
-    epd: &mut Epd,
-    strip: &mut StripBuffer,
-    delay: &mut Delay,
+    screen: &mut Screen,
     heading: &'static BitmapFont,
     body: &'static BitmapFont,
     lines: &[&str],
@@ -1238,9 +1218,10 @@ async fn render_screen(
     };
 
     let result = if full_refresh {
-        epd.full_refresh_async(strip, delay, &draw).await
+        screen.render_full(&draw).await
     } else {
-        epd.partial_refresh_async(strip, delay, 0, 0, SCREEN_W, SCREEN_H, &draw)
+        screen
+            .render_partial(Region::new(0, 0, SCREEN_W, SCREEN_H), &draw)
             .await
     };
     if result.is_err() {

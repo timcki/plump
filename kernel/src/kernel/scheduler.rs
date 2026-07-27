@@ -4,8 +4,9 @@
 // during normal operation, all SD I/O completes before render()
 // touches the EPD; during the DU/GC waveform (~400ms), the EPD
 // charge pump drives pixels with no SPI commands, so the bus is
-// free for SD I/O - busy_wait_with_background exploits this
-// window to run background caching and housekeeping
+// free for SD I/O - Services::wave_window exploits this window to
+// run background caching and housekeeping while a screen.rs Wave
+// session holds the display half of the kernel
 //
 // handle_input and poll_housekeeping are synchronous; they return
 // a bool flag when the caller should enter_sleep (which is async
@@ -60,12 +61,7 @@ impl super::Kernel {
     // hardware init progress in the built-in mono font
     pub async fn show_boot_console(&mut self, console: &super::BootConsole) {
         let draw = |s: &mut StripBuffer| console.draw(s);
-        if self
-            .epd
-            .full_refresh_async(self.strip, &mut self.delay, &draw)
-            .await
-            .is_err()
-        {
+        if self.screen.render_full(&draw).await.is_err() {
             log::warn!("show_boot_console: EPD refresh timed out");
         }
     }
@@ -82,7 +78,7 @@ impl super::Kernel {
         // SD fallback: check if session file exists and is valid.
         // this costs one SD read (~20ms) but saves ~1.6s of EPD refresh
         // when the session is valid.
-        RtcSession::load_from_sd(&self.sd).is_some()
+        RtcSession::load_from_sd(&self.svc.sd).is_some()
     }
 
     // one-time boot: load caches, settings, render the home screen
@@ -107,7 +103,7 @@ impl super::Kernel {
         }
 
         let t0 = Instant::now();
-        self.bm_cache.ensure_loaded(&self.sd);
+        self.svc.bm_cache.ensure_loaded(&self.svc.sd);
         let bm_ms = t0.elapsed().as_millis();
         info!("boot: bookmark cache loaded ({}ms)", bm_ms);
 
@@ -129,7 +125,7 @@ impl super::Kernel {
         } else {
             // RTC invalid — try SD fallback (typical on battery wake)
             let t1 = Instant::now();
-            match RtcSession::load_from_sd(&self.sd) {
+            match RtcSession::load_from_sd(&self.svc.sd) {
                 Some(session) => {
                     info!(
                         "boot: SD session valid (wake count {}) ({}ms)",
@@ -173,12 +169,13 @@ impl super::Kernel {
 
         // apply initial settings to hardware and record them so the
         // generation-based check in run() starts from a known baseline
-        self.idle_timeout_mins = app_mgr.system_settings().sleep_timeout;
-        self.epd
+        self.svc.idle_timeout_mins = app_mgr.system_settings().sleep_timeout;
+        self.screen
             .set_sunlight_mode(app_mgr.system_settings().sunlight_fix);
-        self.applied
+        self.svc
+            .applied
             .init_from(app_mgr.settings_generation(), app_mgr.system_settings());
-        self.log_stats();
+        self.svc.log_stats();
 
         // try to restore session from RTC memory
         let t0 = Instant::now();
@@ -213,12 +210,7 @@ impl super::Kernel {
 
             let t0 = Instant::now();
             let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-            if self
-                .epd
-                .full_refresh_async(self.strip, &mut self.delay, &draw)
-                .await
-                .is_err()
-            {
+            if self.screen.render_full(&draw).await.is_err() {
                 log::warn!("boot: first EPD refresh timed out");
             }
             info!("boot: first EPD refresh ({}ms)", t0.elapsed().as_millis());
@@ -251,8 +243,8 @@ impl super::Kernel {
         // re-arm from here rather than Kernel::new so the initial
         // housekeeping delay counts from UI-ready, not from before the
         // multi-second boot sequence
-        self.hk = super::HousekeepingDeadlines::starting_now();
-        self.last_activity = Instant::now();
+        self.svc.hk = super::HousekeepingDeadlines::starting_now();
+        self.svc.last_activity = Instant::now();
 
         loop {
             if app_mgr.needs_special_mode() {
@@ -266,7 +258,7 @@ impl super::Kernel {
                 if matches!(ev, Event::LongPress(_)) {
                     debug!("scheduler: received {:?}", ev);
                 }
-                if self.handle_input(ev, app_mgr) {
+                if self.svc.handle_input(ev, app_mgr) {
                     self.sleep_with_session(app_mgr, "power held").await;
                 }
                 if app_mgr.needs_special_mode() {
@@ -280,9 +272,9 @@ impl super::Kernel {
 
             // idle sleep by deadline (checked only here, never during a
             // waveform)
-            if self.idle_deadline().is_some_and(|d| Instant::now() >= d) {
+            if self.svc.idle_deadline().is_some_and(|d| Instant::now() >= d) {
                 self.sleep_with_session(app_mgr, "idle timeout").await;
-                self.last_activity = Instant::now();
+                self.svc.last_activity = Instant::now();
                 continue;
             }
 
@@ -296,7 +288,7 @@ impl super::Kernel {
             //      away during long-running operations
             //   2. poll_housekeeping may do SD I/O, also before render
             //   3. render() touches the EPD; during the waveform window
-            //      busy_wait_with_background runs SD I/O because the
+            //      wave_window runs SD I/O because the
             //      EPD charge pump is driving pixels with no SPI commands
             //   4. no SD I/O outside these three sites
             //
@@ -315,7 +307,7 @@ impl super::Kernel {
 
                 // check for pending input between steps
                 if let Ok(ev) = tasks::INPUT_EVENTS.try_receive() {
-                    if self.handle_input(ev, app_mgr) {
+                    if self.svc.handle_input(ev, app_mgr) {
                         self.sleep_with_session(app_mgr, "power held").await;
                         // sleep returns; restart main loop
                         break 'bg;
@@ -338,26 +330,28 @@ impl super::Kernel {
                 continue;
             }
 
-            self.run_due_housekeeping();
+            self.svc.run_due_housekeeping();
 
             // generation-based settings propagation: only re-apply
             // hardware state when the app layer signals a change
             let settings_gen = app_mgr.settings_generation();
-            if settings_gen != self.applied.generation {
-                let swap_changed =
-                    self.applied
-                        .sync(settings_gen, app_mgr.system_settings(), &mut self.epd);
+            if settings_gen != self.svc.applied.generation {
+                let swap_changed = self.svc.applied.sync(
+                    settings_gen,
+                    app_mgr.system_settings(),
+                    &mut self.screen,
+                );
                 if swap_changed {
-                    app_mgr.on_swap_buttons_changed(self.applied.swap_buttons);
+                    app_mgr.on_swap_buttons_changed(self.svc.applied.swap_buttons);
                 }
-                self.idle_timeout_mins = self.applied.sleep_timeout;
+                self.svc.idle_timeout_mins = self.svc.applied.sleep_timeout;
             }
 
             // push live chrome state into the app layer so the top
             // status bar shows up-to-date numbers.
-            let pct = crate::drivers::battery::battery_percentage(self.cached_battery_mv);
-            let day_pages = self.day_stats.pages();
-            let day_secs = self.day_stats.secs_today();
+            let pct = crate::drivers::battery::battery_percentage(self.svc.cached_battery_mv);
+            let day_pages = self.svc.day_stats.pages();
+            let day_secs = self.svc.day_stats.secs_today();
             app_mgr.set_chrome_state(pct, day_pages, day_secs);
 
             // opportunistic flush of deferred app persistence (RECENT,
@@ -387,13 +381,13 @@ impl super::Kernel {
             // redraw, AA setting still on, no power-down in progress).
             // the park below wakes at the armed instant, so fire
             // latency is near zero.
-            if let Some(at) = self.aa_deferred_at {
+            if let Some(at) = self.svc.aa_deferred_at {
                 if !app_mgr.system_settings().text_aa
                     || !matches!(app_mgr.grayscale_mode(), GrayscaleMode::Deferred)
                 {
-                    self.aa_deferred_at = None;
+                    self.svc.aa_deferred_at = None;
                 } else if Instant::now() >= at && !app_mgr.has_redraw() {
-                    self.aa_deferred_at = None;
+                    self.svc.aa_deferred_at = None;
                     self.fire_deferred_grayscale(app_mgr).await;
                 }
             }
@@ -414,17 +408,18 @@ impl super::Kernel {
             // which doubles as the backstop for the worker's silent
             // stale-generation skip (no result is posted for those)
             let mut deadline = self
+                .svc
                 .hk
                 .status_at
-                .min(self.hk.sd_check_at)
-                .min(self.hk.bm_flush_at);
-            if let Some(d) = self.idle_deadline() {
+                .min(self.svc.hk.sd_check_at)
+                .min(self.svc.hk.bm_flush_at);
+            if let Some(d) = self.svc.idle_deadline() {
                 deadline = deadline.min(d);
             }
             if let Some(d) = app_mgr.ctx_mut().next_render_deadline() {
                 deadline = deadline.min(d);
             }
-            if let Some(d) = self.aa_deferred_at {
+            if let Some(d) = self.svc.aa_deferred_at {
                 deadline = deadline.min(d);
             }
 
@@ -437,7 +432,7 @@ impl super::Kernel {
                 .await
                 {
                     Either3::First(ev) => {
-                        if self.handle_input(ev, app_mgr) {
+                        if self.svc.handle_input(ev, app_mgr) {
                             self.sleep_with_session(app_mgr, "power held").await;
                         }
                     }
@@ -446,7 +441,7 @@ impl super::Kernel {
             } else {
                 match select(tasks::INPUT_EVENTS.receive(), Timer::at(deadline)).await {
                     Either::First(ev) => {
-                        if self.handle_input(ev, app_mgr) {
+                        if self.svc.handle_input(ev, app_mgr) {
                             self.sleep_with_session(app_mgr, "power held").await;
                         }
                     }
@@ -460,20 +455,22 @@ impl super::Kernel {
     // (e.g. wifi upload); kernel passes hardware resources through
     async fn handle_special_mode<A: AppLayer>(&mut self, app_mgr: &mut A) {
         app_mgr
-            .run_special_mode(&mut self.epd, self.strip, &mut self.delay, &self.sd)
+            .run_special_mode(&mut self.screen, &self.svc.sd)
             .await;
 
         app_mgr.apply_transition(Transition::Pop, &mut self.handle());
         app_mgr.request_full_redraw();
         // a long special mode (wifi upload) must not be followed by an
         // immediate idle sleep computed from pre-upload activity
-        self.last_activity = Instant::now();
+        self.svc.last_activity = Instant::now();
     }
+}
 
+impl super::Services {
     /// Shared helper: run a hardware event through the input policy and
     /// dispatch forwarded raw events to the app layer.
     ///
-    /// Both `handle_input` (normal path) and `busy_wait_with_background`
+    /// Both `handle_input` (normal path) and `wave_window`
     /// (waveform path) call this so the policy resolution logic cannot
     /// drift between the two sites. Semantic inputs are returned to the
     /// caller so the waveform path can defer them until refresh completes.
@@ -609,10 +606,11 @@ impl super::Kernel {
         (self.idle_timeout_mins > 0)
             .then(|| self.last_activity + Duration::from_secs(self.idle_timeout_mins as u64 * 60))
     }
+}
 
-
+impl super::Kernel {
     // partial refreshes use DU waveform (~400 ms); after ghost_clear_every
-    // partials, a full GC refresh (~1.6 s) clears ghosting
+    // partials, a full GC refresh (~600 ms at faked temp) clears ghosting
     //
     // returns true if power-long-press arrived during the waveform and
     // the caller should enter sleep
@@ -641,177 +639,124 @@ impl super::Kernel {
             );
         }
 
+        let super::Kernel { screen, svc } = self;
+
         'render: {
             if let Redraw::Partial(r) = redraw {
-                let ghost_clear_every = app_mgr.ghost_clear_every();
-
-                if self.partial_refreshes < ghost_clear_every {
-                    // red_stale means RED RAM is desynchronised somewhere
-                    // on screen (grayscale pass, or a skipped phase3).
-                    // expand this refresh to the full screen so the
-                    // inv_red re-drive plus phase3_sync below cover
-                    // everything and the flag can clear. a region-limited
-                    // recovery leaves red_stale set forever, forcing a
-                    // visible full re-drive of every dirty region until
-                    // the next GC (e.g. each home selection move).
-                    let entered_stale = self.red_stale;
-                    let r = if entered_stale {
-                        crate::ui::Region::new(
-                            0,
-                            0,
-                            crate::board::SCREEN_W,
-                            crate::board::SCREEN_H,
-                        )
-                    } else {
-                        r.align8()
-                    };
-
+                if screen.partials_since_clear() < app_mgr.ghost_clear_every() {
+                    // begin_partial picks bw vs inv_red from its own
+                    // plane state and silently expands to the full
+                    // screen when RED RAM is stale
+                    let entered_stale = screen.red_stale();
                     let t_write = Instant::now();
-                    let rs = {
+                    let wave = {
                         let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                        if self.red_stale {
-                            self.epd.partial_phase1_bw_inv_red(
-                                self.strip,
-                                r.x,
-                                r.y,
-                                r.w,
-                                r.h,
-                                &mut self.delay,
-                                &draw,
-                            )
-                        } else {
-                            self.epd.partial_phase1_bw(
-                                self.strip,
-                                r.x,
-                                r.y,
-                                r.w,
-                                r.h,
-                                &mut self.delay,
-                                &draw,
-                            )
-                        }
+                        screen.begin_partial(r, &draw)
                     };
 
-                    if let Some(rs) = rs {
-                        #[cfg(feature = "perf")]
-                        {
-                            actual_mode = "partial";
-                        }
-                        let write_ms = t_write.elapsed().as_millis();
-                        debug!(
-                            "render: partial phase1 region={:?} red_stale={} ({}ms)",
-                            r, self.red_stale, write_ms
-                        );
-                        let t_wave = Instant::now();
-                        self.epd.partial_start_du(&rs);
-                        let (deferred, sleep) = self.busy_wait_with_background(app_mgr).await;
-                        sleep_requested = sleep;
-                        let wave_ms = t_wave.elapsed().as_millis();
-                        debug!(
-                            "render: partial waveform done region={:?} pending_redraw={} deferred={} sleep={} ({}ms)",
-                            r,
-                            app_mgr.has_redraw(),
-                            deferred.is_some(),
-                            sleep,
-                            wave_ms
-                        );
-                        crate::perf_event!(
-                            "render",
-                            "partial write_ms={} wave_ms={} region_x={} region_y={} region_w={} region_h={}",
-                            write_ms,
-                            wave_ms,
-                            r.x,
-                            r.y,
-                            r.w,
-                            r.h
-                        );
+                    match wave {
+                        Ok(mut wave) => {
+                            #[cfg(feature = "perf")]
+                            {
+                                actual_mode = "partial";
+                            }
+                            let write_ms = t_write.elapsed().as_millis();
+                            debug!(
+                                "render: partial phase1 region={:?} red_stale={} ({}ms)",
+                                r, entered_stale, write_ms
+                            );
+                            let t_wave = Instant::now();
+                            let (deferred, sleep) = svc.wave_window(&mut wave, app_mgr).await;
+                            sleep_requested = sleep;
+                            let settled = wave.settle();
+                            let wave_ms = t_wave.elapsed().as_millis();
+                            debug!(
+                                "render: partial waveform done region={:?} pending_redraw={} deferred={} sleep={} ({}ms)",
+                                r,
+                                app_mgr.has_redraw(),
+                                deferred.is_some(),
+                                sleep,
+                                wave_ms
+                            );
+                            crate::perf_event!(
+                                "render",
+                                "partial write_ms={} wave_ms={} region_x={} region_y={} region_w={} region_h={}",
+                                write_ms,
+                                wave_ms,
+                                r.x,
+                                r.y,
+                                r.w,
+                                r.h
+                            );
 
-                        // skip phase 3 when content changed mid-DU or
-                        // a deferred action is queued (the screen
-                        // will be redrawn immediately after); the next
-                        // partial will use inv_red to compensate for
-                        // the desynchronised RED RAM
-                        if app_mgr.has_redraw() || deferred.is_some() {
-                            app_mgr.ctx_mut().mark_dirty(r);
-                            self.red_stale = true;
-                            self.partial_refreshes += 1;
-                            // a fresh redraw is queued — cancel any
-                            // pending deferred-AA so we don't fire it
-                            // on stale content.
-                            self.aa_deferred_at = None;
-                        } else {
-                            self.partial_refreshes += 1;
-
-                            let aa_enabled = app_mgr.system_settings().text_aa;
-                            let mode = if aa_enabled {
-                                app_mgr.grayscale_mode()
+                            // skip phase 3 when content changed mid-DU or
+                            // a deferred action is queued (the screen
+                            // will be redrawn immediately after); the next
+                            // partial recovers the desynchronised RED RAM
+                            // via inv_red
+                            if app_mgr.has_redraw() || deferred.is_some() {
+                                app_mgr.ctx_mut().mark_dirty(r);
+                                settled.abandon();
+                                // a fresh redraw is queued; cancel any
+                                // pending deferred-AA so we don't fire it
+                                // on stale content
+                                svc.aa_deferred_at = None;
                             } else {
-                                GrayscaleMode::Disabled
-                            };
-                            match mode {
-                                GrayscaleMode::Immediate => {
-                                    // grayscale AA: skip phase3_sync (gray overwrites
-                                    // both RAMs) and skip post-gray restore (next page
-                                    // turn uses inv_red to resync)
-                                    let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                                    if self.epd.grayscale_pass(self.strip, &rs, &draw).await.is_err() {
-                                        log::warn!("render: grayscale_pass timed out, forcing full GC next frame");
-                                        // post-wait BW restore was skipped; next partial would
-                                        // see stale BW delta. force a full GC on the next refresh
-                                        self.partial_refreshes = app_mgr.ghost_clear_every();
+                                let aa_enabled = app_mgr.system_settings().text_aa;
+                                let mode = if aa_enabled {
+                                    app_mgr.grayscale_mode()
+                                } else {
+                                    GrayscaleMode::Disabled
+                                };
+                                match mode {
+                                    GrayscaleMode::Immediate => {
+                                        // grayscale AA replaces phase 3 (gray
+                                        // overwrites both RAMs); the next page
+                                        // turn resyncs via inv_red
+                                        let draw = |s: &mut StripBuffer| app_mgr.draw(s);
+                                        if settled.grayscale(&draw).await.is_err() {
+                                            log::warn!("render: grayscale_pass timed out, forcing full GC next frame");
+                                        }
+                                        svc.aa_deferred_at = None;
                                     }
-                                    self.red_stale = true;
-                                    self.aa_deferred_at = None;
-                                }
-                                GrayscaleMode::Deferred | GrayscaleMode::Disabled => {
-                                    let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                                    self.epd.partial_phase3_sync(self.strip, &rs, &draw);
-                                    // clear red_stale only when this frame was
-                                    // expanded to the full screen: then phase1's
-                                    // inv_red re-drive plus this phase3_sync have
-                                    // resynchronised RED RAM everywhere. for
-                                    // region-limited frames RED outside the
-                                    // region may still be desynchronised.
-                                    if entered_stale {
-                                        self.red_stale = false;
+                                    GrayscaleMode::Deferred | GrayscaleMode::Disabled => {
+                                        let draw = |s: &mut StripBuffer| app_mgr.draw(s);
+                                        if settled.sync_red(&draw).await.is_err() {
+                                            log::warn!("render: power_off timed out after partial DU");
+                                        }
+                                        svc.aa_deferred_at = if matches!(mode, GrayscaleMode::Deferred) {
+                                            Some(Instant::now() + DEFERRED_GRAYSCALE_DELAY)
+                                        } else {
+                                            None
+                                        };
                                     }
-                                    if self.epd.power_off_async().await.is_err() {
-                                        log::warn!("render: power_off_async timed out after partial DU");
-                                    }
-                                    self.aa_deferred_at = if matches!(mode, GrayscaleMode::Deferred) {
-                                        Some(Instant::now() + DEFERRED_GRAYSCALE_DELAY)
-                                    } else {
-                                        None
-                                    };
                                 }
                             }
+
+                            if let Some(action) = deferred {
+                                svc.apply_deferred_action(action, app_mgr);
+                            }
+
+                            break 'render;
                         }
-
-                        if let Some(action) = deferred {
-                            self.apply_deferred_action(action, app_mgr);
+                        Err(super::screen::PartialRejected::Empty) => break 'render,
+                        Err(super::screen::PartialRejected::NeedsFull) => {
+                            info!("display: partial failed (initial refresh), promoting to full");
                         }
-
-                        break 'render;
                     }
-
-                    if !self.epd.needs_initial_refresh() {
-                        break 'render;
-                    }
-                    info!("display: partial failed (initial refresh), promoting to full");
                 } else {
                     info!("display: promoted partial to full (ghosting clear)");
                 }
             }
 
             if matches!(redraw, Redraw::Full | Redraw::Partial(_)) {
-                self.log_stats();
+                svc.log_stats();
 
                 let t_write = Instant::now();
-                {
+                let mut wave = {
                     let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                    self.epd
-                        .write_full_frame(self.strip, &mut self.delay, &draw);
-                }
+                    screen.begin_full(&draw)
+                };
                 #[cfg(feature = "perf")]
                 {
                     actual_mode = "full";
@@ -820,10 +765,9 @@ impl super::Kernel {
                 debug!("render: full frame written ({}ms)", write_ms);
 
                 let t_wave = Instant::now();
-                self.epd.start_full_update();
-
-                let (deferred, sleep) = self.busy_wait_with_background(app_mgr).await;
+                let (deferred, sleep) = svc.wave_window(&mut wave, app_mgr).await;
                 sleep_requested = sleep;
+                wave.settle().finish();
                 let wave_ms = t_wave.elapsed().as_millis();
                 debug!(
                     "render: full waveform done pending_redraw={} deferred={} sleep={} ({}ms)",
@@ -834,11 +778,7 @@ impl super::Kernel {
                 );
                 crate::perf_event!("render", "full write_ms={} wave_ms={}", write_ms, wave_ms);
 
-                self.epd.finish_full_update();
-                self.partial_refreshes = 0;
-                self.red_stale = false;
-
-                // After a full GC refresh the panel is left in plain BW.
+                // after a full GC refresh the panel is left in plain BW.
                 // re-apply grayscale AA per the current `GrayscaleMode`
                 // (or arm the deferred timer). next partial will use
                 // inv_red to resync both RAM planes when the gray pass
@@ -851,34 +791,24 @@ impl super::Kernel {
                 };
                 match mode {
                     GrayscaleMode::Immediate => {
-                        let rs = crate::drivers::ssd1677::RenderState {
-                            px: 0,
-                            py: 0,
-                            pw: crate::drivers::ssd1677::WIDTH,
-                            ph: crate::drivers::ssd1677::HEIGHT,
-                            left_mask: 0,
-                            right_mask: 0,
-                        };
                         let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                        if self.epd.grayscale_pass(self.strip, &rs, &draw).await.is_err() {
+                        if screen.grayscale_full(&draw).await.is_err() {
                             log::warn!(
                                 "render: post-GC grayscale_pass timed out, forcing full GC next frame"
                             );
-                            self.partial_refreshes = app_mgr.ghost_clear_every();
                         }
-                        self.red_stale = true;
-                        self.aa_deferred_at = None;
+                        svc.aa_deferred_at = None;
                     }
                     GrayscaleMode::Deferred => {
-                        self.aa_deferred_at = Some(Instant::now() + DEFERRED_GRAYSCALE_DELAY);
+                        svc.aa_deferred_at = Some(Instant::now() + DEFERRED_GRAYSCALE_DELAY);
                     }
                     GrayscaleMode::Disabled => {
-                        self.aa_deferred_at = None;
+                        svc.aa_deferred_at = None;
                     }
                 }
 
                 if let Some(action) = deferred {
-                    self.apply_deferred_action(action, app_mgr);
+                    svc.apply_deferred_action(action, app_mgr);
                 }
             }
         } // 'render
@@ -906,22 +836,12 @@ impl super::Kernel {
     // called power_off_async), grayscale_pass's `0xCF` waveform clocks
     // power back on internally and powers off again at the end.
     async fn fire_deferred_grayscale<A: AppLayer>(&mut self, app_mgr: &mut A) {
-        let rs = crate::drivers::ssd1677::RenderState {
-            px: 0,
-            py: 0,
-            pw: crate::drivers::ssd1677::WIDTH,
-            ph: crate::drivers::ssd1677::HEIGHT,
-            left_mask: 0,
-            right_mask: 0,
-        };
         let draw = |s: &mut StripBuffer| app_mgr.draw(s);
         let t0 = Instant::now();
-        if self.epd.grayscale_pass(self.strip, &rs, &draw).await.is_err() {
+        if self.screen.grayscale_full(&draw).await.is_err() {
             log::warn!(
                 "render: deferred grayscale_pass timed out, forcing full GC next frame"
             );
-            self.partial_refreshes = app_mgr.ghost_clear_every();
-            self.red_stale = true;
             return;
         }
         // BW restore inside grayscale_pass leaves BW RAM in sync with
@@ -931,20 +851,24 @@ impl super::Kernel {
         // an inv_red re-drive of the whole screen on the next input.
         // leftover gray at AA edge pixels under unchanged content is
         // invisible and gets re-grayed on the next deferred pass.
-        self.epd.partial_phase3_sync(self.strip, &rs, &draw);
-        self.red_stale = false;
+        self.screen.resync_red_full(&draw);
         debug!(
             "render: deferred grayscale_pass complete ({}ms)",
             t0.elapsed().as_millis()
         );
     }
 
-    // collect input and run background work while EPD is busy refreshing
+}
+
+impl super::Services {
+    // collect input and run background work while the EPD waveform is
+    // in flight
     //
     // during the DU/GC waveform the EPD charge pump drives pixels;
-    // no SPI commands are sent, so the bus is free for SD I/O.
-    // is_busy() is a sync GPIO read; the busy-pin borrow inside the
-    // park selects ends before resolve_input/handle() runs (NLL).
+    // no SPI commands are sent, so the bus is free for SD I/O. the
+    // Wave session holds the screen half of the kernel, this method
+    // holds the services half; the borrow checker enforces the bus
+    // invariant.
     //
     // background work runs as bounded sync steps via
     // run_background_step; while it reports Progress the steps run
@@ -958,8 +882,9 @@ impl super::Kernel {
     // returns (deferred_action, sleep_requested) so the caller
     // can enter sleep after the EPD finishes if power-long-press
     // arrived during the waveform
-    async fn busy_wait_with_background<A: AppLayer>(
+    async fn wave_window<A: AppLayer, M>(
         &mut self,
+        wave: &mut super::screen::Wave<'_, M>,
         app_mgr: &mut A,
     ) -> (Option<DeferredAction<A::Id>>, bool) {
         // matches the driver's own wait_busy_async timeout; without a
@@ -972,11 +897,11 @@ impl super::Kernel {
         let mut sleep_requested = false;
 
         loop {
-            if !self.epd.is_busy() {
+            if !wave.is_busy() {
                 break;
             }
             if Instant::now() >= guard_at {
-                log::error!("busy_wait: waveform guard timeout (busy pin stuck high)");
+                log::error!("wave_window: waveform guard timeout (busy pin stuck high)");
                 break;
             }
 
@@ -996,9 +921,8 @@ impl super::Kernel {
                         None
                     }
                     super::app::BgOutcome::WaitingExternal => {
-                        let busy = self.epd.busy_pin();
                         match select4(
-                            busy.wait_for_low(),
+                            wave.until_idle(),
                             tasks::INPUT_EVENTS.receive(),
                             crate::kernel::work_queue::result_ready(),
                             Timer::at(guard_at),
@@ -1010,9 +934,8 @@ impl super::Kernel {
                         }
                     }
                     _ => {
-                        let busy = self.epd.busy_pin();
                         match select3(
-                            busy.wait_for_low(),
+                            wave.until_idle(),
                             tasks::INPUT_EVENTS.receive(),
                             Timer::at(guard_at),
                         )
@@ -1031,7 +954,7 @@ impl super::Kernel {
 
                 match self.resolve_input(hw_event, app_mgr, suppress) {
                     InputResult::Sleep => {
-                        info!("busy_wait: sleep requested during waveform, will sleep after");
+                        info!("wave_window: sleep requested during waveform, will sleep after");
                         sleep_requested = true;
                     }
                     InputResult::Transition(t) => {
@@ -1060,7 +983,9 @@ impl super::Kernel {
 
         (deferred, sleep_requested)
     }
+}
 
+impl super::Kernel {
     // save session to RTC memory + SD card and enter deep sleep.
     //
     // RTC FAST memory is the fast path but is lost on battery wake
@@ -1071,18 +996,18 @@ impl super::Kernel {
 
         let sleep_start = Instant::now();
 
-        // about to deep-sleep — cancel any pending grayscale-AA fire so
+        // about to deep-sleep, cancel any pending grayscale-AA fire so
         // it doesn't run with stale state on wake.
-        self.aa_deferred_at = None;
+        self.svc.aa_deferred_at = None;
 
         // save active app state (reader position) to bookmark cache
         // before collecting session, so bookmarks stay in sync
-        app_mgr.save_active_state(&mut *self.bm_cache);
+        app_mgr.save_active_state(&mut *self.svc.bm_cache);
 
         // day-stats only flushes on the 30s bookmark cadence now, so
         // up to 30s of reading stats would be lost without this
-        if self.day_stats.is_dirty() && self.sd_ok {
-            if let Err(e) = self.day_stats.flush(&self.sd) {
+        if self.svc.day_stats.is_dirty() && self.svc.sd_ok {
+            if let Err(e) = self.svc.day_stats.flush(&self.svc.sd) {
                 log::warn!("sleep: daystats flush: {}", e);
             }
         }
@@ -1114,7 +1039,7 @@ impl super::Kernel {
         session.rtc_save();
 
         // save to SD card (reliable fallback for battery wake)
-        session.save_to_sd(&self.sd);
+        session.save_to_sd(&self.svc.sd);
         info!(
             "sleep: session saved to RTC + SD ({}ms)",
             t0.elapsed().as_millis()
@@ -1154,15 +1079,15 @@ impl super::Kernel {
 
         info!("sleep: flushing bookmarks...");
         let t0 = Instant::now();
-        if self.bm_cache.is_dirty() {
-            self.bm_cache.flush(&self.sd);
+        if self.svc.bm_cache.is_dirty() {
+            self.svc.bm_cache.flush(&self.svc.sd);
         }
         info!("sleep: bookmark flush ({}ms)", t0.elapsed().as_millis());
 
         // load sleep wallpaper from SD before putting the card to sleep
         info!("sleep: loading wallpaper from SD...");
         let t0 = Instant::now();
-        let sleep_img = super::sleep_image::load_sleep_image(&self.sd);
+        let sleep_img = super::sleep_image::load_sleep_image(&self.svc.sd);
         if sleep_img.is_some() {
             info!("sleep: wallpaper loaded ({}ms)", t0.elapsed().as_millis());
         } else {
@@ -1171,23 +1096,13 @@ impl super::Kernel {
 
         info!("sleep: putting SD card to sleep...");
         let t0 = Instant::now();
-        self.sd_card_sleep();
+        self.svc.sd_card_sleep();
         info!("sleep: SD card sleep ({}ms)", t0.elapsed().as_millis());
 
         let t0 = Instant::now();
         if let Some(ref img) = sleep_img {
             // render 4-level grayscale wallpaper via dual-plane grayscale pass
             use super::sleep_image::CHUNK_COUNT;
-            use crate::drivers::ssd1677::{HEIGHT, RenderState, WIDTH};
-
-            let rs = RenderState {
-                px: 0,
-                py: 0,
-                pw: WIDTH,
-                ph: HEIGHT,
-                left_mask: 0,
-                right_mask: 0,
-            };
 
             // blit all 6 chunks each strip call; blit_2bpp clips to the
             // current strip window so only the overlapping chunk draws pixels
@@ -1211,21 +1126,16 @@ impl super::Kernel {
             // the normal grayscale text AA flow more closely than a white clear.
             info!("sleep: rendering wallpaper base BW pass...");
             let t1 = Instant::now();
-            if self
-                .epd
-                .full_refresh_async(self.strip, &mut self.delay, &draw)
-                .await
-                .is_err()
-            {
+            if self.screen.render_full(&draw).await.is_err() {
                 log::warn!("sleep: wallpaper base refresh timed out, continuing");
             }
             info!("sleep: wallpaper base BW ({}ms)", t1.elapsed().as_millis());
 
             info!("sleep: rendering wallpaper grayscale overlay...");
             let t1 = Instant::now();
-            // grayscale_pass writes LSB plane to BW RAM and MSB plane to
+            // grayscale_full writes LSB plane to BW RAM and MSB plane to
             // RED RAM, then triggers a single refresh with the grayscale LUT.
-            if self.epd.grayscale_pass(self.strip, &rs, &draw).await.is_err() {
+            if self.screen.grayscale_full(&draw).await.is_err() {
                 log::warn!("sleep: wallpaper grayscale overlay timed out, continuing");
             }
             info!(
@@ -1236,8 +1146,8 @@ impl super::Kernel {
             // fallback: simple text sleep screen
             info!("sleep: rendering fallback sleep text screen...");
             if self
-                .epd
-                .full_refresh_async(self.strip, &mut self.delay, &|s: &mut StripBuffer| {
+                .screen
+                .render_full(&|s: &mut StripBuffer| {
                     let style = MonoTextStyle::new(&FONT_9X18, BinaryColor::On);
                     let _ = Text::new("(sleep)", Point::new(210, 400), style).draw(s);
                 })
@@ -1250,7 +1160,7 @@ impl super::Kernel {
         info!("sleep: screen rendered ({}ms)", t0.elapsed().as_millis());
 
         info!("sleep: EPD entering deep sleep...");
-        self.epd.enter_deep_sleep();
+        self.screen.enter_deep_sleep();
         info!(
             "sleep: EPD deep sleep, total sleep entry {}ms",
             sleep_start.elapsed().as_millis()
@@ -1282,6 +1192,9 @@ impl super::Kernel {
         }
     }
 
+}
+
+impl super::Services {
     // send cmd0 to put sd card into idle/sleep state;
     // reduces sd current from ~150 µa to ~10 µa during deep sleep.
     // call after all sd i/o is done and before epd sleep-screen render

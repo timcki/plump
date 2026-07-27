@@ -13,18 +13,17 @@ use crate::apps::{
     App, AppContext, AppId, AppNav, AppNavSlot, BgBudget, BgOutcome, DeferredPersistenceReason,
     HDir, HResult, Launcher, Modal, PendingSetting, Redraw, Tab, Transition,
 };
-use esp_hal::delay::Delay;
 
 use crate::apps::widgets::quick_menu::{MAX_APP_ACTIONS, QuickMenuResult};
 use crate::apps::widgets::{ButtonFeedback, QuickMenu};
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
-use crate::board::{Epd, SCREEN_H, SCREEN_W};
+use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::input::Event;
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
-use crate::kernel::KernelHandle;
 use crate::kernel::app::AppLayer;
+use crate::kernel::{KernelHandle, Screen};
 use crate::kernel::bookmarks::BookmarkCache;
 use crate::kernel::config::{SystemSettings, WifiConfig};
 use crate::kernel::input_policy::SemanticInput;
@@ -1049,13 +1048,7 @@ impl AppLayer for AppManager {
         self.launcher.active() == AppId::Upload
     }
 
-    async fn run_special_mode(
-        &mut self,
-        epd: &mut Epd,
-        strip: &mut StripBuffer,
-        delay: &mut Delay,
-        sd: &SdStorage,
-    ) {
+    async fn run_special_mode(&mut self, screen: &mut Screen, sd: &SdStorage) {
         // Safety: WIFI is not owned by any other driver.  Upload mode
         // runs in isolation (the scheduler exits the main dispatch loop
         // first) and tears down the radio stack before returning.  The
@@ -1064,9 +1057,7 @@ impl AppLayer for AppManager {
 
         crate::apps::upload::run_upload_mode(
             wifi,
-            epd,
-            strip,
-            delay,
+            screen,
             sd,
             self.settings.system_settings().ui_font_size_idx,
             &*self.bumps,

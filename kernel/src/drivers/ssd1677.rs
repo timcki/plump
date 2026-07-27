@@ -603,11 +603,19 @@ where
     ///   - adds ANALOG_OFF + CLOCK_OFF in sunlight mode to prevent
     ///     UV-induced fading between refreshes
     pub fn start_full_update(&mut self) {
+        // fake a 90C panel temperature so LUT_LOAD picks the shortest
+        // OTP full-clear waveform (~600ms vs ~1.6s at room temp).
+        // TEMP_LOAD stays cleared in ctrl2 below so the controller keeps
+        // this value instead of re-reading the internal sensor.
+        // trick from CrossPoint Reader, proven on this exact panel
+        self.send_command(cmd::WRITE_TEMP_REGISTER);
+        self.send_data(&[0x5A]);
+
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x40, 0x00]);
 
-        // core: TEMP_LOAD + LUT_LOAD + DISPLAY_START
-        let mut ctrl2: u8 = 0x34;
+        // core: LUT_LOAD + DISPLAY_START (no TEMP_LOAD, keeps faked temp)
+        let mut ctrl2: u8 = 0x14;
 
         if !self.power_is_on {
             ctrl2 |= 0xC0; // CLOCK_ON + ANALOG_ON
@@ -696,7 +704,7 @@ where
     // bound the busy-pin wait so a stuck EPD cannot wedge the device.
     // 5s is ~2x worst case (full GC ~1.6s, grayscale ~1-2s, partial DU ~400ms).
     // `ctx` is logged on timeout so the caller can be identified in serial.
-    async fn wait_busy_async(
+    pub(crate) async fn wait_busy_async(
         &mut self,
         ctx: &'static str,
     ) -> Result<(), embassy_time::TimeoutError> {
@@ -718,84 +726,6 @@ where
                 Err(e)
             }
         }
-    }
-
-    pub async fn write_full_frame_async<F>(
-        &mut self,
-        strip: &mut StripBuffer,
-        delay: &mut Delay,
-        draw: &F,
-    ) where
-        F: Fn(&mut StripBuffer),
-    {
-        self.write_full_frame(strip, delay, draw);
-    }
-
-    pub async fn partial_refresh_async<F>(
-        &mut self,
-        strip: &mut StripBuffer,
-        delay: &mut Delay,
-        x: u16,
-        y: u16,
-        w: u16,
-        h: u16,
-        draw: &F,
-    ) -> Result<(), embassy_time::TimeoutError>
-    where
-        F: Fn(&mut StripBuffer),
-    {
-        if self.initial_refresh {
-            return self.full_refresh_async(strip, delay, draw).await;
-        }
-        if !self.init_done {
-            self.init_display(delay);
-        }
-
-        let rs = match self.align_partial_region(x, y, w, h) {
-            Some(rs) => rs,
-            None => return Ok(()),
-        };
-
-        self.write_region_strips(
-            strip,
-            rs.px,
-            rs.py,
-            rs.pw,
-            rs.ph,
-            cmd::WRITE_RAM_BW,
-            draw,
-            rs.left_mask,
-            rs.right_mask,
-        );
-
-        self.partial_start_du(&rs);
-        self.wait_busy_async("partial_du").await?;
-
-        self.write_region_strips_dual(
-            strip,
-            rs.px,
-            rs.py,
-            rs.pw,
-            rs.ph,
-            draw,
-            rs.left_mask,
-            rs.right_mask,
-        );
-
-        self.power_off_async().await
-    }
-
-    pub async fn full_refresh_async<F>(
-        &mut self,
-        strip: &mut StripBuffer,
-        delay: &mut Delay,
-        draw: &F,
-    ) -> Result<(), embassy_time::TimeoutError>
-    where
-        F: Fn(&mut StripBuffer),
-    {
-        self.write_full_frame_async(strip, delay, draw).await;
-        self.update_full_async().await
     }
 
     pub async fn power_off_async(&mut self) -> Result<(), embassy_time::TimeoutError> {
@@ -863,13 +793,6 @@ where
             rs.left_mask,
             rs.right_mask,
         );
-        Ok(())
-    }
-
-    async fn update_full_async(&mut self) -> Result<(), embassy_time::TimeoutError> {
-        self.start_full_update();
-        self.wait_busy_async("full_update").await?;
-        self.finish_full_update();
         Ok(())
     }
 }
