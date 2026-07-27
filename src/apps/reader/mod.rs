@@ -573,6 +573,7 @@ pub struct ReaderApp {
     pub(super) text_w: u32,      // text content width (SCREEN_W - 2 * text_margin)
     pub(super) text_area_h: u16, // height of text area (SCREEN_H - text_y - bottom_pad)
     pub(super) reading_theme_idx: u8,
+    pub(super) line_spacing_idx: u8, // index into config::LINE_SPACING_PCT
     pub(super) show_chrome: bool,
     pub(super) text_alignment: u8, // 0 = Left, 1 = Justify
 
@@ -583,9 +584,10 @@ pub struct ReaderApp {
     pub(super) img_height_count: u8,
 
     pub(super) book_font_size_idx: u8,
-    pub(super) applied_font_idx: u8,
     pub(super) reader_font: ReaderFont,
-    pub(super) applied_reader_font: ReaderFont,
+    // a layout input (font, spacing, margins, chrome) changed via a
+    // setter while suspended; on_resume must re-index the chapter
+    pub(super) layout_stale: bool,
 
     pub(super) chrome_font: Option<&'static BitmapFont>,
     pub(super) qa_buf: [QuickAction; QA_MAX],
@@ -650,6 +652,7 @@ impl ReaderApp {
             text_w: TEXT_W,
             text_area_h: TEXT_AREA_H,
             reading_theme_idx: 0,
+            line_spacing_idx: crate::kernel::config::DEFAULT_LINE_SPACING,
             show_chrome: true,
             text_alignment: 0,
 
@@ -657,9 +660,8 @@ impl ReaderApp {
             img_height_count: 0,
 
             book_font_size_idx: 0,
-            applied_font_idx: 0,
             reader_font: ReaderFont::Bookerly,
-            applied_reader_font: ReaderFont::Bookerly,
+            layout_stale: false,
 
             chrome_font: None,
 
@@ -680,30 +682,42 @@ impl ReaderApp {
 
     // 0 = XSmall, 1 = Small, 2 = Medium, 3 = Large, 4 = XLarge
     pub fn set_book_font_size(&mut self, idx: u8) {
+        self.layout_stale |= idx != self.book_font_size_idx;
         self.book_font_size_idx = idx;
         self.apply_font_metrics();
         self.rebuild_quick_actions();
     }
 
     pub fn set_reader_font(&mut self, font: ReaderFont) {
+        self.layout_stale |= font != self.reader_font;
         self.reader_font = font;
         self.apply_font_metrics();
         self.rebuild_quick_actions();
     }
 
     pub fn set_reading_theme(&mut self, idx: u8) {
+        self.layout_stale |= idx != self.reading_theme_idx;
         self.reading_theme_idx = idx;
         self.apply_theme_layout();
         self.apply_font_metrics();
     }
 
+    pub fn set_line_spacing(&mut self, idx: u8) {
+        self.layout_stale |= idx != self.line_spacing_idx;
+        self.line_spacing_idx = idx;
+        self.apply_font_metrics();
+    }
+
     pub fn set_text_alignment(&mut self, alignment: u8) {
+        // alignment is not a layout input: breaks are alignment-
+        // independent, so no re-index on change
         self.text_alignment = alignment;
     }
 
     pub fn set_show_chrome(&mut self, show: bool) {
         if self.show_chrome != show {
             self.show_chrome = show;
+            self.layout_stale = true;
             self.apply_theme_layout();
             self.apply_font_metrics();
         }
@@ -1341,32 +1355,33 @@ impl ReaderApp {
         self.font_ascent = LINE_H;
         self.max_lines = LINES_PER_PAGE as u8;
 
-        let theme = crate::kernel::config::ReadingTheme::from_idx(self.reading_theme_idx);
-        let spacing_pct = theme.line_spacing_pct;
+        let spacing_pct = crate::kernel::config::line_spacing_pct(self.line_spacing_idx);
 
         if self.reader_font.family().has_regular() {
             let fs = fonts::FontSet::for_reader(self.reader_font, self.book_font_size_idx);
-            let native_h = fs.line_height(fonts::Style::Regular).max(1);
-            // apply line spacing: scale native line height by theme percentage
-            self.font_line_h = ((native_h as u32 * spacing_pct as u32) / 100).max(1) as u16;
+            let native_h = fs.line_height(fonts::Style::Regular).max(1) as u32;
+            let em = fs.em_px().max(1) as u32;
+            // line spacing is a multiple of the em size, so a step
+            // reads identically in every family; the native metric is
+            // the floor so adjacent lines never collide
+            self.font_line_h = ((em * spacing_pct as u32 + 50) / 100).max(native_h) as u16;
             self.font_ascent = fs.ascent(fonts::Style::Regular);
             self.max_lines =
                 ((self.text_area_h / self.font_line_h) as usize).min(LINES_PER_PAGE) as u8;
             log::debug!(
-                "font: family={} size_idx={} line_h={} (native {} x {}%) ascent={} max_lines={} margin={}",
+                "font: family={} size_idx={} line_h={} (em {} x {}%, native {}) ascent={} max_lines={} margin={}",
                 self.reader_font.name(),
                 self.book_font_size_idx,
                 self.font_line_h,
-                native_h,
+                em,
                 spacing_pct,
+                native_h,
                 self.font_ascent,
                 self.max_lines,
                 self.text_margin,
             );
             self.fonts = Some(fs);
         }
-        self.applied_font_idx = self.book_font_size_idx;
-        self.applied_reader_font = self.reader_font;
     }
 
     fn name(&self) -> &str {
@@ -1456,6 +1471,7 @@ impl ReaderApp {
         self.rebuild_quick_actions();
         self.apply_theme_layout();
         self.reset_paging();
+        self.layout_stale = false;
         self.epub.ch_cache = Vec::new();
         self.file_size = 0;
         self.error = None;
@@ -1851,6 +1867,7 @@ impl App<AppId> for ReaderApp {
         self.rebuild_quick_actions();
         self.apply_theme_layout();
         self.reset_paging();
+        self.layout_stale = false;
         self.epub.ch_cache = Vec::new();
         self.file_size = 0;
         self.epub.chapter = 0;
@@ -1993,16 +2010,18 @@ impl App<AppId> for ReaderApp {
 
         // re-derive text area geometry from the (possibly changed) theme
         self.apply_theme_layout();
-
-        let font_changed = self.book_font_size_idx != self.applied_font_idx
-            || self.reader_font != self.applied_reader_font;
         self.apply_font_metrics();
-        if font_changed {
+
+        // the propagate_fonts setters flag layout_stale when any layout
+        // input (font, spacing, margins, chrome) changed while we were
+        // suspended; the in-RAM page tables are keyed to the old metrics
+        if self.layout_stale {
+            self.layout_stale = false;
             self.reset_paging();
-            // invalidate any persisted layout: the saved breaks are
-            // keyed to the old font and would wrap differently now.
-            // the new key carries the live text_w / line_h / max_lines
-            // so subsequent saves match.
+            // invalidate any persisted layout: the saved index is keyed
+            // to the old metrics and would mismatch on load anyway; the
+            // new key carries the live dimensions so subsequent saves
+            // match.
             if self.is_epub {
                 let new_key = layout::LayoutKey::current(
                     self.book_font_size_idx,

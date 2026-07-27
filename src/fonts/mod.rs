@@ -380,6 +380,13 @@ impl FontSet {
         self.font(style).ascent
     }
 
+    /// Em size (rasterisation px) of the body face; the basis for
+    /// user line spacing, identical across families at the same tier.
+    #[inline]
+    pub fn em_px(&self) -> u16 {
+        self.regular.em_px
+    }
+
     #[inline]
     pub fn advance(&self, ch: char, style: Style) -> u8 {
         self.font(style).advance(ch)

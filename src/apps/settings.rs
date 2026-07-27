@@ -1,17 +1,18 @@
 // settings app UI; configuration types live in kernel::config
 //
-// settings items (11 total):
+// settings items (12 total):
 //   0: Sleep After    : power management
 //   1: Ghost Clear    : e-paper refresh interval
 //   2: Book Font      : reading font size
 //   3: Reader Font    : Bookerly / Atkinson Hyperlegible
 //   4: UI Font        : chrome font size
-//   5: Reading Theme  : Compact / Default / Relaxed / Spacious
+//   5: Reading Theme  : Compact / Default / Relaxed / Spacious (margins)
 //   6: Swap Buttons   : swap Back/OK with Left/Right for left-handed use
 //   7: Sunlight Fix   : power off analog after partial refresh (prevents fading)
 //   8: Text AA        : antialiased text via 4-level grayscale LUT
 //   9: Reader Status  : show book title + page info bar
 //  10: Text Align     : Left or Justify
+//  11: Line Spacing   : 1.30x to 2.00x of the em size
 
 use core::fmt::Write as _;
 
@@ -24,8 +25,9 @@ use crate::fonts;
 use crate::fonts::max_size_idx;
 use crate::kernel::KernelHandle;
 use crate::kernel::config::{
-    self, GHOST_CLEAR_STEP, MAX_GHOST_CLEAR, MAX_SLEEP_TIMEOUT, MIN_GHOST_CLEAR, NUM_READER_FONTS,
-    NUM_READING_THEMES, NUM_TEXT_ALIGNMENTS, SLEEP_TIMEOUT_STEP, SystemSettings, WifiConfig,
+    self, GHOST_CLEAR_STEP, MAX_GHOST_CLEAR, MAX_SLEEP_TIMEOUT, MIN_GHOST_CLEAR, NUM_LINE_SPACINGS,
+    NUM_READER_FONTS, NUM_READING_THEMES, NUM_TEXT_ALIGNMENTS, SLEEP_TIMEOUT_STEP, SystemSettings,
+    WifiConfig,
 };
 use crate::ui::{
     Alignment, BUTTON_BAR_H, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, LARGE_MARGIN, Region,
@@ -43,7 +45,7 @@ const COL_GAP: u16 = 8;
 const VALUE_X: u16 = LABEL_X + LABEL_W + COL_GAP;
 const VALUE_W: u16 = FULL_CONTENT_W - LABEL_W - COL_GAP;
 
-const NUM_ITEMS: usize = 11;
+const NUM_ITEMS: usize = 12;
 const HEADING_ITEMS_GAP: u16 = SECTION_GAP;
 
 // reorder rows to match the mockup grouping (READING / DISPLAY / SYSTEM).
@@ -52,6 +54,7 @@ const HEADING_ITEMS_GAP: u16 = SECTION_GAP;
 const VISUAL_TO_LOGICAL: [usize; NUM_ITEMS] = [
     3,  // Reader Font          | READING
     2,  // Book Font
+    11, // Line Spacing
     5,  // Theme
     4,  // UI Font
     9,  // Reader Status
@@ -66,8 +69,8 @@ const VISUAL_TO_LOGICAL: [usize; NUM_ITEMS] = [
 // visual indices at which a new section caption is rendered.
 const SECTION_AT: &[(usize, &str)] = &[
     (0, "READING"),
-    (6, "DISPLAY"),
-    (9, "SYSTEM"),
+    (7, "DISPLAY"),
+    (10, "SYSTEM"),
 ];
 
 const CAPTION_H: u16 = 14;
@@ -200,6 +203,7 @@ impl SettingsApp {
             8 => "Text AA",
             9 => "Reader Status",
             10 => "Text Align",
+            11 => "Line Spacing",
             _ => "",
         }
     }
@@ -279,6 +283,10 @@ impl SettingsApp {
             10 => {
                 let _ = write!(buf, "{}", self.settings.text_alignment_name());
             }
+            11 => {
+                let pct = config::line_spacing_pct(self.settings.line_spacing);
+                let _ = write!(buf, "{}.{:02}x", pct / 100, pct % 100);
+            }
             _ => {}
         }
     }
@@ -338,6 +346,11 @@ impl SettingsApp {
                     self.settings.text_alignment += 1;
                 }
             }
+            11 => {
+                if self.settings.line_spacing < NUM_LINE_SPACINGS - 1 {
+                    self.settings.line_spacing += 1;
+                }
+            }
             _ => return,
         }
         self.mark_save_needed();
@@ -393,6 +406,11 @@ impl SettingsApp {
             10 => {
                 if self.settings.text_alignment > 0 {
                     self.settings.text_alignment -= 1;
+                }
+            }
+            11 => {
+                if self.settings.line_spacing > 0 {
+                    self.settings.line_spacing -= 1;
                 }
             }
             _ => return,

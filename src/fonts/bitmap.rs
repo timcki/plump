@@ -57,6 +57,7 @@ pub struct BitmapFont {
 
     pub line_height: u16, // ascent + descent + leading
     pub ascent: u16,      // baseline to top of tallest glyph
+    pub em_px: u16,       // rasterisation size (the size tier's px)
 }
 
 // result of a glyph lookup: metrics and which bitmap table to use

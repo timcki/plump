@@ -580,6 +580,9 @@ fn emit_font(
         .expect("font has no horizontal metrics");
     let line_height = lm.new_line_size.ceil() as u16;
     let ascent = lm.ascent.ceil() as u16;
+    // rasterisation size in px; runtime line spacing is a multiple of
+    // this (family-independent), not of the designer line_height
+    let em_px = px.round() as u16;
 
     // ascii glyphs (direct-indexed 0x20-0x7E)
 
@@ -696,6 +699,7 @@ fn emit_font(
     writeln!(out, "    ext_bitmaps: &{name}_EXT_BITMAPS,").unwrap();
     writeln!(out, "    line_height: {line_height},").unwrap();
     writeln!(out, "    ascent: {ascent},").unwrap();
+    writeln!(out, "    em_px: {em_px},").unwrap();
     writeln!(out, "}};").unwrap();
     writeln!(out).unwrap();
 }
@@ -710,7 +714,8 @@ fn emit_stub(out: &mut fs::File, name: &str) {
          ext_glyphs: &[], \
          ext_bitmaps: &[], \
          line_height: 13, \
-         ascent: 13 \
+         ascent: 13, \
+         em_px: 13 \
          }};"
     )
     .unwrap();
