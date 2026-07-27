@@ -207,8 +207,21 @@ impl Screen {
     where
         F: Fn(&mut StripBuffer),
     {
+        crate::perf_begin!(_t0);
         let wave = self.begin_full(draw);
-        wave.wait().await?.finish();
+        crate::perf_event!(
+            "render",
+            "full_inline_write write_ms={}",
+            _t0.elapsed().as_millis()
+        );
+        crate::perf_begin!(_t1);
+        let res = wave.wait().await;
+        crate::perf_event!(
+            "render",
+            "full_inline_wave wave_ms={}",
+            _t1.elapsed().as_millis()
+        );
+        res?.finish();
         Ok(())
     }
 
@@ -298,17 +311,30 @@ impl Settled<'_, Du> {
     }
 
     /// Grayscale AA pass over this refresh's region instead of phase 3.
-    /// Both RAM planes end up holding gray data, so `red_stale` is set;
-    /// on timeout the next partial request promotes to a full GC.
+    /// After the pass, both RAM planes are restored to BW content
+    /// (`grayscale_pass` rewrites BW, RED is resynced here), so
+    /// `red_stale` clears and later small marks stay small partials
+    /// instead of full-screen inv_red re-drives. On timeout both
+    /// restores are skipped: RED is marked stale and the next partial
+    /// request promotes to a full GC.
     pub async fn grayscale<F>(self, draw: &F) -> Result<(), TimeoutError>
     where
         F: Fn(&mut StripBuffer),
     {
         let s = self.screen;
         let res = s.epd.grayscale_pass(s.strip, &self.rs, draw).await;
-        s.red_stale = true;
-        if res.is_err() {
-            s.force_ghost_clear();
+        match res {
+            Ok(()) => {
+                // outside rs RED was already in sync (a bw partial
+                // requires !red_stale, an inv_red one covers the full
+                // screen), so a region restore resyncs everything
+                s.epd.partial_phase3_sync(s.strip, &self.rs, draw);
+                s.red_stale = false;
+            }
+            Err(_) => {
+                s.red_stale = true;
+                s.force_ghost_clear();
+            }
         }
         res
     }

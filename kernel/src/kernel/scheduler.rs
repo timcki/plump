@@ -805,6 +805,11 @@ impl super::Kernel {
                             log::warn!(
                                 "render: post-GC grayscale_pass timed out, forcing full GC next frame"
                             );
+                        } else {
+                            // resync RED so red_stale clears; without it
+                            // every later mark expands to a full-screen
+                            // inv_red re-drive
+                            screen.resync_red_full(&draw);
                         }
                         svc.aa_deferred_at = None;
                     }

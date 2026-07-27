@@ -957,8 +957,13 @@ impl AppLayer for AppManager {
         // fired a ~400ms DU partial repainting identical book pixels
         let active = self.launcher.active();
         let show_top = with_app_ref!(active, self, |app| app.show_top_status());
+        // compare at displayed granularity: the bar renders time as
+        // h:mm, so raw-second changes (which follow every page turn)
+        // would repaint pixel-identical content
         if show_top
-            && (prev_pct != battery_pct || prev_pages != today_pages || prev_secs != today_secs)
+            && (prev_pct != battery_pct
+                || prev_pages != today_pages
+                || prev_secs / 60 != today_secs / 60)
         {
             // chrome top bar changed; queue a coalesced redraw so the
             // next paintable window picks it up. width spans the full

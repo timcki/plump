@@ -1101,6 +1101,20 @@ impl ReaderApp {
         }
     }
 
+    // drain pending day-stats deltas (chunk F) into the kernel's
+    // shared DayStats. cheap (a couple of u16/u32 adds + rollover
+    // check), safe to run every pass
+    fn drain_day_stats(&mut self, k: &mut KernelHandle<'_>) {
+        if self.day_pages_pending > 0 || self.day_secs_pending > 0 {
+            let today = k.today_key();
+            let ds = k.day_stats_mut();
+            ds.add_pages(today, self.day_pages_pending);
+            ds.add_secs(today, self.day_secs_pending);
+            self.day_pages_pending = 0;
+            self.day_secs_pending = 0;
+        }
+    }
+
     fn set_cache_loading(&self, ctx: &mut AppContext) {
         let cached_ch = self.cached_chapter_count();
         let total_ch = self.epub.spine.len();
@@ -2021,6 +2035,12 @@ impl App<AppId> for ReaderApp {
         k: &mut KernelHandle<'_>,
         _budget: BgBudget,
     ) -> BgOutcome {
+        // drain every pass so the chrome bar picks up this turn's page
+        // delta before the same pass renders; when this only happened
+        // in the deferred flush (gated to no-redraw windows) the bar
+        // repainted seconds later as a separate refresh
+        self.drain_day_stats(k);
+
         // Phase 1: Open pipeline (NeedBookmark..NeedPage)
         // Each state does ONE step and returns Progress { more: true }
         match self.state {
@@ -2767,17 +2787,9 @@ impl App<AppId> for ReaderApp {
             self.stats_dirty = true;
         }
 
-        // drain pending day-stats deltas (chunk F) into the kernel's
-        // shared DayStats. cheap (a couple of u16/u32 adds + rollover
-        // check); we do this every time the deferred flush runs.
-        if self.day_pages_pending > 0 || self.day_secs_pending > 0 {
-            let today = k.today_key();
-            let ds = k.day_stats_mut();
-            ds.add_pages(today, self.day_pages_pending);
-            ds.add_secs(today, self.day_secs_pending);
-            self.day_pages_pending = 0;
-            self.day_secs_pending = 0;
-        }
+        // drain again here so forced flushes (sleep) stay correct even
+        // when background_step did not run this pass; idempotent
+        self.drain_day_stats(k);
 
         let any_dirty = self.recent_dirty || self.stats_dirty;
         if !any_dirty {
