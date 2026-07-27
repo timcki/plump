@@ -126,7 +126,10 @@ impl Screen {
         F: Fn(&mut StripBuffer),
     {
         match self.begin_partial(region, draw) {
-            Ok(wave) => wave.wait().await?.sync_red(draw).await,
+            Ok(wave) => {
+                wave.wait().await?.sync_red(draw);
+                Ok(())
+            }
             Err(PartialRejected::Empty) => Ok(()),
             Err(PartialRejected::NeedsFull) => self.render_full(draw).await,
         }
@@ -224,9 +227,10 @@ impl Screen {
         res
     }
 
-    /// Rewrite both RAM planes with current content over the whole
-    /// screen (no waveform), clearing `red_stale`. Used after a
-    /// deferred grayscale pass while the device is idle.
+    /// Rewrite RED RAM with current content over the whole screen (no
+    /// waveform), clearing `red_stale`. Used right after a deferred
+    /// grayscale pass while the device is idle; BW RAM is already
+    /// correct there because `grayscale_pass` restores it.
     pub fn resync_red_full<F>(&mut self, draw: &F)
     where
         F: Fn(&mut StripBuffer),
@@ -270,9 +274,10 @@ impl<'s, M> Wave<'s, M> {
 }
 
 impl Settled<'_, Du> {
-    /// Phase 3: rewrite RED+BW with current content so the next DU
-    /// computes a minimal delta, then power off the analog drivers.
-    pub async fn sync_red<F>(self, draw: &F) -> Result<(), TimeoutError>
+    /// Phase 3: rewrite RED RAM with current content (BW already holds
+    /// it from phase 1) so the next DU computes a minimal delta. Panel
+    /// power stays latched for the next refresh.
+    pub fn sync_red<F>(self, draw: &F)
     where
         F: Fn(&mut StripBuffer),
     {
@@ -284,7 +289,6 @@ impl Settled<'_, Du> {
         if self.entered_stale {
             s.red_stale = false;
         }
-        s.epd.power_off_async().await
     }
 
     /// Skip phase 3 (content changed mid-waveform); RED RAM is now

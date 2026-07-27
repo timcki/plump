@@ -4,10 +4,15 @@
 // partial refresh (3-phase):
 //   phase1_bw    -- write new content to BW RAM
 //   start_du     -- kick DU waveform; caller polls input while BUSY
-//   phase3_sync  -- sync RED+BW; skipped on rapid nav (red_stale)
+//   phase3_sync  -- sync RED to BW; skipped on rapid nav (red_stale)
 //
 // when phase3 is skipped, phase1_bw_inv_red writes RED=!BW so DU
 // drives every pixel to the correct BW target without a full GC
+//
+// panel power is latched on across refreshes (crosspoint-style):
+// each start path adds CLOCK_ON + ANALOG_ON only when power is off,
+// and nothing powers down until deep sleep. sunlight mode overrides
+// this with ANALOG_OFF + CLOCK_OFF on every waveform
 
 use embedded_graphics_core::geometry::{OriginDimensions, Size};
 use embedded_hal::digital::{InputPin, OutputPin};
@@ -539,10 +544,21 @@ where
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x00, 0x00]);
 
-        // 0xFC: clock on, analog on, temp load, LUT load, mode, display
-        // 0xFF: same + analog off + clock off after refresh (sunlight fix)
+        // core: TEMP_LOAD + LUT_LOAD + mode + DISPLAY_START. panel power
+        // is latched between refreshes; adding CLOCK_ON + ANALOG_ON only
+        // when it is actually off skips the ~100ms booster start inside
+        // the waveform on every subsequent page turn
+        let mut ctrl2: u8 = 0x3C;
+
+        if !self.power_is_on {
+            ctrl2 |= 0xC0; // CLOCK_ON + ANALOG_ON
+        }
+
+        if self.sunlight_mode {
+            ctrl2 |= 0x03; // ANALOG_OFF + CLOCK_OFF after refresh
+        }
+
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
-        let ctrl2 = if self.sunlight_mode { 0xFF } else { 0xFC };
         self.send_data(&[ctrl2]);
 
         self.send_command(cmd::MASTER_ACTIVATION);
@@ -554,16 +570,21 @@ where
         self.busy.is_high().unwrap_or(false)
     }
 
+    // RED only: every caller reaches phase 3 with BW RAM already
+    // holding the current content (phase 1 wrote it, or grayscale_pass
+    // restored it), so rewriting BW here would halve throughput for
+    // nothing
     pub fn partial_phase3_sync<F>(&mut self, strip: &mut StripBuffer, rs: &RenderState, draw: &F)
     where
         F: Fn(&mut StripBuffer),
     {
-        self.write_region_strips_dual(
+        self.write_region_strips(
             strip,
             rs.px,
             rs.py,
             rs.pw,
             rs.ph,
+            cmd::WRITE_RAM_RED,
             draw,
             rs.left_mask,
             rs.right_mask,
@@ -666,12 +687,24 @@ where
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x00, 0x00]);
 
-        // 0xCF: clock on, analog on, display using custom LUT, power off after
+        // core: display using the custom LUT (no LUT_LOAD). power stays
+        // latched like the other refresh paths unless sunlight mode
+        // demands an off-after-refresh
+        let mut ctrl2: u8 = 0x0C;
+
+        if !self.power_is_on {
+            ctrl2 |= 0xC0; // CLOCK_ON + ANALOG_ON
+        }
+
+        if self.sunlight_mode {
+            ctrl2 |= 0x03; // ANALOG_OFF + CLOCK_OFF after refresh
+        }
+
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
-        self.send_data(&[0xCF]);
+        self.send_data(&[ctrl2]);
 
         self.send_command(cmd::MASTER_ACTIVATION);
-        self.power_is_on = false; // 0xCF powers off after refresh
+        self.power_is_on = !self.sunlight_mode;
     }
 
     // mode 1: image retained, ~3 uA; requires hw reset to wake
@@ -726,17 +759,6 @@ where
                 Err(e)
             }
         }
-    }
-
-    pub async fn power_off_async(&mut self) -> Result<(), embassy_time::TimeoutError> {
-        if self.power_is_on {
-            self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
-            self.send_data(&[0x83]);
-            self.send_command(cmd::MASTER_ACTIVATION);
-            self.wait_busy_async("power_off").await?;
-            self.power_is_on = false;
-        }
-        Ok(())
     }
 
     /// Perform a grayscale antialiasing pass.

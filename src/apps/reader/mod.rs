@@ -1073,6 +1073,34 @@ impl ReaderApp {
 
     // update the kernel loading indicator with current caching progress.
     // uses a unified percentage: chapters contribute 0-80%, images 80-100%.
+    fn cache_loading_pct(&self) -> u8 {
+        let cached_ch = self.cached_chapter_count();
+        let total_ch = self.epub.spine.len();
+        let img_found = self.epub.img_found_count as usize;
+        let img_cached = self.epub.img_cached_count as usize;
+
+        let in_chapter_phase = matches!(
+            self.epub.bg_cache,
+            BgCacheState::CacheChapter | BgCacheState::WaitNearbyImage
+        ) && cached_ch < total_ch;
+
+        if in_chapter_phase {
+            // chapters: 0% to 80%
+            if total_ch > 0 {
+                ((cached_ch * 80) / total_ch).min(80) as u8
+            } else {
+                80
+            }
+        } else {
+            // image phase: 80% to 100%
+            if img_found > 0 {
+                (80 + (img_cached * 20) / img_found).min(100) as u8
+            } else {
+                80
+            }
+        }
+    }
+
     fn set_cache_loading(&self, ctx: &mut AppContext) {
         let cached_ch = self.cached_chapter_count();
         let total_ch = self.epub.spine.len();
@@ -1086,26 +1114,15 @@ impl ReaderApp {
             BgCacheState::CacheChapter | BgCacheState::WaitNearbyImage
         ) && cached_ch < total_ch;
 
-        let pct = if in_chapter_phase {
+        if in_chapter_phase {
             let _ = write!(lbuf, "Caching {}/{}", cached_ch, total_ch);
-            // chapters: 0% to 80%
-            if total_ch > 0 {
-                ((cached_ch * 80) / total_ch).min(80) as u8
-            } else {
-                80
-            }
+        } else if img_found > 0 {
+            let _ = write!(lbuf, "Caching images {}/{}", img_cached, img_found);
         } else {
-            // image phase: 80% to 100%
-            if img_found > 0 {
-                let _ = write!(lbuf, "Caching images {}/{}", img_cached, img_found);
-                (80 + (img_cached * 20) / img_found).min(100) as u8
-            } else {
-                let _ = write!(lbuf, "Caching images");
-                80
-            }
-        };
+            let _ = write!(lbuf, "Caching images");
+        }
 
-        ctx.set_loading(LOADING_REGION, lbuf.as_str(), pct);
+        ctx.set_loading(LOADING_REGION, lbuf.as_str(), self.cache_loading_pct());
     }
 
     // ── deferred persistence ────────────────────────────────────────
@@ -2463,6 +2480,7 @@ impl App<AppId> for ReaderApp {
             let prev_bg = self.epub.bg_cache;
             let prev_img_found = self.epub.img_found_count;
             let prev_img_cached = self.epub.img_cached_count;
+            let prev_pct = self.cache_loading_pct();
             let outcome = self.bg_cache_step_sync(k);
             if self.epub.bg_cache == BgCacheState::Idle {
                 ctx.clear_loading();
@@ -2471,7 +2489,15 @@ impl App<AppId> for ReaderApp {
                 || self.epub.img_found_count != prev_img_found
                 || self.epub.img_cached_count != prev_img_cached
             {
-                self.set_cache_loading(ctx);
+                // with the page visible, every indicator repaint costs a
+                // DU refresh (and risks an abandoned phase 3 when the
+                // mark lands mid-waveform), so throttle to 10% steps;
+                // the loading screen keeps per-chapter granularity
+                if self.shows_loading_screen()
+                    || self.cache_loading_pct() / 10 != prev_pct / 10
+                {
+                    self.set_cache_loading(ctx);
+                }
             }
             return outcome;
         }

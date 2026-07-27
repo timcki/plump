@@ -319,6 +319,17 @@ impl super::Kernel {
 
                 match outcome {
                     super::app::BgOutcome::Progress { more: true } => {
+                        // paint before draining the rest of the chain:
+                        // on a cold book open the first page (and the
+                        // loading percentages before it) would otherwise
+                        // wait on caching work unrelated to showing it.
+                        // no throughput loss: the render's wave_window
+                        // keeps stepping this chain during the waveform,
+                        // and the post-render Progress check re-enters
+                        // this loop
+                        if app_mgr.ctx_mut().render_ready() {
+                            break 'bg;
+                        }
                         embassy_futures::yield_now().await;
                         continue 'bg;
                     }
@@ -721,9 +732,7 @@ impl super::Kernel {
                                     }
                                     GrayscaleMode::Deferred | GrayscaleMode::Disabled => {
                                         let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                                        if settled.sync_red(&draw).await.is_err() {
-                                            log::warn!("render: power_off timed out after partial DU");
-                                        }
+                                        settled.sync_red(&draw);
                                         svc.aa_deferred_at = if matches!(mode, GrayscaleMode::Deferred) {
                                             Some(Instant::now() + DEFERRED_GRAYSCALE_DELAY)
                                         } else {
@@ -832,9 +841,8 @@ impl super::Kernel {
 
     // run a full-screen grayscale_pass on top of an already-rendered
     // BW image. fires only from the main loop after the deferred-AA
-    // timer expires; the EPD is powered off coming in (last partial DU
-    // called power_off_async), grayscale_pass's `0xCF` waveform clocks
-    // power back on internally and powers off again at the end.
+    // timer expires; panel power is normally still latched on from the
+    // last partial DU, so the pass skips the booster start entirely.
     async fn fire_deferred_grayscale<A: AppLayer>(&mut self, app_mgr: &mut A) {
         let draw = |s: &mut StripBuffer| app_mgr.draw(s);
         let t0 = Instant::now();
