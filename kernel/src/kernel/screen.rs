@@ -21,6 +21,7 @@ use esp_hal::delay::Delay;
 use crate::board::{Epd, SCREEN_H, SCREEN_W};
 use crate::drivers::ssd1677::{HEIGHT, RenderState, WIDTH};
 use crate::drivers::strip::StripBuffer;
+use crate::kernel::plane_map::{AaQueue, PlaneMap, SessionOutcome};
 use crate::ui::{AlignedRegion, Region};
 
 pub struct Screen {
@@ -28,28 +29,17 @@ pub struct Screen {
     strip: &'static mut StripBuffer,
     delay: Delay,
 
-    // bounding box of the area whose panel content is not represented
-    // by the RAM planes: intermediate gray left by an AA pass, or the
-    // pre-waveform content left by a skipped phase 3. a DU delta
-    // against those planes would compute from an image the panel is
-    // not showing, so a partial overlapping this box re-drives its own
-    // region via inv_red instead
-    stale: Option<AlignedRegion>,
+    // which panel areas the RAM planes do not describe, and what
+    // recovering each takes (re-drive, or revert-then-re-drive).
+    // area absent from the map is in sync: delta DUs are safe there
+    planes: PlaneMap,
 
-    // bounding box of the area driven to plain BW since the last AA
-    // pass. only this area needs (and may take) gray pulses: the gray
-    // LUT lightens pixels the BW waveform just drove black, so pulsing
-    // an area that already carries its gray drives it further off
-    fresh: Option<AlignedRegion>,
-
-    // area whose RAM planes still hold the gray codes an AA pass
-    // wrote (a subset of `stale`). those codes index the revert LUT,
-    // so a partial overlapping this box first snaps the grays back to
-    // their rails; re-driving straight over intermediate gray levels
-    // gave every DU transition a starting state its waveform does not
-    // expect, which is what broke AA on page turns. any plane write
-    // that does not end in a gray pass invalidates the box
-    gray: Option<AlignedRegion>,
+    // rects driven to plain BW since their last AA pass; the deferred
+    // fire pulses exactly these. only just-re-driven pixels may take
+    // gray pulses: the LUT lightens pixels the BW waveform just drove
+    // black, so re-pulsing an area already carrying its gray drives
+    // it further off level
+    pending_aa: AaQueue,
 
     // partial refreshes since the last full GC; the scheduler promotes
     // to a full clear once this reaches ghost_clear_every
@@ -78,7 +68,6 @@ pub struct Settled<'s, M> {
     screen: &'s mut Screen,
     rs: RenderState,
     region: AlignedRegion,
-    hard_redrive: bool,
     _mode: PhantomData<M>,
 }
 
@@ -106,9 +95,8 @@ impl Screen {
             epd,
             strip,
             delay,
-            stale: None,
-            fresh: None,
-            gray: None,
+            planes: PlaneMap::new(),
+            pending_aa: AaQueue::new(),
             partials: 0,
         }
     }
@@ -118,63 +106,10 @@ impl Screen {
         self.partials
     }
 
+    /// Bounding box of everything a delta DU may not touch; debug view.
     #[inline]
     pub fn stale_region(&self) -> Option<Region> {
-        self.stale.map(AlignedRegion::get)
-    }
-
-    // grow the stale box to cover `r`
-    fn mark_stale(&mut self, r: AlignedRegion) {
-        self.stale = Some(match self.stale {
-            Some(s) => s.union(r),
-            None => r,
-        });
-    }
-
-    // an inv_red pass over `r` re-drove every pixel it covers and
-    // rewrote both planes there, so the box clears once `r` swallows
-    // it. a partial overlap leaves the box alone: it is a bounding
-    // box, not a pixel set, and shrinking it by guesswork would strand
-    // gray outside the next delta DU
-    fn clear_stale_within(&mut self, r: AlignedRegion) {
-        if self.stale.is_some_and(|s| r.contains(s)) {
-            self.stale = None;
-        }
-    }
-
-    // a gray pass over `r` left codes in the planes there. keep the
-    // old box only when it strictly contains `r` (this session's
-    // phase 1 wrote content planes inside `r` alone, so codes outside
-    // survive); a bounding-box union could cover never-grayed area
-    // whose content planes would misindex the revert LUT
-    fn set_gray_region(&mut self, r: AlignedRegion) {
-        self.gray = Some(match self.gray {
-            Some(g) if g.contains(r) => g,
-            _ => r,
-        });
-    }
-
-    // a plane write over `r` that did not end in a gray pass replaced
-    // codes with content; the box can no longer be vouched for. the
-    // areas outside `r` merely lose revert coverage: they stay inside
-    // `stale`, so correctness falls back to the inv_red re-drive
-    fn invalidate_gray_within(&mut self, r: AlignedRegion) {
-        if self.gray.is_some_and(|g| g.intersects(r)) {
-            self.gray = None;
-        }
-    }
-
-    fn mark_fresh(&mut self, r: AlignedRegion) {
-        self.fresh = Some(match self.fresh {
-            Some(f) => f.union(r),
-            None => r,
-        });
-    }
-
-    fn clear_fresh_within(&mut self, r: AlignedRegion) {
-        if self.fresh.is_some_and(|f| r.contains(f)) {
-            self.fresh = None;
-        }
+        self.planes.bbox().map(AlignedRegion::get)
     }
 
     /// Force the next partial request to promote to a full GC.
@@ -198,34 +133,33 @@ impl Screen {
     }
 
     /// Snap AA grays under `region` back to their rails before a
-    /// partial re-drive. No-op unless the region overlaps the
-    /// gray-coded box; the wave runs only over the overlap, so a small
-    /// partial does not strip AA from the rest of the screen. Returns
-    /// whether a wave ran. On timeout the next frame is promoted to a
-    /// full GC; the caller may still proceed with its partial, since
-    /// the inv_red re-drive keeps the content correct either way.
+    /// partial re-drive. Runs one wave per gray-coded window under the
+    /// region (usually one), so a small partial does not strip AA from
+    /// the rest of the screen and never drives outside the tracked
+    /// codes: the intersection of aligned regions is aligned, so the
+    /// physical window cannot snap outward onto planes holding content,
+    /// which the revert LUT would misdrive (white content reads {1,1},
+    /// its drive-black state). Returns whether any wave ran. On timeout
+    /// the next frame is promoted to a full GC; the caller may still
+    /// proceed with its partial, since the inv_red re-drive keeps the
+    /// content correct either way.
     pub async fn revert_gray_for(&mut self, region: Region) -> Result<bool, TimeoutError> {
-        let Some(g) = self.gray else {
-            return Ok(false);
-        };
-        // the intersection of aligned regions is aligned, so the
-        // physical window cannot snap outward past the gray box onto
-        // planes holding content, which the revert LUT would misdrive
-        // (white content reads {1,1}, its drive-black state)
-        let Some(w) = g.intersection(AlignedRegion::snap(region)) else {
-            return Ok(false);
-        };
-        let w = w.get();
-        let Some(rs) = self.epd.region_state(w.x, w.y, w.w, w.h) else {
-            return Ok(false);
-        };
-        let res = self.epd.grayscale_revert_pass(&rs).await;
-        // the codes in RAM stay valid (the pass writes nothing), so
-        // the box survives for the closers of the following session
-        if res.is_err() {
-            self.force_ghost_clear();
+        let region = AlignedRegion::snap(region);
+        let mut ran = false;
+        for w in self.planes.gray_windows(region).into_iter().flatten() {
+            let w = w.get();
+            let Some(rs) = self.epd.region_state(w.x, w.y, w.w, w.h) else {
+                continue;
+            };
+            // the codes in RAM stay valid (the pass writes nothing),
+            // so the map survives for the following session's closer
+            if let Err(e) = self.epd.grayscale_revert_pass(&rs).await {
+                self.force_ghost_clear();
+                return Err(e);
+            }
+            ran = true;
         }
-        res.map(|()| true)
+        Ok(ran)
     }
 
     /// Partial DU refresh, waiting inline on the busy pin. Falls back
@@ -272,7 +206,7 @@ impl Screen {
         // slop, and the 0-7 extra rows repaint with real content
         // instead of the old masks parking fake white in both planes
         let r = AlignedRegion::snap(region);
-        let hard_redrive = self.stale.is_some_and(|s| s.intersects(r));
+        let hard_redrive = self.planes.needs_redrive(r);
 
         let (x, y, w, h) = {
             let r = r.get();
@@ -289,7 +223,7 @@ impl Screen {
 
         self.epd.partial_start_du(&rs);
         self.partials = self.partials.saturating_add(1);
-        self.mark_fresh(r);
+        self.pending_aa.push(r);
 
         Ok(Wave {
             screen: self,
@@ -307,9 +241,12 @@ impl Screen {
     {
         self.epd.write_full_frame(self.strip, &mut self.delay, draw);
         self.epd.start_full_update();
-        self.fresh = Some(FULL_REGION);
-        // both planes now hold content, not gray codes
-        self.gray = None;
+        // both planes hold content the panel does not show yet; if the
+        // GC completes, finish() clears the map, and if it times out
+        // the whole screen correctly stays marked for re-drive
+        self.planes.apply(FULL_REGION, SessionOutcome::Abandoned);
+        self.pending_aa.clear();
+        self.pending_aa.push(FULL_REGION);
         Wave {
             screen: self,
             rs: FULL_RS,
@@ -344,17 +281,16 @@ impl Screen {
     }
 
     /// Full-screen grayscale AA pass. Leaves the panel holding gray
-    /// levels the RAM planes cannot express, so the whole screen is
-    /// marked stale; on timeout the next partial request additionally
-    /// promotes to a full GC.
+    /// levels only the codes now in RAM describe, so the whole screen
+    /// is tracked as gray-coded; on timeout the next partial request
+    /// additionally promotes to a full GC.
     pub async fn grayscale_full<F>(&mut self, draw: &F) -> Result<(), TimeoutError>
     where
         F: Fn(&mut StripBuffer),
     {
         let res = self.epd.grayscale_pass(self.strip, &FULL_RS, draw).await;
-        self.mark_stale(FULL_REGION);
-        self.gray = Some(FULL_REGION);
-        self.fresh = None;
+        self.planes.apply(FULL_REGION, SessionOutcome::Grayed);
+        self.pending_aa.clear();
         if res.is_err() {
             self.force_ghost_clear();
         }
@@ -362,31 +298,29 @@ impl Screen {
     }
 
     /// Grayscale AA pass over everything driven to plain BW since the
-    /// last pass. Used by the deferred fire: a full-screen pass would
-    /// re-pulse areas that already carry their gray and drive them
-    /// off level, while areas nobody redrew still show the AA the
-    /// previous pass gave them. No-op when nothing was refreshed.
+    /// last pass. Used by the deferred fire: one pass per pending
+    /// rect, never their bounding box, whose slop would re-pulse
+    /// areas that already carry their gray and drive them off level.
+    /// No-op when nothing was refreshed.
     pub async fn grayscale_fresh<F>(&mut self, draw: &F) -> Result<(), TimeoutError>
     where
         F: Fn(&mut StripBuffer),
     {
-        let Some(region) = self.fresh else {
-            return Ok(());
-        };
-        let r = region.get();
-        let Some(rs) = self.epd.region_state(r.x, r.y, r.w, r.h) else {
-            self.fresh = None;
-            return Ok(());
-        };
-
-        let res = self.epd.grayscale_pass(self.strip, &rs, draw).await;
-        self.fresh = None;
-        self.mark_stale(region);
-        self.set_gray_region(region);
-        if res.is_err() {
-            self.force_ghost_clear();
+        while let Some(region) = self.pending_aa.take_next() {
+            let r = region.get();
+            let Some(rs) = self.epd.region_state(r.x, r.y, r.w, r.h) else {
+                continue;
+            };
+            let res = self.epd.grayscale_pass(self.strip, &rs, draw).await;
+            // the planes were rewritten with codes before the wave
+            // started, so the region is gray-coded even on timeout
+            self.planes.apply(region, SessionOutcome::Grayed);
+            if res.is_err() {
+                self.force_ghost_clear();
+                return res;
+            }
         }
-        res
+        Ok(())
     }
 }
 
@@ -418,7 +352,6 @@ impl<'s, M> Wave<'s, M> {
             screen: self.screen,
             rs: self.rs,
             region: self.region,
-            hard_redrive: self.hard_redrive,
             _mode: PhantomData,
         }
     }
@@ -441,23 +374,21 @@ impl Settled<'_, Du> {
     {
         let s = self.screen;
         s.epd.partial_phase3_sync(s.strip, &self.rs, draw);
-        // the panel now matches both planes across this region; if the
-        // re-drive swallowed the stale box, nothing is outstanding
-        if self.hard_redrive {
-            s.clear_stale_within(self.region);
-        }
-        // planes over this region hold content now, not gray codes
-        s.invalidate_gray_within(self.region);
+        // the panel matches both planes across this region again; the
+        // carve is exact, so claims outside it (gray codes elsewhere,
+        // an old skipped phase 3) survive as fragments instead of the
+        // old whole-box invalidation that kept dropping revert
+        // coverage after every sync
+        s.planes.apply(self.region, SessionOutcome::Synced);
     }
 
     /// Skip phase 3 (content changed mid-waveform); RED RAM keeps the
     /// pre-waveform image while the panel shows the new one, so the
     /// region needs an inv_red re-drive before any delta DU.
     pub fn abandon(self) {
-        let region = self.region;
-        self.screen.mark_stale(region);
-        // phase 1 replaced any gray codes here with content planes
-        self.screen.invalidate_gray_within(region);
+        self.screen
+            .planes
+            .apply(self.region, SessionOutcome::Abandoned);
     }
 
     /// Grayscale AA pass over this refresh's region instead of phase 3.
@@ -465,28 +396,21 @@ impl Settled<'_, Du> {
     /// The gray LUT states are short relative pulses that lighten
     /// pixels the BW frame just drove black, and `{0,0}` is literally
     /// "no change", so the pass leaves the panel holding intermediate
-    /// levels neither RAM plane can express. The region is therefore
-    /// marked stale: the next partial touching it re-drives from black
-    /// via inv_red, which is the starting state the pulses assume.
-    /// Clearing the mark instead (RED := BW) makes the following DU
-    /// skip those pixels and the next pass stack another pulse on an
-    /// already-gray pixel, washing the AA ramp out over a few turns.
-    /// On timeout the pass is additionally promoted to a full GC.
+    /// levels only the codes now in RAM describe. The region is
+    /// tracked as gray-coded: the next partial touching it reverts the
+    /// grays to their rails and re-drives via inv_red, the starting
+    /// state the DU transitions assume. On timeout the pass is
+    /// additionally promoted to a full GC.
     pub async fn grayscale<F>(self, draw: &F) -> Result<(), TimeoutError>
     where
         F: Fn(&mut StripBuffer),
     {
         let s = self.screen;
         let res = s.epd.grayscale_pass(s.strip, &self.rs, draw).await;
-        // the DU that preceded this pass re-drove the region when it
-        // took the inv_red path, so retire the old box before marking
-        // the fresh gray; otherwise the box only ever grows
-        if self.hard_redrive {
-            s.clear_stale_within(self.region);
-        }
-        s.mark_stale(self.region);
-        s.set_gray_region(self.region);
-        s.clear_fresh_within(self.region);
+        s.planes.apply(self.region, SessionOutcome::Grayed);
+        // this region just took its gray; a later deferred fire over
+        // a queued rect covering it would stack a second pulse
+        s.pending_aa.subtract(self.region);
         if res.is_err() {
             s.force_ghost_clear();
         }
@@ -501,7 +425,6 @@ impl Settled<'_, Gc> {
         let s = self.screen;
         s.epd.finish_full_update();
         s.partials = 0;
-        s.stale = None;
-        s.gray = None;
+        s.planes.clear();
     }
 }

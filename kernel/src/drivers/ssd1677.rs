@@ -549,10 +549,10 @@ where
         self.busy.is_high().unwrap_or(false)
     }
 
-    // RED only: every caller reaches phase 3 with BW RAM already
-    // holding the current content (phase 1 wrote it, or grayscale_pass
-    // restored it), so rewriting BW here would halve throughput for
-    // nothing
+    // RED only: phase 3 always follows a phase 1 that wrote the
+    // current content into BW RAM (a gray pass replaces phase 3
+    // entirely, never precedes it), so rewriting BW here would halve
+    // throughput for nothing
     pub fn partial_phase3_sync<F>(&mut self, strip: &mut StripBuffer, rs: &RenderState, draw: &F)
     where
         F: Fn(&mut StripBuffer),
