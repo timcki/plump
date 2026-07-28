@@ -134,11 +134,12 @@ impl LibraryApp {
             ctx.mark_dirty(row_region(self.selected));
         } else if self.page > 0 {
             // every page before the last is full, so the bottom row
-            // always exists on the previous page
+            // always exists on the previous page. no dirty mark here:
+            // background_step marks after the reload, so the panel
+            // never paints the old page's rows under the new state
             self.page -= 1;
             self.selected = ROWS_PER_PAGE - 1;
             self.needs_load = true;
-            ctx.mark_dirty(CONTENT_REGION);
         }
     }
 
@@ -148,28 +149,34 @@ impl LibraryApp {
             self.selected += 1;
             ctx.mark_dirty(row_region(self.selected));
         } else if self.page + 1 < self.total_pages() {
+            // dirty mark deferred to background_step, after the reload
             self.page += 1;
             self.selected = 0;
             self.needs_load = true;
-            ctx.mark_dirty(CONTENT_REGION);
         }
     }
 
     /// Left = previous page, right = next page. AtEdge on the
     /// first/last page hands the gesture back for a tab switch.
-    fn move_page(&mut self, dir: HDir, ctx: &mut AppContext) -> HResult {
+    fn move_page(&mut self, dir: HDir, _ctx: &mut AppContext) -> HResult {
         match dir {
             HDir::Right if self.page + 1 < self.total_pages() => self.page += 1,
             HDir::Left if self.page > 0 => self.page -= 1,
             _ => return HResult::AtEdge,
         }
-        // keep the row index; load_page clamps it on short last pages
+        // keep the row index; load_page clamps it on short last pages.
+        // the dirty mark waits for background_step so the render never
+        // races the reload and paints the previous page's entries
         self.needs_load = true;
-        ctx.mark_dirty(CONTENT_REGION);
         HResult::Consumed
     }
 
     fn select(&mut self, ctx: &mut AppContext) -> Transition {
+        // between a page change and its reload the entries still hold
+        // the previous page; opening one would launch the wrong book
+        if self.needs_load {
+            return Transition::None;
+        }
         if let Some(entry) = self.entries.get(self.selected).and_then(|e| e.as_ref()) {
             ctx.set_message(entry.name.as_bytes());
             Transition::Push(AppId::Reader)

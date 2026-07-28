@@ -219,7 +219,15 @@ impl SettingsList {
         if self.scroll != old_scroll {
             Damage::Viewport(self.viewport())
         } else {
-            Damage::Rows([old_region, self.row_region(self.cursor)])
+            // one scanline of growth: the hairline at the top of the
+            // row below is suppressed based on this row's selection,
+            // so it changes with the move but sits outside the row's
+            // own rect; without it 1px lines accumulated on scroll
+            let with_boundary = |r: Region| Region::new(r.x, r.y, r.w, r.h + 1);
+            Damage::Rows([
+                old_region.map(with_boundary),
+                self.row_region(self.cursor).map(with_boundary),
+            ])
         }
     }
 
@@ -249,9 +257,17 @@ impl SettingsList {
     }
 }
 
+// must match the cell draw_item renders into (inset from the right
+// edge by margin_md): a narrower damage box left stubs of the old
+// chip on the panel whenever a stepped value got shorter
 fn value_box(row: Region) -> Region {
     let w = VALUE_W.min(row.w);
-    Region::new(row.x + row.w - w, row.y, w, row.h)
+    Region::new(
+        row.x + (row.w - w).saturating_sub(THEME.margin_md),
+        row.y,
+        w,
+        row.h,
+    )
 }
 
 fn item_at(idx: usize) -> Option<SettingId> {
