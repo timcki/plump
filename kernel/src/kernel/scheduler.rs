@@ -655,34 +655,23 @@ impl super::Kernel {
         'render: {
             if let Redraw::Partial(r) = redraw {
                 if screen.partials_since_clear() < app_mgr.ghost_clear_every() {
-                    // snap AA grays under the region back to their
-                    // rails first, so the re-drive below starts from
-                    // the bimodal state its DU transitions assume; on
-                    // timeout the next frame promotes to a full GC and
-                    // the re-drive still paints correct content
-                    crate::perf_begin!(_t_revert);
-                    match screen.revert_gray_for(r).await {
-                        Ok(true) => {
-                            crate::perf_event!(
-                                "render",
-                                "revert wave_ms={}",
-                                _t_revert.elapsed().as_millis()
-                            );
-                        }
-                        Ok(false) => {}
-                        Err(_) => {
-                            log::warn!("render: revert pass timed out, forcing full GC next frame");
-                        }
-                    }
-
-                    // begin_partial picks bw vs inv_red from its own
-                    // plane state: a region overlapping gray left by an
-                    // AA pass is re-driven, everything else is a delta
+                    // the plan picks bw vs inv_red from its own plane
+                    // state: a region overlapping gray left by an AA
+                    // pass comes back RevertFirst, whose only path to
+                    // a wave snaps the grays to their rails before the
+                    // re-drive; everything else is Ready with the DU
+                    // already running
                     let stale = screen.stale_region();
                     let t_write = Instant::now();
                     let wave = {
                         let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                        screen.begin_partial(r, &draw)
+                        match screen.plan_partial(r, &draw) {
+                            Ok(super::screen::PartialPlan::Ready(wave)) => Ok(wave),
+                            Ok(super::screen::PartialPlan::RevertFirst(pending)) => {
+                                pending.proceed(&draw).await
+                            }
+                            Err(e) => Err(e),
+                        }
                     };
 
                     match wave {

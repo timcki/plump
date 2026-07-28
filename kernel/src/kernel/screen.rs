@@ -3,7 +3,8 @@
 // owns the EPD driver, the strip buffer, and all display-plane state
 // (stale region, partial counter). a refresh is a linear session:
 //
-//   begin_partial / begin_full  ->  Wave<'_, M>   (waveform running)
+//   plan_partial -> PartialPlan (Ready(Wave) | RevertFirst)
+//   begin_full   -> Wave<'_, M>   (waveform running)
 //   wave.settle() / wave.wait() ->  Settled<'_, M>
 //   settled.sync_red / .abandon / .grayscale / .finish
 //
@@ -71,6 +72,54 @@ pub struct Settled<'s, M> {
     _mode: PhantomData<M>,
 }
 
+/// A planned partial refresh.
+///
+/// The revert obligation is part of the type: when AA gray codes
+/// underlie the region, the only way to obtain a [`Wave`] is through
+/// [`PendingRevert::proceed`], which runs the revert wave first. A
+/// call site cannot forget the revert and re-drive straight over
+/// intermediate grays (the page-turn mottle) or start phase 1 over
+/// the codes the revert reads.
+pub enum PartialPlan<'s> {
+    /// No gray codes under the region; phase 1 is written and the DU
+    /// waveform is already running.
+    Ready(Wave<'s, Du>),
+    /// Gray codes underlie the region; call
+    /// [`PendingRevert::proceed`] to revert them and start the DU.
+    RevertFirst(PendingRevert<'s>),
+}
+
+/// Proof-of-obligation stage of [`PartialPlan`]: holds the screen
+/// until the revert runs.
+pub struct PendingRevert<'s> {
+    screen: &'s mut Screen,
+    region: AlignedRegion,
+}
+
+impl<'s> PendingRevert<'s> {
+    /// Revert grays under the region to their rails, then write
+    /// phase 1 and start the DU. A revert timeout degrades gracefully:
+    /// the next frame is promoted to a full GC and the partial still
+    /// runs, since its inv_red re-drive keeps the content correct.
+    pub async fn proceed<F>(self, draw: &F) -> Result<Wave<'s, Du>, PartialRejected>
+    where
+        F: Fn(&mut StripBuffer),
+    {
+        let PendingRevert { screen, region } = self;
+        crate::perf_begin!(_t0);
+        match screen.revert_windows(region).await {
+            Ok(true) => {
+                crate::perf_event!("render", "revert wave_ms={}", _t0.elapsed().as_millis());
+            }
+            Ok(false) => {}
+            Err(_) => {
+                log::warn!("partial: revert pass timed out, forcing full GC next frame");
+            }
+        }
+        screen.start_partial_wave(region, draw)
+    }
+}
+
 /// Why a partial refresh could not start.
 pub enum PartialRejected {
     /// The region aligned to nothing; there is no work to do.
@@ -132,27 +181,22 @@ impl Screen {
         self.epd.enter_deep_sleep();
     }
 
-    /// Snap AA grays under `region` back to their rails before a
-    /// partial re-drive. Runs one wave per gray-coded window under the
-    /// region (usually one), so a small partial does not strip AA from
-    /// the rest of the screen and never drives outside the tracked
-    /// codes: the intersection of aligned regions is aligned, so the
-    /// physical window cannot snap outward onto planes holding content,
-    /// which the revert LUT would misdrive (white content reads {1,1},
-    /// its drive-black state). Returns whether any wave ran. On timeout
-    /// the next frame is promoted to a full GC; the caller may still
-    /// proceed with its partial, since the inv_red re-drive keeps the
-    /// content correct either way.
-    pub async fn revert_gray_for(&mut self, region: Region) -> Result<bool, TimeoutError> {
-        let region = AlignedRegion::snap(region);
+    // snap AA grays under `region` back to their rails: one wave per
+    // gray-coded window (usually one), so a small partial does not
+    // strip AA from the rest of the screen and never drives outside
+    // the tracked codes. the intersection of aligned regions is
+    // aligned, so the physical window cannot snap outward onto planes
+    // holding content, which the revert LUT would misdrive (white
+    // content reads {1,1}, its drive-black state). the codes in RAM
+    // stay valid (the pass writes nothing), so the map survives for
+    // the following session's closer
+    async fn revert_windows(&mut self, region: AlignedRegion) -> Result<bool, TimeoutError> {
         let mut ran = false;
         for w in self.planes.gray_windows(region).into_iter().flatten() {
             let w = w.get();
             let Some(rs) = self.epd.region_state(w.x, w.y, w.w, w.h) else {
                 continue;
             };
-            // the codes in RAM stay valid (the pass writes nothing),
-            // so the map survives for the following session's closer
             if let Err(e) = self.epd.grayscale_revert_pass(&rs).await {
                 self.force_ghost_clear();
                 return Err(e);
@@ -169,32 +213,39 @@ impl Screen {
     where
         F: Fn(&mut StripBuffer),
     {
-        if self.revert_gray_for(region).await.is_err() {
-            log::warn!("render_partial: revert pass timed out, forcing full GC next frame");
-        }
-        match self.begin_partial(region, draw) {
-            Ok(wave) => {
+        match self.plan_partial(region, draw) {
+            Ok(PartialPlan::Ready(wave)) => {
                 wave.wait().await?.sync_red(draw);
                 Ok(())
             }
+            Ok(PartialPlan::RevertFirst(pending)) => match pending.proceed(draw).await {
+                Ok(wave) => {
+                    wave.wait().await?.sync_red(draw);
+                    Ok(())
+                }
+                Err(_) => Ok(()),
+            },
             Err(PartialRejected::Empty) => Ok(()),
             Err(PartialRejected::NeedsFull) => self.render_full(draw).await,
         }
     }
 
-    /// Write BW RAM for `region` and kick the DU waveform.
+    /// Plan a partial DU refresh of `region`.
     ///
     /// When the region overlaps panel area the RAM planes no longer
-    /// describe (gray from an AA pass, a skipped phase 3), the write
-    /// goes through inv_red so the waveform re-drives every pixel it
-    /// covers from a known state instead of computing a delta against
-    /// a stale plane. Recovery stays scoped to the requested region;
-    /// the caller never tracks plane state.
-    pub fn begin_partial<F>(
+    /// describe, the write goes through inv_red so the waveform
+    /// re-drives every pixel it covers from a known state instead of
+    /// computing a delta against a stale plane; and when those planes
+    /// hold AA gray codes, the plan comes back as
+    /// [`PartialPlan::RevertFirst`], whose only path to a [`Wave`]
+    /// runs the revert pass. Callers cannot skip the revert or start
+    /// phase 1 over codes; recovery stays scoped to the requested
+    /// region and the caller never tracks plane state.
+    pub fn plan_partial<F>(
         &mut self,
         region: Region,
         draw: &F,
-    ) -> Result<Wave<'_, Du>, PartialRejected>
+    ) -> Result<PartialPlan<'_>, PartialRejected>
     where
         F: Fn(&mut StripBuffer),
     {
@@ -206,6 +257,33 @@ impl Screen {
         // slop, and the 0-7 extra rows repaint with real content
         // instead of the old masks parking fake white in both planes
         let r = AlignedRegion::snap(region);
+
+        if self
+            .planes
+            .gray_windows(r)
+            .iter()
+            .any(|w| w.is_some())
+        {
+            // phase 1 must not run yet: it would overwrite the codes
+            // the revert wave reads as its index
+            return Ok(PartialPlan::RevertFirst(PendingRevert {
+                screen: self,
+                region: r,
+            }));
+        }
+
+        self.start_partial_wave(r, draw).map(PartialPlan::Ready)
+    }
+
+    // phase 1 + DU kick, shared by the two plan arms
+    fn start_partial_wave<F>(
+        &mut self,
+        r: AlignedRegion,
+        draw: &F,
+    ) -> Result<Wave<'_, Du>, PartialRejected>
+    where
+        F: Fn(&mut StripBuffer),
+    {
         let hard_redrive = self.planes.needs_redrive(r);
 
         let (x, y, w, h) = {
