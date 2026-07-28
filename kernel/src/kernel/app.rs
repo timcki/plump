@@ -34,19 +34,33 @@ pub const MAX_APP_ACTIONS: usize = 6;
 
 /// Scheduler-owned budget for a single background step.
 ///
-/// The exact field layout is intentionally minimal for now.
-/// The scheduler may use different budgets in normal vs waveform
-/// windows; apps should not inspect the budget to determine which
-/// window they are running in.
+/// Steps that run inside a waveform window get a quiet budget: any
+/// drawable-state change there means the closing phase would write
+/// planes the panel does not show, forcing an abandon and a wasted
+/// full re-drive on the next frame. Apps must gate progress-indicator
+/// updates (and any other dirty marks driven purely by background
+/// work) on [`BgBudget::allows_repaint`] and defer them to the next
+/// permissive step; the scheduler always runs one after the render.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BgBudget {
-    _private: (),
+    repaint_ok: bool,
 }
 
 impl BgBudget {
-    /// Create a new budget (scheduler-side only).
+    /// Budget for a normal step; repaints are fine (scheduler-side only).
     pub const fn new() -> Self {
-        Self { _private: () }
+        Self { repaint_ok: true }
+    }
+
+    /// Budget for a step inside a waveform window (scheduler-side only).
+    pub const fn quiet() -> Self {
+        Self { repaint_ok: false }
+    }
+
+    /// Whether this step may change drawable state / mark regions dirty.
+    #[inline]
+    pub fn allows_repaint(&self) -> bool {
+        self.repaint_ok
     }
 }
 

@@ -655,6 +655,26 @@ impl super::Kernel {
         'render: {
             if let Redraw::Partial(r) = redraw {
                 if screen.partials_since_clear() < app_mgr.ghost_clear_every() {
+                    // snap AA grays under the region back to their
+                    // rails first, so the re-drive below starts from
+                    // the bimodal state its DU transitions assume; on
+                    // timeout the next frame promotes to a full GC and
+                    // the re-drive still paints correct content
+                    crate::perf_begin!(_t_revert);
+                    match screen.revert_gray_for(r).await {
+                        Ok(true) => {
+                            crate::perf_event!(
+                                "render",
+                                "revert wave_ms={}",
+                                _t_revert.elapsed().as_millis()
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(_) => {
+                            log::warn!("render: revert pass timed out, forcing full GC next frame");
+                        }
+                    }
+
                     // begin_partial picks bw vs inv_red from its own
                     // plane state: a region overlapping gray left by an
                     // AA pass is re-driven, everything else is a delta
@@ -927,10 +947,12 @@ impl super::Services {
                 break;
             }
 
-            // run one bounded background step, then poll for input
+            // run one bounded background step, then poll for input.
+            // quiet budget: a drawable-state change during the wave
+            // would force the closing phase to abandon
             let outcome = {
                 let mut handle = self.handle();
-                app_mgr.run_background_step(&mut handle, super::app::BgBudget::new())
+                app_mgr.run_background_step(&mut handle, super::app::BgBudget::quiet())
             };
 
             let ev = if let Ok(ev) = tasks::INPUT_EVENTS.try_receive() {

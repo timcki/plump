@@ -42,6 +42,15 @@ pub struct Screen {
     // an area that already carries its gray drives it further off
     fresh: Option<Region>,
 
+    // area whose RAM planes still hold the gray codes an AA pass
+    // wrote (a subset of `stale`). those codes index the revert LUT,
+    // so a partial overlapping this box first snaps the grays back to
+    // their rails; re-driving straight over intermediate gray levels
+    // gave every DU transition a starting state its waveform does not
+    // expect, which is what broke AA on page turns. any plane write
+    // that does not end in a gray pass invalidates the box
+    gray: Option<Region>,
+
     // partial refreshes since the last full GC; the scheduler promotes
     // to a full clear once this reaches ghost_clear_every
     partials: u32,
@@ -100,6 +109,7 @@ impl Screen {
             delay,
             stale: None,
             fresh: None,
+            gray: None,
             partials: 0,
         }
     }
@@ -130,6 +140,28 @@ impl Screen {
     fn clear_stale_within(&mut self, r: Region) {
         if self.stale.is_some_and(|s| r.contains(s)) {
             self.stale = None;
+        }
+    }
+
+    // a gray pass over `r` left codes in the planes there. keep the
+    // old box only when it strictly contains `r` (this session's
+    // phase 1 wrote content planes inside `r` alone, so codes outside
+    // survive); a bounding-box union could cover never-grayed area
+    // whose content planes would misindex the revert LUT
+    fn set_gray_region(&mut self, r: Region) {
+        self.gray = Some(match self.gray {
+            Some(g) if g.contains(r) => g,
+            _ => r,
+        });
+    }
+
+    // a plane write over `r` that did not end in a gray pass replaced
+    // codes with content; the box can no longer be vouched for. the
+    // areas outside `r` merely lose revert coverage: they stay inside
+    // `stale`, so correctness falls back to the inv_red re-drive
+    fn invalidate_gray_within(&mut self, r: Region) {
+        if self.gray.is_some_and(|g| g.intersects(r)) {
+            self.gray = None;
         }
     }
 
@@ -166,6 +198,35 @@ impl Screen {
         self.epd.enter_deep_sleep();
     }
 
+    /// Snap AA grays under `region` back to their rails before a
+    /// partial re-drive. No-op unless the region overlaps the
+    /// gray-coded box; the wave runs only over the overlap, so a small
+    /// partial does not strip AA from the rest of the screen. Returns
+    /// whether a wave ran. On timeout the next frame is promoted to a
+    /// full GC; the caller may still proceed with its partial, since
+    /// the inv_red re-drive keeps the content correct either way.
+    pub async fn revert_gray_for(&mut self, region: Region) -> Result<bool, TimeoutError> {
+        let Some(g) = self.gray else {
+            return Ok(false);
+        };
+        // both boxes are 8-aligned, so the overlap needs no edge
+        // masks; masked slop bits would hand drive states to the
+        // revert LUT
+        let Some(w) = g.intersection(region.align8()) else {
+            return Ok(false);
+        };
+        let Some(rs) = self.epd.region_state(w.x, w.y, w.w, w.h) else {
+            return Ok(false);
+        };
+        let res = self.epd.grayscale_revert_pass(&rs).await;
+        // the codes in RAM stay valid (the pass writes nothing), so
+        // the box survives for the closers of the following session
+        if res.is_err() {
+            self.force_ghost_clear();
+        }
+        res.map(|()| true)
+    }
+
     /// Partial DU refresh, waiting inline on the busy pin. Falls back
     /// to a full GC when the panel has not been refreshed yet. For
     /// paths with no background work to overlap (wifi upload screens).
@@ -173,6 +234,9 @@ impl Screen {
     where
         F: Fn(&mut StripBuffer),
     {
+        if self.revert_gray_for(region).await.is_err() {
+            log::warn!("render_partial: revert pass timed out, forcing full GC next frame");
+        }
         match self.begin_partial(region, draw) {
             Ok(wave) => {
                 wave.wait().await?.sync_red(draw);
@@ -243,6 +307,8 @@ impl Screen {
         self.epd.write_full_frame(self.strip, &mut self.delay, draw);
         self.epd.start_full_update();
         self.fresh = Some(FULL_REGION);
+        // both planes now hold content, not gray codes
+        self.gray = None;
         Wave {
             screen: self,
             rs: FULL_RS,
@@ -286,6 +352,7 @@ impl Screen {
     {
         let res = self.epd.grayscale_pass(self.strip, &FULL_RS, draw).await;
         self.mark_stale(FULL_REGION);
+        self.gray = Some(FULL_REGION);
         self.fresh = None;
         if res.is_err() {
             self.force_ghost_clear();
@@ -320,6 +387,7 @@ impl Screen {
         let res = self.epd.grayscale_pass(self.strip, &rs, draw).await;
         self.fresh = None;
         self.mark_stale(region);
+        self.set_gray_region(region);
         if res.is_err() {
             self.force_ghost_clear();
         }
@@ -383,6 +451,8 @@ impl Settled<'_, Du> {
         if self.hard_redrive {
             s.clear_stale_within(self.region);
         }
+        // planes over this region hold content now, not gray codes
+        s.invalidate_gray_within(self.region);
     }
 
     /// Skip phase 3 (content changed mid-waveform); RED RAM keeps the
@@ -391,6 +461,8 @@ impl Settled<'_, Du> {
     pub fn abandon(self) {
         let region = self.region;
         self.screen.mark_stale(region);
+        // phase 1 replaced any gray codes here with content planes
+        self.screen.invalidate_gray_within(region);
     }
 
     /// Grayscale AA pass over this refresh's region instead of phase 3.
@@ -418,6 +490,7 @@ impl Settled<'_, Du> {
             s.clear_stale_within(self.region);
         }
         s.mark_stale(self.region);
+        s.set_gray_region(self.region);
         s.clear_fresh_within(self.region);
         if res.is_err() {
             s.force_ghost_clear();
@@ -434,5 +507,6 @@ impl Settled<'_, Gc> {
         s.epd.finish_full_update();
         s.partials = 0;
         s.stale = None;
+        s.gray = None;
     }
 }

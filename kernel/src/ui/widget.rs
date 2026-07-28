@@ -71,6 +71,23 @@ impl Region {
         }
     }
 
+    /// Overlap of two regions, None when they do not intersect.
+    pub fn intersection(self, other: Region) -> Option<Region> {
+        if !self.intersects(other) {
+            return None;
+        }
+        let x1 = self.x.max(other.x);
+        let y1 = self.y.max(other.y);
+        let x2 = (self.x + self.w).min(other.x + other.w);
+        let y2 = (self.y + self.h).min(other.y + other.h);
+        Some(Self {
+            x: x1,
+            y: y1,
+            w: x2 - x1,
+            h: y2 - y1,
+        })
+    }
+
     pub fn intersects(self, other: Region) -> bool {
         self.x < other.x + other.w
             && self.x + self.w > other.x

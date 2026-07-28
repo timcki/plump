@@ -97,6 +97,44 @@ static LUT_GRAYSCALE: [u8; 112] = [
     0x17, 0x41, 0xA8, 0x32, 0x30, 0x00, 0x00,
 ];
 
+/// Revert LUT: snaps each AA gray state back to its nearest rail.
+///
+/// Indexed by the same {RED, BW} pair as [`LUT_GRAYSCALE`], and driven
+/// with the gray planes still resident in controller RAM, so the pass
+/// needs no RAM writes. After it the panel is bimodal (pure black /
+/// white), which is the starting state the OTP DU transitions assume;
+/// re-driving straight over intermediate grays is what produced the
+/// mottled, non-uniform AA on page turns.
+///
+/// Waveform bytes from CrossPoint Reader's lut_grayscale_revert (X4):
+/// medium gray ({1,0}, the strong-lift state) snaps white-ward, dark
+/// gray ({1,1}) snaps black-ward. {0,1} is unused by our glyph
+/// encoding and stays a no-op.
+#[rustfmt::skip]
+static LUT_GRAYSCALE_REVERT: [u8; 112] = [
+    // VS[0..4] waveform entries (5 x 10 bytes = 50 bytes)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 00 no change
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 01 unused
+    0xA8, 0xA8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 10 medium -> white
+    0xFC, 0xFC, 0xFC, 0xFC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 11 dark -> black
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // VCOM
+    // TP/RP timing groups (10 x 5 bytes = 50 bytes)
+    0x01, 0x01, 0x01, 0x01, 0x01,  // G0
+    0x01, 0x01, 0x01, 0x01, 0x01,  // G1
+    0x01, 0x01, 0x01, 0x01, 0x00,  // G2
+    0x01, 0x01, 0x01, 0x01, 0x00,  // G3
+    0x00, 0x00, 0x00, 0x00, 0x00,  // G4
+    0x00, 0x00, 0x00, 0x00, 0x00,  // G5
+    0x00, 0x00, 0x00, 0x00, 0x00,  // G6
+    0x00, 0x00, 0x00, 0x00, 0x00,  // G7
+    0x00, 0x00, 0x00, 0x00, 0x00,  // G8
+    0x00, 0x00, 0x00, 0x00, 0x00,  // G9
+    // Frame rate (5 bytes)
+    0x8F, 0x8F, 0x8F, 0x8F, 0x8F,
+    // Voltages: VGH, VSH1, VSH2, VSL, VCOM (5 bytes) + reserved (2)
+    0x17, 0x41, 0xA8, 0x32, 0x30, 0x00, 0x00,
+];
+
 #[derive(Clone, Copy, Debug)]
 pub struct RenderState {
     pub px: u16,
@@ -777,11 +815,12 @@ where
     ///
     /// Renders content once per strip in GrayDual mode, writing LSB plane
     /// to BW RAM and MSB plane to RED RAM, then triggers a grayscale LUT
-    /// refresh. After this, both RAMs contain gray plane data (not BW
-    /// content), so the caller should mark red_stale = true.
+    /// refresh. Both RAMs keep the gray plane data afterwards: it is the
+    /// index for a later [`Self::grayscale_revert_pass`], so the caller
+    /// must track the region as gray-coded and stale.
     ///
-    /// On timeout, the post-wait BW RAM restore is skipped; the caller
-    /// must force a full GC on the next refresh to resync both planes.
+    /// On timeout the caller must force a full GC on the next refresh
+    /// to bring panel and planes back in sync.
     pub async fn grayscale_pass<F>(
         &mut self,
         strip: &mut StripBuffer,
@@ -822,26 +861,44 @@ where
         self.wait_busy_async("grayscale_refresh").await?;
         crate::perf_event!("render", "gray wave_ms={}", _t1.elapsed().as_millis());
 
-        // restore BW RAM with correct content so subsequent partial
-        // DU refreshes compute correct pixel deltas. the physical
-        // display keeps the grayscale image (latched by the EPD),
-        // but BW RAM must match what the DU waveform expects as the
-        // "old" image. without this, a partial update on a sub-region
-        // (e.g. quick menu overlay) leaves the rest of BW RAM with
-        // stale gray plane data, causing the next full-region DU to
-        // see a huge delta and drive everything black.
-        self.write_region_strips(
-            strip,
-            rs.px,
-            rs.py,
-            rs.pw,
-            rs.ph,
-            cmd::WRITE_RAM_BW,
-            draw,
-            rs.left_mask,
-            rs.right_mask,
-        );
+        // both RAMs deliberately keep the gray plane data: the revert
+        // pass reads them as its waveform index, so restoring BW here
+        // would break it. the caller marks the region gray-coded and
+        // stale; the next partial over it reverts, then rewrites both
+        // planes via inv_red
         Ok(())
+    }
+
+    /// Revert pass over `rs`: drives every AA gray pixel back to its
+    /// nearest rail using [`LUT_GRAYSCALE_REVERT`], indexed by the
+    /// gray planes still resident in RAM from the preceding
+    /// [`Self::grayscale_pass`]. No RAM writes.
+    pub async fn grayscale_revert_pass(
+        &mut self,
+        rs: &RenderState,
+    ) -> Result<(), embassy_time::TimeoutError> {
+        self.load_custom_lut(&LUT_GRAYSCALE_REVERT);
+        self.set_partial_ram_area(rs.px, rs.py, rs.pw, rs.ph);
+
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
+        self.send_data(&[0x00, 0x00]);
+
+        // display with the custom LUT (no LUT_LOAD); the following DU
+        // sets LUT_LOAD and restores the OTP waveform
+        let mut ctrl2: u8 = 0x0C;
+        if !self.power_is_on {
+            ctrl2 |= 0xC0; // CLOCK_ON + ANALOG_ON
+        }
+        if self.sunlight_mode {
+            ctrl2 |= 0x03; // ANALOG_OFF + CLOCK_OFF after refresh
+        }
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
+        self.send_data(&[ctrl2]);
+
+        self.send_command(cmd::MASTER_ACTIVATION);
+        self.power_is_on = !self.sunlight_mode;
+
+        self.wait_busy_async("grayscale_revert").await
     }
 }
 
