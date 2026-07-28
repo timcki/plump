@@ -22,7 +22,7 @@ pub use statusbar::{
 };
 pub use theme::Theme;
 pub use widget::{
-    Alignment, LoadingIndicator, ProgressBar, Region, wrap_next, wrap_prev,
+    AlignedRegion, Alignment, LoadingIndicator, ProgressBar, Region, wrap_next, wrap_prev,
 };
 
 pub use crate::board::{SCREEN_H, SCREEN_W};

@@ -107,6 +107,62 @@ impl Region {
     }
 }
 
+/// A [`Region`] whose x, y, w and h are all multiples of 8.
+///
+/// The panel windows on byte boundaries in physical coordinates and
+/// rotation swaps the axes, so a region snapped on both logical axes
+/// maps to an unmasked physical window under every rotation. Making
+/// the snap part of the type removes the per-call-site choice between
+/// [`Region::align8`] and [`Region::align8_xy`] that previously let
+/// partial windows carry edge masks (and let the mask slop park fake
+/// plane state over neighbouring rows).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AlignedRegion(Region);
+
+impl AlignedRegion {
+    /// Snap `r` outward to the nearest byte boundaries.
+    pub fn snap(r: Region) -> Self {
+        Self(r.align8_xy())
+    }
+
+    /// Wrap a region that is already aligned; asserts the invariant,
+    /// for compile-time constants like the full screen.
+    pub const fn from_aligned(r: Region) -> Self {
+        assert!(
+            r.x.is_multiple_of(8)
+                && r.y.is_multiple_of(8)
+                && r.w.is_multiple_of(8)
+                && r.h.is_multiple_of(8)
+        );
+        Self(r)
+    }
+
+    #[inline]
+    pub fn get(self) -> Region {
+        self.0
+    }
+
+    /// Overlap of two aligned regions; max/min of multiples of 8 stay
+    /// multiples of 8, so the result needs no re-snap.
+    pub fn intersection(self, other: Self) -> Option<Self> {
+        self.0.intersection(other.0).map(Self)
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self(self.0.union(other.0))
+    }
+
+    #[inline]
+    pub fn intersects(self, other: Self) -> bool {
+        self.0.intersects(other.0)
+    }
+
+    #[inline]
+    pub fn contains(self, other: Self) -> bool {
+        self.0.contains(other.0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Alignment {
     #[default]

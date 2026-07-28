@@ -135,14 +135,19 @@ static LUT_GRAYSCALE_REVERT: [u8; 112] = [
     0x17, 0x41, 0xA8, 0x32, 0x30, 0x00, 0x00,
 ];
 
+/// Physical window of a refresh. Callers hand the driver logical
+/// regions snapped to byte boundaries on both axes (see
+/// `AlignedRegion`), so the window never carries edge masks: every
+/// pixel inside it is drawn with real content, and the old practice
+/// of parking mask slop bits at 1 in both planes (which erased up to
+/// 7 rows of the neighbouring content on every unaligned partial) is
+/// gone with the masks.
 #[derive(Clone, Copy, Debug)]
 pub struct RenderState {
     pub px: u16,
     pub py: u16,
     pub pw: u16,
     pub ph: u16,
-    pub left_mask: u8,
-    pub right_mask: u8,
 }
 
 pub struct DisplayDriver<SPI, DC, RST, BUSY> {
@@ -202,14 +207,10 @@ where
         ph: u16,
         ram_cmd: u8,
         draw: &F,
-        left_mask: u8,
-        right_mask: u8,
     ) where
         F: Fn(&mut StripBuffer),
     {
         let max_rows = StripBuffer::max_rows_for_width(pw);
-        let row_bytes = (pw / 8) as usize;
-        let needs_mask = left_mask != 0 || right_mask != 0;
 
         self.set_partial_ram_area(px, py, pw, ph);
         self.send_command(ram_cmd);
@@ -219,20 +220,12 @@ where
             let rows = max_rows.min(py + ph - y);
             strip.begin_window(self.rotation, px, y, pw, rows);
             draw(strip);
-
-            if needs_mask && row_bytes > 0 {
-                for row in strip.data_mut().chunks_mut(row_bytes) {
-                    row[0] |= left_mask;
-                    row[row.len() - 1] |= right_mask;
-                }
-            }
             self.send_data(strip.data());
             y += rows;
         }
     }
 
     // write BW RAM with content, RED RAM with inverted content
-    #[allow(clippy::too_many_arguments)]
     fn write_region_strips_bw_inv_red<F>(
         &mut self,
         strip: &mut StripBuffer,
@@ -241,27 +234,16 @@ where
         pw: u16,
         ph: u16,
         draw: &F,
-        left_mask: u8,
-        right_mask: u8,
     ) where
         F: Fn(&mut StripBuffer),
     {
         let max_rows = StripBuffer::max_rows_for_width(pw);
-        let row_bytes = (pw / 8) as usize;
-        let needs_mask = left_mask != 0 || right_mask != 0;
 
         let mut y = py;
         while y < py + ph {
             let rows = max_rows.min(py + ph - y);
             strip.begin_window(self.rotation, px, y, pw, rows);
             draw(strip);
-
-            if needs_mask && row_bytes > 0 {
-                for row in strip.data_mut().chunks_mut(row_bytes) {
-                    row[0] |= left_mask;
-                    row[row.len() - 1] |= right_mask;
-                }
-            }
 
             self.set_partial_ram_area(px, y, pw, rows);
             self.send_command(cmd::WRITE_RAM_BW);
@@ -274,13 +256,6 @@ where
             // with per-byte row math per strip
             for b in strip.data_mut().iter_mut() {
                 *b = !*b;
-            }
-            if needs_mask && row_bytes > 0 {
-                // inversion flipped the edge mask bits; re-apply them
-                for row in strip.data_mut().chunks_mut(row_bytes) {
-                    row[0] |= left_mask;
-                    row[row.len() - 1] |= right_mask;
-                }
             }
             self.set_partial_ram_area(px, y, pw, rows);
             self.send_command(cmd::WRITE_RAM_RED);
@@ -299,27 +274,16 @@ where
         pw: u16,
         ph: u16,
         draw: &F,
-        left_mask: u8,
-        right_mask: u8,
     ) where
         F: Fn(&mut StripBuffer),
     {
         let max_rows = StripBuffer::max_rows_for_width(pw);
-        let row_bytes = (pw / 8) as usize;
-        let needs_mask = left_mask != 0 || right_mask != 0;
 
         let mut y = py;
         while y < py + ph {
             let rows = max_rows.min(py + ph - y);
             strip.begin_window(self.rotation, px, y, pw, rows);
             draw(strip);
-
-            if needs_mask && row_bytes > 0 {
-                for row in strip.data_mut().chunks_mut(row_bytes) {
-                    row[0] |= left_mask;
-                    row[row.len() - 1] |= right_mask;
-                }
-            }
 
             // send the same rendered strip to both RAMs directly;
             // no replay copy needed since send_data only reads the buffer
@@ -334,7 +298,6 @@ where
     }
 
     // draw once per strip in GrayDual mode, send LSB → BW RAM and MSB → RED RAM
-    #[allow(clippy::too_many_arguments)]
     fn write_region_strips_gray_dual<F>(
         &mut self,
         strip: &mut StripBuffer,
@@ -343,36 +306,16 @@ where
         pw: u16,
         ph: u16,
         draw: &F,
-        left_mask: u8,
-        right_mask: u8,
     ) where
         F: Fn(&mut StripBuffer),
     {
         let max_rows = StripBuffer::max_rows_for_width(pw);
-        let row_bytes = (pw / 8) as usize;
-        let needs_mask = left_mask != 0 || right_mask != 0;
 
         let mut y = py;
         while y < py + ph {
             let rows = max_rows.min(py + ph - y);
             strip.begin_window(self.rotation, px, y, pw, rows);
             draw(strip);
-
-            // the BW paths park out-of-region bits at 1 in both planes so
-            // the DU sees no delta. the gray LUT's neutral state is {0,0}
-            // instead, so here the same bits must be cleared: leaving them
-            // set hands the byte-alignment slop a gray waveform, which
-            // shows up as a driven band along the edge of the region
-            if needs_mask && row_bytes > 0 {
-                for row in strip.data_mut().chunks_mut(row_bytes) {
-                    row[0] &= !left_mask;
-                    row[row.len() - 1] &= !right_mask;
-                }
-                for row in strip.gray_data_mut().chunks_mut(row_bytes) {
-                    row[0] &= !left_mask;
-                    row[row.len() - 1] &= !right_mask;
-                }
-            }
 
             // LSB plane → BW RAM
             self.set_partial_ram_area(px, y, pw, rows);
@@ -423,6 +366,10 @@ where
         }
     }
 
+    // callers pass logical regions snapped to byte boundaries on both
+    // axes, so after the rotation transform the physical window is
+    // already byte-aligned; the outward snap here is a no-op kept as a
+    // guard against an unsnapped caller
     fn align_partial_region(&self, x: u16, y: u16, w: u16, h: u16) -> Option<RenderState> {
         let (tx, ty, tw, th) = self.transform_region(x, y, w, h);
 
@@ -435,19 +382,7 @@ where
             return None;
         }
 
-        let lp = (tx - px) as u32;
-        let rp = ((px + pw) - (tx + tw)) as u32;
-        let left_mask: u8 = if lp > 0 { !((1u8 << (8 - lp)) - 1) } else { 0 };
-        let right_mask: u8 = if rp > 0 { (1u8 << rp) - 1 } else { 0 };
-
-        Some(RenderState {
-            px,
-            py,
-            pw,
-            ph,
-            left_mask,
-            right_mask,
-        })
+        Some(RenderState { px, py, pw, ph })
     }
 
     // gates wired in reverse; Y flipped, X inc / Y dec.
@@ -551,17 +486,7 @@ where
         }
 
         let rs = self.align_partial_region(x, y, w, h)?;
-        self.write_region_strips(
-            strip,
-            rs.px,
-            rs.py,
-            rs.pw,
-            rs.ph,
-            cmd::WRITE_RAM_BW,
-            draw,
-            rs.left_mask,
-            rs.right_mask,
-        );
+        self.write_region_strips(strip, rs.px, rs.py, rs.pw, rs.ph, cmd::WRITE_RAM_BW, draw);
         Some(rs)
     }
 
@@ -587,16 +512,7 @@ where
         }
 
         let rs = self.align_partial_region(x, y, w, h)?;
-        self.write_region_strips_bw_inv_red(
-            strip,
-            rs.px,
-            rs.py,
-            rs.pw,
-            rs.ph,
-            draw,
-            rs.left_mask,
-            rs.right_mask,
-        );
+        self.write_region_strips_bw_inv_red(strip, rs.px, rs.py, rs.pw, rs.ph, draw);
         Some(rs)
     }
 
@@ -641,17 +557,7 @@ where
     where
         F: Fn(&mut StripBuffer),
     {
-        self.write_region_strips(
-            strip,
-            rs.px,
-            rs.py,
-            rs.pw,
-            rs.ph,
-            cmd::WRITE_RAM_RED,
-            draw,
-            rs.left_mask,
-            rs.right_mask,
-        );
+        self.write_region_strips(strip, rs.px, rs.py, rs.pw, rs.ph, cmd::WRITE_RAM_RED, draw);
     }
 
     pub fn needs_initial_refresh(&self) -> bool {
@@ -683,7 +589,7 @@ where
 
         // render each strip once and send it to both RAMs; running the
         // draw callback per plane doubled the CPU side of every full GC
-        self.write_region_strips_dual(strip, 0, 0, WIDTH, HEIGHT, draw, 0, 0);
+        self.write_region_strips_dual(strip, 0, 0, WIDTH, HEIGHT, draw);
     }
 
     /// Start a full GC refresh.
@@ -856,27 +762,16 @@ where
         // single draw pass fills both LSB (buf) and MSB (gray_buf) planes
         crate::perf_begin!(_t0);
         strip.set_gray_mode(GrayMode::GrayDual);
-        self.write_region_strips_gray_dual(
-            strip,
-            rs.px,
-            rs.py,
-            rs.pw,
-            rs.ph,
-            draw,
-            rs.left_mask,
-            rs.right_mask,
-        );
+        self.write_region_strips_gray_dual(strip, rs.px, rs.py, rs.pw, rs.ph, draw);
         strip.set_gray_mode(GrayMode::Bw);
         crate::perf_event!(
             "render",
-            "gray write_ms={} px={} py={} pw={} ph={} lmask={} rmask={}",
+            "gray write_ms={} px={} py={} pw={} ph={}",
             _t0.elapsed().as_millis(),
             rs.px,
             rs.py,
             rs.pw,
-            rs.ph,
-            rs.left_mask,
-            rs.right_mask
+            rs.ph
         );
 
         crate::perf_begin!(_t1);

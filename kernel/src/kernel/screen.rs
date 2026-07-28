@@ -21,7 +21,7 @@ use esp_hal::delay::Delay;
 use crate::board::{Epd, SCREEN_H, SCREEN_W};
 use crate::drivers::ssd1677::{HEIGHT, RenderState, WIDTH};
 use crate::drivers::strip::StripBuffer;
-use crate::ui::Region;
+use crate::ui::{AlignedRegion, Region};
 
 pub struct Screen {
     epd: Epd,
@@ -34,13 +34,13 @@ pub struct Screen {
     // against those planes would compute from an image the panel is
     // not showing, so a partial overlapping this box re-drives its own
     // region via inv_red instead
-    stale: Option<Region>,
+    stale: Option<AlignedRegion>,
 
     // bounding box of the area driven to plain BW since the last AA
     // pass. only this area needs (and may take) gray pulses: the gray
     // LUT lightens pixels the BW waveform just drove black, so pulsing
     // an area that already carries its gray drives it further off
-    fresh: Option<Region>,
+    fresh: Option<AlignedRegion>,
 
     // area whose RAM planes still hold the gray codes an AA pass
     // wrote (a subset of `stale`). those codes index the revert LUT,
@@ -49,7 +49,7 @@ pub struct Screen {
     // gave every DU transition a starting state its waveform does not
     // expect, which is what broke AA on page turns. any plane write
     // that does not end in a gray pass invalidates the box
-    gray: Option<Region>,
+    gray: Option<AlignedRegion>,
 
     // partial refreshes since the last full GC; the scheduler promotes
     // to a full clear once this reaches ghost_clear_every
@@ -68,7 +68,7 @@ pub struct Wave<'s, M> {
     rs: RenderState,
     // logical counterpart of `rs`: the area this session drives, used
     // for stale-region bookkeeping
-    region: Region,
+    region: AlignedRegion,
     hard_redrive: bool,
     _mode: PhantomData<M>,
 }
@@ -77,7 +77,7 @@ pub struct Wave<'s, M> {
 pub struct Settled<'s, M> {
     screen: &'s mut Screen,
     rs: RenderState,
-    region: Region,
+    region: AlignedRegion,
     hard_redrive: bool,
     _mode: PhantomData<M>,
 }
@@ -95,11 +95,10 @@ const FULL_RS: RenderState = RenderState {
     py: 0,
     pw: WIDTH,
     ph: HEIGHT,
-    left_mask: 0,
-    right_mask: 0,
 };
 
-const FULL_REGION: Region = Region::new(0, 0, SCREEN_W, SCREEN_H);
+const FULL_REGION: AlignedRegion =
+    AlignedRegion::from_aligned(Region::new(0, 0, SCREEN_W, SCREEN_H));
 
 impl Screen {
     pub fn new(epd: Epd, strip: &'static mut StripBuffer, delay: Delay) -> Self {
@@ -121,11 +120,11 @@ impl Screen {
 
     #[inline]
     pub fn stale_region(&self) -> Option<Region> {
-        self.stale
+        self.stale.map(AlignedRegion::get)
     }
 
     // grow the stale box to cover `r`
-    fn mark_stale(&mut self, r: Region) {
+    fn mark_stale(&mut self, r: AlignedRegion) {
         self.stale = Some(match self.stale {
             Some(s) => s.union(r),
             None => r,
@@ -137,7 +136,7 @@ impl Screen {
     // it. a partial overlap leaves the box alone: it is a bounding
     // box, not a pixel set, and shrinking it by guesswork would strand
     // gray outside the next delta DU
-    fn clear_stale_within(&mut self, r: Region) {
+    fn clear_stale_within(&mut self, r: AlignedRegion) {
         if self.stale.is_some_and(|s| r.contains(s)) {
             self.stale = None;
         }
@@ -148,7 +147,7 @@ impl Screen {
     // phase 1 wrote content planes inside `r` alone, so codes outside
     // survive); a bounding-box union could cover never-grayed area
     // whose content planes would misindex the revert LUT
-    fn set_gray_region(&mut self, r: Region) {
+    fn set_gray_region(&mut self, r: AlignedRegion) {
         self.gray = Some(match self.gray {
             Some(g) if g.contains(r) => g,
             _ => r,
@@ -159,20 +158,20 @@ impl Screen {
     // codes with content; the box can no longer be vouched for. the
     // areas outside `r` merely lose revert coverage: they stay inside
     // `stale`, so correctness falls back to the inv_red re-drive
-    fn invalidate_gray_within(&mut self, r: Region) {
+    fn invalidate_gray_within(&mut self, r: AlignedRegion) {
         if self.gray.is_some_and(|g| g.intersects(r)) {
             self.gray = None;
         }
     }
 
-    fn mark_fresh(&mut self, r: Region) {
+    fn mark_fresh(&mut self, r: AlignedRegion) {
         self.fresh = Some(match self.fresh {
             Some(f) => f.union(r),
             None => r,
         });
     }
 
-    fn clear_fresh_within(&mut self, r: Region) {
+    fn clear_fresh_within(&mut self, r: AlignedRegion) {
         if self.fresh.is_some_and(|f| r.contains(f)) {
             self.fresh = None;
         }
@@ -209,12 +208,14 @@ impl Screen {
         let Some(g) = self.gray else {
             return Ok(false);
         };
-        // both boxes are 8-aligned, so the overlap needs no edge
-        // masks; masked slop bits would hand drive states to the
-        // revert LUT
-        let Some(w) = g.intersection(region.align8()) else {
+        // the intersection of aligned regions is aligned, so the
+        // physical window cannot snap outward past the gray box onto
+        // planes holding content, which the revert LUT would misdrive
+        // (white content reads {1,1}, its drive-black state)
+        let Some(w) = g.intersection(AlignedRegion::snap(region)) else {
             return Ok(false);
         };
+        let w = w.get();
         let Some(rs) = self.epd.region_state(w.x, w.y, w.w, w.h) else {
             return Ok(false);
         };
@@ -267,22 +268,22 @@ impl Screen {
             return Err(PartialRejected::NeedsFull);
         }
 
-        let r = region.align8();
+        // snap on both axes: the physical window then carries no edge
+        // slop, and the 0-7 extra rows repaint with real content
+        // instead of the old masks parking fake white in both planes
+        let r = AlignedRegion::snap(region);
         let hard_redrive = self.stale.is_some_and(|s| s.intersects(r));
 
+        let (x, y, w, h) = {
+            let r = r.get();
+            (r.x, r.y, r.w, r.h)
+        };
         let rs = if hard_redrive {
-            self.epd.partial_phase1_bw_inv_red(
-                self.strip,
-                r.x,
-                r.y,
-                r.w,
-                r.h,
-                &mut self.delay,
-                draw,
-            )
+            self.epd
+                .partial_phase1_bw_inv_red(self.strip, x, y, w, h, &mut self.delay, draw)
         } else {
             self.epd
-                .partial_phase1_bw(self.strip, r.x, r.y, r.w, r.h, &mut self.delay, draw)
+                .partial_phase1_bw(self.strip, x, y, w, h, &mut self.delay, draw)
         }
         .ok_or(PartialRejected::Empty)?;
 
@@ -372,14 +373,8 @@ impl Screen {
         let Some(region) = self.fresh else {
             return Ok(());
         };
-        // snap outward so the physical window carries no edge masks:
-        // masked bits land in both planes, which the gray LUT reads as
-        // a drive-dark state
-        let region = region.align8_xy();
-        let Some(rs) = self
-            .epd
-            .region_state(region.x, region.y, region.w, region.h)
-        else {
+        let r = region.get();
+        let Some(rs) = self.epd.region_state(r.x, r.y, r.w, r.h) else {
             self.fresh = None;
             return Ok(());
         };
