@@ -61,14 +61,14 @@ impl Chrome {
     }
 
     /// Paint just the bottom tab bar (5 Phosphor icons).
-    pub fn draw_tabs(&self, p: &mut Painter<'_>, text_font: &BitmapFont, icon_font: &BitmapFont) {
-        self.tabs.draw(p, text_font, icon_font);
+    pub fn draw_tabs(&self, p: &mut Painter<'_>, icon_font: &BitmapFont) {
+        self.tabs.draw(p, icon_font);
     }
 
     /// Convenience: draw top and tabs in one call.
     pub fn draw(&self, p: &mut Painter<'_>, text_font: &BitmapFont, icon_font: &BitmapFont) {
         self.draw_top(p, text_font);
-        self.draw_tabs(p, text_font, icon_font);
+        self.draw_tabs(p, icon_font);
     }
 }
 
