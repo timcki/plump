@@ -321,8 +321,9 @@ impl Screen {
         self.epd.start_full_update();
         // both planes hold content the panel does not show yet; if the
         // GC completes, finish() clears the map, and if it times out
-        // the whole screen correctly stays marked for re-drive
-        self.planes.apply(FULL_REGION, SessionOutcome::Abandoned);
+        // the whole screen correctly stays marked for re-drive. gray
+        // loss is moot: the running GC wipes the panel gray anyway
+        let _ = self.planes.apply(FULL_REGION, SessionOutcome::Abandoned);
         self.pending_aa.clear();
         self.pending_aa.push(FULL_REGION);
         Wave {
@@ -367,7 +368,9 @@ impl Screen {
         F: Fn(&mut StripBuffer),
     {
         let res = self.epd.grayscale_pass(self.strip, &FULL_RS, draw).await;
-        self.planes.apply(FULL_REGION, SessionOutcome::Grayed);
+        if self.planes.apply(FULL_REGION, SessionOutcome::Grayed) {
+            self.force_ghost_clear();
+        }
         self.pending_aa.clear();
         if res.is_err() {
             self.force_ghost_clear();
@@ -392,7 +395,9 @@ impl Screen {
             let res = self.epd.grayscale_pass(self.strip, &rs, draw).await;
             // the planes were rewritten with codes before the wave
             // started, so the region is gray-coded even on timeout
-            self.planes.apply(region, SessionOutcome::Grayed);
+            if self.planes.apply(region, SessionOutcome::Grayed) {
+                self.force_ghost_clear();
+            }
             if res.is_err() {
                 self.force_ghost_clear();
                 return res;
@@ -457,16 +462,22 @@ impl Settled<'_, Du> {
         // an old skipped phase 3) survive as fragments instead of the
         // old whole-box invalidation that kept dropping revert
         // coverage after every sync
-        s.planes.apply(self.region, SessionOutcome::Synced);
+        if s.planes.apply(self.region, SessionOutcome::Synced) {
+            s.force_ghost_clear();
+        }
     }
 
     /// Skip phase 3 (content changed mid-waveform); RED RAM keeps the
     /// pre-waveform image while the panel shows the new one, so the
     /// region needs an inv_red re-drive before any delta DU.
     pub fn abandon(self) {
-        self.screen
+        if self
+            .screen
             .planes
-            .apply(self.region, SessionOutcome::Abandoned);
+            .apply(self.region, SessionOutcome::Abandoned)
+        {
+            self.screen.force_ghost_clear();
+        }
     }
 
     /// Grayscale AA pass over this refresh's region instead of phase 3.
@@ -485,7 +496,9 @@ impl Settled<'_, Du> {
     {
         let s = self.screen;
         let res = s.epd.grayscale_pass(s.strip, &self.rs, draw).await;
-        s.planes.apply(self.region, SessionOutcome::Grayed);
+        if s.planes.apply(self.region, SessionOutcome::Grayed) {
+            s.force_ghost_clear();
+        }
         // this region just took its gray; a later deferred fire over
         // a queued rect covering it would stack a second pulse
         s.pending_aa.subtract(self.region);

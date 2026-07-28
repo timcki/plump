@@ -10,11 +10,16 @@
 // over-approximate (the cost is an extra re-drive); GrayCodes must
 // never claim area whose planes hold content, because the revert LUT
 // reads white content as {1,1}, its drive-black state, so gray demotes
-// to Stale whenever exact tracking would overflow capacity
+// to Stale whenever exact tracking would overflow capacity. demotion
+// is reported to the caller: the demoted area's panel gray would be
+// re-driven open-loop (fog), so the caller promotes to a full GC
 
 use crate::ui::{AlignedRegion, Region};
 
-const CAP: usize = 8;
+// carving a scroll bbox out of a full-screen gray claim already costs
+// four fragments; sized so exact coalescing (not the lossy degrade
+// path) is what normally reclaims slots
+const CAP: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlaneState {
@@ -88,16 +93,23 @@ impl PlaneMap {
     /// by older entries, and their remainder survives as fragments
     /// (the old bounding boxes could only drop the whole claim, which
     /// is what kept losing revert coverage after every sync).
-    pub fn apply(&mut self, r: AlignedRegion, outcome: SessionOutcome) {
-        self.carve(r);
-        match outcome {
-            SessionOutcome::Synced => {}
+    ///
+    /// Returns true when gray coverage was lost to capacity. The
+    /// untracked panel gray would be re-driven open-loop on the next
+    /// partial and accumulate as fog, so the caller should promote
+    /// the next frame to a full GC instead.
+    pub fn apply(&mut self, r: AlignedRegion, outcome: SessionOutcome) -> bool {
+        let mut gray_lost = self.carve(r);
+        gray_lost |= match outcome {
+            SessionOutcome::Synced => false,
             SessionOutcome::Abandoned => self.insert(r, PlaneState::Stale),
             SessionOutcome::Grayed => self.insert(r, PlaneState::GrayCodes),
-        }
+        };
+        gray_lost
     }
 
-    fn carve(&mut self, r: AlignedRegion) {
+    fn carve(&mut self, r: AlignedRegion) -> bool {
+        let mut gray_lost = false;
         for i in 0..CAP {
             let Some((e, state)) = self.entries[i] else {
                 continue;
@@ -107,30 +119,53 @@ impl PlaneMap {
             }
             self.entries[i] = None;
             for frag in subtract_aligned(e, r).into_iter().flatten() {
-                self.insert(frag, state);
+                gray_lost |= self.insert(frag, state);
             }
         }
+        gray_lost
     }
 
-    fn insert(&mut self, r: AlignedRegion, state: PlaneState) {
+    fn insert(&mut self, r: AlignedRegion, state: PlaneState) -> bool {
         // already covered by a same-state entry: nothing new to track
         for (e, s) in self.entries.iter().flatten() {
             if *s == state && e.contains(r) {
-                return;
+                return false;
+            }
+        }
+        // fold exactly-adjacent same-state entries into `r` first:
+        // carving churns out band fragments whose unions are exact,
+        // so coalescing (not the lossy degrade path) reclaims slots
+        let mut r = r;
+        loop {
+            let mut merged = false;
+            for slot in self.entries.iter_mut() {
+                let Some((e, s)) = *slot else {
+                    continue;
+                };
+                if s == state && let Some(u) = merge_exact(e, r) {
+                    *slot = None;
+                    r = u;
+                    merged = true;
+                }
+            }
+            if !merged {
+                break;
             }
         }
         if let Some(slot) = self.entries.iter_mut().find(|s| s.is_none()) {
             *slot = Some((r, state));
-            return;
+            return false;
         }
-        self.degrade_insert(r);
+        self.degrade_insert(r, state)
     }
 
     // capacity overflow: fold `r` into a Stale entry as an
     // over-approximation. if only gray entries exist, demote one:
-    // its area falls back from revert to plain re-drive (one mottled
-    // frame), which is safe; growing a gray entry never is
-    fn degrade_insert(&mut self, r: AlignedRegion) {
+    // its area falls back from revert to plain re-drive, which keeps
+    // content correct; growing a gray entry never is safe. returns
+    // whether any gray coverage was lost
+    fn degrade_insert(&mut self, r: AlignedRegion, state: PlaneState) -> bool {
+        let gray_lost = state == PlaneState::GrayCodes;
         if let Some(entry) = self
             .entries
             .iter_mut()
@@ -138,12 +173,28 @@ impl PlaneMap {
             .find(|(_, s)| *s == PlaneState::Stale)
         {
             entry.0 = entry.0.union(r);
-            return;
+            return gray_lost;
         }
         if let Some(entry) = self.entries.iter_mut().flatten().next() {
             *entry = (entry.0.union(r), PlaneState::Stale);
+            return true;
         }
+        gray_lost
     }
+}
+
+// union of two rects when it introduces no new area: identical span
+// on one axis, touching or overlapping on the other
+fn merge_exact(a: AlignedRegion, b: AlignedRegion) -> Option<AlignedRegion> {
+    let (ar, br) = (a.get(), b.get());
+    let spans_touch = |a0: u16, al: u16, b0: u16, bl: u16| a0 <= b0 + bl && b0 <= a0 + al;
+    if ar.x == br.x && ar.w == br.w && spans_touch(ar.y, ar.h, br.y, br.h) {
+        return Some(a.union(b));
+    }
+    if ar.y == br.y && ar.h == br.h && spans_touch(ar.x, ar.w, br.x, br.w) {
+        return Some(a.union(b));
+    }
+    None
 }
 
 /// Pending deferred-AA work: rects driven to plain BW since their
@@ -171,24 +222,32 @@ impl AaQueue {
         self.entries = [None; Self::CAP];
     }
 
+    /// Queue `r` minus everything already queued. Entries stay
+    /// pairwise disjoint: each fire pulses every entry, so an overlap
+    /// (consecutive scroll marks share the previously selected row)
+    /// would pulse the shared pixels twice in one fire and drift them
+    /// dark. On overflow fragments are dropped, never widened.
     pub fn push(&mut self, r: AlignedRegion) {
+        let mut frags: [Option<AlignedRegion>; 8] = [None; 8];
+        frags[0] = Some(r);
         for e in self.entries.iter().flatten() {
-            if e.contains(r) {
-                return;
+            let mut next: [Option<AlignedRegion>; 8] = [None; 8];
+            let mut n = 0;
+            for f in frags.iter().flatten() {
+                for piece in subtract_aligned(*f, *e).into_iter().flatten() {
+                    if n < next.len() {
+                        next[n] = Some(piece);
+                        n += 1;
+                    }
+                }
+            }
+            frags = next;
+        }
+        for f in frags.into_iter().flatten() {
+            if let Some(slot) = self.entries.iter_mut().find(|s| s.is_none()) {
+                *slot = Some(f);
             }
         }
-        // absorb entries the new rect covers
-        for slot in self.entries.iter_mut() {
-            if slot.is_some_and(|e| r.contains(e)) {
-                *slot = None;
-            }
-        }
-        if let Some(slot) = self.entries.iter_mut().find(|s| s.is_none()) {
-            *slot = Some(r);
-            return;
-        }
-        // full: sacrifice one entry's AA rather than widening any rect
-        self.entries[0] = Some(r);
     }
 
     /// Remove `r` from the queue: a gray pass just covered it, so
