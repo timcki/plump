@@ -499,6 +499,25 @@ where
         }
     }
 
+    // the controller takes a moment to assert busy after
+    // MASTER_ACTIVATION; every completion path (is_busy poll,
+    // wait_for_low) reads not-yet-started as finished, which let
+    // phase 3 rewrite RAM mid-waveform and leave half-driven ghosts.
+    // block the few microseconds until the pin rises; a spin is
+    // cheaper than any wakeup at this scale, and the timeout covers
+    // a dead panel
+    fn wait_busy_rise(&mut self) {
+        use esp_hal::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_millis(5);
+        while self.busy.is_low().unwrap_or(false) {
+            if Instant::now() >= deadline {
+                log::warn!("ssd1677: busy never rose after activation");
+                return;
+            }
+        }
+    }
+
     fn send_command(&mut self, cmd: u8) {
         let _ = self.dc.set_low();
         let _ = self.spi.write(&[cmd]);
@@ -605,6 +624,7 @@ where
         self.send_data(&[ctrl2]);
 
         self.send_command(cmd::MASTER_ACTIVATION);
+        self.wait_busy_rise();
         self.power_is_on = !self.sunlight_mode;
     }
 
@@ -675,7 +695,8 @@ where
     ///     UV-induced fading between refreshes
     pub fn start_full_update(&mut self) {
         // fake a 90C panel temperature so LUT_LOAD picks the shortest
-        // OTP full-clear waveform (~600ms vs ~1.6s at room temp).
+        // OTP full-clear waveform (~1.7s measured, matching CrossPoint's
+        // 1720ms figure; the unfaked room-temp waveform runs ~2.3s).
         // TEMP_LOAD stays cleared in ctrl2 below so the controller keeps
         // this value instead of re-reading the internal sensor.
         // trick from CrossPoint Reader, proven on this exact panel
@@ -700,6 +721,7 @@ where
         self.send_data(&[ctrl2]);
 
         self.send_command(cmd::MASTER_ACTIVATION);
+        self.wait_busy_rise();
 
         // power state after waveform completes
         self.power_is_on = !self.sunlight_mode;
@@ -754,6 +776,7 @@ where
         self.send_data(&[ctrl2]);
 
         self.send_command(cmd::MASTER_ACTIVATION);
+        self.wait_busy_rise();
         self.power_is_on = !self.sunlight_mode;
     }
 
@@ -896,6 +919,7 @@ where
         self.send_data(&[ctrl2]);
 
         self.send_command(cmd::MASTER_ACTIVATION);
+        self.wait_busy_rise();
         self.power_is_on = !self.sunlight_mode;
 
         self.wait_busy_async("grayscale_revert").await
