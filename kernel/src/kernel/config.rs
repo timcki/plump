@@ -115,6 +115,12 @@ pub const DEFAULT_TEXT_ALIGNMENT: u8 = 1;
 
 const TEXT_ALIGNMENT_NAMES: &[&str] = &["Left", "Justify"];
 
+/// Alignment index -> display name; out-of-range clamps to the last.
+pub fn text_alignment_name(idx: u8) -> &'static str {
+    let i = (idx as usize).min(TEXT_ALIGNMENT_NAMES.len() - 1);
+    TEXT_ALIGNMENT_NAMES[i]
+}
+
 #[derive(Clone, Copy)]
 pub struct SystemSettings {
     // power settings
@@ -173,8 +179,7 @@ impl SystemSettings {
 
     /// Return the display name for the current text alignment.
     pub fn text_alignment_name(&self) -> &'static str {
-        let i = (self.text_alignment as usize).min(TEXT_ALIGNMENT_NAMES.len() - 1);
-        TEXT_ALIGNMENT_NAMES[i]
+        text_alignment_name(self.text_alignment)
     }
 
     pub fn sanitize(&mut self) {

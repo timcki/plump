@@ -753,7 +753,7 @@ impl AppManager {
                 self.chrome.draw_top(&mut painter, text_font);
             }
             if show_tabs {
-                self.chrome.draw_tabs(&mut painter, text_font, icon_font);
+                self.chrome.draw_tabs(&mut painter, icon_font);
             }
         }
 
