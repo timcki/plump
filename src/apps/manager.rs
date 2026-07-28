@@ -970,6 +970,19 @@ impl AppLayer for AppManager {
             // chrome top bar changed; queue a coalesced redraw so the
             // next paintable window picks it up. width spans the full
             // bar; height is the top chrome region.
+            //
+            // discriminator for the post-turn extra refresh: if this
+            // fires right after a page turn's render, the day-stat
+            // drain missed that render and the bar repaint rides its
+            // own follow-up refresh (item 15 regression via item 8's
+            // break-to-render)
+            plump_kernel::perf_event!(
+                "chrome",
+                "bar_mark pct={} pages={} mins={}",
+                battery_pct,
+                today_pages,
+                today_secs / 60
+            );
             let theme = Theme::default_v1();
             self.launcher.ctx.mark_dirty_coalesced(crate::ui::Region::new(
                 0,

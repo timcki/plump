@@ -708,6 +708,19 @@ impl super::Kernel {
                             // partial recovers the desynchronised RED RAM
                             // via inv_red
                             if app_mgr.has_redraw() || deferred.is_some() {
+                                // discriminator for the page-turn AA hunt:
+                                // any turn logging this line skipped its AA
+                                // pass because a mark landed mid-waveform
+                                crate::perf_event!(
+                                    "render",
+                                    "partial_abandon pending_redraw={} deferred={} region_x={} region_y={} region_w={} region_h={}",
+                                    app_mgr.has_redraw(),
+                                    deferred.is_some(),
+                                    r.x,
+                                    r.y,
+                                    r.w,
+                                    r.h
+                                );
                                 app_mgr.ctx_mut().mark_dirty(r);
                                 settled.abandon();
                                 // a fresh redraw is queued; cancel any
