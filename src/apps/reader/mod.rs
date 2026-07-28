@@ -60,19 +60,11 @@ pub(super) const CHROME_PAD: u16 = 2;
 const CHROME_BAR_GAP: u16 = 3;
 pub(super) const CHROME_Y: u16 = BOTTOM_BAR_Y - CHROME_H - CHROME_BAR_GAP;
 
-// reader text starts here when the user has chrome disabled (full
-// page reading) - just below the physical screen pad.
-pub(super) const TEXT_Y_NO_CHROME: u16 = SCREEN_PAD + 4;
-
-// when chrome is enabled, text starts below the shared top status
-// bar (chunk D adds it for every screen). value derived from the
-// kernel theme so the constants stay in lockstep.
-const THEME_V1: plump_kernel::ui::Theme = plump_kernel::ui::Theme::default_v1();
-pub(super) const TEXT_Y_WITH_CHROME: u16 = THEME_V1.content_top() + 4;
-
-// historical alias still used by callers that don't care about the
-// chrome / no-chrome split (loading screen position, etc).
-pub(super) const TEXT_Y: u16 = TEXT_Y_NO_CHROME;
+// reader text always starts just below the physical screen pad: the
+// shared top status bar is never shown in the reader (its per-turn
+// repaints cost a separate refresh), so the full height belongs to
+// the page. the chrome setting only affects the bottom info bar.
+pub(super) const TEXT_Y: u16 = SCREEN_PAD + 4;
 
 pub(super) const LINE_H: u16 = 20;
 
@@ -561,6 +553,8 @@ pub struct ReaderApp {
     pub(super) page_img: Option<DecodedImage>,
     pub(super) fullscreen_img: bool,
     pub(super) defer_image_decode: bool,
+    // caching-indicator update deferred out of a waveform-window step
+    cache_ui_stale: bool,
 
     pub(super) fonts: Option<fonts::FontSet>,
     pub(super) font_line_h: u16,
@@ -646,6 +640,7 @@ impl ReaderApp {
             page_img: None,
             fullscreen_img: false,
             defer_image_decode: false,
+            cache_ui_stale: false,
 
             fonts: None,
             font_line_h: LINE_H,
@@ -743,15 +738,9 @@ impl ReaderApp {
     fn apply_theme_layout(&mut self) {
         let theme = crate::kernel::config::ReadingTheme::from_idx(self.reading_theme_idx);
         self.text_margin = theme.margin_h;
-        // when chrome is on, text starts below the shared top status
-        // bar drawn by the manager; when off, it goes near the top
-        // edge for a full-page reading experience.
-        let top = if self.show_chrome {
-            TEXT_Y_WITH_CHROME
-        } else {
-            TEXT_Y_NO_CHROME
-        };
-        self.text_y = top + theme.margin_v;
+        // no top status bar in the reader; text always starts at the
+        // top edge, chrome only reserves the bottom info bar
+        self.text_y = TEXT_Y + theme.margin_v;
         self.text_w = (SCREEN_W - 2 * self.text_margin) as u32;
         let bottom = if self.show_chrome {
             CHROME_Y - CHROME_PAD
@@ -1495,6 +1484,7 @@ impl ReaderApp {
         self.error = None;
         self.show_position = false;
         self.defer_image_decode = true;
+        self.cache_ui_stale = false;
         self.goto_last_page = false;
         self.recent_dirty = false;
         self.pending_position_change = Some(PendingPositionChange::RestoreReady);
@@ -1893,6 +1883,7 @@ impl App<AppId> for ReaderApp {
         self.error = None;
         self.show_position = false;
         self.defer_image_decode = true;
+        self.cache_ui_stale = false;
         self.goto_last_page = false;
         self.restore_offset = None;
         self.restore_page_hint = None;
@@ -2090,13 +2081,22 @@ impl App<AppId> for ReaderApp {
         &mut self,
         ctx: &mut AppContext,
         k: &mut KernelHandle<'_>,
-        _budget: BgBudget,
+        budget: BgBudget,
     ) -> BgOutcome {
-        // drain every pass so the chrome bar picks up this turn's page
-        // delta before the same pass renders; when this only happened
-        // in the deferred flush (gated to no-redraw windows) the bar
-        // repainted seconds later as a separate refresh
+        // drain every pass so the stats stay current no matter which
+        // pass flushes them
         self.drain_day_stats(k);
+
+        // apply a caching-indicator update that was held back during
+        // a waveform-window step
+        if self.cache_ui_stale && budget.allows_repaint() {
+            self.cache_ui_stale = false;
+            if self.epub.bg_cache == BgCacheState::Idle {
+                ctx.clear_loading();
+            } else {
+                self.set_cache_loading(ctx);
+            }
+        }
 
         // Phase 1: Open pipeline (NeedBookmark..NeedPage)
         // Each state does ONE step and returns Progress { more: true }
@@ -2550,8 +2550,19 @@ impl App<AppId> for ReaderApp {
             State::Ready | State::ShowToc | State::NeedIndex | State::NeedPage
         ) && self.epub.bg_cache != BgCacheState::Idle
         {
+            // indicator repaints are held back during waveform-window
+            // steps: the mark would force the closing phase to abandon
+            // and re-drive the whole region (serial signature:
+            // partial_abandon right after a chapter-cross turn). the
+            // deferred paint lands via cache_ui_stale on the next
+            // permissive step
+            let can_paint = budget.allows_repaint();
             if !ctx.loading_active() {
-                self.set_cache_loading(ctx);
+                if can_paint {
+                    self.set_cache_loading(ctx);
+                } else {
+                    self.cache_ui_stale = true;
+                }
             }
             let prev_count = self.cached_chapter_count();
             let prev_bg = self.epub.bg_cache;
@@ -2560,20 +2571,29 @@ impl App<AppId> for ReaderApp {
             let prev_pct = self.cache_loading_pct();
             let outcome = self.bg_cache_step_sync(k);
             if self.epub.bg_cache == BgCacheState::Idle {
-                ctx.clear_loading();
+                if can_paint {
+                    ctx.clear_loading();
+                    self.cache_ui_stale = false;
+                } else {
+                    self.cache_ui_stale = true;
+                }
             } else if self.cached_chapter_count() != prev_count
                 || self.epub.bg_cache != prev_bg
                 || self.epub.img_found_count != prev_img_found
                 || self.epub.img_cached_count != prev_img_cached
             {
                 // with the page visible, every indicator repaint costs a
-                // DU refresh (and risks an abandoned phase 3 when the
-                // mark lands mid-waveform), so throttle to 10% steps;
-                // the loading screen keeps per-chapter granularity
+                // DU refresh, so throttle to 10% steps; the loading
+                // screen keeps per-chapter granularity
                 if self.shows_loading_screen()
                     || self.cache_loading_pct() / 10 != prev_pct / 10
                 {
-                    self.set_cache_loading(ctx);
+                    if can_paint {
+                        self.set_cache_loading(ctx);
+                        self.cache_ui_stale = false;
+                    } else {
+                        self.cache_ui_stale = true;
+                    }
                 }
             }
             return outcome;
@@ -2817,13 +2837,13 @@ impl App<AppId> for ReaderApp {
         true
     }
 
-    /// Reader shows the shared top status bar (same today / battery
-    /// line as the tab screens) when the user's "show chrome" setting
-    /// is on, and paints its own progress footer in place of the tab
-    /// bar via `draw`. Returns false during loading / TOC / non-Ready
-    /// states so the loading screen renders edge-to-edge.
+    /// The reader never shows the shared top status bar: its stat
+    /// fields change with every page turn, so each turn used to pay a
+    /// separate bar refresh (DU + gray pass) right after the page
+    /// settled. The "show chrome" setting still controls the reader's
+    /// own bottom info bar.
     fn show_top_status(&self) -> bool {
-        self.show_chrome && matches!(self.state, State::Ready | State::ShowToc)
+        false
     }
 
     fn show_tab_bar(&self) -> bool {
