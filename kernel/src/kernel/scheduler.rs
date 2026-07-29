@@ -654,7 +654,7 @@ impl super::Kernel {
 
         'render: {
             if let Redraw::Partial(r) = redraw {
-                if screen.partials_since_clear() < app_mgr.ghost_clear_every() {
+                if !screen.ghost_clear_due(app_mgr.ghost_clear_every()) {
                     // the plan picks bw vs inv_red from its own plane
                     // state: a region overlapping gray left by an AA
                     // pass comes back RevertFirst, whose only path to

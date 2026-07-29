@@ -1,24 +1,33 @@
 // SSD1677 e-paper driver (board-independent)
 // tested on GDEQ0426T82 (800x480), no framebuffer, strip-streamed
 //
-// partial refresh (3-phase):
-//   phase1_bw    -- write new content to BW RAM
-//   start_du     -- kick DU waveform; caller polls input while BUSY
-//   phase3_sync  -- sync RED to BW; skipped on rapid nav (red_stale)
+// a refresh is a linear sequence, enforced by driver-minted tokens
+// whose fields are private to this module:
+//
+//   phase1_bw / phase1_bw_inv_red / write_full_frame -> FrameWritten
+//   partial_start_du / start_full_update(FrameWritten) -> Driven
+//   partial_phase3_sync(&Driven) / finish_full_update(Driven)
+//   grayscale_pass(&Window)  -- Window from region_state or Driven
+//
+// no caller can kick a waveform over a window it never wrote, or run
+// a closing phase for a waveform that never started. which closer a
+// given session is allowed (phase 3 vs finish vs a gray pass) is the
+// session layer's business, see kernel/screen.rs
 //
 // when phase3 is skipped, phase1_bw_inv_red writes RED=!BW so DU
 // drives every pixel to the correct BW target without a full GC
 //
 // panel power is latched on across refreshes (crosspoint-style):
-// each start path adds CLOCK_ON + ANALOG_ON only when power is off,
-// and nothing powers down until deep sleep. sunlight mode overrides
-// this with ANALOG_OFF + CLOCK_OFF on every waveform
+// `kick` adds CLOCK_ON + ANALOG_ON only when power is actually off,
+// and nothing powers down until deep sleep. the OffAfterRefresh power
+// policy (sunlight mode) overrides this with ANALOG_OFF + CLOCK_OFF
+// on every waveform
 
 use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
 use esp_hal::delay::Delay;
 
-use super::strip::{GrayMode, StripBuffer};
+use super::strip::StripBuffer;
 
 pub const WIDTH: u16 = 800;
 pub const HEIGHT: u16 = 480;
@@ -50,6 +59,23 @@ mod cmd {
     pub const SET_RAM_Y_RANGE: u8 = 0x45;
     pub const SET_RAM_X_COUNTER: u8 = 0x4E;
     pub const SET_RAM_Y_COUNTER: u8 = 0x4F;
+}
+
+// DISPLAY_UPDATE_CONTROL_2 bits. the base byte of a waveform selects
+// what the activation runs; `kick` ors in the power bits
+mod ctrl2 {
+    /// Power-up bits, added only when the panel is actually off.
+    pub const POWER_ON: u8 = 0xC0; // CLOCK_ON + ANALOG_ON
+    /// Power-down-after-refresh bits, added under the sunlight policy.
+    pub const POWER_OFF: u8 = 0x03; // ANALOG_OFF + CLOCK_OFF
+
+    /// TEMP_LOAD + LUT_LOAD + mode + DISPLAY_START: the partial DU.
+    pub const DU: u8 = 0x3C;
+    /// LUT_LOAD + DISPLAY_START, no TEMP_LOAD so the faked temperature
+    /// written just before survives into the OTP LUT pick.
+    pub const FULL: u8 = 0x14;
+    /// DISPLAY_START only: run the custom LUT already loaded.
+    pub const CUSTOM_LUT: u8 = 0x0C;
 }
 
 /// Custom waveform LUT for 4-level grayscale rendering.
@@ -132,12 +158,132 @@ static LUT_GRAYSCALE_REVERT: [u8; 112] = [
 /// of parking mask slop bits at 1 in both planes (which erased up to
 /// 7 rows of the neighbouring content on every unaligned partial) is
 /// gone with the masks.
+///
+/// The fields are private: a window only comes from
+/// [`DisplayDriver::region_state`] or out of a session token, so it
+/// always describes an area the driver itself aligned.
 #[derive(Clone, Copy, Debug)]
-pub struct RenderState {
-    pub px: u16,
-    pub py: u16,
-    pub pw: u16,
-    pub ph: u16,
+pub(crate) struct Window {
+    px: u16,
+    py: u16,
+    pw: u16,
+    ph: u16,
+}
+
+impl Window {
+    /// The whole panel.
+    pub(crate) const FULL: Window = Window {
+        px: 0,
+        py: 0,
+        pw: WIDTH,
+        ph: HEIGHT,
+    };
+}
+
+/// Proof that RAM holds this window's new content.
+///
+/// Minted only by the phase-1 writers and
+/// [`DisplayDriver::write_full_frame`], and moved into a waveform
+/// starter, so no waveform can be kicked over a window nobody wrote.
+pub(crate) struct FrameWritten(Window);
+
+/// Proof that a waveform was activated over this window.
+///
+/// Minted only by the starters, and required by every closing phase,
+/// so phase 3 (or a gray pass standing in for it) cannot run before
+/// phase 1 and its kick.
+pub(crate) struct Driven(Window);
+
+impl Driven {
+    /// The window this waveform drove, for a pass that follows it.
+    #[inline]
+    pub(crate) fn window(&self) -> Window {
+        self.0
+    }
+}
+
+/// Outcome of a phase-1 write.
+pub(crate) enum Phase1 {
+    /// RAM holds the new content; kick the waveform.
+    Written(FrameWritten),
+    /// The region aligned to an empty window; nothing to refresh.
+    EmptyWindow,
+    /// The panel has never taken a full GC, so a DU has no defined
+    /// starting state; run a full refresh instead.
+    NeedsFullFirst,
+}
+
+/// Which controller planes a strip feeds.
+#[derive(Clone, Copy)]
+enum PlaneWrite {
+    /// One plane, content as drawn. Streams the whole window as a
+    /// single RAM command instead of re-addressing per strip.
+    Single(u8),
+    /// The same strip into both planes (full frame).
+    DualSame,
+    /// BW takes the content, RED its inverse (delta-free re-drive).
+    BwInvRed,
+    /// Gray dual-plane: LSB -> BW RAM, MSB -> RED RAM.
+    GrayDual,
+}
+
+/// Whether the controller registers are programmed, and whether the
+/// panel has ever taken a full GC (a DU has no defined starting state
+/// until it has). Deep sleep drops the registers but not the image,
+/// so `ever_gc` survives it.
+#[derive(Clone, Copy)]
+enum PanelLife {
+    Asleep { ever_gc: bool },
+    Inited { ever_gc: bool },
+}
+
+impl PanelLife {
+    #[inline]
+    fn ever_gc(self) -> bool {
+        match self {
+            PanelLife::Asleep { ever_gc } | PanelLife::Inited { ever_gc } => ever_gc,
+        }
+    }
+
+    #[inline]
+    fn is_inited(self) -> bool {
+        matches!(self, PanelLife::Inited { .. })
+    }
+
+    #[inline]
+    fn inited(&mut self) {
+        *self = PanelLife::Inited {
+            ever_gc: self.ever_gc(),
+        };
+    }
+
+    #[inline]
+    fn slept(&mut self) {
+        *self = PanelLife::Asleep {
+            ever_gc: self.ever_gc(),
+        };
+    }
+
+    #[inline]
+    fn gc_done(&mut self) {
+        *self = PanelLife::Inited { ever_gc: true };
+    }
+}
+
+/// What the panel does with its analog rails after a waveform.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PowerPolicy {
+    /// Leave them up: the next refresh skips the ~100ms booster start.
+    Latch,
+    /// Drop them every refresh; prevents UV-induced fading on
+    /// white-bezel X4 models.
+    OffAfterRefresh,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PanelPower {
+    Off,
+    On,
 }
 
 pub struct DisplayDriver<SPI, DC, RST, BUSY> {
@@ -145,10 +291,9 @@ pub struct DisplayDriver<SPI, DC, RST, BUSY> {
     dc: DC,
     rst: RST,
     busy: BUSY,
-    power_is_on: bool,
-    init_done: bool,
-    initial_refresh: bool,
-    sunlight_mode: bool,
+    power: PanelPower,
+    policy: PowerPolicy,
+    life: PanelLife,
 }
 
 impl<SPI, DC, RST, BUSY, E> DisplayDriver<SPI, DC, RST, BUSY>
@@ -164,14 +309,13 @@ where
             dc,
             rst,
             busy,
-            power_is_on: false,
-            init_done: false,
-            initial_refresh: true,
-            sunlight_mode: false,
+            power: PanelPower::Off,
+            policy: PowerPolicy::Latch,
+            life: PanelLife::Asleep { ever_gc: false },
         }
     }
 
-    pub fn reset(&mut self, delay: &mut Delay) {
+    fn reset(&mut self, delay: &mut Delay) {
         let _ = self.rst.set_high();
         delay.delay_millis(20);
         let _ = self.rst.set_low();
@@ -185,47 +329,28 @@ where
         self.init_display(delay);
     }
 
-    #[allow(clippy::too_many_arguments)]
+    // one strip loop for every plane layout: the shell (window walk,
+    // begin_window, draw callback) is identical, only the per-strip
+    // plane sends differ. the match monomorphizes into the loop
     fn write_region_strips<F>(
         &mut self,
         strip: &mut StripBuffer,
-        px: u16,
-        py: u16,
-        pw: u16,
-        ph: u16,
-        ram_cmd: u8,
+        win: &Window,
+        planes: PlaneWrite,
         draw: &F,
     ) where
         F: Fn(&mut StripBuffer),
     {
+        let Window { px, py, pw, ph } = *win;
         let max_rows = StripBuffer::max_rows_for_width(pw);
 
-        self.set_partial_ram_area(px, py, pw, ph);
-        self.send_command(ram_cmd);
-
-        let mut y = py;
-        while y < py + ph {
-            let rows = max_rows.min(py + ph - y);
-            strip.begin_window(px, y, pw, rows);
-            draw(strip);
-            self.send_data(strip.data());
-            y += rows;
+        // a single plane streams as one continuous window: address the
+        // RAM and send the write command once, then push every strip
+        // back to back
+        if let PlaneWrite::Single(ram_cmd) = planes {
+            self.set_partial_ram_area(px, py, pw, ph);
+            self.send_command(ram_cmd);
         }
-    }
-
-    // write BW RAM with content, RED RAM with inverted content
-    fn write_region_strips_bw_inv_red<F>(
-        &mut self,
-        strip: &mut StripBuffer,
-        px: u16,
-        py: u16,
-        pw: u16,
-        ph: u16,
-        draw: &F,
-    ) where
-        F: Fn(&mut StripBuffer),
-    {
-        let max_rows = StripBuffer::max_rows_for_width(pw);
 
         let mut y = py;
         while y < py + ph {
@@ -233,87 +358,48 @@ where
             strip.begin_window(px, y, pw, rows);
             draw(strip);
 
-            self.set_partial_ram_area(px, y, pw, rows);
-            self.send_command(cmd::WRITE_RAM_BW);
-            self.send_data(strip.data());
+            match planes {
+                PlaneWrite::Single(_) => self.send_data(strip.data()),
+                PlaneWrite::DualSame => {
+                    // send the same rendered strip to both RAMs directly;
+                    // no replay copy needed since send_data only reads
+                    // the buffer
+                    for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
+                        self.set_partial_ram_area(px, y, pw, rows);
+                        self.send_command(ram_cmd);
+                        self.send_data(strip.data());
+                    }
+                }
+                PlaneWrite::BwInvRed => {
+                    self.set_partial_ram_area(px, y, pw, rows);
+                    self.send_command(cmd::WRITE_RAM_BW);
+                    self.send_data(strip.data());
 
-            // invert in place for the RED plane and send it as one DMA
-            // transfer; safe because this strip's contents are dead
-            // after the RED send (the next iteration's begin_window
-            // refills the buffer). replaces ~62 64-byte transactions
-            // with per-byte row math per strip
-            for b in strip.data_mut().iter_mut() {
-                *b = !*b;
+                    // invert in place for the RED plane and send it as
+                    // one DMA transfer; safe because this strip's
+                    // contents are dead after the RED send (the next
+                    // iteration's begin_window refills the buffer).
+                    // replaces ~62 64-byte transactions with per-byte
+                    // row math per strip
+                    for b in strip.data_mut().iter_mut() {
+                        *b = !*b;
+                    }
+                    self.set_partial_ram_area(px, y, pw, rows);
+                    self.send_command(cmd::WRITE_RAM_RED);
+                    self.send_data(strip.data());
+                }
+                PlaneWrite::GrayDual => {
+                    // LSB plane → BW RAM
+                    self.set_partial_ram_area(px, y, pw, rows);
+                    self.send_command(cmd::WRITE_RAM_BW);
+                    self.send_data(strip.data());
+
+                    // MSB plane → RED RAM
+                    self.set_partial_ram_area(px, y, pw, rows);
+                    self.send_command(cmd::WRITE_RAM_RED);
+                    self.send_data(strip.gray_data());
+                }
             }
-            self.set_partial_ram_area(px, y, pw, rows);
-            self.send_command(cmd::WRITE_RAM_RED);
-            self.send_data(strip.data());
-
-            y += rows;
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn write_region_strips_dual<F>(
-        &mut self,
-        strip: &mut StripBuffer,
-        px: u16,
-        py: u16,
-        pw: u16,
-        ph: u16,
-        draw: &F,
-    ) where
-        F: Fn(&mut StripBuffer),
-    {
-        let max_rows = StripBuffer::max_rows_for_width(pw);
-
-        let mut y = py;
-        while y < py + ph {
-            let rows = max_rows.min(py + ph - y);
-            strip.begin_window(px, y, pw, rows);
-            draw(strip);
-
-            // send the same rendered strip to both RAMs directly;
-            // no replay copy needed since send_data only reads the buffer
-            for &ram_cmd in &[cmd::WRITE_RAM_RED, cmd::WRITE_RAM_BW] {
-                self.set_partial_ram_area(px, y, pw, rows);
-                self.send_command(ram_cmd);
-                self.send_data(strip.data());
-            }
-
-            y += rows;
-        }
-    }
-
-    // draw once per strip in GrayDual mode, send LSB → BW RAM and MSB → RED RAM
-    fn write_region_strips_gray_dual<F>(
-        &mut self,
-        strip: &mut StripBuffer,
-        px: u16,
-        py: u16,
-        pw: u16,
-        ph: u16,
-        draw: &F,
-    ) where
-        F: Fn(&mut StripBuffer),
-    {
-        let max_rows = StripBuffer::max_rows_for_width(pw);
-
-        let mut y = py;
-        while y < py + ph {
-            let rows = max_rows.min(py + ph - y);
-            strip.begin_window(px, y, pw, rows);
-            draw(strip);
-
-            // LSB plane → BW RAM
-            self.set_partial_ram_area(px, y, pw, rows);
-            self.send_command(cmd::WRITE_RAM_BW);
-            self.send_data(strip.data());
-
-            // MSB plane → RED RAM
-            self.set_partial_ram_area(px, y, pw, rows);
-            self.send_command(cmd::WRITE_RAM_RED);
-            self.send_data(strip.gray_data());
 
             y += rows;
         }
@@ -342,7 +428,16 @@ where
 
         self.set_partial_ram_area(0, 0, WIDTH, HEIGHT);
 
-        self.init_done = true;
+        self.life.inited();
+    }
+
+    // every write path starts here: the controller loses its registers
+    // over deep sleep, so the first access after a wake reprograms them
+    #[inline]
+    fn ensure_inited(&mut self, delay: &mut Delay) {
+        if !self.life.is_inited() {
+            self.init_display(delay);
+        }
     }
 
     fn transform_region(&self, x: u16, y: u16, w: u16, h: u16) -> (u16, u16, u16, u16) {
@@ -353,7 +448,7 @@ where
     // axes, so after the rotation transform the physical window is
     // already byte-aligned; the outward snap here is a no-op kept as a
     // guard against an unsnapped caller
-    fn align_partial_region(&self, x: u16, y: u16, w: u16, h: u16) -> Option<RenderState> {
+    fn align_partial_region(&self, x: u16, y: u16, w: u16, h: u16) -> Option<Window> {
         let (tx, ty, tw, th) = self.transform_region(x, y, w, h);
 
         let px = (tx & !7).min(WIDTH);
@@ -365,7 +460,7 @@ where
             return None;
         }
 
-        Some(RenderState { px, py, pw, ph })
+        Some(Window { px, py, pw, ph })
     }
 
     // gates wired in reverse; Y flipped, X inc / Y dec.
@@ -447,8 +542,36 @@ where
         let _ = self.spi.write(data);
     }
 
+    // single source of the power-latch policy: assemble CTRL2 from the
+    // waveform's base byte, activate, block until the controller
+    // asserts busy, then record where the rails end up. panel power is
+    // latched between refreshes, so adding the power-up bits only when
+    // it is actually off skips the ~100ms booster start inside the
+    // waveform on every subsequent page turn
+    fn kick(&mut self, base_ctrl2: u8) {
+        let mut c = base_ctrl2;
+        if self.power == PanelPower::Off {
+            c |= ctrl2::POWER_ON;
+        }
+        if self.policy == PowerPolicy::OffAfterRefresh {
+            c |= ctrl2::POWER_OFF;
+        }
+
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
+        self.send_data(&[c]);
+
+        self.send_command(cmd::MASTER_ACTIVATION);
+        self.wait_busy_rise();
+
+        // state the rails are in once the waveform completes
+        self.power = match self.policy {
+            PowerPolicy::Latch => PanelPower::On,
+            PowerPolicy::OffAfterRefresh => PanelPower::Off,
+        };
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub fn partial_phase1_bw<F>(
+    pub(crate) fn partial_phase1_bw<F>(
         &mut self,
         strip: &mut StripBuffer,
         x: u16,
@@ -457,24 +580,24 @@ where
         h: u16,
         delay: &mut Delay,
         draw: &F,
-    ) -> Option<RenderState>
+    ) -> Phase1
     where
         F: Fn(&mut StripBuffer),
     {
-        if self.initial_refresh {
-            return None;
-        }
-        if !self.init_done {
-            self.init_display(delay);
-        }
-
-        let rs = self.align_partial_region(x, y, w, h)?;
-        self.write_region_strips(strip, rs.px, rs.py, rs.pw, rs.ph, cmd::WRITE_RAM_BW, draw);
-        Some(rs)
+        self.begin_phase1(
+            strip,
+            x,
+            y,
+            w,
+            h,
+            delay,
+            PlaneWrite::Single(cmd::WRITE_RAM_BW),
+            draw,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn partial_phase1_bw_inv_red<F>(
+    pub(crate) fn partial_phase1_bw_inv_red<F>(
         &mut self,
         strip: &mut StripBuffer,
         x: u16,
@@ -483,52 +606,53 @@ where
         h: u16,
         delay: &mut Delay,
         draw: &F,
-    ) -> Option<RenderState>
+    ) -> Phase1
     where
         F: Fn(&mut StripBuffer),
     {
-        if self.initial_refresh {
-            return None;
-        }
-        if !self.init_done {
-            self.init_display(delay);
-        }
-
-        let rs = self.align_partial_region(x, y, w, h)?;
-        self.write_region_strips_bw_inv_red(strip, rs.px, rs.py, rs.pw, rs.ph, draw);
-        Some(rs)
+        self.begin_phase1(strip, x, y, w, h, delay, PlaneWrite::BwInvRed, draw)
     }
 
-    pub fn partial_start_du(&mut self, rs: &RenderState) {
-        self.set_partial_ram_area(rs.px, rs.py, rs.pw, rs.ph);
+    #[allow(clippy::too_many_arguments)]
+    fn begin_phase1<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        delay: &mut Delay,
+        planes: PlaneWrite,
+        draw: &F,
+    ) -> Phase1
+    where
+        F: Fn(&mut StripBuffer),
+    {
+        if !self.life.ever_gc() {
+            return Phase1::NeedsFullFirst;
+        }
+        self.ensure_inited(delay);
+
+        let Some(win) = self.align_partial_region(x, y, w, h) else {
+            return Phase1::EmptyWindow;
+        };
+        self.write_region_strips(strip, &win, planes, draw);
+        Phase1::Written(FrameWritten(win))
+    }
+
+    pub(crate) fn partial_start_du(&mut self, written: FrameWritten) -> Driven {
+        let FrameWritten(win) = written;
+        self.set_partial_ram_area(win.px, win.py, win.pw, win.ph);
 
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x00, 0x00]);
 
-        // core: TEMP_LOAD + LUT_LOAD + mode + DISPLAY_START. panel power
-        // is latched between refreshes; adding CLOCK_ON + ANALOG_ON only
-        // when it is actually off skips the ~100ms booster start inside
-        // the waveform on every subsequent page turn
-        let mut ctrl2: u8 = 0x3C;
-
-        if !self.power_is_on {
-            ctrl2 |= 0xC0; // CLOCK_ON + ANALOG_ON
-        }
-
-        if self.sunlight_mode {
-            ctrl2 |= 0x03; // ANALOG_OFF + CLOCK_OFF after refresh
-        }
-
-        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
-        self.send_data(&[ctrl2]);
-
-        self.send_command(cmd::MASTER_ACTIVATION);
-        self.wait_busy_rise();
-        self.power_is_on = !self.sunlight_mode;
+        self.kick(ctrl2::DU);
+        Driven(win)
     }
 
     #[inline]
-    pub fn is_busy(&mut self) -> bool {
+    pub(crate) fn is_busy(&mut self) -> bool {
         self.busy.is_high().unwrap_or(false)
     }
 
@@ -536,58 +660,71 @@ where
     // current content into BW RAM (a gray pass replaces phase 3
     // entirely, never precedes it), so rewriting BW here would halve
     // throughput for nothing
-    pub fn partial_phase3_sync<F>(&mut self, strip: &mut StripBuffer, rs: &RenderState, draw: &F)
-    where
+    pub(crate) fn partial_phase3_sync<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        driven: &Driven,
+        draw: &F,
+    ) where
         F: Fn(&mut StripBuffer),
     {
-        self.write_region_strips(strip, rs.px, rs.py, rs.pw, rs.ph, cmd::WRITE_RAM_RED, draw);
+        self.write_region_strips(
+            strip,
+            &driven.0,
+            PlaneWrite::Single(cmd::WRITE_RAM_RED),
+            draw,
+        );
     }
 
-    pub fn needs_initial_refresh(&self) -> bool {
-        self.initial_refresh
+    pub(crate) fn needs_initial_refresh(&self) -> bool {
+        !self.life.ever_gc()
     }
 
     /// Physical window for a logical region, for callers that drive a
     /// waveform over an area they did not just write (the deferred AA
     /// pass over everything refreshed since the last one).
-    pub fn region_state(&self, x: u16, y: u16, w: u16, h: u16) -> Option<RenderState> {
+    pub(crate) fn region_state(&self, x: u16, y: u16, w: u16, h: u16) -> Option<Window> {
         self.align_partial_region(x, y, w, h)
     }
 
     /// Power off analog drivers after each partial refresh to prevent
     /// sunlight-induced fading on white-bezel X4 models.
-    pub fn set_sunlight_mode(&mut self, enabled: bool) {
-        self.sunlight_mode = enabled;
+    pub(crate) fn set_sunlight_mode(&mut self, enabled: bool) {
+        self.policy = if enabled {
+            PowerPolicy::OffAfterRefresh
+        } else {
+            PowerPolicy::Latch
+        };
     }
 
-    pub fn write_full_frame<F>(&mut self, strip: &mut StripBuffer, delay: &mut Delay, draw: &F)
+    pub(crate) fn write_full_frame<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        delay: &mut Delay,
+        draw: &F,
+    ) -> FrameWritten
     where
         F: Fn(&mut StripBuffer),
     {
-        if !self.init_done {
-            self.init_display(delay);
-        }
+        self.ensure_inited(delay);
 
         delay.delay_millis(1);
 
         // render each strip once and send it to both RAMs; running the
         // draw callback per plane doubled the CPU side of every full GC
-        self.write_region_strips_dual(strip, 0, 0, WIDTH, HEIGHT, draw);
+        self.write_region_strips(strip, &Window::FULL, PlaneWrite::DualSame, draw);
+        FrameWritten(Window::FULL)
     }
 
-    /// Start a full GC refresh.
-    ///
-    /// Builds the CTRL2 byte dynamically:
-    ///   - skips CLOCK_ON + ANALOG_ON when power is already on (avoids
-    ///     booster re-start transient that causes extra visible flashes)
-    ///   - adds ANALOG_OFF + CLOCK_OFF in sunlight mode to prevent
-    ///     UV-induced fading between refreshes
-    pub fn start_full_update(&mut self) {
+    /// Start a full GC refresh over the frame just written.
+    pub(crate) fn start_full_update(&mut self, written: FrameWritten) -> Driven {
+        let FrameWritten(win) = written;
+
         // fake a 90C panel temperature so LUT_LOAD picks the shortest
         // OTP full-clear waveform (~1.7s measured, matching CrossPoint's
         // 1720ms figure; the unfaked room-temp waveform runs ~2.3s).
-        // TEMP_LOAD stays cleared in ctrl2 below so the controller keeps
-        // this value instead of re-reading the internal sensor.
+        // TEMP_LOAD stays cleared in the base byte so the controller
+        // keeps this value instead of re-reading the internal sensor.
         // trick from CrossPoint Reader, proven on this exact panel
         self.send_command(cmd::WRITE_TEMP_REGISTER);
         self.send_data(&[0x5A]);
@@ -595,29 +732,15 @@ where
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x40, 0x00]);
 
-        // core: LUT_LOAD + DISPLAY_START (no TEMP_LOAD, keeps faked temp)
-        let mut ctrl2: u8 = 0x14;
-
-        if !self.power_is_on {
-            ctrl2 |= 0xC0; // CLOCK_ON + ANALOG_ON
-        }
-
-        if self.sunlight_mode {
-            ctrl2 |= 0x03; // ANALOG_OFF + CLOCK_OFF after refresh
-        }
-
-        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
-        self.send_data(&[ctrl2]);
-
-        self.send_command(cmd::MASTER_ACTIVATION);
-        self.wait_busy_rise();
-
-        // power state after waveform completes
-        self.power_is_on = !self.sunlight_mode;
+        self.kick(ctrl2::FULL);
+        Driven(win)
     }
 
-    pub fn finish_full_update(&mut self) {
-        self.initial_refresh = false;
+    /// Close out a full GC: the panel now has a defined bimodal state,
+    /// so partial DUs are allowed from here on.
+    pub(crate) fn finish_full_update(&mut self, driven: Driven) {
+        let Driven(_) = driven;
+        self.life.gc_done();
     }
 
     /// Load a custom LUT waveform into the SSD1677.
@@ -641,47 +764,29 @@ where
 
     /// Start a grayscale refresh using the custom LUT.
     /// Call after LSB plane → BW RAM and MSB plane → RED RAM are written.
-    fn start_grayscale_refresh(&mut self, rs: &RenderState) {
+    fn start_grayscale_refresh(&mut self, win: &Window) {
         self.load_custom_lut(&LUT_GRAYSCALE);
-        self.set_partial_ram_area(rs.px, rs.py, rs.pw, rs.ph);
+        self.set_partial_ram_area(win.px, win.py, win.pw, win.ph);
 
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x00, 0x00]);
 
-        // core: display using the custom LUT (no LUT_LOAD). power stays
-        // latched like the other refresh paths unless sunlight mode
-        // demands an off-after-refresh
-        let mut ctrl2: u8 = 0x0C;
-
-        if !self.power_is_on {
-            ctrl2 |= 0xC0; // CLOCK_ON + ANALOG_ON
-        }
-
-        if self.sunlight_mode {
-            ctrl2 |= 0x03; // ANALOG_OFF + CLOCK_OFF after refresh
-        }
-
-        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
-        self.send_data(&[ctrl2]);
-
-        self.send_command(cmd::MASTER_ACTIVATION);
-        self.wait_busy_rise();
-        self.power_is_on = !self.sunlight_mode;
+        self.kick(ctrl2::CUSTOM_LUT);
     }
 
     // mode 1: image retained, ~3 uA; requires hw reset to wake
-    pub fn enter_deep_sleep(&mut self) {
-        if self.power_is_on {
+    pub(crate) fn enter_deep_sleep(&mut self) {
+        if self.power == PanelPower::On {
             self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
             self.send_data(&[0x83]);
             self.send_command(cmd::MASTER_ACTIVATION);
             self.wait_busy(POWER_OFF_TIME_MS);
-            self.power_is_on = false;
+            self.power = PanelPower::Off;
         }
 
         self.send_command(cmd::DEEP_SLEEP);
         self.send_data(&[0x01]);
-        self.init_done = false;
+        self.life.slept();
     }
 }
 
@@ -692,7 +797,7 @@ where
     RST: OutputPin,
     BUSY: InputPin + embedded_hal_async::digital::Wait,
 {
-    pub fn busy_pin(&mut self) -> &mut BUSY {
+    pub(crate) fn busy_pin(&mut self) -> &mut BUSY {
         &mut self.busy
     }
 
@@ -733,32 +838,34 @@ where
     ///
     /// On timeout the caller must force a full GC on the next refresh
     /// to bring panel and planes back in sync.
-    pub async fn grayscale_pass<F>(
+    pub(crate) async fn grayscale_pass<F>(
         &mut self,
         strip: &mut StripBuffer,
-        rs: &RenderState,
+        win: &Window,
         draw: &F,
     ) -> Result<(), embassy_time::TimeoutError>
     where
         F: Fn(&mut StripBuffer),
     {
-        // single draw pass fills both LSB (buf) and MSB (gray_buf) planes
+        // single draw pass fills both LSB (buf) and MSB (gray_buf)
+        // planes; the bracket owns the restore so a later BW frame
+        // cannot inherit the gray polarity
         crate::perf_begin!(_t0);
-        strip.set_gray_mode(GrayMode::GrayDual);
-        self.write_region_strips_gray_dual(strip, rs.px, rs.py, rs.pw, rs.ph, draw);
-        strip.set_gray_mode(GrayMode::Bw);
+        strip.with_gray_dual(|strip| {
+            self.write_region_strips(strip, win, PlaneWrite::GrayDual, draw)
+        });
         crate::perf_event!(
             "render",
             "gray write_ms={} px={} py={} pw={} ph={}",
             _t0.elapsed().as_millis(),
-            rs.px,
-            rs.py,
-            rs.pw,
-            rs.ph
+            win.px,
+            win.py,
+            win.pw,
+            win.ph
         );
 
         crate::perf_begin!(_t1);
-        self.start_grayscale_refresh(rs);
+        self.start_grayscale_refresh(win);
         self.wait_busy_async("grayscale_refresh").await?;
         crate::perf_event!("render", "gray wave_ms={}", _t1.elapsed().as_millis());
 
@@ -770,35 +877,23 @@ where
         Ok(())
     }
 
-    /// Revert pass over `rs`: drives every AA gray pixel back to its
+    /// Revert pass over `win`: drives every AA gray pixel back to its
     /// nearest rail using [`LUT_GRAYSCALE_REVERT`], indexed by the
     /// gray planes still resident in RAM from the preceding
     /// [`Self::grayscale_pass`]. No RAM writes.
-    pub async fn grayscale_revert_pass(
+    pub(crate) async fn grayscale_revert_pass(
         &mut self,
-        rs: &RenderState,
+        win: &Window,
     ) -> Result<(), embassy_time::TimeoutError> {
         self.load_custom_lut(&LUT_GRAYSCALE_REVERT);
-        self.set_partial_ram_area(rs.px, rs.py, rs.pw, rs.ph);
+        self.set_partial_ram_area(win.px, win.py, win.pw, win.ph);
 
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x00, 0x00]);
 
         // display with the custom LUT (no LUT_LOAD); the following DU
         // sets LUT_LOAD and restores the OTP waveform
-        let mut ctrl2: u8 = 0x0C;
-        if !self.power_is_on {
-            ctrl2 |= 0xC0; // CLOCK_ON + ANALOG_ON
-        }
-        if self.sunlight_mode {
-            ctrl2 |= 0x03; // ANALOG_OFF + CLOCK_OFF after refresh
-        }
-        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
-        self.send_data(&[ctrl2]);
-
-        self.send_command(cmd::MASTER_ACTIVATION);
-        self.wait_busy_rise();
-        self.power_is_on = !self.sunlight_mode;
+        self.kick(ctrl2::CUSTOM_LUT);
 
         self.wait_busy_async("grayscale_revert").await
     }

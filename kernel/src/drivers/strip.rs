@@ -98,8 +98,17 @@ impl StripBuffer {
         self.gray_mode
     }
 
-    pub fn set_gray_mode(&mut self, mode: GrayMode) {
-        self.gray_mode = mode;
+    /// Run `f` with the buffer in [`GrayMode::GrayDual`], restoring
+    /// [`GrayMode::Bw`] afterwards.
+    ///
+    /// The pairing is the bracket's, not the caller's: a forgotten
+    /// restore leaves every later BW frame drawing into the gray
+    /// planes, which the panel then reads as drive-gray states.
+    pub fn with_gray_dual<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.gray_mode = GrayMode::GrayDual;
+        let r = f(self);
+        self.gray_mode = GrayMode::Bw;
+        r
     }
 
     pub fn begin_window(&mut self, x: u16, y: u16, w: u16, mut h: u16) {
@@ -386,18 +395,15 @@ impl StripBuffer {
     }
 
     fn fill_physical_rect(&mut self, px0: u16, py0: u16, px1: u16, py1: u16, black: bool) {
-        let cx0 = px0.max(self.win.x);
-        let cx1 = px1.min(self.win.x + self.win.w);
-        let cy0 = py0.max(self.win.y);
-        let cy1 = py1.min(self.win.y + self.win.h);
-        if cx0 >= cx1 || cy0 >= cy1 {
+        let c = Region::new(px0, py0, px1 - px0, py1 - py0).clip(self.win);
+        if c.w == 0 || c.h == 0 {
             return;
         }
 
-        let lx0 = (cx0 - self.win.x) as usize;
-        let lx1 = (cx1 - self.win.x) as usize;
-        let ly0 = (cy0 - self.win.y) as usize;
-        let ly1 = (cy1 - self.win.y) as usize;
+        let lx0 = (c.x - self.win.x) as usize;
+        let lx1 = (c.x + c.w - self.win.x) as usize;
+        let ly0 = (c.y - self.win.y) as usize;
+        let ly1 = (c.y + c.h - self.win.y) as usize;
         let rb = self.row_bytes as usize;
 
         let first_byte = lx0 / 8;

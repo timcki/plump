@@ -37,10 +37,13 @@ impl<const N: usize> StackFmt<N> {
 
 impl<const N: usize> core::fmt::Write for StackFmt<N> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let n = bytes.len().min(N - self.len);
-        self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
-        self.len += n;
+        // borrow the owned buffer and reuse the one truncating append
+        let mut w = BorrowedFmt {
+            buf: &mut self.buf,
+            pos: self.len,
+        };
+        w.append(s);
+        self.len = w.pos;
         Ok(())
     }
 }
@@ -70,15 +73,20 @@ impl<'a> BorrowedFmt<'a> {
     pub fn is_empty(&self) -> bool {
         self.pos == 0
     }
+
+    // append as much of `s` as fits, silently dropping the rest
+    #[inline]
+    fn append(&mut self, s: &str) {
+        let bytes = s.as_bytes();
+        let n = bytes.len().min(self.buf.len() - self.pos);
+        self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
+        self.pos += n;
+    }
 }
 
 impl core::fmt::Write for BorrowedFmt<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let room = self.buf.len() - self.pos;
-        let n = bytes.len().min(room);
-        self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
-        self.pos += n;
+        self.append(s);
         Ok(())
     }
 }

@@ -85,15 +85,17 @@ const BMP_HEADER_SIZE: usize = 54;
 /// Max palette entries we support (8-bit indexed).
 const MAX_PALETTE: usize = 256;
 
+/// Rec.601 luminance with weights scaled by 256: 77*R + 150*G + 29*B.
+#[inline]
+fn lum(r: u8, g: u8, b: u8) -> u8 {
+    ((77 * r as u32 + 150 * g as u32 + 29 * b as u32) >> 8) as u8
+}
+
 /// Convert a BGRA palette slice (`count` × 4 bytes) into a luminance LUT.
-/// Uses Rec.601 weights scaled by 256: 77*R + 150*G + 29*B.
 fn fill_palette_lum(bgra: &[u8], count: usize, dst: &mut [u8; MAX_PALETTE]) {
     for i in 0..count {
         let off = i * 4;
-        let b = bgra[off] as u32;
-        let g = bgra[off + 1] as u32;
-        let r = bgra[off + 2] as u32;
-        dst[i] = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
+        dst[i] = lum(bgra[off + 2], bgra[off + 1], bgra[off]);
     }
 }
 
@@ -238,10 +240,7 @@ fn decode_row_lum(
             }
             for x in 0..IMG_W {
                 let off = x * 3;
-                let b = row[off] as u32;
-                let g = row[off + 1] as u32;
-                let r = row[off + 2] as u32;
-                lum_out[x] = ((77 * r + 150 * g + 29 * b) >> 8) as i16;
+                lum_out[x] = lum(row[off + 2], row[off + 1], row[off]) as i16;
             }
             true
         }

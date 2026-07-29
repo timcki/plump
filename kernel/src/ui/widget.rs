@@ -71,21 +71,28 @@ impl Region {
         }
     }
 
-    /// Overlap of two regions, None when they do not intersect.
-    pub fn intersection(self, other: Region) -> Option<Region> {
-        if !self.intersects(other) {
-            return None;
-        }
+    /// Overlap of two regions, empty (at the clipped origin) when they
+    /// do not intersect. The single max/min dance every clip goes
+    /// through: painter clips, strip fills, region intersection.
+    pub fn clip(self, other: Region) -> Region {
         let x1 = self.x.max(other.x);
         let y1 = self.y.max(other.y);
         let x2 = (self.x + self.w).min(other.x + other.w);
         let y2 = (self.y + self.h).min(other.y + other.h);
-        Some(Self {
+        if x2 <= x1 || y2 <= y1 {
+            return Self::new(x1, y1, 0, 0);
+        }
+        Self {
             x: x1,
             y: y1,
             w: x2 - x1,
             h: y2 - y1,
-        })
+        }
+    }
+
+    /// Overlap of two regions, None when they do not intersect.
+    pub fn intersection(self, other: Region) -> Option<Region> {
+        self.intersects(other).then(|| self.clip(other))
     }
 
     pub fn intersects(self, other: Region) -> bool {

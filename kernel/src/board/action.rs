@@ -2,7 +2,7 @@
 // apps match on Action, never on HwButton
 
 use crate::board::button::Button;
-use crate::drivers::input::Event;
+use crate::drivers::input::{Event, InputEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -15,13 +15,7 @@ pub enum Action {
     Menu,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActionEvent {
-    Press(Action),
-    Release(Action),
-    LongPress(Action),
-    Repeat(Action),
-}
+pub type ActionEvent = InputEvent<Action>;
 
 // portrait one-handed layout with optional button swap
 //
@@ -40,6 +34,20 @@ pub struct ButtonMapper {
     swap_buttons: bool,
 }
 
+// (default, swapped) semantic role of one physical button, so the two
+// layouts stay side by side instead of drifting across twin matches
+const fn roles(button: Button) -> (Action, Action) {
+    match button {
+        Button::VolDown => (Action::Next, Action::Next),
+        Button::VolUp => (Action::Prev, Action::Prev),
+        Button::Right => (Action::NextJump, Action::Select),
+        Button::Left => (Action::PrevJump, Action::Back),
+        Button::Confirm => (Action::Select, Action::NextJump),
+        Button::Back => (Action::Back, Action::PrevJump),
+        Button::Power => (Action::Menu, Action::Menu),
+    }
+}
+
 impl ButtonMapper {
     pub const fn new() -> Self {
         Self {
@@ -56,37 +64,11 @@ impl ButtonMapper {
     }
 
     pub fn map_button(&self, button: Button) -> Action {
-        if self.swap_buttons {
-            // swapped: Back<->Left, Confirm<->Right
-            match button {
-                Button::VolDown => Action::Next,
-                Button::VolUp => Action::Prev,
-                Button::Right => Action::Select,     // was NextJump
-                Button::Left => Action::Back,        // was PrevJump
-                Button::Confirm => Action::NextJump, // was Select
-                Button::Back => Action::PrevJump,    // was Back
-                Button::Power => Action::Menu,
-            }
-        } else {
-            // default right-handed layout
-            match button {
-                Button::VolDown => Action::Next,
-                Button::VolUp => Action::Prev,
-                Button::Right => Action::NextJump,
-                Button::Left => Action::PrevJump,
-                Button::Confirm => Action::Select,
-                Button::Back => Action::Back,
-                Button::Power => Action::Menu,
-            }
-        }
+        let (default, swapped) = roles(button);
+        if self.swap_buttons { swapped } else { default }
     }
 
     pub fn map_event(&self, event: Event) -> ActionEvent {
-        match event {
-            Event::Press(b) => ActionEvent::Press(self.map_button(b)),
-            Event::Release(b) => ActionEvent::Release(self.map_button(b)),
-            Event::LongPress(b) => ActionEvent::LongPress(self.map_button(b)),
-            Event::Repeat(b) => ActionEvent::Repeat(self.map_button(b)),
-        }
+        event.map(|b| self.map_button(b))
     }
 }

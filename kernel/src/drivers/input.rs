@@ -18,13 +18,29 @@ macro_rules! read_averaged {
     }};
 }
 
+/// A press lifecycle over whatever a layer names its inputs: physical
+/// buttons here, semantic actions after the [`crate::board::action::ButtonMapper`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Event {
-    Press(Button),
-    Release(Button),
-    LongPress(Button),
-    Repeat(Button),
+pub enum InputEvent<T> {
+    Press(T),
+    Release(T),
+    LongPress(T),
+    Repeat(T),
 }
+
+impl<T> InputEvent<T> {
+    /// Translate the carried input, keeping the lifecycle variant.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> InputEvent<U> {
+        match self {
+            InputEvent::Press(t) => InputEvent::Press(f(t)),
+            InputEvent::Release(t) => InputEvent::Release(f(t)),
+            InputEvent::LongPress(t) => InputEvent::LongPress(f(t)),
+            InputEvent::Repeat(t) => InputEvent::Repeat(f(t)),
+        }
+    }
+}
+
+pub type Event = InputEvent<Button>;
 
 struct EventQueue {
     buf: [Option<Event>; 4],
@@ -58,15 +74,40 @@ impl EventQueue {
     }
 }
 
+/// Linear progression of a held button, replacing the three booleans
+/// and two timestamps that used to encode it.
+#[derive(Clone, Copy)]
+enum Hold {
+    /// Nothing held.
+    Idle,
+    /// Held, long press not yet due.
+    Armed { since: Instant },
+    /// Long press fired; repeats run off `last`.
+    Repeating { last: Instant },
+    /// The hold was acknowledged elsewhere (quick menu took it), so it
+    /// emits nothing more until the button is released.
+    Consumed,
+}
+
+impl Hold {
+    /// Restart the hold timer. A consumed hold stays consumed: the
+    /// acknowledgement outlives sub-debounce chatter and survives a
+    /// press that arrives while nothing was held.
+    #[inline]
+    fn arm(self, now: Instant) -> Self {
+        match self {
+            Hold::Consumed => Hold::Consumed,
+            _ => Hold::Armed { since: now },
+        }
+    }
+}
+
 pub struct InputDriver {
     hw: InputHw,
     stable: Option<Button>,
     candidate: Option<Button>,
     candidate_since: Instant,
-    press_since: Instant,
-    long_press_fired: bool,
-    last_repeat: Instant,
-    hold_consumed: bool,
+    hold: Hold,
     queue: EventQueue,
 }
 
@@ -78,16 +119,13 @@ impl InputDriver {
             stable: None,
             candidate: None,
             candidate_since: now,
-            press_since: now,
-            long_press_fired: false,
-            last_repeat: now,
-            hold_consumed: false,
+            hold: Hold::Idle,
             queue: EventQueue::new(),
         }
     }
 
     pub fn reset_hold_state(&mut self) {
-        self.hold_consumed = true;
+        self.hold = Hold::Consumed;
     }
 
     pub fn poll(&mut self) -> Option<Event> {
@@ -102,9 +140,7 @@ impl InputDriver {
             // raw deviated from stable; restart hold timer so
             // sub-debounce releases don't accumulate into LongPress
             if self.stable.is_some() && raw != self.stable {
-                self.press_since = now;
-                self.long_press_fired = false;
-                self.last_repeat = now;
+                self.hold = self.hold.arm(now);
             }
             self.candidate = raw;
             self.candidate_since = now;
@@ -120,35 +156,33 @@ impl InputDriver {
         if debounced != self.stable {
             if let Some(old) = self.stable {
                 self.queue.push(Event::Release(old));
-                self.hold_consumed = false;
+                self.hold = Hold::Idle;
             }
             if let Some(new) = debounced {
                 self.queue.push(Event::Press(new));
-                self.press_since = now;
-                self.long_press_fired = false;
-                self.last_repeat = now;
+                self.hold = self.hold.arm(now);
             }
             self.stable = debounced;
             return self.queue.pop();
         }
 
-        if let Some(btn) = self.stable
-            && !self.hold_consumed
-        {
-            let held = now - self.press_since;
-
-            if !self.long_press_fired && held >= Duration::from_millis(timing::LONG_PRESS_MS) {
-                self.long_press_fired = true;
-                self.last_repeat = now;
-                log::debug!("input: LongPress({:?}) after {}ms", btn, held.as_millis());
-                return Some(Event::LongPress(btn));
-            }
-
-            if self.long_press_fired
-                && (now - self.last_repeat) >= Duration::from_millis(timing::REPEAT_MS)
-            {
-                self.last_repeat = now;
-                return Some(Event::Repeat(btn));
+        if let Some(btn) = self.stable {
+            match self.hold {
+                Hold::Armed { since } => {
+                    let held = now - since;
+                    if held >= Duration::from_millis(timing::LONG_PRESS_MS) {
+                        self.hold = Hold::Repeating { last: now };
+                        log::debug!("input: LongPress({:?}) after {}ms", btn, held.as_millis());
+                        return Some(Event::LongPress(btn));
+                    }
+                }
+                Hold::Repeating { last } => {
+                    if now - last >= Duration::from_millis(timing::REPEAT_MS) {
+                        self.hold = Hold::Repeating { last: now };
+                        return Some(Event::Repeat(btn));
+                    }
+                }
+                Hold::Idle | Hold::Consumed => {}
             }
         }
 

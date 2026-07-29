@@ -1,7 +1,8 @@
 // screen: typestate refresh interface over the SSD1677 driver
 //
 // owns the EPD driver, the strip buffer, and all display-plane state
-// (stale region, partial counter). a refresh is a linear session:
+// (stale region, partial counter, forced-clear debt). a refresh is a
+// linear session:
 //
 //   plan_partial -> PartialPlan (Ready(Wave) | RevertFirst)
 //   begin_full   -> Wave<'_, M>   (waveform running)
@@ -12,7 +13,9 @@
 // compile while a waveform is in flight; the scheduler exploits that
 // window for SD I/O (the charge pump drives pixels with no SPI
 // traffic). misordered phases are unrepresentable: phase 3 methods
-// only exist on Settled, which only exists after the wave is consumed
+// only exist on Settled, which only exists after the wave is consumed,
+// and the driver tokens the session carries (see drivers/ssd1677.rs)
+// make the same order unrepresentable one layer down
 
 use core::marker::PhantomData;
 
@@ -20,7 +23,7 @@ use embassy_time::TimeoutError;
 use esp_hal::delay::Delay;
 
 use crate::board::{Epd, SCREEN_H, SCREEN_W};
-use crate::drivers::ssd1677::{HEIGHT, RenderState, WIDTH};
+use crate::drivers::ssd1677::{Driven, Phase1, Window};
 use crate::drivers::strip::StripBuffer;
 use crate::kernel::plane_map::{AaQueue, PlaneMap, SessionOutcome};
 use crate::ui::{AlignedRegion, Region};
@@ -45,6 +48,11 @@ pub struct Screen {
     // partial refreshes since the last full GC; the scheduler promotes
     // to a full clear once this reaches ghost_clear_every
     partials: u32,
+
+    // set when a session left panel and planes out of sync (a timeout,
+    // or lost gray coverage): the next partial request promotes to a
+    // full GC whatever the counter says
+    force_gc: bool,
 }
 
 /// Marker for a partial DU waveform session.
@@ -56,9 +64,12 @@ pub struct Gc;
 /// other panel access can compile while the EPD is busy.
 pub struct Wave<'s, M> {
     screen: &'s mut Screen,
-    rs: RenderState,
-    // logical counterpart of `rs`: the area this session drives, used
-    // for stale-region bookkeeping
+    // driver token proving the waveform was kicked over a window the
+    // driver itself wrote; the closing phases will not compile without
+    // it, so this session type cannot skip ahead
+    driven: Driven,
+    // logical counterpart of `driven`: the area this session drives,
+    // used for stale-region bookkeeping
     region: AlignedRegion,
     hard_redrive: bool,
     _mode: PhantomData<M>,
@@ -67,7 +78,7 @@ pub struct Wave<'s, M> {
 /// A completed waveform awaiting its closing phase.
 pub struct Settled<'s, M> {
     screen: &'s mut Screen,
-    rs: RenderState,
+    driven: Driven,
     region: AlignedRegion,
     _mode: PhantomData<M>,
 }
@@ -128,13 +139,6 @@ pub enum PartialRejected {
     NeedsFull,
 }
 
-const FULL_RS: RenderState = RenderState {
-    px: 0,
-    py: 0,
-    pw: WIDTH,
-    ph: HEIGHT,
-};
-
 const FULL_REGION: AlignedRegion =
     AlignedRegion::from_aligned(Region::new(0, 0, SCREEN_W, SCREEN_H));
 
@@ -147,12 +151,16 @@ impl Screen {
             planes: PlaneMap::new(),
             pending_aa: AaQueue::new(),
             partials: 0,
+            force_gc: false,
         }
     }
 
+    /// True when the next refresh should be a full GC: either enough
+    /// partials have piled up since the last clear, or a session left
+    /// panel and planes out of sync.
     #[inline]
-    pub fn partials_since_clear(&self) -> u32 {
-        self.partials
+    pub fn ghost_clear_due(&self, every: u32) -> bool {
+        self.force_gc || self.partials >= every
     }
 
     /// Bounding box of everything a delta DU may not touch; debug view.
@@ -164,7 +172,7 @@ impl Screen {
     /// Force the next partial request to promote to a full GC.
     #[inline]
     pub fn force_ghost_clear(&mut self) {
-        self.partials = u32::MAX;
+        self.force_gc = true;
     }
 
     #[inline]
@@ -189,10 +197,10 @@ impl Screen {
         let mut ran = false;
         for w in self.planes.gray_windows(region).into_iter().flatten() {
             let w = w.get();
-            let Some(rs) = self.epd.region_state(w.x, w.y, w.w, w.h) else {
+            let Some(win) = self.epd.region_state(w.x, w.y, w.w, w.h) else {
                 continue;
             };
-            if let Err(e) = self.epd.grayscale_revert_pass(&rs).await {
+            if let Err(e) = self.epd.grayscale_revert_pass(&win).await {
                 self.force_ghost_clear();
                 return Err(e);
             }
@@ -285,22 +293,30 @@ impl Screen {
             let r = r.get();
             (r.x, r.y, r.w, r.h)
         };
-        let rs = if hard_redrive {
+        let phase1 = if hard_redrive {
             self.epd
                 .partial_phase1_bw_inv_red(self.strip, x, y, w, h, &mut self.delay, draw)
         } else {
             self.epd
                 .partial_phase1_bw(self.strip, x, y, w, h, &mut self.delay, draw)
-        }
-        .ok_or(PartialRejected::Empty)?;
+        };
 
-        self.epd.partial_start_du(&rs);
+        // the driver reports the two failure modes separately, so the
+        // rejection the caller sees is the driver's own verdict rather
+        // than a re-derivation of it
+        let written = match phase1 {
+            Phase1::Written(w) => w,
+            Phase1::EmptyWindow => return Err(PartialRejected::Empty),
+            Phase1::NeedsFullFirst => return Err(PartialRejected::NeedsFull),
+        };
+
+        let driven = self.epd.partial_start_du(written);
         self.partials = self.partials.saturating_add(1);
         self.pending_aa.push(r);
 
         Ok(Wave {
             screen: self,
-            rs,
+            driven,
             region: r,
             hard_redrive,
             _mode: PhantomData,
@@ -312,8 +328,8 @@ impl Screen {
     where
         F: Fn(&mut StripBuffer),
     {
-        self.epd.write_full_frame(self.strip, &mut self.delay, draw);
-        self.epd.start_full_update();
+        let written = self.epd.write_full_frame(self.strip, &mut self.delay, draw);
+        let driven = self.epd.start_full_update(written);
         // both planes hold content the panel does not show yet; if the
         // GC completes, finish() clears the map, and if it times out
         // the whole screen correctly stays marked for re-drive. gray
@@ -323,7 +339,7 @@ impl Screen {
         self.pending_aa.push(FULL_REGION);
         Wave {
             screen: self,
-            rs: FULL_RS,
+            driven,
             region: FULL_REGION,
             hard_redrive: true,
             _mode: PhantomData,
@@ -362,7 +378,10 @@ impl Screen {
     where
         F: Fn(&mut StripBuffer),
     {
-        let res = self.epd.grayscale_pass(self.strip, &FULL_RS, draw).await;
+        let res = self
+            .epd
+            .grayscale_pass(self.strip, &Window::FULL, draw)
+            .await;
         if self.planes.apply(FULL_REGION, SessionOutcome::Grayed) {
             self.force_ghost_clear();
         }
@@ -384,10 +403,10 @@ impl Screen {
     {
         while let Some(region) = self.pending_aa.take_next() {
             let r = region.get();
-            let Some(rs) = self.epd.region_state(r.x, r.y, r.w, r.h) else {
+            let Some(win) = self.epd.region_state(r.x, r.y, r.w, r.h) else {
                 continue;
             };
-            let res = self.epd.grayscale_pass(self.strip, &rs, draw).await;
+            let res = self.epd.grayscale_pass(self.strip, &win, draw).await;
             // the planes were rewritten with codes before the wave
             // started, so the region is gray-coded even on timeout
             if self.planes.apply(region, SessionOutcome::Grayed) {
@@ -428,7 +447,7 @@ impl<'s, M> Wave<'s, M> {
     pub fn settle(self) -> Settled<'s, M> {
         Settled {
             screen: self.screen,
-            rs: self.rs,
+            driven: self.driven,
             region: self.region,
             _mode: PhantomData,
         }
@@ -451,7 +470,7 @@ impl Settled<'_, Du> {
         F: Fn(&mut StripBuffer),
     {
         let s = self.screen;
-        s.epd.partial_phase3_sync(s.strip, &self.rs, draw);
+        s.epd.partial_phase3_sync(s.strip, &self.driven, draw);
         // the panel matches both planes across this region again; the
         // carve is exact, so claims outside it (gray codes elsewhere,
         // an old skipped phase 3) survive as fragments instead of the
@@ -490,7 +509,10 @@ impl Settled<'_, Du> {
         F: Fn(&mut StripBuffer),
     {
         let s = self.screen;
-        let res = s.epd.grayscale_pass(s.strip, &self.rs, draw).await;
+        let res = s
+            .epd
+            .grayscale_pass(s.strip, &self.driven.window(), draw)
+            .await;
         if s.planes.apply(self.region, SessionOutcome::Grayed) {
             s.force_ghost_clear();
         }
@@ -509,8 +531,9 @@ impl Settled<'_, Gc> {
     /// cleared, so the partial counter and stale flag reset.
     pub fn finish(self) {
         let s = self.screen;
-        s.epd.finish_full_update();
+        s.epd.finish_full_update(self.driven);
         s.partials = 0;
+        s.force_gc = false;
         s.planes.clear();
     }
 }

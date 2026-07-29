@@ -78,7 +78,7 @@ impl<'a> Painter<'a> {
     /// Fill an arbitrary sub-region with a specific color. Region is
     /// clamped to the current clip before drawing.
     pub fn fill_in(&mut self, r: Region, color: BinaryColor) {
-        let r = clamp(self.region, r);
+        let r = self.region.clip(r);
         if r.w == 0 || r.h == 0 {
             return;
         }
@@ -123,16 +123,4 @@ impl<'a> Painter<'a> {
     pub fn intersects(&self, r: Region) -> bool {
         self.region.intersects(r)
     }
-}
-
-#[inline]
-fn clamp(parent: Region, child: Region) -> Region {
-    let x0 = parent.x.max(child.x);
-    let y0 = parent.y.max(child.y);
-    let x1 = (parent.x + parent.w).min(child.x + child.w);
-    let y1 = (parent.y + parent.h).min(child.y + child.h);
-    if x1 <= x0 || y1 <= y0 {
-        return Region::new(x0, y0, 0, 0);
-    }
-    Region::new(x0, y0, x1 - x0, y1 - y0)
 }
