@@ -63,6 +63,10 @@ impl ButtonMapper {
         self.swap_buttons
     }
 
+    // never inlined: llvm lowers roles() to per-call-site switch
+    // tables in dram, and the perf build sits within bytes of the
+    // linker's 160K heap assert; one out-of-line copy keeps it flat
+    #[inline(never)]
     pub fn map_button(&self, button: Button) -> Action {
         let (default, swapped) = roles(button);
         if self.swap_buttons { swapped } else { default }
