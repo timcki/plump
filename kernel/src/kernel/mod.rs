@@ -48,7 +48,7 @@ use esp_hal::delay::Delay;
 use crate::board::Epd;
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::strip::StripBuffer;
-use crate::kernel::daystats::DayStats;
+use crate::kernel::daystats::{DayKey, DayStats};
 use crate::kernel::dir_cache::DirCache;
 
 // default ghost-clear interval (overridden by settings once loaded)
@@ -171,9 +171,9 @@ pub struct Services {
     // by the active reader; flushed by housekeeping when dirty.
     pub(crate) day_stats: &'static mut DayStats,
 
-    // current day key (derived from FAT mtime of DAYSTATS.BIN). 0 when
-    // the SD card has no usable wall clock (no battery-backed RTC).
-    pub(crate) today_key: u32,
+    // current day key (derived from FAT mtime of DAYSTATS.BIN). None
+    // when the SD card has no usable wall clock (no battery-backed RTC).
+    pub(crate) today_key: Option<DayKey>,
 
     // housekeeping deadlines, re-armed as now + interval when due (no
     // ticker catch-up bursts after a long EPD waveform)
@@ -315,14 +315,13 @@ impl Kernel {
         battery_mv: u16,
     ) -> Self {
         // load today's stats from disk and derive today's key from the
-        // file's FAT mtime. on a fresh SD or a card without an RTC, we
-        // fall back to EMPTY + today_key=0 (counters accumulate from
+        // file's FAT mtime. on a fresh SD or a card without an RTC we
+        // fall back to EMPTY with no key (counters accumulate from
         // boot, no rollover).
         let today_key = if sd_ok {
             sd.file_mtime_day_key_in_plump(daystats::DAYSTATS_FILE)
-                .unwrap_or(0)
         } else {
-            0
+            None
         };
         *day_stats = if sd_ok {
             DayStats::load(&sd)

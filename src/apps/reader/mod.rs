@@ -7,6 +7,7 @@ pub use plump_kernel::util::decode_utf8_char;
 use plump_kernel::util::FixedStr;
 
 use crate::apps::PendingSetting;
+use crate::apps::recent::{self, RecentRecord};
 use crate::fonts::bitmap::{self, BitmapFont};
 
 use alloc::boxed::Box;
@@ -1595,7 +1596,7 @@ impl ReaderApp {
             }
         }
 
-        if let Some(slot) = k.bookmark_cache().find(self.filename.as_bytes()) {
+        if let Some(slot) = k.bookmarks().find(self.filename.as_bytes()) {
             log::debug!(
                 "bookmark: restoring from BKMK.BIN off={} ch={} for {}",
                 slot.byte_offset,
@@ -1694,43 +1695,25 @@ impl ReaderApp {
         Some(filled as u16)
     }
 
-    // write extended RECENT file: filename\0title\0author\0progress
+    // write the RECENT file; layout lives in apps::recent
     // returns Err on write failure (dirty state kept for retry)
     fn write_recent(&mut self, k: &mut KernelHandle<'_>) -> crate::error::Result<()> {
         plump_kernel::perf_begin!(_wr_t0);
-        let mut buf = [0u8; 196];
-        let mut pos = 0usize;
-
-        // filename
-        let fl = self.filename.len();
-        buf[pos..pos + fl].copy_from_slice(self.filename.as_bytes());
-        pos += fl;
-        buf[pos] = 0;
-        pos += 1;
-
-        // title
-        let tl = self.title.len();
-        buf[pos..pos + tl].copy_from_slice(self.title.as_bytes());
-        pos += tl;
-        buf[pos] = 0;
-        pos += 1;
-
-        // author
-        let al = if self.is_epub {
-            (self.epub.meta.author_len as usize).min(64)
+        // txt books carry no author metadata
+        let author: &[u8] = if self.is_epub {
+            let al = (self.epub.meta.author_len as usize).min(recent::AUTHOR_CAP);
+            &self.epub.meta.author[..al]
         } else {
-            0
+            &[]
         };
-        if al > 0 {
-            buf[pos..pos + al].copy_from_slice(&self.epub.meta.author[..al]);
+        let mut buf = [0u8; recent::BUF_LEN];
+        let pos = RecentRecord {
+            filename: self.filename.as_bytes(),
+            title: self.title.as_bytes(),
+            author,
+            progress: self.progress_pct(),
         }
-        pos += al;
-        buf[pos] = 0;
-        pos += 1;
-
-        // progress percentage as a single byte
-        buf[pos] = self.progress_pct();
-        pos += 1;
+        .encode(&mut buf);
 
         k.sd().write_file_in_dir(k.sd().data_dir(), RECENT_FILE, &buf[..pos])?;
         self.recent_dirty = false;

@@ -77,48 +77,11 @@ pub const FLAG_PAGEIDX_READY: u32 = 1 << 2;
 pub const FLAG_HAS_BOOKMARK: u32 = 1 << 3;
 pub const FLAG_IS_EPUB: u32 = 1 << 4;
 
-// header field offsets (kept explicit so the on-disk layout is auditable)
+// the header's field offsets live in the `record!` field list below;
+// these two are named because `BundleFile::open` peeks at them before
+// it is willing to trust a full decode
 const OFF_MAGIC: usize = 0; // 4
 const OFF_VERSION: usize = 4; // 2
-const OFF_HEADER_SIZE: usize = 6; // 2
-const OFF_SOURCE_SIZE: usize = 8; // 4
-const OFF_NAME_HASH: usize = 12; // 4
-const OFF_FLAGS: usize = 16; // 4
-// 20..24 reserved (was last_open_gen)
-
-const OFF_TITLE_LEN: usize = 24; // 1
-const OFF_TITLE: usize = 25; // 80
-const OFF_AUTHOR_LEN: usize = 105; // 1
-const OFF_AUTHOR: usize = 106; // 40
-const OFF_CHAPTER_COUNT: usize = 146; // 2
-const OFF_SPINE_COUNT: usize = 148; // 2
-// 150..152 pad
-
-const OFF_BM_CHAPTER: usize = 152; // 2
-const OFF_BM_PAGE_HINT: usize = 154; // 2
-const OFF_BM_BYTE_OFFSET: usize = 156; // 4
-const OFF_BM_FONT_IDX: usize = 160; // 1
-const OFF_BM_FLAGS: usize = 161; // 1
-// 162..168 pad
-
-// 168..180 reserved (was pages_read / time_spent_secs / sessions /
-// progress_pct + 1 pad)
-
-const OFF_COVERS_OFFSET: usize = 180; // 4
-const OFF_COVERS_SIZE: usize = 184; // 4
-const OFF_SPINE_OFFSET: usize = 188; // 4
-const OFF_SPINE_SIZE: usize = 192; // 4
-// 196..204 reserved (was toc_offset / toc_size)
-const OFF_CONTENT_OFFSET: usize = 204; // 4
-const OFF_CONTENT_SIZE: usize = 208; // 4
-// 212..220 reserved (was images_offset / images_size)
-const OFF_PIDX_DIR_OFFSET: usize = 220; // 4
-const OFF_PIDX_DIR_SIZE: usize = 224; // 4
-const OFF_PIDX_FONT_IDX: usize = 228; // 1
-const OFF_CONTENT_FMT: usize = 229; // 1
-const OFF_PIDX_DATA_OFFSET: usize = 230; // 4
-const OFF_PIDX_DATA_SIZE: usize = 234; // 4
-// 238..256 reserved
 
 // bookmark flags bits (inside `bm_flags`)
 pub const BM_FLAG_VALID: u8 = 1 << 0;
@@ -165,13 +128,51 @@ impl SectionId {
         SectionId::Covers,
         SectionId::PidxData,
     ];
+
+    /// Index into `BundleHeader::sections` and `SECTION_HDR_OFF`.
+    #[inline]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
 }
+
+/// Byte offset of each section's `{offset, size}` pair inside the
+/// header, indexed by `SectionId`. The gaps between entries are the
+/// reserved words left by removed v1/v2 fields and must stay zero.
+const SECTION_HDR_OFF: [usize; SECTION_COUNT] = [
+    188, // Spine
+    204, // Content
+    220, // PidxDir
+    180, // Covers
+    230, // PidxData
+];
 
 /// Half-open byte range `[offset, offset + size)` within a bundle.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SectionRange {
     pub offset: u32,
     pub size: u32,
+}
+
+// a section range is one u32 offset followed by one u32 size, so the
+// header's whole section table decodes as an array over SECTION_HDR_OFF
+impl crate::util::Field for SectionRange {
+    const WIDTH: usize = 8;
+    const ZERO: Self = Self::EMPTY;
+
+    #[inline]
+    fn read(src: &[u8]) -> Option<Self> {
+        Some(Self {
+            offset: u32::read(src)?,
+            size: u32::read(src.get(4..)?)?,
+        })
+    }
+
+    #[inline]
+    fn write(self, dst: &mut [u8]) {
+        self.offset.write(dst);
+        self.size.write(&mut dst[4..]);
+    }
 }
 
 impl SectionRange {
@@ -294,36 +295,37 @@ impl From<BundleError> for crate::error::Error {
     }
 }
 
-/// owned, decoded bundle header
-#[derive(Clone, Copy)]
-pub struct BundleHeader {
-    pub source_size: u32,
-    pub name_hash: u32,
-    pub flags: u32,
-
-    pub title: FixedStr<TITLE_CAP>,
-    pub author: FixedStr<AUTHOR_CAP>,
-    pub chapter_count: u16,
-    pub spine_count: u16,
-
-    pub bm_chapter: u16,
-    pub bm_page_hint: u16,
-    pub bm_byte_offset: u32,
-    pub bm_font_idx: u8,
-    pub bm_flags: u8,
-
-    pub covers_offset: u32,
-    pub covers_size: u32,
-    pub spine_offset: u32,
-    pub spine_size: u32,
-    pub content_offset: u32,
-    pub content_size: u32,
-    pub pidx_dir_offset: u32,
-    pub pidx_dir_size: u32,
-    pub pidx_data_offset: u32,
-    pub pidx_data_size: u32,
-    pub pidx_font_idx: u8,
-    pub content_fmt: u8,
+crate::record! {
+    /// owned, decoded bundle header
+    #[derive(Clone, Copy)]
+    pub struct BundleHeader [HEADER_SIZE] {
+        source_size: u32 @ 8,
+        name_hash:   u32 @ 12,
+        flags:       u32 @ 16,
+        // 20..24 reserved (was last_open_gen)
+        title:  {str TITLE_CAP}  @ (24, 25),
+        author: {str AUTHOR_CAP} @ (105, 106),
+        chapter_count: u16 @ 146,
+        spine_count:   u16 @ 148,
+        // 150..152 pad
+        bm_chapter:     u16 @ 152,
+        bm_page_hint:   u16 @ 154,
+        bm_byte_offset: u32 @ 156,
+        bm_font_idx:     u8 @ 160,
+        bm_flags:        u8 @ 161,
+        // 162..180 reserved (was pages_read / time_spent_secs /
+        // sessions / progress_pct, plus pad)
+        /// section ranges, indexed by `SectionId`
+        sections: {arr SectionRange; SECTION_COUNT} @ SECTION_HDR_OFF,
+        pidx_font_idx: u8 @ 228,
+        content_fmt:   u8 @ 229,
+        // 238..256 reserved
+    }
+    fixed {
+        magic:       [u8; 4] @ OFF_MAGIC = HEADER_MAGIC,
+        version:         u16 @ OFF_VERSION = HEADER_VERSION,
+        header_size:     u16 @ 6 = HEADER_SIZE as u16,
+    }
 }
 
 impl BundleHeader {
@@ -340,109 +342,10 @@ impl BundleHeader {
         bm_byte_offset: 0,
         bm_font_idx: 0,
         bm_flags: 0,
-        covers_offset: 0,
-        covers_size: 0,
-        spine_offset: 0,
-        spine_size: 0,
-        content_offset: 0,
-        content_size: 0,
-        pidx_dir_offset: 0,
-        pidx_dir_size: 0,
-        pidx_data_offset: 0,
-        pidx_data_size: 0,
+        sections: [SectionRange::EMPTY; SECTION_COUNT],
         pidx_font_idx: 0,
         content_fmt: CONTENT_FMT_LATEST,
     };
-
-    /// decode a 256-byte header. returns None when magic/version/header_size
-    /// do not match v1.
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < HEADER_SIZE {
-            return None;
-        }
-        if buf[OFF_MAGIC..OFF_MAGIC + 4] != HEADER_MAGIC {
-            return None;
-        }
-        if r_u16(buf, OFF_VERSION) != HEADER_VERSION {
-            return None;
-        }
-        if r_u16(buf, OFF_HEADER_SIZE) as usize != HEADER_SIZE {
-            return None;
-        }
-
-        let title = decode_fixed::<TITLE_CAP>(buf, OFF_TITLE_LEN, OFF_TITLE);
-        let author = decode_fixed::<AUTHOR_CAP>(buf, OFF_AUTHOR_LEN, OFF_AUTHOR);
-
-        Some(Self {
-            source_size: r_u32(buf, OFF_SOURCE_SIZE),
-            name_hash: r_u32(buf, OFF_NAME_HASH),
-            flags: r_u32(buf, OFF_FLAGS),
-            title,
-            author,
-            chapter_count: r_u16(buf, OFF_CHAPTER_COUNT),
-            spine_count: r_u16(buf, OFF_SPINE_COUNT),
-            bm_chapter: r_u16(buf, OFF_BM_CHAPTER),
-            bm_page_hint: r_u16(buf, OFF_BM_PAGE_HINT),
-            bm_byte_offset: r_u32(buf, OFF_BM_BYTE_OFFSET),
-            bm_font_idx: buf[OFF_BM_FONT_IDX],
-            bm_flags: buf[OFF_BM_FLAGS],
-            covers_offset: r_u32(buf, OFF_COVERS_OFFSET),
-            covers_size: r_u32(buf, OFF_COVERS_SIZE),
-            spine_offset: r_u32(buf, OFF_SPINE_OFFSET),
-            spine_size: r_u32(buf, OFF_SPINE_SIZE),
-            content_offset: r_u32(buf, OFF_CONTENT_OFFSET),
-            content_size: r_u32(buf, OFF_CONTENT_SIZE),
-            pidx_dir_offset: r_u32(buf, OFF_PIDX_DIR_OFFSET),
-            pidx_dir_size: r_u32(buf, OFF_PIDX_DIR_SIZE),
-            pidx_data_offset: r_u32(buf, OFF_PIDX_DATA_OFFSET),
-            pidx_data_size: r_u32(buf, OFF_PIDX_DATA_SIZE),
-            pidx_font_idx: buf[OFF_PIDX_FONT_IDX],
-            content_fmt: buf[OFF_CONTENT_FMT],
-        })
-    }
-
-    /// encode the header into a fresh 256-byte buffer
-    pub fn encode(&self) -> [u8; HEADER_SIZE] {
-        let mut out = [0u8; HEADER_SIZE];
-        out[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&HEADER_MAGIC);
-        w_u16(&mut out, OFF_VERSION, HEADER_VERSION);
-        w_u16(&mut out, OFF_HEADER_SIZE, HEADER_SIZE as u16);
-        w_u32(&mut out, OFF_SOURCE_SIZE, self.source_size);
-        w_u32(&mut out, OFF_NAME_HASH, self.name_hash);
-        w_u32(&mut out, OFF_FLAGS, self.flags);
-
-        encode_fixed(&mut out, OFF_TITLE_LEN, OFF_TITLE, TITLE_CAP, &self.title);
-        encode_fixed(
-            &mut out,
-            OFF_AUTHOR_LEN,
-            OFF_AUTHOR,
-            AUTHOR_CAP,
-            &self.author,
-        );
-        w_u16(&mut out, OFF_CHAPTER_COUNT, self.chapter_count);
-        w_u16(&mut out, OFF_SPINE_COUNT, self.spine_count);
-
-        w_u16(&mut out, OFF_BM_CHAPTER, self.bm_chapter);
-        w_u16(&mut out, OFF_BM_PAGE_HINT, self.bm_page_hint);
-        w_u32(&mut out, OFF_BM_BYTE_OFFSET, self.bm_byte_offset);
-        out[OFF_BM_FONT_IDX] = self.bm_font_idx;
-        out[OFF_BM_FLAGS] = self.bm_flags;
-
-        w_u32(&mut out, OFF_COVERS_OFFSET, self.covers_offset);
-        w_u32(&mut out, OFF_COVERS_SIZE, self.covers_size);
-        w_u32(&mut out, OFF_SPINE_OFFSET, self.spine_offset);
-        w_u32(&mut out, OFF_SPINE_SIZE, self.spine_size);
-        w_u32(&mut out, OFF_CONTENT_OFFSET, self.content_offset);
-        w_u32(&mut out, OFF_CONTENT_SIZE, self.content_size);
-        w_u32(&mut out, OFF_PIDX_DIR_OFFSET, self.pidx_dir_offset);
-        w_u32(&mut out, OFF_PIDX_DIR_SIZE, self.pidx_dir_size);
-        w_u32(&mut out, OFF_PIDX_DATA_OFFSET, self.pidx_data_offset);
-        w_u32(&mut out, OFF_PIDX_DATA_SIZE, self.pidx_data_size);
-        out[OFF_PIDX_FONT_IDX] = self.pidx_font_idx;
-        out[OFF_CONTENT_FMT] = self.content_fmt;
-
-        out
-    }
 
     #[inline]
     pub fn has_flag(&self, bit: u32) -> bool {
@@ -465,57 +368,24 @@ impl BundleHeader {
 
     /// Return the `SectionRange` recorded in the header for `id`, or
     /// `None` when the section has not been allocated yet (size == 0).
+    #[inline]
     pub fn section(&self, id: SectionId) -> Option<SectionRange> {
-        let r = match id {
-            SectionId::Spine => SectionRange {
-                offset: self.spine_offset,
-                size: self.spine_size,
-            },
-            SectionId::Content => SectionRange {
-                offset: self.content_offset,
-                size: self.content_size,
-            },
-            SectionId::PidxDir => SectionRange {
-                offset: self.pidx_dir_offset,
-                size: self.pidx_dir_size,
-            },
-            SectionId::Covers => SectionRange {
-                offset: self.covers_offset,
-                size: self.covers_size,
-            },
-            SectionId::PidxData => SectionRange {
-                offset: self.pidx_data_offset,
-                size: self.pidx_data_size,
-            },
-        };
+        let r = self.range(id);
         if r.is_empty() { None } else { Some(r) }
+    }
+
+    /// Raw recorded range, empty when unallocated. Use `section` when
+    /// "not allocated yet" needs to be distinguished.
+    #[inline]
+    pub fn range(&self, id: SectionId) -> SectionRange {
+        self.sections[id.index()]
     }
 
     /// Set the `SectionRange` for `id` in the header (does not write
     /// to disk; caller must invoke `write_header` separately).
+    #[inline]
     pub fn set_section(&mut self, id: SectionId, range: SectionRange) {
-        match id {
-            SectionId::Spine => {
-                self.spine_offset = range.offset;
-                self.spine_size = range.size;
-            }
-            SectionId::Content => {
-                self.content_offset = range.offset;
-                self.content_size = range.size;
-            }
-            SectionId::PidxDir => {
-                self.pidx_dir_offset = range.offset;
-                self.pidx_dir_size = range.size;
-            }
-            SectionId::Covers => {
-                self.covers_offset = range.offset;
-                self.covers_size = range.size;
-            }
-            SectionId::PidxData => {
-                self.pidx_data_offset = range.offset;
-                self.pidx_data_size = range.size;
-            }
-        }
+        self.sections[id.index()] = range;
     }
 
     /// Walk every allocated section and assert pairwise non-overlap.
@@ -578,47 +448,49 @@ impl CoverKind {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct CoversHeader {
-    pub variant_count: u8,
-    pub raw_format: u8,
-    pub raw_offset: u32, // offset of raw source bytes within covers section
-    pub raw_size: u32,   // size of raw source bytes (0 when absent)
-}
+// a variant entry carries its kind on disk; an unknown discriminant
+// makes the whole entry decode to None so the caller skips it rather
+// than silently mistyping it
+impl crate::util::Field for CoverKind {
+    const WIDTH: usize = 1;
+    const ZERO: Self = CoverKind::Tiny;
 
-impl CoversHeader {
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < COVERS_HDR_SIZE {
-            return None;
-        }
-        Some(Self {
-            variant_count: buf[0],
-            raw_format: buf[1],
-            // buf[2..4] pad
-            raw_offset: r_u32(buf, 4),
-            raw_size: r_u32(buf, 8),
-        })
+    #[inline]
+    fn read(src: &[u8]) -> Option<Self> {
+        Self::from_u8(*src.first()?)
     }
 
-    pub fn encode(&self) -> [u8; COVERS_HDR_SIZE] {
-        let mut out = [0u8; COVERS_HDR_SIZE];
-        out[0] = self.variant_count;
-        out[1] = self.raw_format;
-        // buf[2..4] pad
-        w_u32(&mut out, 4, self.raw_offset);
-        w_u32(&mut out, 8, self.raw_size);
-        out
+    #[inline]
+    fn write(self, dst: &mut [u8]) {
+        dst[0] = self.as_u8();
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct CoverVariant {
-    pub kind: CoverKind,
-    pub width: u16,
-    pub height: u16,
-    pub stride: u16,
-    pub data_offset: u32, // within covers section
-    pub data_size: u32,
+crate::record! {
+    #[derive(Clone, Copy)]
+    pub struct CoversHeader [COVERS_HDR_SIZE] {
+        variant_count: u8 @ 0,
+        raw_format:    u8 @ 1,
+        // 2..4 pad
+        /// offset of raw source bytes within the covers section
+        raw_offset: u32 @ 4,
+        /// size of raw source bytes (0 when absent)
+        raw_size: u32 @ 8,
+    }
+}
+
+crate::record! {
+    #[derive(Clone, Copy)]
+    pub struct CoverVariant [COVER_VARIANT_SIZE] {
+        kind: CoverKind @ 0,
+        // 1 pad
+        width:  u16 @ 2,
+        height: u16 @ 4,
+        stride: u16 @ 6,
+        /// within the covers section
+        data_offset: u32 @ 8,
+        data_size:   u32 @ 12,
+    }
 }
 
 impl CoverVariant {
@@ -630,36 +502,6 @@ impl CoverVariant {
         data_offset: 0,
         data_size: 0,
     };
-
-    /// Decode a variant entry. Returns None on malformed buffer OR
-    /// unknown `kind` byte (forward-compat policy: unknown variants
-    /// are skipped by the caller rather than silently mistyped).
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < COVER_VARIANT_SIZE {
-            return None;
-        }
-        Some(Self {
-            kind: CoverKind::from_u8(buf[0])?,
-            // buf[1] pad
-            width: r_u16(buf, 2),
-            height: r_u16(buf, 4),
-            stride: r_u16(buf, 6),
-            data_offset: r_u32(buf, 8),
-            data_size: r_u32(buf, 12),
-        })
-    }
-
-    pub fn encode(&self) -> [u8; COVER_VARIANT_SIZE] {
-        let mut out = [0u8; COVER_VARIANT_SIZE];
-        out[0] = self.kind.as_u8();
-        // out[1] pad
-        w_u16(&mut out, 2, self.width);
-        w_u16(&mut out, 4, self.height);
-        w_u16(&mut out, 6, self.stride);
-        w_u32(&mut out, 8, self.data_offset);
-        w_u32(&mut out, 12, self.data_size);
-        out
-    }
 }
 
 // ── spine table ────────────────────────────────────────────────────
@@ -672,18 +514,20 @@ pub const SPINE_ENTRY_SIZE: usize = 16;
 // spine entry flags
 pub const SPINE_FLAG_CACHED: u16 = 1 << 0;
 
-#[derive(Clone, Copy)]
-pub struct SpineEntry {
-    /// absolute byte offset within the bundle file where the
-    /// chapter's stripped content begins (not relative to the
-    /// content section). keeps reads a single lookup.
-    pub content_offset: u32,
-    /// number of bytes of chapter content at `content_offset`
-    pub content_size: u32,
-    /// cached text bytes after HTML stripping (may equal content_size)
-    pub text_bytes: u32,
-    pub flags: u16,
-    pub _reserved: u16,
+crate::record! {
+    #[derive(Clone, Copy)]
+    pub struct SpineEntry [SPINE_ENTRY_SIZE] {
+        /// absolute byte offset within the bundle file where the
+        /// chapter's stripped content begins (not relative to the
+        /// content section). keeps reads a single lookup.
+        content_offset: u32 @ 0,
+        /// number of bytes of chapter content at `content_offset`
+        content_size: u32 @ 4,
+        /// cached text bytes after HTML stripping (may equal content_size)
+        text_bytes: u32 @ 8,
+        flags:     u16 @ 12,
+        _reserved: u16 @ 14,
+    }
 }
 
 impl SpineEntry {
@@ -694,29 +538,6 @@ impl SpineEntry {
         flags: 0,
         _reserved: 0,
     };
-
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < SPINE_ENTRY_SIZE {
-            return None;
-        }
-        Some(Self {
-            content_offset: r_u32(buf, 0),
-            content_size: r_u32(buf, 4),
-            text_bytes: r_u32(buf, 8),
-            flags: r_u16(buf, 12),
-            _reserved: r_u16(buf, 14),
-        })
-    }
-
-    pub fn encode(&self) -> [u8; SPINE_ENTRY_SIZE] {
-        let mut out = [0u8; SPINE_ENTRY_SIZE];
-        w_u32(&mut out, 0, self.content_offset);
-        w_u32(&mut out, 4, self.content_size);
-        w_u32(&mut out, 8, self.text_bytes);
-        w_u16(&mut out, 12, self.flags);
-        w_u16(&mut out, 14, self._reserved);
-        out
-    }
 
     #[inline]
     pub fn is_cached(&self) -> bool {
@@ -855,94 +676,32 @@ pub const CHAPTER_LAYOUT_DIR_SIZE: usize = 24;
 pub const PAGE_RECORD_SIZE: usize = 12;
 pub const LINE_RECORD_SIZE: usize = 12;
 
-// LayoutIdxHeader byte layout (20 bytes):
-//   0..4   magic           [u8; 4] = b"PIDX"
-//   4      format_version  u8
-//   5      algo_version    u8
-//   6      font_idx        u8
-//   7      content_fmt     u8
-//   8..10  text_w          u16
-//   10..12 line_h          u16
-//   12     max_lines       u8
-//   13     flags           u8
-//   14     font_family     u8   reader font family (0=Bookerly, 1=Atkinson)
-//   15     _pad            1 byte
-//   16..20 total_pages     u32
-//
 // font_family default 0 keeps pre-upgrade caches valid for users who
 // stay on Bookerly; switching reader font invalidates the cache because
 // wrap points differ between families at the same size.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LayoutIdxHeader {
-    pub format_version: u8,
-    pub algo_version: u8,
-    pub font_idx: u8,
-    pub content_fmt: u8,
-    pub text_w: u16,
-    pub line_h: u16,
-    pub max_lines: u8,
-    pub flags: u8,
-    pub font_family: u8,
-    pub total_pages: u32,
-}
-
-impl LayoutIdxHeader {
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < PAGEIDX_HDR_V2_SIZE {
-            return None;
-        }
-        if buf[0..4] != PAGEIDX_MAGIC {
-            return None;
-        }
-        if buf[4] != PAGEIDX_FORMAT_VERSION {
-            return None;
-        }
-        Some(Self {
-            format_version: buf[4],
-            algo_version: buf[5],
-            font_idx: buf[6],
-            content_fmt: buf[7],
-            text_w: r_u16(buf, 8),
-            line_h: r_u16(buf, 10),
-            max_lines: buf[12],
-            flags: buf[13],
-            font_family: buf[14],
-            // 15 pad
-            total_pages: r_u32(buf, 16),
-        })
-    }
-
-    pub fn encode(&self) -> [u8; PAGEIDX_HDR_V2_SIZE] {
-        let mut out = [0u8; PAGEIDX_HDR_V2_SIZE];
-        out[0..4].copy_from_slice(&PAGEIDX_MAGIC);
-        out[4] = self.format_version;
-        out[5] = self.algo_version;
-        out[6] = self.font_idx;
-        out[7] = self.content_fmt;
-        w_u16(&mut out, 8, self.text_w);
-        w_u16(&mut out, 10, self.line_h);
-        out[12] = self.max_lines;
-        out[13] = self.flags;
-        out[14] = self.font_family;
+crate::record! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct LayoutIdxHeader [PAGEIDX_HDR_V2_SIZE] {
+        format_version: u8 @ 4,
+        algo_version:   u8 @ 5,
+        font_idx:       u8 @ 6,
+        content_fmt:    u8 @ 7,
+        text_w:    u16 @ 8,
+        line_h:    u16 @ 10,
+        max_lines:  u8 @ 12,
+        flags:      u8 @ 13,
+        /// reader font family (0 = Bookerly, 1 = Atkinson)
+        font_family: u8 @ 14,
         // 15 pad
-        w_u32(&mut out, 16, self.total_pages);
-        out
+        total_pages: u32 @ 16,
     }
+    fixed {
+        magic: [u8; 4] @ 0 = PAGEIDX_MAGIC,
+    }
+    verify |h: &LayoutIdxHeader| h.format_version == PAGEIDX_FORMAT_VERSION;
 }
 
-// ChapterLayoutDir byte layout (24 bytes):
-//   0..2   chapter_index    u16
-//   2..4   page_count       u16
-//   4..6   line_count       u16
-//   6..8   flags            u16
-//   8..12  pages_offset     u32  (within pageidx section)
-//   12..16 lines_offset     u32  (within pageidx section; 0 when no lines)
-//   16..20 byte_size        u32  (chapter content byte size at layout time)
-//   20..22 pages_line_h     u16  (line_h this chapter's PAGES were built at)
-//   22..23 pages_max_lines  u8   (max_lines ditto)
-//   23..24 _reserved        u8
-//
 // pages_line_h / pages_max_lines are PER CHAPTER because the global
 // LayoutIdxHeader can only advertise one spacing: after a spacing
 // change, chapters typeset later save pages at the new metrics while
@@ -950,18 +709,25 @@ impl LayoutIdxHeader {
 // against the dir entry, never the header, so stale pages are always
 // re-paginated from the (spacing-independent) line table.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChapterLayoutDir {
-    pub chapter_index: u16,
-    pub page_count: u16,
-    pub line_count: u16,
-    pub flags: u16,
-    pub pages_offset: u32,
-    pub lines_offset: u32,
-    pub byte_size: u32,
-    pub pages_line_h: u16,
-    pub pages_max_lines: u8,
-    pub _reserved: u8,
+crate::record! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ChapterLayoutDir [CHAPTER_LAYOUT_DIR_SIZE] {
+        chapter_index: u16 @ 0,
+        page_count:    u16 @ 2,
+        line_count:    u16 @ 4,
+        flags:         u16 @ 6,
+        /// within the pageidx section
+        pages_offset: u32 @ 8,
+        /// within the pageidx section; 0 when no lines
+        lines_offset: u32 @ 12,
+        /// chapter content byte size at layout time
+        byte_size: u32 @ 16,
+        /// line_h this chapter's PAGES were built at
+        pages_line_h: u16 @ 20,
+        /// max_lines ditto
+        pages_max_lines: u8 @ 22,
+        _reserved:       u8 @ 23,
+    }
 }
 
 impl ChapterLayoutDir {
@@ -977,55 +743,20 @@ impl ChapterLayoutDir {
         pages_max_lines: 0,
         _reserved: 0,
     };
-
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < CHAPTER_LAYOUT_DIR_SIZE {
-            return None;
-        }
-        Some(Self {
-            chapter_index: r_u16(buf, 0),
-            page_count: r_u16(buf, 2),
-            line_count: r_u16(buf, 4),
-            flags: r_u16(buf, 6),
-            pages_offset: r_u32(buf, 8),
-            lines_offset: r_u32(buf, 12),
-            byte_size: r_u32(buf, 16),
-            pages_line_h: r_u16(buf, 20),
-            pages_max_lines: buf[22],
-            _reserved: buf[23],
-        })
-    }
-
-    pub fn encode(&self) -> [u8; CHAPTER_LAYOUT_DIR_SIZE] {
-        let mut out = [0u8; CHAPTER_LAYOUT_DIR_SIZE];
-        w_u16(&mut out, 0, self.chapter_index);
-        w_u16(&mut out, 2, self.page_count);
-        w_u16(&mut out, 4, self.line_count);
-        w_u16(&mut out, 6, self.flags);
-        w_u32(&mut out, 8, self.pages_offset);
-        w_u32(&mut out, 12, self.lines_offset);
-        w_u32(&mut out, 16, self.byte_size);
-        w_u16(&mut out, 20, self.pages_line_h);
-        out[22] = self.pages_max_lines;
-        out[23] = self._reserved;
-        out
-    }
 }
 
-// PageRecord byte layout (12 bytes):
-//   0..2   first_line  u16  (index into chapter line table)
-//   2      line_count  u8
-//   3      flags       u8
-//   4..8   start_byte  u32  (chapter-relative)
-//   8..12  end_byte    u32  (chapter-relative)
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PageRecord {
-    pub first_line: u16,
-    pub line_count: u8,
-    pub flags: u8,
-    pub start_byte: u32,
-    pub end_byte: u32,
+crate::record! {
+    /// one page of a chapter: which lines it holds and the chapter-
+    /// relative byte span it covers
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct PageRecord [PAGE_RECORD_SIZE] {
+        /// index into the chapter line table
+        first_line: u16 @ 0,
+        line_count: u8  @ 2,
+        flags:      u8  @ 3,
+        start_byte: u32 @ 4,
+        end_byte:   u32 @ 8,
+    }
 }
 
 impl PageRecord {
@@ -1036,50 +767,24 @@ impl PageRecord {
         start_byte: 0,
         end_byte: 0,
     };
-
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < PAGE_RECORD_SIZE {
-            return None;
-        }
-        Some(Self {
-            first_line: r_u16(buf, 0),
-            line_count: buf[2],
-            flags: buf[3],
-            start_byte: r_u32(buf, 4),
-            end_byte: r_u32(buf, 8),
-        })
-    }
-
-    pub fn encode(&self) -> [u8; PAGE_RECORD_SIZE] {
-        let mut out = [0u8; PAGE_RECORD_SIZE];
-        w_u16(&mut out, 0, self.first_line);
-        out[2] = self.line_count;
-        out[3] = self.flags;
-        w_u32(&mut out, 4, self.start_byte);
-        w_u32(&mut out, 8, self.end_byte);
-        out
-    }
 }
 
-// LineRecord byte layout (12 bytes):
-//   0..4   start_byte  u32  (chapter-relative)
-//   4..8   end_byte    u32  (chapter-relative)
-//   8      flags       u8   (see LineLayout::FLAG_* in src/apps/reader/layout/mod.rs)
-//   9      indent      u8   (or alt_len for image-origin lines)
-//   10     align       u8
-//   11     extra       u8   (algo_version >= 2: per-gap stretch/shrink in px;
-//                            bit 7 = sign (1 = shrink, 0 = stretch),
-//                            bits 0-6 = magnitude in px-per-gap, cap 127.
-//                            algo_version == 1: layout-only, e.g. visible soft-hyphen)
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LineRecord {
-    pub start_byte: u32,
-    pub end_byte: u32,
-    pub flags: u8,
-    pub indent: u8,
-    pub align: u8,
-    pub extra: u8,
+crate::record! {
+    /// one laid-out line, chapter-relative
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct LineRecord [LINE_RECORD_SIZE] {
+        start_byte: u32 @ 0,
+        end_byte:   u32 @ 4,
+        /// see LineLayout::FLAG_* in src/apps/reader/layout/mod.rs
+        flags:  u8 @ 8,
+        /// or alt_len for image-origin lines
+        indent: u8 @ 9,
+        align:  u8 @ 10,
+        /// algo_version >= 2: per-gap stretch/shrink in px; bit 7 = sign
+        /// (1 = shrink, 0 = stretch), bits 0-6 = magnitude per gap, cap
+        /// 127. algo_version == 1: layout-only, e.g. visible soft-hyphen
+        extra: u8 @ 11,
+    }
 }
 
 impl LineRecord {
@@ -1091,97 +796,19 @@ impl LineRecord {
         align: 0,
         extra: 0,
     };
-
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < LINE_RECORD_SIZE {
-            return None;
-        }
-        Some(Self {
-            start_byte: r_u32(buf, 0),
-            end_byte: r_u32(buf, 4),
-            flags: buf[8],
-            indent: buf[9],
-            align: buf[10],
-            extra: buf[11],
-        })
-    }
-
-    pub fn encode(&self) -> [u8; LINE_RECORD_SIZE] {
-        let mut out = [0u8; LINE_RECORD_SIZE];
-        w_u32(&mut out, 0, self.start_byte);
-        w_u32(&mut out, 4, self.end_byte);
-        out[8] = self.flags;
-        out[9] = self.indent;
-        out[10] = self.align;
-        out[11] = self.extra;
-        out
-    }
 }
 
 // ── compile-time layout asserts ────────────────────────────────────
 //
-// these catch off-by-one errors in the `OFF_*` constants if anyone
-// adds or reorders fields without updating the running total.
+// each `record!` above proves its own fields are disjoint and land
+// inside the record; these pin the sizes the on-disk format promises.
 
 const _: () = {
-    assert!(OFF_FLAGS + 4 + 4 == OFF_TITLE_LEN);
-    assert!(OFF_TITLE + TITLE_CAP == OFF_AUTHOR_LEN);
-    assert!(OFF_AUTHOR + AUTHOR_CAP == OFF_CHAPTER_COUNT);
-    assert!(OFF_SPINE_COUNT + 2 + 2 == OFF_BM_CHAPTER);
-    assert!(OFF_BM_FLAGS + 1 + 6 + 12 == OFF_COVERS_OFFSET);
-    assert!(OFF_SPINE_SIZE + 4 + 8 == OFF_CONTENT_OFFSET);
-    assert!(OFF_CONTENT_SIZE + 4 + 8 == OFF_PIDX_DIR_OFFSET);
-    assert!(OFF_PIDX_FONT_IDX < HEADER_SIZE);
-    assert!(OFF_PIDX_DATA_OFFSET + 4 == OFF_PIDX_DATA_SIZE);
-    assert!(OFF_PIDX_DATA_SIZE + 4 <= HEADER_SIZE);
-
-    // PIDX v2 record sizes
     assert!(PAGEIDX_HDR_V2_SIZE == 20);
     assert!(CHAPTER_LAYOUT_DIR_SIZE == 24);
     assert!(PAGE_RECORD_SIZE == 12);
     assert!(LINE_RECORD_SIZE == 12);
 };
-
-// ── little-endian helpers ──────────────────────────────────────────
-
-#[inline]
-fn r_u16(buf: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([buf[off], buf[off + 1]])
-}
-
-#[inline]
-fn r_u32(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-}
-
-#[inline]
-fn w_u16(buf: &mut [u8], off: usize, val: u16) {
-    buf[off..off + 2].copy_from_slice(&val.to_le_bytes());
-}
-
-#[inline]
-fn w_u32(buf: &mut [u8], off: usize, val: u32) {
-    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
-}
-
-fn decode_fixed<const N: usize>(buf: &[u8], len_off: usize, body_off: usize) -> FixedStr<N> {
-    let n = (buf[len_off] as usize).min(N);
-    let mut b = [0u8; N];
-    b[..n].copy_from_slice(&buf[body_off..body_off + n]);
-    FixedStr::from_raw(b, n as u8)
-}
-
-fn encode_fixed<const N: usize>(
-    buf: &mut [u8],
-    len_off: usize,
-    body_off: usize,
-    cap: usize,
-    s: &FixedStr<N>,
-) {
-    let n = s.len().min(cap);
-    buf[len_off] = n as u8;
-    buf[body_off..body_off + n].copy_from_slice(&s.raw_buf()[..n]);
-}
 
 // ── bundle I/O ─────────────────────────────────────────────────────
 //
@@ -1371,7 +998,8 @@ impl<'a> BundleFile<'a> {
         if buf[OFF_MAGIC..OFF_MAGIC + 4] != HEADER_MAGIC {
             return Err(BundleError::MissingOrCorrupt);
         }
-        let on_disk_version = r_u16(&buf, OFF_VERSION);
+        let on_disk_version =
+            <u16 as crate::util::Field>::read(&buf[OFF_VERSION..]).unwrap_or(0);
         if on_disk_version != HEADER_VERSION {
             return Err(BundleError::StaleVersion(on_disk_version));
         }
@@ -1754,14 +1382,10 @@ mod tests {
         // section's start sits inside the dir region; verify_layout
         // must catch this before the header is committed to disk.
         let mut hdr = BundleHeader::EMPTY;
-        hdr.spine_offset = 256;
-        hdr.spine_size = 1104;
-        hdr.content_offset = 1360;
-        hdr.content_size = 1_013_793;
-        hdr.pidx_dir_offset = 1_015_153;
-        hdr.pidx_dir_size = 1676;
-        hdr.covers_offset = 1_016_065;
-        hdr.covers_size = 4006;
+        hdr.set_section(SectionId::Spine, SectionRange { offset: 256, size: 1104 });
+        hdr.set_section(SectionId::Content, SectionRange { offset: 1360, size: 1_013_793 });
+        hdr.set_section(SectionId::PidxDir, SectionRange { offset: 1_015_153, size: 1676 });
+        hdr.set_section(SectionId::Covers, SectionRange { offset: 1_016_065, size: 4006 });
 
         match hdr.verify_layout() {
             Err(BundleError::Overlap { a, b }) => {
@@ -1782,16 +1406,11 @@ mod tests {
     fn verify_layout_accepts_contiguous_disjoint_layout() {
         // Spine -> Content -> PidxDir -> Covers -> PidxData, end-to-end.
         let mut hdr = BundleHeader::EMPTY;
-        hdr.spine_offset = 256;
-        hdr.spine_size = 1104;
-        hdr.content_offset = 1360;
-        hdr.content_size = 1_013_793;
-        hdr.pidx_dir_offset = 1_015_153;
-        hdr.pidx_dir_size = 1676;
-        hdr.covers_offset = 1_016_829;
-        hdr.covers_size = 4006;
-        hdr.pidx_data_offset = 1_020_835;
-        hdr.pidx_data_size = 8000;
+        hdr.set_section(SectionId::Spine, SectionRange { offset: 256, size: 1104 });
+        hdr.set_section(SectionId::Content, SectionRange { offset: 1360, size: 1_013_793 });
+        hdr.set_section(SectionId::PidxDir, SectionRange { offset: 1_015_153, size: 1676 });
+        hdr.set_section(SectionId::Covers, SectionRange { offset: 1_016_829, size: 4006 });
+        hdr.set_section(SectionId::PidxData, SectionRange { offset: 1_020_835, size: 8000 });
 
         hdr.verify_layout().expect("contiguous disjoint must pass");
     }
@@ -1800,8 +1419,7 @@ mod tests {
     fn verify_layout_accepts_unallocated_sections() {
         // Only spine recorded; everything else is empty.
         let mut hdr = BundleHeader::EMPTY;
-        hdr.spine_offset = 256;
-        hdr.spine_size = 1104;
+        hdr.set_section(SectionId::Spine, SectionRange { offset: 256, size: 1104 });
         hdr.verify_layout().expect("empty sections never overlap");
         assert_eq!(hdr.section(SectionId::Content), None);
         assert!(hdr.section(SectionId::Spine).is_some());
@@ -1821,21 +1439,21 @@ mod tests {
     #[test]
     fn header_encode_decode_preserves_v3_pidx_fields() {
         let mut h = BundleHeader::EMPTY;
-        h.spine_offset = 256;
-        h.spine_size = 1104;
-        h.content_offset = 1360;
-        h.content_size = 100_000;
-        h.pidx_dir_offset = 101_360;
-        h.pidx_dir_size = 1676;
-        h.pidx_data_offset = 107_042;
-        h.pidx_data_size = 8000;
+        h.set_section(SectionId::Spine, SectionRange { offset: 256, size: 1104 });
+        h.set_section(SectionId::Content, SectionRange { offset: 1360, size: 100_000 });
+        h.set_section(SectionId::PidxDir, SectionRange { offset: 101_360, size: 1676 });
+        h.set_section(SectionId::PidxData, SectionRange { offset: 107_042, size: 8000 });
         h.pidx_font_idx = 5;
         let bytes = h.encode();
         let back = BundleHeader::decode(&bytes).expect("round-trip");
-        assert_eq!(back.pidx_dir_offset, 101_360);
-        assert_eq!(back.pidx_dir_size, 1676);
-        assert_eq!(back.pidx_data_offset, 107_042);
-        assert_eq!(back.pidx_data_size, 8000);
+        assert_eq!(
+            back.range(SectionId::PidxDir),
+            SectionRange { offset: 101_360, size: 1676 }
+        );
+        assert_eq!(
+            back.range(SectionId::PidxData),
+            SectionRange { offset: 107_042, size: 8000 }
+        );
         assert_eq!(back.pidx_font_idx, 5);
     }
 
@@ -1846,8 +1464,9 @@ mod tests {
         // and silently reinterpreted as v3.
         let mut buf = [0u8; HEADER_SIZE];
         buf[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&HEADER_MAGIC);
-        w_u16(&mut buf, OFF_VERSION, 2);
-        w_u16(&mut buf, OFF_HEADER_SIZE, HEADER_SIZE as u16);
+        use crate::util::Field;
+        2u16.write(&mut buf[OFF_VERSION..]);
+        (HEADER_SIZE as u16).write(&mut buf[6..]);
         assert!(BundleHeader::decode(&buf).is_none());
     }
 

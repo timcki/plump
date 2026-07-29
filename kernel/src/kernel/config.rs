@@ -270,56 +270,171 @@ fn parse_bool(val: &[u8]) -> bool {
     matches!(val, b"1" | b"true")
 }
 
+/// One scalar setting: its key, where it lives, how it parses, and the
+/// literal text emitted immediately before its `key=value` line.
+struct Row {
+    key: &'static [u8],
+    field: Field,
+    kind: Kind,
+    prefix: &'static [u8],
+}
+
+/// Every scalar setting, in emit order. The wifi keys are deliberately
+/// absent: they are strings, not u16, and stay special-cased.
+const ROWS: &[Row] = &[
+    Row {
+        key: b"sleep_timeout",
+        field: Field::SleepTimeout,
+        kind: Kind::Num,
+        prefix: b"# power settings\n",
+    },
+    Row {
+        key: b"ghost_clear",
+        field: Field::GhostClear,
+        kind: Kind::Num,
+        prefix: b"",
+    },
+    Row {
+        key: b"book_font",
+        field: Field::BookFont,
+        kind: Kind::Num,
+        prefix: b"\n# font settings\n",
+    },
+    Row {
+        key: b"ui_font",
+        field: Field::UiFont,
+        kind: Kind::Num,
+        prefix: b"",
+    },
+    Row {
+        key: b"reader_font",
+        field: Field::ReaderFont,
+        kind: Kind::Num,
+        prefix: b"# reader font (0=Bookerly, 1=Atkinson)\n",
+    },
+    Row {
+        key: b"reading_theme",
+        field: Field::ReadingTheme,
+        kind: Kind::Num,
+        prefix: b"\n# reading settings (0=Compact, 1=Default, 2=Relaxed, 3=Spacious)\n",
+    },
+    Row {
+        key: b"line_spacing",
+        field: Field::LineSpacing,
+        kind: Kind::Num,
+        prefix: b"# line spacing (0=1.30x 1=1.45x 2=1.60x 3=1.80x 4=2.00x of em)\n",
+    },
+    Row {
+        key: b"sunlight_fix",
+        field: Field::SunlightFix,
+        kind: Kind::Bool,
+        prefix: b"\n# display settings\n",
+    },
+    Row {
+        key: b"text_aa",
+        field: Field::TextAa,
+        kind: Kind::Bool,
+        prefix: b"",
+    },
+    Row {
+        key: b"reader_status",
+        field: Field::ReaderStatus,
+        kind: Kind::Bool,
+        prefix: b"\n# reader settings\n",
+    },
+    Row {
+        key: b"text_alignment",
+        field: Field::TextAlignment,
+        kind: Kind::Num,
+        prefix: b"# text alignment (0=Left, 1=Justify)\n",
+    },
+    Row {
+        key: b"swap_buttons",
+        field: Field::SwapButtons,
+        kind: Kind::Bool,
+        prefix: b"\n# control settings\n",
+    },
+];
+
+#[derive(Clone, Copy)]
+enum Field {
+    SleepTimeout,
+    GhostClear,
+    BookFont,
+    UiFont,
+    ReaderFont,
+    ReadingTheme,
+    LineSpacing,
+    SunlightFix,
+    TextAa,
+    ReaderStatus,
+    TextAlignment,
+    SwapButtons,
+}
+
+// the two parse paths are deliberately asymmetric and predate the
+// table: a numeric key with an unparseable value is ignored (the field
+// keeps its previous value), while a bool key with an unparseable
+// value is set to false, because parse_bool maps everything that is
+// not 1/true to false. do not unify them, files in the wild rely on it.
+#[derive(Clone, Copy)]
+enum Kind {
+    Num,
+    Bool,
+}
+
 impl SystemSettings {
+    // bools live in the table as 0/1, matching what the writer emits
+    const fn get(&self, f: Field) -> u16 {
+        match f {
+            Field::SleepTimeout => self.sleep_timeout,
+            Field::GhostClear => self.ghost_clear_every as u16,
+            Field::BookFont => self.book_font_size_idx as u16,
+            Field::UiFont => self.ui_font_size_idx as u16,
+            Field::ReaderFont => self.reader_font as u16,
+            Field::ReadingTheme => self.reading_theme as u16,
+            Field::LineSpacing => self.line_spacing as u16,
+            Field::SunlightFix => self.sunlight_fix as u16,
+            Field::TextAa => self.text_aa as u16,
+            Field::ReaderStatus => self.reader_status as u16,
+            Field::TextAlignment => self.text_alignment as u16,
+            Field::SwapButtons => self.swap_buttons as u16,
+        }
+    }
+
+    fn set(&mut self, f: Field, v: u16) {
+        match f {
+            Field::SleepTimeout => self.sleep_timeout = v,
+            Field::GhostClear => self.ghost_clear_every = v as u8,
+            Field::BookFont => self.book_font_size_idx = v as u8,
+            Field::UiFont => self.ui_font_size_idx = v as u8,
+            Field::ReaderFont => self.reader_font = v as u8,
+            Field::ReadingTheme => self.reading_theme = v as u8,
+            Field::LineSpacing => self.line_spacing = v as u8,
+            Field::SunlightFix => self.sunlight_fix = v != 0,
+            Field::TextAa => self.text_aa = v != 0,
+            Field::ReaderStatus => self.reader_status = v != 0,
+            Field::TextAlignment => self.text_alignment = v as u8,
+            Field::SwapButtons => self.swap_buttons = v != 0,
+        }
+    }
+
     fn apply_setting(&mut self, key: &[u8], val: &[u8], wifi: &mut WifiConfig) {
         match key {
-            b"sleep_timeout" => {
-                if let Some(v) = parse_u16(val) {
-                    self.sleep_timeout = v;
-                }
-            }
-            b"ghost_clear" => {
-                if let Some(v) = parse_u16(val) {
-                    self.ghost_clear_every = v as u8;
-                }
-            }
-            b"book_font" => {
-                if let Some(v) = parse_u16(val) {
-                    self.book_font_size_idx = v as u8;
-                }
-            }
-            b"ui_font" => {
-                if let Some(v) = parse_u16(val) {
-                    self.ui_font_size_idx = v as u8;
-                }
-            }
-            b"reader_font" => {
-                if let Some(v) = parse_u16(val) {
-                    self.reader_font = v as u8;
-                }
-            }
-            b"reading_theme" => {
-                if let Some(v) = parse_u16(val) {
-                    self.reading_theme = v as u8;
-                }
-            }
-            b"line_spacing" => {
-                if let Some(v) = parse_u16(val) {
-                    self.line_spacing = v as u8;
-                }
-            }
-            b"swap_buttons" => self.swap_buttons = parse_bool(val),
-            b"sunlight_fix" => self.sunlight_fix = parse_bool(val),
-            b"text_aa" => self.text_aa = parse_bool(val),
-            b"reader_status" => self.reader_status = parse_bool(val),
-            b"text_alignment" => {
-                if let Some(v) = parse_u16(val) {
-                    self.text_alignment = v as u8;
-                }
-            }
             b"wifi_ssid" => wifi.set_ssid(val),
             b"wifi_pass" => wifi.set_pass(val),
-            _ => {}
+            _ => {
+                if let Some(row) = ROWS.iter().find(|r| r.key == key) {
+                    match row.kind {
+                        Kind::Num => {
+                            if let Some(v) = parse_u16(val) {
+                                self.set(row.field, v);
+                            }
+                        }
+                        Kind::Bool => self.set(row.field, parse_bool(val) as u16),
+                    }
+                }
+            }
         }
     }
 
@@ -351,18 +466,25 @@ struct TxtWriter<'a> {
     pos: usize,
 }
 
+// every method is const so the byte-identity check at the bottom of
+// this file can render the whole file at compile time
 impl<'a> TxtWriter<'a> {
-    fn new(buf: &'a mut [u8]) -> Self {
+    const fn new(buf: &'a mut [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
-    fn put(&mut self, data: &[u8]) {
-        let n = data.len().min(self.buf.len() - self.pos);
-        self.buf[self.pos..self.pos + n].copy_from_slice(&data[..n]);
+    const fn put(&mut self, data: &[u8]) {
+        let room = self.buf.len() - self.pos;
+        let n = if data.len() < room { data.len() } else { room };
+        let mut i = 0;
+        while i < n {
+            self.buf[self.pos + i] = data[i];
+            i += 1;
+        }
         self.pos += n;
     }
 
-    fn put_u16(&mut self, val: u16) {
+    const fn put_u16(&mut self, val: u16) {
         if val == 0 {
             self.put(b"0");
             return;
@@ -375,17 +497,18 @@ impl<'a> TxtWriter<'a> {
             digits[i] = b'0' + (v % 10) as u8;
             v /= 10;
         }
-        self.put(&digits[i..5]);
+        // split_at, not digits[i..5]: range indexing is not const yet
+        self.put(digits.split_at(i).1);
     }
 
-    fn kv_num(&mut self, key: &[u8], val: u16) {
+    const fn kv_num(&mut self, key: &[u8], val: u16) {
         self.put(key);
         self.put(b"=");
         self.put_u16(val);
         self.put(b"\n");
     }
 
-    fn kv_str(&mut self, key: &[u8], val: &[u8]) {
+    const fn kv_str(&mut self, key: &[u8], val: &[u8]) {
         self.put(key);
         self.put(b"=");
         self.put(val);
@@ -393,43 +516,139 @@ impl<'a> TxtWriter<'a> {
     }
 }
 
+const HEADER: &[u8] = b"# plump settings\n# lines starting with # are ignored\n\n";
+const WIFI_HEADER: &[u8] = b"\n# wifi credentials for upload mode\n";
+
 impl SystemSettings {
     /// Serialize self + wifi config to SETTINGS.TXT format.
     pub fn write_txt(&self, w: &WifiConfig, buf: &mut [u8]) -> usize {
-    let mut wr = TxtWriter::new(buf);
-    wr.put(b"# plump settings\n");
-    wr.put(b"# lines starting with # are ignored\n\n");
+        self.render(w.ssid.as_bytes(), w.pass.as_bytes(), buf)
+    }
 
-    wr.put(b"# power settings\n");
-    wr.kv_num(b"sleep_timeout", self.sleep_timeout);
-    wr.kv_num(b"ghost_clear", self.ghost_clear_every as u16);
-
-    wr.put(b"\n# font settings\n");
-    wr.kv_num(b"book_font", self.book_font_size_idx as u16);
-    wr.kv_num(b"ui_font", self.ui_font_size_idx as u16);
-    wr.put(b"# reader font (0=Bookerly, 1=Atkinson)\n");
-    wr.kv_num(b"reader_font", self.reader_font as u16);
-
-    wr.put(b"\n# reading settings (0=Compact, 1=Default, 2=Relaxed, 3=Spacious)\n");
-    wr.kv_num(b"reading_theme", self.reading_theme as u16);
-    wr.put(b"# line spacing (0=1.30x 1=1.45x 2=1.60x 3=1.80x 4=2.00x of em)\n");
-    wr.kv_num(b"line_spacing", self.line_spacing as u16);
-
-    wr.put(b"\n# display settings\n");
-    wr.kv_num(b"sunlight_fix", if self.sunlight_fix { 1 } else { 0 });
-    wr.kv_num(b"text_aa", if self.text_aa { 1 } else { 0 });
-
-    wr.put(b"\n# reader settings\n");
-    wr.kv_num(b"reader_status", if self.reader_status { 1 } else { 0 });
-    wr.put(b"# text alignment (0=Left, 1=Justify)\n");
-    wr.kv_num(b"text_alignment", self.text_alignment as u16);
-
-    wr.put(b"\n# control settings\n");
-    wr.kv_num(b"swap_buttons", if self.swap_buttons { 1 } else { 0 });
-
-    wr.put(b"\n# wifi credentials for upload mode\n");
-    wr.kv_str(b"wifi_ssid", w.ssid.as_bytes());
-    wr.kv_str(b"wifi_pass", w.pass.as_bytes());
-    wr.pos
+    // const so the whole emit path is exercised by a compile-time
+    // assert; write_txt only peels the strings off the wifi config
+    const fn render(&self, ssid: &[u8], pass: &[u8], buf: &mut [u8]) -> usize {
+        let mut wr = TxtWriter::new(buf);
+        wr.put(HEADER);
+        let mut i = 0;
+        while i < ROWS.len() {
+            let row = &ROWS[i];
+            wr.put(row.prefix);
+            wr.kv_num(row.key, self.get(row.field));
+            i += 1;
+        }
+        // wifi stays outside the table: string-valued and always last
+        wr.put(WIFI_HEADER);
+        wr.kv_str(b"wifi_ssid", ssid);
+        wr.kv_str(b"wifi_pass", pass);
+        wr.pos
     }
 }
+
+// compile-time byte-identity proof. the kernel crate cannot host
+// tests (esp-hal is riscv-only), so the expected bytes are transcribed
+// from the hand-rolled writer this table replaced and checked during
+// the real target build. two cases: defaults with empty credentials,
+// and an all-flipped variant that also covers 0/1 bool encoding,
+// multi-digit numbers and non-empty wifi values.
+const EXPECTED_DEFAULT_TXT: &[u8] = b"# plump settings\n\
+# lines starting with # are ignored\n\
+\n\
+# power settings\n\
+sleep_timeout=10\n\
+ghost_clear=10\n\
+\n\
+# font settings\n\
+book_font=2\n\
+ui_font=2\n\
+# reader font (0=Bookerly, 1=Atkinson)\n\
+reader_font=0\n\
+\n\
+# reading settings (0=Compact, 1=Default, 2=Relaxed, 3=Spacious)\n\
+reading_theme=1\n\
+# line spacing (0=1.30x 1=1.45x 2=1.60x 3=1.80x 4=2.00x of em)\n\
+line_spacing=2\n\
+\n\
+# display settings\n\
+sunlight_fix=0\n\
+text_aa=0\n\
+\n\
+# reader settings\n\
+reader_status=1\n\
+# text alignment (0=Left, 1=Justify)\n\
+text_alignment=1\n\
+\n\
+# control settings\n\
+swap_buttons=0\n\
+\n\
+# wifi credentials for upload mode\n\
+wifi_ssid=\n\
+wifi_pass=\n";
+
+const EXPECTED_FLIPPED_TXT: &[u8] = b"# plump settings\n\
+# lines starting with # are ignored\n\
+\n\
+# power settings\n\
+sleep_timeout=120\n\
+ghost_clear=100\n\
+\n\
+# font settings\n\
+book_font=4\n\
+ui_font=0\n\
+# reader font (0=Bookerly, 1=Atkinson)\n\
+reader_font=1\n\
+\n\
+# reading settings (0=Compact, 1=Default, 2=Relaxed, 3=Spacious)\n\
+reading_theme=3\n\
+# line spacing (0=1.30x 1=1.45x 2=1.60x 3=1.80x 4=2.00x of em)\n\
+line_spacing=4\n\
+\n\
+# display settings\n\
+sunlight_fix=1\n\
+text_aa=1\n\
+\n\
+# reader settings\n\
+reader_status=0\n\
+# text alignment (0=Left, 1=Justify)\n\
+text_alignment=0\n\
+\n\
+# control settings\n\
+swap_buttons=1\n\
+\n\
+# wifi credentials for upload mode\n\
+wifi_ssid=plump-net\n\
+wifi_pass=hunter2\n";
+
+const fn assert_renders(s: &SystemSettings, ssid: &[u8], pass: &[u8], expect: &[u8]) {
+    let mut buf = [0u8; SETTINGS_BUF_CAP];
+    let n = s.render(ssid, pass, &mut buf);
+    assert!(n == expect.len(), "settings emit length drifted");
+    let mut i = 0;
+    while i < n {
+        assert!(buf[i] == expect[i], "settings emit bytes drifted");
+        i += 1;
+    }
+}
+
+const _: () = {
+    assert_renders(&SystemSettings::defaults(), b"", b"", EXPECTED_DEFAULT_TXT);
+    assert_renders(
+        &SystemSettings {
+            sleep_timeout: 120,
+            ghost_clear_every: 100,
+            book_font_size_idx: 4,
+            ui_font_size_idx: 0,
+            reader_font: 1,
+            reading_theme: 3,
+            line_spacing: 4,
+            swap_buttons: true,
+            sunlight_fix: true,
+            text_aa: true,
+            reader_status: false,
+            text_alignment: 0,
+        },
+        b"plump-net",
+        b"hunter2",
+        EXPECTED_FLIPPED_TXT,
+    );
+};

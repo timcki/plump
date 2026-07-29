@@ -6,8 +6,8 @@
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::storage::{DirEntry, DirPage};
 use crate::error::Result;
-use crate::kernel::bookmarks::BookmarkCache;
-use crate::kernel::daystats::DayStats;
+use crate::kernel::bookmarks::{self, BookmarkCache};
+use crate::kernel::daystats::{DayKey, DayStats};
 use crate::kernel::dir_cache::DirCache;
 
 // synchronous API surface for apps
@@ -56,9 +56,12 @@ impl<'k> KernelHandle<'k> {
 
     // direct cache accessors
 
+    /// Bookmark cache, loaded if it wasn't already. The returned view
+    /// needs no per-call "is it loaded" test.
     #[inline]
-    pub fn bookmark_cache(&self) -> &BookmarkCache {
-        &*self.svc.bm_cache
+    pub fn bookmarks(&mut self) -> bookmarks::Loaded<'_> {
+        let k = &mut *self.svc;
+        k.bm_cache.loaded(&k.sd)
     }
 
     #[inline]
@@ -85,10 +88,10 @@ impl<'k> KernelHandle<'k> {
     }
 
     /// Current day key (derived from `_PLUMP/DAYSTATS.BIN` mtime).
-    /// Zero when the SD card has no usable wall clock, in which case
+    /// None when the SD card has no usable wall clock, in which case
     /// counters accumulate from boot without ever rolling over.
     #[inline]
-    pub fn today_key(&self) -> u32 {
+    pub fn today_key(&self) -> Option<DayKey> {
         self.svc.today_key
     }
 }

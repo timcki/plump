@@ -1,35 +1,8 @@
 // bookmark cache: 16 slots, RAM-resident, flushed to SD on dirty
-//
-// record layout (little-endian, 48 bytes per slot):
-//   [0..4)   name_hash  u32    [8..10)  chapter    u16
-//   [4..8)   byte_offset u32   [10..12) flags      u16 (bit 0 = valid)
-//   [12..14) generation u16    [14] name_len u8  [15] pad
-//   [16..48) filename [u8;32]
 
 use crate::drivers::sdcard::SdStorage;
 use crate::util::FixedStr;
 use crate::util::hash::fnv1a_icase;
-
-// little-endian helpers for binary record encoding
-#[inline]
-fn read_u16_le(buf: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([buf[off], buf[off + 1]])
-}
-
-#[inline]
-fn read_u32_le(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-}
-
-#[inline]
-fn write_u16_le(buf: &mut [u8], off: usize, val: u16) {
-    buf[off..off + 2].copy_from_slice(&val.to_le_bytes());
-}
-
-#[inline]
-fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
-    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
-}
 
 pub const BOOKMARK_FILE: &str = "BKMK.BIN";
 pub const SLOTS: usize = 16;
@@ -37,14 +10,18 @@ pub const RECORD_LEN: usize = 48;
 pub const FILE_LEN: usize = SLOTS * RECORD_LEN; // 768B
 pub const FILENAME_CAP: usize = 32;
 
-#[derive(Clone, Copy)]
-pub struct BookmarkSlot {
-    pub name_hash: u32,
-    pub byte_offset: u32,
-    pub chapter: u16,
-    pub valid: bool,
-    pub generation: u16,
-    pub filename: FixedStr<FILENAME_CAP>,
+crate::record! {
+    #[derive(Clone, Copy)]
+    pub struct BookmarkSlot [RECORD_LEN] {
+        name_hash:   u32 @ 0,
+        byte_offset: u32 @ 4,
+        chapter:     u16 @ 8,
+        /// bit 0 of the flags word
+        valid:   bool16 @ 10,
+        generation:  u16 @ 12,
+        // 15 pad
+        filename: {str FILENAME_CAP} @ (14, 16),
+    }
 }
 
 impl BookmarkSlot {
@@ -59,37 +36,6 @@ impl BookmarkSlot {
 
     pub fn filename_str(&self) -> &str {
         self.filename.as_str()
-    }
-
-    fn decode(rec: &[u8]) -> Self {
-        if rec.len() < RECORD_LEN {
-            return Self::EMPTY;
-        }
-        let name_len = rec[14].min(FILENAME_CAP as u8);
-        let mut filename = [0u8; FILENAME_CAP];
-        filename[..name_len as usize].copy_from_slice(&rec[16..16 + name_len as usize]);
-
-        Self {
-            name_hash: read_u32_le(rec, 0),
-            byte_offset: read_u32_le(rec, 4),
-            chapter: read_u16_le(rec, 8),
-            valid: read_u16_le(rec, 10) & 1 != 0,
-            generation: read_u16_le(rec, 12),
-            filename: FixedStr::from_raw(filename, name_len),
-        }
-    }
-
-    fn encode(&self) -> [u8; RECORD_LEN] {
-        let mut rec = [0u8; RECORD_LEN];
-        write_u32_le(&mut rec, 0, self.name_hash);
-        write_u32_le(&mut rec, 4, self.byte_offset);
-        write_u16_le(&mut rec, 8, self.chapter);
-        write_u16_le(&mut rec, 10, if self.valid { 1 } else { 0 });
-        write_u16_le(&mut rec, 12, self.generation);
-        rec[14] = self.filename.raw_len();
-        let n = self.filename.len();
-        rec[16..16 + n].copy_from_slice(&self.filename.raw_buf()[..n]);
-        rec
     }
 
     fn matches_name(&self, name: &[u8]) -> bool {
@@ -153,7 +99,8 @@ impl BookmarkCache {
 
         for i in 0..slot_count {
             let base = i * RECORD_LEN;
-            self.slots[i] = BookmarkSlot::decode(&buf[base..base + RECORD_LEN]);
+            self.slots[i] = BookmarkSlot::decode(&buf[base..base + RECORD_LEN])
+                .unwrap_or(BookmarkSlot::EMPTY);
         }
         for i in slot_count..SLOTS {
             self.slots[i] = BookmarkSlot::EMPTY;
@@ -166,11 +113,16 @@ impl BookmarkCache {
         log::debug!("bookmarks: loaded {} slots from SD", slot_count);
     }
 
-    pub fn find(&self, filename: &[u8]) -> Option<BookmarkSlot> {
-        if !self.loaded {
-            return None;
-        }
+    /// Load if needed and hand back a view whose reads need no
+    /// "did anyone load this yet?" check. Mint this wherever an
+    /// `&SdStorage` is in reach; the guarded `save` below stays for the
+    /// app-trait path, which only ever receives `&mut BookmarkCache`.
+    pub fn loaded(&mut self, sd: &SdStorage) -> Loaded<'_> {
+        self.ensure_loaded(sd);
+        Loaded { cache: self }
+    }
 
+    fn find_slot(&self, filename: &[u8]) -> Option<BookmarkSlot> {
         let key = fnv1a_icase(filename);
         self.slots[..self.count]
             .iter()
@@ -178,11 +130,7 @@ impl BookmarkCache {
             .copied()
     }
 
-    pub fn load_all(&self, out: &mut [BmListEntry]) -> usize {
-        if !self.loaded {
-            return 0;
-        }
-
+    fn list_all(&self, out: &mut [BmListEntry]) -> usize {
         let mut gens = [0u16; SLOTS];
         let mut count = 0usize;
 
@@ -216,12 +164,18 @@ impl BookmarkCache {
         count
     }
 
+    /// Guarded fallback for the app-trait path (`App::save_state` only
+    /// ever gets `&mut BookmarkCache`, with no `&SdStorage` in reach to
+    /// mint a [`Loaded`] from). Prefer `Loaded::save`.
     pub fn save(&mut self, filename: &[u8], byte_offset: u32, chapter: u16) {
         if !self.loaded {
             log::warn!("bookmarks: save called before load, ignoring");
             return;
         }
+        self.write_slot(filename, byte_offset, chapter);
+    }
 
+    fn write_slot(&mut self, filename: &[u8], byte_offset: u32, chapter: u16) {
         let key = fnv1a_icase(filename);
 
         let mut max_gen: u16 = 0;
@@ -297,9 +251,11 @@ impl BookmarkCache {
     }
 
     pub fn flush(&mut self, sd: &SdStorage) {
-        if !self.dirty || !self.loaded {
+        // an unloaded cache is also never dirty, so one test covers both
+        if !self.dirty {
             return;
         }
+        debug_assert!(self.loaded, "dirty bookmark cache was never loaded");
 
         let file_len = self.count * RECORD_LEN;
         let mut buf = [0u8; FILE_LEN];
@@ -319,5 +275,29 @@ impl BookmarkCache {
                 log::warn!("bookmarks: flush failed: {}", e);
             }
         }
+    }
+}
+
+/// A [`BookmarkCache`] that is known to be loaded, because the only way
+/// to get one is [`BookmarkCache::loaded`]. Its methods carry no
+/// "loaded?" test: the borrow is the proof.
+pub struct Loaded<'a> {
+    cache: &'a mut BookmarkCache,
+}
+
+impl Loaded<'_> {
+    #[inline]
+    pub fn find(&self, filename: &[u8]) -> Option<BookmarkSlot> {
+        self.cache.find_slot(filename)
+    }
+
+    #[inline]
+    pub fn load_all(&self, out: &mut [BmListEntry]) -> usize {
+        self.cache.list_all(out)
+    }
+
+    #[inline]
+    pub fn save(&mut self, filename: &[u8], byte_offset: u32, chapter: u16) {
+        self.cache.write_slot(filename, byte_offset, chapter);
     }
 }

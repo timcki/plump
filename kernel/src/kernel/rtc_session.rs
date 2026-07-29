@@ -101,23 +101,25 @@ impl RtcSession {
         rtc_read_magic() == RTC_SESSION_MAGIC
     }
 
-    /// Check if RTC session data is valid and available for restore.
-    /// Returns true only once per boot (subsequent calls return false).
-    pub fn rtc_consume() -> bool {
+    /// Consume the RTC session, if there is one to consume.
+    ///
+    /// `Some` at most once per boot: a valid session is handed over and
+    /// marked consumed in the same step, so there is no window in which
+    /// a caller can check validity and then forget to take the payload
+    /// (or take it twice).
+    pub fn rtc_take() -> Option<Self> {
         if SESSION_CONSUMED.load(Ordering::Relaxed) != 0 {
-            return false;
+            return None;
         }
-
-        let valid = rtc_read_magic() == RTC_SESSION_MAGIC;
-        if valid {
-            SESSION_CONSUMED.store(1, Ordering::Relaxed);
+        if rtc_read_magic() != RTC_SESSION_MAGIC {
+            return None;
         }
-        valid
-    }
+        SESSION_CONSUMED.store(1, Ordering::Relaxed);
 
-    /// Load session data from RTC FAST memory.
-    pub fn rtc_load() -> Self {
-        rtc_read_session()
+        let session = rtc_read_session();
+        // magic matched in RTC FAST but the struct itself must agree;
+        // a torn write is indistinguishable from a stale layout here
+        session.is_valid().then_some(session)
     }
 
     /// Save session data to RTC FAST memory before entering deep sleep.

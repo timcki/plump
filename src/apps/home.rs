@@ -14,6 +14,7 @@ use embedded_graphics::primitives::{PrimitiveStyle, Rectangle, RoundedRectangle}
 
 use plump_kernel::util::FixedStr;
 
+use crate::apps::recent::{self, RecentRecord};
 use crate::apps::widgets::{BOOK_ROW_H, BookRow};
 use crate::apps::{App, AppContext, AppId, BgBudget, BgOutcome, RECENT_FILE, Transition};
 use crate::board::action::{Action, ActionEvent};
@@ -191,7 +192,7 @@ impl HomeApp {
     }
 
     fn load_card(&mut self, k: &mut KernelHandle<'_>) {
-        let mut buf = [0u8; 196];
+        let mut buf = [0u8; recent::BUF_LEN];
         match k
             .sd()
             .read_file_start_in_dir(k.sd().data_dir(), RECENT_FILE, &mut buf)
@@ -227,7 +228,7 @@ impl HomeApp {
         // pull the bookmark list sorted by generation (most recent
         // first), drop the one matching the card, take the next 3.
         let mut all = [BmListEntry::EMPTY; bookmarks::SLOTS];
-        let n = k.bookmark_cache().load_all(&mut all);
+        let n = k.bookmarks().load_all(&mut all);
 
         let _ = k.ensure_dir_cache_loaded();
 
@@ -263,21 +264,11 @@ impl HomeApp {
     }
 
     fn parse_recent(&mut self, data: &[u8]) {
-        // format: filename\0title\0author\0progress_byte
-        let mut fields = data.splitn(4, |&b| b == 0);
-
-        if let Some(fname) = fields.next() {
-            self.recent_book.set(fname);
-        } else {
-            self.recent_book = FixedStr::EMPTY;
-            return;
-        }
-        self.recent_title = fields.next().map(FixedStr::from_bytes).unwrap_or_default();
-        self.recent_author = fields.next().map(FixedStr::from_bytes).unwrap_or_default();
-        self.recent_progress = fields
-            .next()
-            .and_then(|r| r.first().copied())
-            .unwrap_or(0);
+        let rec = RecentRecord::decode(data);
+        self.recent_book.set(rec.filename);
+        self.recent_title = FixedStr::from_bytes(rec.title);
+        self.recent_author = FixedStr::from_bytes(rec.author);
+        self.recent_progress = rec.progress;
     }
 
     fn rebuild_item_count(&mut self) {

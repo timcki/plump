@@ -14,7 +14,7 @@ use crate::error::{Error, ErrorKind};
 use crate::kernel::KernelHandle;
 use crate::kernel::work_queue;
 use plump_kernel::kernel::bundle;
-use plump_kernel::kernel::bundle::{BundleFile, SectionId};
+use plump_kernel::kernel::bundle::{BundleFile, SectionId, SectionRange};
 use plump_kernel::util::hash;
 
 use crate::apps::BgOutcome;
@@ -183,7 +183,7 @@ impl EpubState {
         let n = bundle::read_at(
             k.sd(),
             self.name_hash,
-            hdr.spine_offset,
+            hdr.range(SectionId::Spine).offset,
             &mut scratch[..spine_bytes],
         )?;
         if n < spine_bytes {
@@ -241,15 +241,25 @@ impl EpubState {
         hdr.name_hash = self.name_hash;
         hdr.spine_count = spine_len as u16;
         hdr.chapter_count = spine_len as u16;
-        hdr.spine_offset = spine_offset();
-        hdr.spine_size = spine_section_size(spine_len);
-        hdr.content_offset = content_start_offset(spine_len);
+        hdr.set_section(
+            SectionId::Spine,
+            SectionRange {
+                offset: spine_offset(),
+                size: spine_section_size(spine_len),
+            },
+        );
         // compute total content bytes = sum of chapter sizes (for reporting)
         let mut content_bytes: u32 = 0;
         for i in 0..spine_len {
             content_bytes = content_bytes.saturating_add(self.chapter_table[i].1);
         }
-        hdr.content_size = content_bytes;
+        hdr.set_section(
+            SectionId::Content,
+            SectionRange {
+                offset: content_start_offset(spine_len),
+                size: content_bytes,
+            },
+        );
 
         hdr.set_flag(bundle::FLAG_CORE_READY, true);
         hdr.set_flag(bundle::FLAG_IS_EPUB, true);
@@ -270,13 +280,16 @@ impl EpubState {
         // layout.
         let dir_size = (bundle::PAGEIDX_HDR_V2_SIZE
             + spine_len * bundle::CHAPTER_LAYOUT_DIR_SIZE) as u32;
-        let pidx_dir_offset = hdr.content_offset.saturating_add(hdr.content_size);
-        hdr.pidx_dir_offset = pidx_dir_offset;
-        hdr.pidx_dir_size = dir_size;
-        hdr.pidx_data_offset = 0;
-        hdr.pidx_data_size = 0;
-        hdr.covers_offset = 0;
-        hdr.covers_size = 0;
+        let pidx_dir_offset = hdr.range(SectionId::Content).end();
+        hdr.set_section(
+            SectionId::PidxDir,
+            SectionRange {
+                offset: pidx_dir_offset,
+                size: dir_size,
+            },
+        );
+        hdr.set_section(SectionId::PidxData, SectionRange::EMPTY);
+        hdr.set_section(SectionId::Covers, SectionRange::EMPTY);
 
         // verify_layout catches any overlap (spine/content/pidx_dir)
         // before the header is committed.
@@ -299,7 +312,8 @@ impl EpubState {
                 _reserved: 0,
             };
             let bytes = entry.encode();
-            let at = hdr.spine_offset + (i * bundle::SPINE_ENTRY_SIZE) as u32;
+            let at = hdr.range(SectionId::Spine).offset
+                + (i * bundle::SPINE_ENTRY_SIZE) as u32;
             bundle::write_at(k.sd(), self.name_hash, at, &bytes)?;
         }
 
@@ -378,10 +392,20 @@ impl EpubState {
         hdr.name_hash = self.name_hash;
         hdr.spine_count = spine_len as u16;
         hdr.chapter_count = spine_len as u16;
-        hdr.spine_offset = spine_offset();
-        hdr.spine_size = spine_section_size(spine_len);
-        hdr.content_offset = content_start_offset(spine_len);
-        hdr.content_size = 0;
+        hdr.set_section(
+            SectionId::Spine,
+            SectionRange {
+                offset: spine_offset(),
+                size: spine_section_size(spine_len),
+            },
+        );
+        hdr.set_section(
+            SectionId::Content,
+            SectionRange {
+                offset: content_start_offset(spine_len),
+                size: 0,
+            },
+        );
         hdr.set_flag(bundle::FLAG_IS_EPUB, true);
 
         // create file by writing header at offset 0
@@ -390,7 +414,7 @@ impl EpubState {
         // append zeroed spine entries in 64-byte chunks
         let mut remaining = spine_section_size(spine_len) as usize;
         let zeros = [0u8; 64];
-        let mut off = hdr.spine_offset;
+        let mut off = hdr.range(SectionId::Spine).offset;
         while remaining > 0 {
             let chunk = remaining.min(zeros.len());
             bundle::write_at(k.sd(), self.name_hash, off, &zeros[..chunk])?;

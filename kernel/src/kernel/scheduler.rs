@@ -192,8 +192,8 @@ impl super::Kernel {
     fn load_session(&self) -> Option<(super::rtc_session::RtcSession, SessionSource)> {
         use super::rtc_session::RtcSession;
 
-        if RtcSession::rtc_consume() {
-            return Some((RtcSession::rtc_load(), SessionSource::Rtc));
+        if let Some(session) = RtcSession::rtc_take() {
+            return Some((session, SessionSource::Rtc));
         }
         RtcSession::load_from_sd(&self.svc.sd).map(|s| (s, SessionSource::Sd))
     }
@@ -689,7 +689,7 @@ impl super::Services {
             .sd
             .file_mtime_day_key_in_plump(super::daystats::DAYSTATS_FILE)
         {
-            self.today_key = k;
+            self.today_key = Some(k);
         }
     }
 

@@ -2,10 +2,25 @@
 // loaded lazily from SD, held in RAM, invalidated on demand
 
 use crate::drivers::sdcard::SdStorage;
-use crate::drivers::storage::{DirEntry, DirPage, TITLES_FILE};
+use crate::drivers::storage::{DirEntry, DirPage, MAX_TITLE_LINE, TITLES_FILE};
 use crate::error::Result;
 
 const MAX_DIR_ENTRIES: usize = 128;
+
+// carry buffer for lines split across read chunks. save_title never
+// writes more than MAX_TITLE_LINE; the slack absorbs foreign lines that
+// are a little longer, and anything past it is dropped as poisoned.
+const CARRY_CAP: usize = MAX_TITLE_LINE + 32;
+
+// where the title reader stands between newlines
+enum LineState {
+    // nothing buffered; the next span is a whole line
+    Fresh,
+    // n bytes of a split line held in the carry buffer
+    Carrying(usize),
+    // a line too long for the carry buffer: drop through its newline
+    Poisoned,
+}
 
 pub struct DirCache {
     entries: [DirEntry; MAX_DIR_ENTRIES],
@@ -51,11 +66,8 @@ impl DirCache {
         // across chunk boundaries; later lines overwrite earlier ones.
         const READ_CAP: u32 = 256 * 1024; // sanity bound for corrupt files
         let mut buf = [0u8; 2048];
-        // save_title caps lines at 128 bytes; anything longer is
-        // foreign data and gets discarded via the poisoned flag
-        let mut carry = [0u8; 160];
-        let mut carry_len = 0usize;
-        let mut poisoned = false;
+        let mut carry = [0u8; CARRY_CAP];
+        let mut state = LineState::Fresh;
         let mut offset = 0u32;
 
         while offset < READ_CAP {
@@ -71,32 +83,33 @@ impl DirCache {
             let mut chunk = &buf[..n];
             while let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
                 let (part, rest) = chunk.split_at(pos);
-                if poisoned {
-                    poisoned = false;
-                } else if carry_len > 0 {
-                    if carry_len + part.len() <= carry.len() {
-                        carry[carry_len..carry_len + part.len()].copy_from_slice(part);
-                        let line_len = carry_len + part.len();
-                        self.apply_title_line(&carry[..line_len]);
+                match state {
+                    // the rest of an oversized line: the newline ends it
+                    LineState::Poisoned => {}
+                    LineState::Carrying(len) if len + part.len() <= CARRY_CAP => {
+                        carry[len..len + part.len()].copy_from_slice(part);
+                        self.apply_title_line(&carry[..len + part.len()]);
                     }
-                } else if !part.is_empty() {
-                    self.apply_title_line(part);
+                    LineState::Carrying(_) => {}
+                    LineState::Fresh if !part.is_empty() => self.apply_title_line(part),
+                    LineState::Fresh => {}
                 }
-                carry_len = 0;
+                state = LineState::Fresh;
                 chunk = &rest[1..];
             }
 
-            if poisoned {
-                continue;
-            }
-            if carry_len + chunk.len() <= carry.len() {
-                carry[carry_len..carry_len + chunk.len()].copy_from_slice(chunk);
-                carry_len += chunk.len();
+            // chunk tail with no newline: carry it into the next read
+            let len = match state {
+                LineState::Poisoned => continue,
+                LineState::Carrying(len) => len,
+                LineState::Fresh => 0,
+            };
+            state = if len + chunk.len() <= CARRY_CAP {
+                carry[len..len + chunk.len()].copy_from_slice(chunk);
+                LineState::Carrying(len + chunk.len())
             } else {
-                // oversized line: drop bytes until the next newline
-                carry_len = 0;
-                poisoned = true;
-            }
+                LineState::Poisoned
+            };
         }
     }
 

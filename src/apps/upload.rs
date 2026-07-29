@@ -207,16 +207,19 @@ enum ServerEvent {
     DeleteFailed,
 }
 
-/// Ensures a cancelled upload never leaks an open FAT handle.
+/// Removes the partial file when an upload does not run to completion.
+///
+/// The FAT handle itself is the [`storage::FileWriter`]'s business: it
+/// closes on drop, so this guard only owns the commit decision.
 struct UploadFileGuard<'a> {
-    file: Option<storage::OpenFile>,
+    file: Option<storage::FileWriter<'a>>,
     sd: &'a SdStorage,
     name: FileName,
     committed: bool,
 }
 
 impl<'a> UploadFileGuard<'a> {
-    fn new(file: storage::OpenFile, sd: &'a SdStorage, name: FileName) -> Self {
+    fn new(file: storage::FileWriter<'a>, sd: &'a SdStorage, name: FileName) -> Self {
         Self {
             file: Some(file),
             sd,
@@ -229,7 +232,7 @@ impl<'a> UploadFileGuard<'a> {
         self.file
             .as_ref()
             .expect("upload file already closed")
-            .write(self.sd, data)
+            .write(data)
     }
 
     fn finish(mut self) -> crate::error::Result<()> {
@@ -237,7 +240,7 @@ impl<'a> UploadFileGuard<'a> {
             .file
             .take()
             .expect("upload file already closed")
-            .close(self.sd);
+            .close();
         if result.is_ok() {
             self.committed = true;
         }
@@ -247,9 +250,9 @@ impl<'a> UploadFileGuard<'a> {
 
 impl Drop for UploadFileGuard<'_> {
     fn drop(&mut self) {
-        if let Some(file) = self.file.take() {
-            let _ = file.close(self.sd);
-        }
+        // close before unlinking: never delete an entry the volume
+        // manager still holds open
+        drop(self.file.take());
         if !self.committed {
             if let Err(e) = self.sd.delete_file(self.name.as_str()) {
                 warn!("upload: failed to remove incomplete '{}': {}", self.name, e);

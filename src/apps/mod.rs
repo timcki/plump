@@ -10,6 +10,7 @@ pub mod home;
 pub mod library;
 pub mod manager;
 pub mod reader;
+pub mod recent;
 pub mod stats;
 pub mod tab;
 pub mod widgets;
