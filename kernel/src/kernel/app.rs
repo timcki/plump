@@ -137,12 +137,18 @@ impl QuickAction {
 pub const RECENT_FILE: &str = "RECENT";
 
 // distros define their own AppId enum and implement this trait
-// the kernel uses HOME to initialise the nav stack and reset on
-// Transition::Home; nothing else about the concrete variants is
-// known to the kernel
+// the kernel uses HOME to initialise the nav stack, reset on
+// Transition::Home, and read back a persisted nav stack; nothing else
+// about the concrete variants is known to the kernel
 
 pub trait AppIdType: Copy + Eq + core::fmt::Debug {
     const HOME: Self;
+
+    /// Decode one byte of a persisted nav stack. The distro owns the
+    /// encoding (`collect_session` writes it); unrecognised values must
+    /// map to [`Self::HOME`]. This is the kernel's only way to reason
+    /// about a saved stack without hardcoding the distro's numbering.
+    fn from_raw(raw: u8) -> Self;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -215,22 +221,42 @@ pub enum Redraw {
 const MSG_BUF_SIZE: usize = 64;
 const LOADING_BUF_SIZE: usize = 32;
 
+/// The pending redraw, if any.
+///
+/// One value for one state: a coalescing window only exists while a
+/// partial redraw is being held back, and "render me now" carries no
+/// window at all, so the scheduler reads the state instead of
+/// re-deriving it from a flag and an `Option` that could disagree.
+///
+/// `Now` never holds [`Redraw::None`]; that state is spelled `None`.
+#[derive(Debug)]
+enum PendingRedraw {
+    None,
+    /// Render on the next tick.
+    Now(Redraw),
+    /// Background batch marks, held until `until` so a burst of them
+    /// costs one refresh instead of one each.
+    Coalescing { region: Region, until: Instant },
+}
+
+/// Loading indicator state; present only while one is shown.
+struct Loading {
+    buf: [u8; LOADING_BUF_SIZE],
+    len: u8,
+    pct: u8,
+    region: Region,
+}
+
 pub struct AppContext {
     msg_buf: [u8; MSG_BUF_SIZE],
     msg_len: usize,
-    redraw: Redraw,
-    coalesce_until: Option<Instant>,
-    immediate: bool,
+    redraw: PendingRedraw,
 
     // loading indicator; kernel-level so any app can use it.
     // drawn by the app manager after app content, before overlays.
     // uses the built-in mono font so it works even with no bitmap
     // fonts loaded.
-    loading_buf: [u8; LOADING_BUF_SIZE],
-    loading_len: u8,
-    loading_pct: u8,
-    loading_active: bool,
-    loading_region: Region,
+    loading: Option<Loading>,
 }
 
 impl Default for AppContext {
@@ -244,14 +270,8 @@ impl AppContext {
         Self {
             msg_buf: [0u8; MSG_BUF_SIZE],
             msg_len: 0,
-            redraw: Redraw::None,
-            coalesce_until: None,
-            immediate: false,
-            loading_buf: [0u8; LOADING_BUF_SIZE],
-            loading_len: 0,
-            loading_pct: 0,
-            loading_active: false,
-            loading_region: Region::new(0, 0, 0, 0),
+            redraw: PendingRedraw::None,
+            loading: None,
         }
     }
 
@@ -270,25 +290,40 @@ impl AppContext {
     }
 
     pub fn request_full_redraw(&mut self) {
-        self.redraw = Redraw::Full;
+        self.redraw = PendingRedraw::Now(Redraw::Full);
     }
 
-    pub fn request_partial_redraw(&mut self, region: Region) {
-        match self.redraw {
-            Redraw::Full => {}
-            Redraw::Partial(existing) => {
-                self.redraw = Redraw::Partial(existing.union(region));
+    // union `region` into whatever is pending, preserving its urgency:
+    // a full redraw already covers it, and a coalescing window keeps
+    // its original deadline
+    fn union_partial(&mut self, region: Region) {
+        self.redraw = match self.redraw {
+            PendingRedraw::Now(Redraw::Full) => return,
+            PendingRedraw::Now(Redraw::Partial(existing)) => {
+                PendingRedraw::Now(Redraw::Partial(existing.union(region)))
             }
-            Redraw::None => self.redraw = Redraw::Partial(region),
-        }
+            PendingRedraw::Coalescing {
+                region: existing,
+                until,
+            } => PendingRedraw::Coalescing {
+                region: existing.union(region),
+                until,
+            },
+            PendingRedraw::None | PendingRedraw::Now(Redraw::None) => {
+                PendingRedraw::Now(Redraw::Partial(region))
+            }
+        };
     }
 
     // mark dirty and render on next tick; the default for all callers
     #[inline]
     pub fn mark_dirty(&mut self, region: Region) {
-        self.request_partial_redraw(region);
-        self.immediate = true;
-        self.coalesce_until = None;
+        self.union_partial(region);
+        // a direct mark outranks a batch window: promote rather than
+        // wait out a deadline armed by background work
+        if let PendingRedraw::Coalescing { region, .. } = self.redraw {
+            self.redraw = PendingRedraw::Now(Redraw::Partial(region));
+        }
     }
 
     // mark dirty with coalescing window; use only for background
@@ -297,26 +332,33 @@ impl AppContext {
     #[inline]
     pub fn mark_dirty_coalesced(&mut self, region: Region) {
         use super::timing;
-        self.request_partial_redraw(region);
-        if !self.immediate && self.coalesce_until.is_none() {
-            self.coalesce_until = Some(
-                Instant::now() + embassy_time::Duration::from_millis(timing::COALESCE_WINDOW_MS),
-            );
+        match self.redraw {
+            // clean slate: hold this mark for the batch window
+            PendingRedraw::None => {
+                self.redraw = PendingRedraw::Coalescing {
+                    region,
+                    until: Instant::now()
+                        + embassy_time::Duration::from_millis(timing::COALESCE_WINDOW_MS),
+                };
+            }
+            // already pending: fold in without changing its urgency. an
+            // armed window keeps its original deadline, so a steady
+            // drip of marks cannot postpone the refresh forever, and a
+            // render-now mark is never demoted to waiting
+            _ => self.union_partial(region),
         }
     }
 
     pub fn has_redraw(&self) -> bool {
-        !matches!(self.redraw, Redraw::None)
+        !matches!(self.redraw, PendingRedraw::None)
     }
 
     // true when a pending redraw is ready to render
     pub fn render_ready(&self) -> bool {
         match self.redraw {
-            Redraw::None => false,
-            Redraw::Full => true,
-            Redraw::Partial(_) => {
-                self.immediate || self.coalesce_until.is_none_or(|t| Instant::now() >= t)
-            }
+            PendingRedraw::None => false,
+            PendingRedraw::Now(_) => true,
+            PendingRedraw::Coalescing { until, .. } => Instant::now() >= until,
         }
     }
 
@@ -326,17 +368,17 @@ impl AppContext {
     /// only a future coalesce window needs a timed wake).
     pub fn next_render_deadline(&self) -> Option<Instant> {
         match self.redraw {
-            Redraw::Partial(_) if !self.immediate => self.coalesce_until,
+            PendingRedraw::Coalescing { until, .. } => Some(until),
             _ => None,
         }
     }
 
     pub fn take_redraw(&mut self) -> Redraw {
-        let r = self.redraw;
-        self.redraw = Redraw::None;
-        self.coalesce_until = None;
-        self.immediate = false;
-        r
+        match core::mem::replace(&mut self.redraw, PendingRedraw::None) {
+            PendingRedraw::None => Redraw::None,
+            PendingRedraw::Now(r) => r,
+            PendingRedraw::Coalescing { region, .. } => Redraw::Partial(region),
+        }
     }
 
     // loading indicator: set text and percentage.
@@ -355,50 +397,53 @@ impl AppContext {
         );
 
         let n = msg.len().min(LOADING_BUF_SIZE);
-        self.loading_buf[..n].copy_from_slice(&msg.as_bytes()[..n]);
-        self.loading_len = n as u8;
-        self.loading_pct = pct;
-        self.loading_region = region;
-
-        self.loading_active = true;
+        let mut buf = [0u8; LOADING_BUF_SIZE];
+        buf[..n].copy_from_slice(&msg.as_bytes()[..n]);
+        self.loading = Some(Loading {
+            buf,
+            len: n as u8,
+            pct,
+            region,
+        });
         self.mark_dirty(region);
     }
 
     // clear the loading indicator and mark its region dirty so
     // the underlying content repaints
     pub fn clear_loading(&mut self) {
-        if self.loading_active {
-            let region = self.loading_region;
+        if let Some(l) = self.loading.take() {
             log::debug!(
                 "ui: clear_loading region={:?} redraw_before={:?}",
-                region,
+                l.region,
                 self.redraw
             );
-            self.loading_active = false;
-            self.loading_len = 0;
-            self.loading_pct = 0;
-            self.mark_dirty(region);
+            self.mark_dirty(l.region);
         }
     }
 
     #[inline]
     pub fn loading_active(&self) -> bool {
-        self.loading_active
+        self.loading.is_some()
     }
 
     #[inline]
     pub fn loading_msg(&self) -> &str {
-        core::str::from_utf8(&self.loading_buf[..self.loading_len as usize]).unwrap_or("")
+        self.loading
+            .as_ref()
+            .and_then(|l| core::str::from_utf8(&l.buf[..l.len as usize]).ok())
+            .unwrap_or("")
     }
 
     #[inline]
     pub fn loading_pct(&self) -> u8 {
-        self.loading_pct
+        self.loading.as_ref().map_or(0, |l| l.pct)
     }
 
     #[inline]
     pub fn loading_region(&self) -> Region {
-        self.loading_region
+        self.loading
+            .as_ref()
+            .map_or(Region::new(0, 0, 0, 0), |l| l.region)
     }
 }
 

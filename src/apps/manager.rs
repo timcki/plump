@@ -22,7 +22,7 @@ use crate::drivers::input::Event;
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
-use crate::kernel::app::AppLayer;
+use crate::kernel::app::{AppIdType, AppLayer};
 use crate::kernel::{KernelHandle, Screen};
 use crate::kernel::bookmarks::BookmarkCache;
 use crate::kernel::config::SystemSettings;
@@ -399,14 +399,7 @@ impl AppManager {
         self.launcher.restore_stack(
             session.nav_depth as usize,
             &session.nav_stack,
-            |id| match id {
-                0 => AppId::Home,
-                1 => AppId::Library,
-                2 => AppId::Reader,
-                3 => AppId::Settings,
-                4 => AppId::Stats,
-                _ => AppId::Home,
-            },
+            AppId::from_raw,
         );
         self.sync_nav_from_launcher();
 

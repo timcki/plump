@@ -36,6 +36,13 @@ pub const SPI_FREQ_MHZ: u32 = 20;
 
 const POWER_OFF_TIME_MS: u32 = 200; // analog shutdown timeout
 
+/// How long any wait on the busy pin may last before the driver gives
+/// up. ~2x worst case (full GC ~1.6s, grayscale ~1-2s, partial DU
+/// ~400ms). Callers that watch the pin themselves (the scheduler's
+/// waveform window) derive their own guard from this so the two
+/// cannot drift.
+pub(crate) const BUSY_TIMEOUT_MS: u64 = 5_000;
+
 #[allow(dead_code)]
 mod cmd {
     pub const DRIVER_OUTPUT_CONTROL: u8 = 0x01;
@@ -802,14 +809,12 @@ where
     }
 
     // bound the busy-pin wait so a stuck EPD cannot wedge the device.
-    // 5s is ~2x worst case (full GC ~1.6s, grayscale ~1-2s, partial DU ~400ms).
     // `ctx` is logged on timeout so the caller can be identified in serial.
     pub(crate) async fn wait_busy_async(
         &mut self,
         ctx: &'static str,
     ) -> Result<(), embassy_time::TimeoutError> {
         use embassy_time::{Duration, with_timeout};
-        const BUSY_TIMEOUT_MS: u64 = 5_000;
         match with_timeout(
             Duration::from_millis(BUSY_TIMEOUT_MS),
             self.busy.wait_for_low(),

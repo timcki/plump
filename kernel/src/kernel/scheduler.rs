@@ -8,18 +8,18 @@
 // run background caching and housekeeping while a screen.rs Wave
 // session holds the display half of the kernel
 //
-// handle_input and poll_housekeeping are synchronous; they return
-// a bool flag when the caller should enter_sleep (which is async
-// because it renders a sleep screen via the EPD)
+// handle_input is synchronous and reports AfterInput::Sleep when the
+// caller should sleep (sleeping is async because it renders a sleep
+// screen via the EPD)
 //
 // sd_card_sleep sends cmd0 before deep sleep to reduce sd card
 // idle current from ~150 uA to ~10 uA
 
-use embassy_futures::select::{Either, Either3, Either4, select, select3, select4};
+use embassy_futures::select::{Either3, Either4, select3, select4};
 use embassy_time::{Duration, Instant, Timer};
 use log::{debug, info};
 
-use super::app::{AppLayer, GrayscaleMode, Redraw, Transition};
+use super::app::{AppIdType, AppLayer, GrayscaleMode, Redraw, Transition};
 
 /// Idle window before a `GrayscaleMode::Deferred` AA pass fires. Sized
 /// to feel "settled" without making the user wait noticeably: shorter
@@ -33,8 +33,6 @@ use crate::drivers::strip::StripBuffer;
 use crate::kernel::tasks;
 
 use crate::ui::free_stack_bytes;
-
-use super::timing;
 
 /// Outcome of resolving a hardware event through the input policy.
 enum InputResult<Id> {
@@ -54,6 +52,111 @@ enum InputResult<Id> {
 enum DeferredAction<Id> {
     Transition(Transition<Id>),
     Semantic(SemanticInput),
+}
+
+/// What the caller should do after an input pass or a render.
+///
+/// Sleep entry is async (it renders a sleep screen), so the sync
+/// halves report it instead of doing it; naming the two outcomes keeps
+/// the obligation out of comments.
+#[must_use]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AfterInput {
+    Continue,
+    Sleep,
+}
+
+impl AfterInput {
+    #[inline]
+    const fn sleep_if(cond: bool) -> Self {
+        if cond { Self::Sleep } else { Self::Continue }
+    }
+
+    #[inline]
+    const fn wants_sleep(self) -> bool {
+        matches!(self, Self::Sleep)
+    }
+}
+
+/// What a waveform window collected while the EPD was busy.
+struct WaveOutcome<Id> {
+    /// First input that needs applying once the refresh completes.
+    deferred: Option<DeferredAction<Id>>,
+    /// A power-long-press arrived during the waveform.
+    sleep: bool,
+}
+
+/// What closes a refresh session once its waveform has settled.
+///
+/// Both render paths derive this from the same three inputs (whether
+/// the frame was overtaken mid-waveform, the `text_aa` setting, and
+/// the app's `GrayscaleMode`) and then interpret it with their own
+/// closers, so the partial and full paths cannot drift apart. Each
+/// path writes the deferred-AA arm exactly once, from the plan.
+enum ClosePlan {
+    /// The frame was overtaken: skip phase 3 (partial) or the AA pass
+    /// (full), and cancel any armed deferred fire.
+    Abandon,
+    /// Plain phase 3, nothing more.
+    SyncRed,
+    /// Grayscale AA pass in place of phase 3.
+    GrayNow,
+    /// Phase 3 now, deferred AA fire at the given instant.
+    SyncThenArm(Instant),
+}
+
+impl ClosePlan {
+    fn decide(interrupted: bool, aa_enabled: bool, mode: GrayscaleMode) -> Self {
+        if interrupted {
+            return Self::Abandon;
+        }
+        match mode {
+            GrayscaleMode::Immediate if aa_enabled => Self::GrayNow,
+            GrayscaleMode::Deferred if aa_enabled => {
+                Self::SyncThenArm(Instant::now() + DEFERRED_GRAYSCALE_DELAY)
+            }
+            _ => Self::SyncRed,
+        }
+    }
+
+    /// The deferred-AA arm this plan implies; every other plan cancels.
+    #[inline]
+    const fn aa_arm(&self) -> Option<Instant> {
+        match self {
+            Self::SyncThenArm(at) => Some(*at),
+            _ => None,
+        }
+    }
+}
+
+/// Select arm for the background worker's result channel.
+///
+/// Armed only while the app layer reported `WaitingExternal`: armed
+/// while idle, a stale-generation result nobody consumes would keep
+/// the select permanently ready. Parking on a never-ready future
+/// otherwise lets both park sites keep a single select instead of two
+/// spellings of the same one; the branch monomorphizes away.
+async fn worker_arm(waiting: bool) {
+    if waiting {
+        crate::kernel::work_queue::result_ready().await
+    } else {
+        core::future::pending::<()>().await
+    }
+}
+
+/// Where a restored session was read from.
+enum SessionSource {
+    Rtc,
+    Sd,
+}
+
+impl SessionSource {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Rtc => "RTC",
+            Self::Sd => "SD",
+        }
+    }
 }
 
 impl super::Kernel {
@@ -81,11 +184,23 @@ impl super::Kernel {
         RtcSession::load_from_sd(&self.svc.sd).is_some()
     }
 
+    // load the saved session: RTC first (a volatile read), SD second.
+    //
+    // on battery wake the brownout detector fires during the voltage
+    // sag, causing a full system reset that wipes RTC FAST memory; the
+    // SD-backed copy survives that and provides reliable resume.
+    fn load_session(&self) -> Option<(super::rtc_session::RtcSession, SessionSource)> {
+        use super::rtc_session::RtcSession;
+
+        if RtcSession::rtc_consume() {
+            return Some((RtcSession::rtc_load(), SessionSource::Rtc));
+        }
+        RtcSession::load_from_sd(&self.svc.sd).map(|s| (s, SessionSource::Sd))
+    }
+
     // one-time boot: load caches, settings, render the home screen
     // if waking from deep sleep with valid RTC session, restore it
     pub async fn boot<A: AppLayer>(&mut self, app_mgr: &mut A) {
-        use super::rtc_session::RtcSession;
-
         let boot_start = Instant::now();
 
         // log reset reason for debugging RTC session persistence
@@ -107,39 +222,17 @@ impl super::Kernel {
         let bm_ms = t0.elapsed().as_millis();
         info!("boot: bookmark cache loaded ({}ms)", bm_ms);
 
-        // check for valid session: try RTC first (fast), then SD fallback.
-        //
-        // on battery wake, the brownout detector fires during the voltage
-        // sag, causing a full system reset that wipes RTC FAST memory.
-        // the SD-backed session survives this and provides reliable resume.
         let t0 = Instant::now();
-        let has_rtc_session = RtcSession::rtc_consume();
-        let rtc_session_data = if has_rtc_session {
-            let session = RtcSession::rtc_load();
-            info!(
-                "boot: RTC session valid (wake count {}) ({}ms)",
+        let loaded_session = self.load_session();
+        match &loaded_session {
+            Some((session, src)) => info!(
+                "boot: {} session valid (wake count {}) ({}ms)",
+                src.as_str(),
                 session.wake_count(),
                 t0.elapsed().as_millis()
-            );
-            Some(session)
-        } else {
-            // RTC invalid — try SD fallback (typical on battery wake)
-            let t1 = Instant::now();
-            match RtcSession::load_from_sd(&self.svc.sd) {
-                Some(session) => {
-                    info!(
-                        "boot: SD session valid (wake count {}) ({}ms)",
-                        session.wake_count(),
-                        t1.elapsed().as_millis()
-                    );
-                    Some(session)
-                }
-                None => {
-                    info!("boot: no session (power-on or first boot)");
-                    None
-                }
-            }
-        };
+            ),
+            None => info!("boot: no session (power-on or first boot)"),
+        }
 
         // load settings from SD
         let t0 = Instant::now();
@@ -150,10 +243,13 @@ impl super::Kernel {
         info!("boot: settings loaded ({}ms)", t0.elapsed().as_millis());
 
         // only load home recent data if we're not restoring into a
-        // different app — saves SD I/O when waking directly to reader
-        let skip_home_load = rtc_session_data.as_ref().map_or(false, |s| {
+        // different app — saves SD I/O when waking directly to reader.
+        // the raw stack byte goes through the app layer's own decoder,
+        // so the kernel never spells the distro's Home variant itself
+        let skip_home_load = loaded_session.as_ref().is_some_and(|(s, _)| {
             // active app is the top of the stack
-            s.nav_depth > 0 && s.nav_stack[(s.nav_depth - 1) as usize] != 0 // 0 = Home
+            s.nav_depth > 0
+                && A::Id::from_raw(s.nav_stack[(s.nav_depth - 1) as usize]) != A::Id::HOME
         });
 
         if !skip_home_load {
@@ -179,7 +275,7 @@ impl super::Kernel {
 
         // try to restore session from RTC memory
         let t0 = Instant::now();
-        let restored = if let Some(session) = rtc_session_data {
+        let restored = if let Some((session, _)) = loaded_session {
             let ok = app_mgr.apply_session(&session, &mut self.handle());
             info!(
                 "boot: apply_session {} ({}ms)",
@@ -258,9 +354,7 @@ impl super::Kernel {
                 if matches!(ev, Event::LongPress(_)) {
                     debug!("scheduler: received {:?}", ev);
                 }
-                if self.svc.handle_input(ev, app_mgr) {
-                    self.sleep_with_session(app_mgr, "power held").await;
-                }
+                let _ = self.dispatch_input(ev, app_mgr).await;
                 if app_mgr.needs_special_mode() {
                     break;
                 }
@@ -307,8 +401,7 @@ impl super::Kernel {
 
                 // check for pending input between steps
                 if let Ok(ev) = tasks::INPUT_EVENTS.try_receive() {
-                    if self.svc.handle_input(ev, app_mgr) {
-                        self.sleep_with_session(app_mgr, "power held").await;
+                    if self.dispatch_input(ev, app_mgr).await.wants_sleep() {
                         // sleep returns; restart main loop
                         break 'bg;
                     }
@@ -379,7 +472,7 @@ impl super::Kernel {
 
             if app_mgr.ctx_mut().render_ready() {
                 let redraw = app_mgr.take_redraw();
-                if self.render(app_mgr, redraw).await {
+                if self.render(app_mgr, redraw).await.wants_sleep() {
                     self.sleep_with_session(app_mgr, "power held").await;
                     continue;
                 }
@@ -387,20 +480,17 @@ impl super::Kernel {
 
             // deferred grayscale fire: when the active app uses
             // `GrayscaleMode::Deferred` the previous render armed
-            // `aa_deferred_at`. fire the AA pass once the idle window
-            // has elapsed and the screen is still settled (no pending
+            // `svc.aa`. fire the AA pass once the idle window has
+            // elapsed and the screen is still settled (no pending
             // redraw, AA setting still on, no power-down in progress).
             // the park below wakes at the armed instant, so fire
             // latency is near zero.
-            if let Some(at) = self.svc.aa_deferred_at {
-                if !app_mgr.system_settings().text_aa
-                    || !matches!(app_mgr.grayscale_mode(), GrayscaleMode::Deferred)
-                {
-                    self.svc.aa_deferred_at = None;
-                } else if Instant::now() >= at && !app_mgr.has_redraw() {
-                    self.svc.aa_deferred_at = None;
-                    self.fire_deferred_grayscale(app_mgr).await;
-                }
+            if !app_mgr.system_settings().text_aa
+                || !matches!(app_mgr.grayscale_mode(), GrayscaleMode::Deferred)
+            {
+                self.svc.aa.cancel();
+            } else if !app_mgr.has_redraw() && self.svc.aa.take_due(Instant::now()) {
+                self.fire_deferred_grayscale(app_mgr).await;
             }
 
             // re-run the loop instead of parking when work is already
@@ -418,48 +508,39 @@ impl super::Kernel {
             // status-log cadence bounds the park at STATUS_INTERVAL_SECS,
             // which doubles as the backstop for the worker's silent
             // stale-generation skip (no result is posted for those)
-            let mut deadline = self
-                .svc
-                .hk
-                .status_at
-                .min(self.svc.hk.sd_check_at)
-                .min(self.svc.hk.bm_flush_at);
+            let mut deadline = self.svc.hk.earliest();
             if let Some(d) = self.svc.idle_deadline() {
                 deadline = deadline.min(d);
             }
             if let Some(d) = app_mgr.ctx_mut().next_render_deadline() {
                 deadline = deadline.min(d);
             }
-            if let Some(d) = self.svc.aa_deferred_at {
+            if let Some(d) = self.svc.aa.deadline() {
                 deadline = deadline.min(d);
             }
 
-            if matches!(outcome, super::app::BgOutcome::WaitingExternal) {
-                match select3(
-                    tasks::INPUT_EVENTS.receive(),
-                    crate::kernel::work_queue::result_ready(),
-                    Timer::at(deadline),
-                )
-                .await
-                {
-                    Either3::First(ev) => {
-                        if self.svc.handle_input(ev, app_mgr) {
-                            self.sleep_with_session(app_mgr, "power held").await;
-                        }
-                    }
-                    Either3::Second(()) | Either3::Third(()) => {}
-                }
-            } else {
-                match select(tasks::INPUT_EVENTS.receive(), Timer::at(deadline)).await {
-                    Either::First(ev) => {
-                        if self.svc.handle_input(ev, app_mgr) {
-                            self.sleep_with_session(app_mgr, "power held").await;
-                        }
-                    }
-                    Either::Second(()) => {}
-                }
+            let ev = select3(
+                tasks::INPUT_EVENTS.receive(),
+                worker_arm(matches!(outcome, super::app::BgOutcome::WaitingExternal)),
+                Timer::at(deadline),
+            )
+            .await;
+            if let Either3::First(ev) = ev {
+                let _ = self.dispatch_input(ev, app_mgr).await;
             }
         }
+    }
+
+    // run one hardware event through the input policy and take the
+    // sleep it may ask for. the outcome is reported back because the
+    // background-chain caller restarts the main loop afterwards while
+    // the other two carry on
+    async fn dispatch_input<A: AppLayer>(&mut self, ev: Event, app_mgr: &mut A) -> AfterInput {
+        let after = self.svc.handle_input(ev, app_mgr);
+        if after.wants_sleep() {
+            self.sleep_with_session(app_mgr, "power held").await;
+        }
+        after
     }
 
     // delegate to app layer for modes that bypass normal dispatch
@@ -536,35 +617,34 @@ impl super::Services {
         }
     }
 
-    // returns true if caller should call enter_sleep
-    fn handle_input<A: AppLayer>(&mut self, hw_event: Event, app_mgr: &mut A) -> bool {
+    fn handle_input<A: AppLayer>(&mut self, hw_event: Event, app_mgr: &mut A) -> AfterInput {
         self.last_activity = Instant::now();
 
         match self.resolve_input(hw_event, app_mgr, false) {
-            InputResult::Sleep => true,
+            InputResult::Sleep => AfterInput::Sleep,
             InputResult::Transition(t) => {
                 app_mgr.apply_transition(t, &mut self.handle());
                 tasks::request_hold_reset();
-                false
+                AfterInput::Continue
             }
             InputResult::OverlayChanged => {
                 tasks::request_hold_reset();
-                false
+                AfterInput::Continue
             }
             InputResult::Semantic(input) => {
                 let t = app_mgr.dispatch_semantic(input);
                 if t != Transition::None {
                     app_mgr.apply_transition(t, &mut self.handle());
                 }
-                false
+                AfterInput::Continue
             }
-            InputResult::Nothing => false,
+            InputResult::Nothing => AfterInput::Continue,
         }
     }
 
     // shared housekeeping body: battery, sd probe, bookmark flush,
-    // stats. deadlines re-arm as now + interval so a 1.6s GC waveform
-    // cannot queue catch-up runs
+    // stats. each slot re-arms itself when due (see Periodic) so a
+    // 1.6s GC waveform cannot queue catch-up runs
     fn run_due_housekeeping(&mut self) {
         if let Some(mv) = tasks::BATTERY_MV.try_take() {
             self.cached_battery_mv = mv;
@@ -572,41 +652,44 @@ impl super::Services {
 
         let now = Instant::now();
 
-        if now >= self.hk.sd_check_at {
-            self.hk.sd_check_at = now + Duration::from_secs(timing::SD_CHECK_INTERVAL_SECS);
+        if self.hk.sd_check.due(now) {
             self.sd_ok = self.sd.probe_ok();
         }
 
-        if now >= self.hk.bm_flush_at {
-            self.hk.bm_flush_at = now + Duration::from_secs(timing::BOOKMARK_FLUSH_INTERVAL_SECS);
+        if self.hk.bm_flush.due(now) {
             if self.bm_cache.is_dirty() {
                 self.bm_cache.flush(&self.sd);
             }
-
-            // flush today's reading stats on the bookmark cadence; an
-            // ungated check here would run an SD write plus a FAT mtime
-            // lookup on every page turn's keypress-to-render path (each
+            // day stats piggyback the bookmark cadence; an ungated
+            // check here would run an SD write plus a FAT mtime lookup
+            // on every page turn's keypress-to-render path (each
             // add_pages/add_secs sets the dirty bit)
-            if self.day_stats.is_dirty() && self.sd_ok {
-                if let Err(e) = self.day_stats.flush(&self.sd) {
-                    log::warn!("daystats flush: {}", e);
-                } else {
-                    // mtime of DAYSTATS.BIN just advanced; refresh
-                    // today_key so a same-session rollover is detected
-                    // before the next boot.
-                    if let Some(k) = self
-                        .sd
-                        .file_mtime_day_key_in_plump(super::daystats::DAYSTATS_FILE)
-                    {
-                        self.today_key = k;
-                    }
-                }
-            }
+            self.flush_day_stats();
         }
 
-        if now >= self.hk.status_at {
-            self.hk.status_at = now + Duration::from_secs(timing::STATUS_INTERVAL_SECS);
+        if self.hk.status.due(now) {
             self.log_stats();
+        }
+    }
+
+    // flush today's reading stats and re-derive today_key from the
+    // file's now-advanced FAT mtime, so a same-session calendar
+    // rollover is detected before the next boot. no-op when nothing is
+    // dirty or the card is unusable. shared by the housekeeping
+    // cadence and the sleep path, which would otherwise drift
+    fn flush_day_stats(&mut self) {
+        if !self.day_stats.is_dirty() || !self.sd_ok {
+            return;
+        }
+        if let Err(e) = self.day_stats.flush(&self.sd) {
+            log::warn!("daystats flush: {}", e);
+            return;
+        }
+        if let Some(k) = self
+            .sd
+            .file_mtime_day_key_in_plump(super::daystats::DAYSTATS_FILE)
+        {
+            self.today_key = k;
         }
     }
 
@@ -623,9 +706,8 @@ impl super::Kernel {
     // partial refreshes use DU waveform (~400 ms); after ghost_clear_every
     // partials, a full GC refresh (~600 ms at faked temp) clears ghosting
     //
-    // returns true if power-long-press arrived during the waveform and
-    // the caller should enter sleep
-    async fn render<A: AppLayer>(&mut self, app_mgr: &mut A, redraw: Redraw) -> bool {
+    // reports Sleep if a power-long-press arrived during the waveform
+    async fn render<A: AppLayer>(&mut self, app_mgr: &mut A, redraw: Redraw) -> AfterInput {
         crate::perf_begin!(_render_t0);
 
         #[cfg(feature = "perf")]
@@ -687,7 +769,8 @@ impl super::Kernel {
                                 r, redrive, stale, write_ms
                             );
                             let t_wave = Instant::now();
-                            let (deferred, sleep) = svc.wave_window(&mut wave, app_mgr).await;
+                            let WaveOutcome { deferred, sleep } =
+                                svc.wave_window(&mut wave, app_mgr).await;
                             sleep_requested = sleep;
                             let settled = wave.settle();
                             let wave_ms = t_wave.elapsed().as_millis();
@@ -711,60 +794,56 @@ impl super::Kernel {
                                 r.h
                             );
 
-                            // skip phase 3 when content changed mid-DU or
-                            // a deferred action is queued (the screen
-                            // will be redrawn immediately after); the next
-                            // partial recovers the desynchronised RED RAM
-                            // via inv_red
-                            if app_mgr.has_redraw() || deferred.is_some() {
-                                // discriminator for the page-turn AA hunt:
-                                // any turn logging this line skipped its AA
-                                // pass because a mark landed mid-waveform
-                                crate::perf_event!(
-                                    "render",
-                                    "partial_abandon pending_redraw={} deferred={} region_x={} region_y={} region_w={} region_h={}",
-                                    app_mgr.has_redraw(),
-                                    deferred.is_some(),
-                                    r.x,
-                                    r.y,
-                                    r.w,
-                                    r.h
-                                );
-                                app_mgr.ctx_mut().mark_dirty(r);
-                                settled.abandon();
-                                // a fresh redraw is queued; cancel any
-                                // pending deferred-AA so we don't fire it
-                                // on stale content
-                                svc.aa_deferred_at = None;
-                            } else {
-                                let aa_enabled = app_mgr.system_settings().text_aa;
-                                let mode = if aa_enabled {
-                                    app_mgr.grayscale_mode()
-                                } else {
-                                    GrayscaleMode::Disabled
-                                };
-                                match mode {
-                                    GrayscaleMode::Immediate => {
-                                        // grayscale AA replaces phase 3; the
-                                        // region stays marked stale so the next
-                                        // partial touching it re-drives via
-                                        // inv_red, which is the black starting
-                                        // state the gray pulses assume
-                                        let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                                        if settled.grayscale(&draw).await.is_err() {
-                                            log::warn!("render: grayscale_pass timed out, forcing full GC next frame");
-                                        }
-                                        svc.aa_deferred_at = None;
+                            let plan = ClosePlan::decide(
+                                app_mgr.has_redraw() || deferred.is_some(),
+                                app_mgr.system_settings().text_aa,
+                                app_mgr.grayscale_mode(),
+                            );
+                            // the plan is the only writer of the arm on
+                            // this path; nothing below reads it
+                            svc.aa.set(plan.aa_arm());
+
+                            match plan {
+                                ClosePlan::Abandon => {
+                                    // skip phase 3 when content changed
+                                    // mid-DU or a deferred action is queued
+                                    // (the screen will be redrawn right
+                                    // after); the next partial recovers the
+                                    // desynchronised RED RAM via inv_red.
+                                    //
+                                    // discriminator for the page-turn AA
+                                    // hunt: any turn logging this line
+                                    // skipped its AA pass because a mark
+                                    // landed mid-waveform
+                                    crate::perf_event!(
+                                        "render",
+                                        "partial_abandon pending_redraw={} deferred={} region_x={} region_y={} region_w={} region_h={}",
+                                        app_mgr.has_redraw(),
+                                        deferred.is_some(),
+                                        r.x,
+                                        r.y,
+                                        r.w,
+                                        r.h
+                                    );
+                                    app_mgr.ctx_mut().mark_dirty(r);
+                                    settled.abandon();
+                                }
+                                ClosePlan::GrayNow => {
+                                    // grayscale AA replaces phase 3; the
+                                    // region stays marked stale so the next
+                                    // partial touching it re-drives via
+                                    // inv_red, which is the black starting
+                                    // state the gray pulses assume
+                                    let draw = |s: &mut StripBuffer| app_mgr.draw(s);
+                                    if settled.grayscale(&draw).await.is_err() {
+                                        log::warn!(
+                                            "render: grayscale_pass timed out, forcing full GC next frame"
+                                        );
                                     }
-                                    GrayscaleMode::Deferred | GrayscaleMode::Disabled => {
-                                        let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                                        settled.sync_red(&draw);
-                                        svc.aa_deferred_at = if matches!(mode, GrayscaleMode::Deferred) {
-                                            Some(Instant::now() + DEFERRED_GRAYSCALE_DELAY)
-                                        } else {
-                                            None
-                                        };
-                                    }
+                                }
+                                ClosePlan::SyncRed | ClosePlan::SyncThenArm(_) => {
+                                    let draw = |s: &mut StripBuffer| app_mgr.draw(s);
+                                    settled.sync_red(&draw);
                                 }
                             }
 
@@ -800,7 +879,7 @@ impl super::Kernel {
                 debug!("render: full frame written ({}ms)", write_ms);
 
                 let t_wave = Instant::now();
-                let (deferred, sleep) = svc.wave_window(&mut wave, app_mgr).await;
+                let WaveOutcome { deferred, sleep } = svc.wave_window(&mut wave, app_mgr).await;
                 sleep_requested = sleep;
                 wave.settle().finish();
                 let wave_ms = t_wave.elapsed().as_millis();
@@ -818,27 +897,23 @@ impl super::Kernel {
                 // (or arm the deferred timer). the pass marks the screen
                 // stale, so later partials re-drive the area they touch
                 // via inv_red.
-                let aa_enabled = app_mgr.system_settings().text_aa;
-                let mode = if aa_enabled && !app_mgr.has_redraw() && deferred.is_none() {
-                    app_mgr.grayscale_mode()
-                } else {
-                    GrayscaleMode::Disabled
-                };
-                match mode {
-                    GrayscaleMode::Immediate => {
-                        let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                        if screen.grayscale_full(&draw).await.is_err() {
-                            log::warn!(
-                                "render: post-GC grayscale_pass timed out, forcing full GC next frame"
-                            );
-                        }
-                        svc.aa_deferred_at = None;
-                    }
-                    GrayscaleMode::Deferred => {
-                        svc.aa_deferred_at = Some(Instant::now() + DEFERRED_GRAYSCALE_DELAY);
-                    }
-                    GrayscaleMode::Disabled => {
-                        svc.aa_deferred_at = None;
+                //
+                // finish() already closed the session, so the plan's
+                // sync arms carry no work here: only GrayNow has a
+                // closer, and Abandon just means "skip the AA pass"
+                let plan = ClosePlan::decide(
+                    app_mgr.has_redraw() || deferred.is_some(),
+                    app_mgr.system_settings().text_aa,
+                    app_mgr.grayscale_mode(),
+                );
+                svc.aa.set(plan.aa_arm());
+
+                if matches!(plan, ClosePlan::GrayNow) {
+                    let draw = |s: &mut StripBuffer| app_mgr.draw(s);
+                    if screen.grayscale_full(&draw).await.is_err() {
+                        log::warn!(
+                            "render: post-GC grayscale_pass timed out, forcing full GC next frame"
+                        );
                     }
                 }
 
@@ -862,7 +937,7 @@ impl super::Kernel {
             _render_t0.elapsed().as_millis()
         );
 
-        sleep_requested
+        AfterInput::sleep_if(sleep_requested)
     }
 
     // run a grayscale_pass over everything refreshed since the last
@@ -910,18 +985,19 @@ impl super::Services {
     // first deferred action wins; hold reset prevents the held
     // button from re-firing LongPress/Repeat for the waveform
     //
-    // returns (deferred_action, sleep_requested) so the caller
-    // can enter sleep after the EPD finishes if power-long-press
-    // arrived during the waveform
+    // the outcome carries the deferred action and whether a
+    // power-long-press arrived, so the caller can sleep after the EPD
+    // finishes
     async fn wave_window<A: AppLayer, M>(
         &mut self,
         wave: &mut super::screen::Wave<'_, M>,
         app_mgr: &mut A,
-    ) -> (Option<DeferredAction<A::Id>>, bool) {
-        // matches the driver's own wait_busy_async timeout; without a
-        // timed arm in the parks, a stuck-high busy pin would park the
-        // whole loop forever
-        const WAVEFORM_GUARD: Duration = Duration::from_secs(5);
+    ) -> WaveOutcome<A::Id> {
+        // derived from the driver's own busy-pin bound; without a timed
+        // arm in the parks, a stuck-high busy pin would park the whole
+        // loop forever
+        const WAVEFORM_GUARD: Duration =
+            Duration::from_millis(crate::drivers::ssd1677::BUSY_TIMEOUT_MS);
         let guard_at = Instant::now() + WAVEFORM_GUARD;
 
         let mut deferred: Option<DeferredAction<A::Id>> = None;
@@ -953,28 +1029,19 @@ impl super::Services {
                         embassy_futures::yield_now().await;
                         None
                     }
-                    super::app::BgOutcome::WaitingExternal => {
+                    _ => {
                         match select4(
                             wave.until_idle(),
                             tasks::INPUT_EVENTS.receive(),
-                            crate::kernel::work_queue::result_ready(),
+                            worker_arm(matches!(
+                                outcome,
+                                super::app::BgOutcome::WaitingExternal
+                            )),
                             Timer::at(guard_at),
                         )
                         .await
                         {
                             Either4::Second(ev) => Some(ev),
-                            _ => None,
-                        }
-                    }
-                    _ => {
-                        match select3(
-                            wave.until_idle(),
-                            tasks::INPUT_EVENTS.receive(),
-                            Timer::at(guard_at),
-                        )
-                        .await
-                        {
-                            Either3::Second(ev) => Some(ev),
                             _ => None,
                         }
                     }
@@ -1014,7 +1081,10 @@ impl super::Services {
             self.run_due_housekeeping();
         }
 
-        (deferred, sleep_requested)
+        WaveOutcome {
+            deferred,
+            sleep: sleep_requested,
+        }
     }
 }
 
@@ -1031,7 +1101,7 @@ impl super::Kernel {
 
         // about to deep-sleep, cancel any pending grayscale-AA fire so
         // it doesn't run with stale state on wake.
-        self.svc.aa_deferred_at = None;
+        self.svc.aa.cancel();
 
         // save active app state (reader position) to bookmark cache
         // before collecting session, so bookmarks stay in sync
@@ -1039,11 +1109,7 @@ impl super::Kernel {
 
         // day-stats only flushes on the 30s bookmark cadence now, so
         // up to 30s of reading stats would be lost without this
-        if self.svc.day_stats.is_dirty() && self.svc.sd_ok {
-            if let Err(e) = self.svc.day_stats.flush(&self.svc.sd) {
-                log::warn!("sleep: daystats flush: {}", e);
-            }
-        }
+        self.svc.flush_day_stats();
 
         // force flush deferred app persistence (RECENT, reading stats)
         // before deep sleep so no dirty state is lost

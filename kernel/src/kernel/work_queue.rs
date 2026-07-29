@@ -57,16 +57,27 @@ pub enum BgWorkKind {
     DecodeImage = 1,
 }
 
+/// A work-queue generation.
+///
+/// [`reset`] is the only mint: it bumps the counter, makes the new
+/// value active, and drains both channels in one step, so a caller
+/// cannot conjure a generation, arm one without draining, or mix up
+/// the counter with the active value. Holding one is a claim on
+/// results, not a way to make one current: [`resume`] takes a
+/// previously minted value back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WorkGen(u16);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BgStatus {
     pub kind: BgWorkKind,
-    pub generation: u16,
+    pub generation: WorkGen,
 }
 
 impl BgStatus {
     pub const IDLE: Self = Self {
         kind: BgWorkKind::Idle,
-        generation: 0,
+        generation: WorkGen(0),
     };
 
     #[inline]
@@ -95,13 +106,15 @@ fn set_status(s: BgStatus) {
     critical_section::with(|cs| STATUS.borrow(cs).set(s));
 }
 
-static ACTIVE_GEN: Mutex<Cell<u16>> = Mutex::new(Cell::new(0));
-static GEN_COUNTER: Mutex<Cell<u16>> = Mutex::new(Cell::new(0));
+// the generation results are matched against; only reset/resume move it
+static ACTIVE_GEN: Mutex<Cell<WorkGen>> = Mutex::new(Cell::new(WorkGen(0)));
+// monotonic source of fresh generations; never read for matching
+static GEN_COUNTER: Mutex<Cell<WorkGen>> = Mutex::new(Cell::new(WorkGen(0)));
 
-fn next_generation() -> u16 {
+fn next_generation() -> WorkGen {
     critical_section::with(|cs| {
         let c = GEN_COUNTER.borrow(cs);
-        let g = c.get().wrapping_add(1);
+        let g = WorkGen(c.get().0.wrapping_add(1));
         c.set(g);
         ACTIVE_GEN.borrow(cs).set(g);
         g
@@ -109,11 +122,14 @@ fn next_generation() -> u16 {
 }
 
 #[inline]
-pub fn active_generation() -> u16 {
+fn active_generation() -> WorkGen {
     critical_section::with(|cs| ACTIVE_GEN.borrow(cs).get())
 }
 
-pub fn set_active_generation(g: u16) {
+/// Make a previously minted generation active again, so in-flight
+/// results submitted under it count as current. Used when an app that
+/// owns pending work is resumed after another app reset the queue.
+pub fn resume(g: WorkGen) {
     critical_section::with(|cs| ACTIVE_GEN.borrow(cs).set(g));
 }
 
@@ -127,9 +143,9 @@ pub enum WorkTask {
     },
 }
 
-pub struct WorkItem {
-    pub generation: u16,
-    pub task: WorkTask,
+struct WorkItem {
+    generation: WorkGen,
+    task: WorkTask,
 }
 
 pub enum WorkOutcome {
@@ -138,11 +154,17 @@ pub enum WorkOutcome {
 }
 
 pub struct WorkResult {
-    pub generation: u16,
+    generation: WorkGen,
     pub outcome: WorkOutcome,
 }
 
 impl WorkResult {
+    /// Generation this result was submitted under.
+    #[inline]
+    pub fn generation(&self) -> WorkGen {
+        self.generation
+    }
+
     #[inline]
     pub fn is_current(&self) -> bool {
         self.generation == active_generation()
@@ -158,7 +180,7 @@ pub fn can_submit() -> bool {
     !WORK_IN.is_full()
 }
 
-pub fn submit(generation: u16, task: WorkTask) -> bool {
+pub fn submit(generation: WorkGen, task: WorkTask) -> bool {
     WORK_IN.try_send(WorkItem { generation, task }).is_ok()
 }
 
@@ -182,10 +204,12 @@ pub fn drain() {
     while WORK_OUT.try_receive().is_ok() {}
 }
 
-pub fn reset() -> u16 {
+/// Mint a fresh generation, make it active, and drop everything queued
+/// under the old one. The only way to obtain a [`WorkGen`].
+pub fn reset() -> WorkGen {
     let g = next_generation();
     drain();
-    log::debug!("[work] reset -> gen {}", g);
+    log::debug!("[work] reset -> gen {:?}", g);
     g
 }
 
@@ -200,7 +224,7 @@ pub async fn worker_task() -> ! {
         let g = item.generation;
         if g != active_generation() {
             log::debug!(
-                "[work] skip stale item (gen {} != active {})",
+                "[work] skip stale item (gen {:?} != active {:?})",
                 g,
                 active_generation()
             );
@@ -223,7 +247,7 @@ pub async fn worker_task() -> ! {
 
                 let fmt = if is_jpeg { "JPEG" } else { "PNG" };
                 log::debug!(
-                    "[work] img {:#010X}: decode {} ({} bytes, {}x{}, gen {})",
+                    "[work] img {:#010X}: decode {} ({} bytes, {}x{}, gen {:?})",
                     path_hash,
                     fmt,
                     data.len(),
@@ -238,7 +262,7 @@ pub async fn worker_task() -> ! {
 
                 if g != active_generation() {
                     log::debug!(
-                        "[work] img {:#010X}: discarded (gen {} stale)",
+                        "[work] img {:#010X}: discarded (gen {:?} stale)",
                         path_hash,
                         g,
                     );

@@ -406,7 +406,9 @@ pub(super) struct EpubState {
     pub(super) ch_cache: Vec<u8>,
 
     pub(super) bg_cache: BgCacheState,
-    pub(super) work_gen: u16,
+    // generation this book's queued work was submitted under; None
+    // until the first reset. only work_queue::reset mints one
+    pub(super) work_gen: Option<work_queue::WorkGen>,
 
     pub(super) img_cache_ch: u16,
     pub(super) img_cache_offset: u32,
@@ -445,7 +447,7 @@ impl EpubState {
             ch_cached: [false; cache::MAX_CACHE_CHAPTERS],
             ch_cache: Vec::new(),
             bg_cache: BgCacheState::Idle,
-            work_gen: 0,
+            work_gen: None,
             img_cache_ch: 0,
             img_cache_offset: 0,
             img_scan_wrapped: false,
@@ -1465,7 +1467,7 @@ impl ReaderApp {
         self.book_font_size_idx = font_size;
 
         // reset work queue for clean start
-        self.epub.work_gen = work_queue::reset();
+        self.epub.work_gen = Some(work_queue::reset());
         self.epub.bg_cache = BgCacheState::Idle;
         self.epub.ch_cached = [false; smol_epub::cache::MAX_CACHE_CHAPTERS];
         self.epub.img_scan_wrapped = false;
@@ -1865,7 +1867,7 @@ impl App<AppId> for ReaderApp {
         // Bump to a new work-queue generation and drain stale work
         // from any previous book (covers the case where on_enter is
         // called without a preceding on_exit, e.g. Replace transition).
-        self.epub.work_gen = work_queue::reset();
+        self.epub.work_gen = Some(work_queue::reset());
         self.epub.bg_cache = BgCacheState::Idle;
         self.epub.ch_cached = [false; cache::MAX_CACHE_CHAPTERS];
         self.epub.img_scan_wrapped = false;
@@ -2014,8 +2016,8 @@ impl App<AppId> for ReaderApp {
         // Restore our generation so the worker considers in-flight
         // results current again (another app may have submitted work
         // under a different generation while we were suspended).
-        if self.epub.work_gen != 0 {
-            work_queue::set_active_generation(self.epub.work_gen);
+        if let Some(g) = self.epub.work_gen {
+            work_queue::resume(g);
         }
 
         // re-derive text area geometry from the (possibly changed) theme

@@ -154,12 +154,9 @@ pub struct Services {
     pub(crate) sd_ok: bool,
     pub(crate) cached_battery_mv: u16,
 
-    // armed by the render path when the active app uses
-    // `GrayscaleMode::Deferred`. the main loop fires the AA pass once
-    // this instant has passed AND no new redraw is pending. cleared on
-    // every render (re-armed if the new frame still wants Deferred),
-    // on sleep, and when `text_aa` is toggled off.
-    pub(crate) aa_deferred_at: Option<embassy_time::Instant>,
+    // deferred grayscale-AA fire; armed by the render path when the
+    // active app uses `GrayscaleMode::Deferred`
+    pub(crate) aa: DeferredAa,
 
     // power-button policy state machine; resolves raw power events
     // into semantic inputs (MenuTap) or sleep requests
@@ -190,25 +187,117 @@ pub struct Services {
     pub(crate) idle_timeout_mins: u16,
 }
 
+/// Armed deferred grayscale-AA fire.
+///
+/// The main loop fires the AA pass once the armed instant has passed
+/// AND no new redraw is pending. Every render decides the arm exactly
+/// once (see the scheduler's `ClosePlan`); sleep and a `text_aa`
+/// toggle cancel it.
+#[derive(Default)]
+pub(crate) struct DeferredAa {
+    at: Option<embassy_time::Instant>,
+}
+
+impl DeferredAa {
+    pub const fn new() -> Self {
+        Self { at: None }
+    }
+
+    /// Arm for `at`, or cancel when the close plan carries no arm.
+    #[inline]
+    pub fn set(&mut self, at: Option<embassy_time::Instant>) {
+        self.at = at;
+    }
+
+    #[inline]
+    pub fn cancel(&mut self) {
+        self.at = None;
+    }
+
+    /// Instant the park should wake at, so fire latency is near zero.
+    #[inline]
+    pub fn deadline(&self) -> Option<embassy_time::Instant> {
+        self.at
+    }
+
+    /// Disarm and report true when the idle window has elapsed. Leaves
+    /// the arm in place while it has not.
+    #[inline]
+    pub fn take_due(&mut self, now: embassy_time::Instant) -> bool {
+        match self.at {
+            Some(at) if now >= at => {
+                self.at = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// A deadline that re-arms itself when it fires.
+///
+/// `due` pushes the next fire to `now + period` rather than
+/// `at + period`, so a 1.6s GC waveform cannot leave a burst of
+/// catch-up runs queued the way a ticker would.
+#[derive(Clone, Copy)]
+pub(crate) struct Periodic {
+    at: embassy_time::Instant,
+    period: embassy_time::Duration,
+}
+
+impl Periodic {
+    pub fn new(first: embassy_time::Instant, period: embassy_time::Duration) -> Self {
+        Self { at: first, period }
+    }
+
+    #[inline]
+    pub fn due(&mut self, now: embassy_time::Instant) -> bool {
+        if now < self.at {
+            return false;
+        }
+        self.at = now + self.period;
+        true
+    }
+}
+
 pub(crate) struct HousekeepingDeadlines {
-    pub status_at: embassy_time::Instant,
-    pub sd_check_at: embassy_time::Instant,
-    pub bm_flush_at: embassy_time::Instant,
+    pub status: Periodic,
+    pub sd_check: Periodic,
+    pub bm_flush: Periodic,
 }
 
 impl HousekeepingDeadlines {
     // initial delay lets boot settle; the bookmark flush keeps its 2s
     // stagger off the SD check so the two never coincide
     pub fn starting_now() -> Self {
-        let now = embassy_time::Instant::now();
-        let initial = embassy_time::Duration::from_secs(timing::HOUSEKEEPING_INITIAL_DELAY_SECS);
+        use embassy_time::{Duration, Instant};
+        let now = Instant::now();
+        let initial = Duration::from_secs(timing::HOUSEKEEPING_INITIAL_DELAY_SECS);
         Self {
-            status_at: now + initial,
-            sd_check_at: now + initial,
-            bm_flush_at: now
-                + initial
-                + embassy_time::Duration::from_secs(timing::BOOKMARK_FLUSH_STAGGER_SECS),
+            status: Periodic::new(
+                now + initial,
+                Duration::from_secs(timing::STATUS_INTERVAL_SECS),
+            ),
+            sd_check: Periodic::new(
+                now + initial,
+                Duration::from_secs(timing::SD_CHECK_INTERVAL_SECS),
+            ),
+            bm_flush: Periodic::new(
+                now + initial + Duration::from_secs(timing::BOOKMARK_FLUSH_STAGGER_SECS),
+                Duration::from_secs(timing::BOOKMARK_FLUSH_INTERVAL_SECS),
+            ),
         }
+    }
+
+    /// Earliest of every slot. The park chain folds over this instead
+    /// of listing the slots itself, so a new slot cannot silently miss
+    /// the wake-up.
+    pub fn earliest(&self) -> embassy_time::Instant {
+        let mut e = self.status.at;
+        for at in [self.sd_check.at, self.bm_flush.at] {
+            e = e.min(at);
+        }
+        e
     }
 }
 
@@ -250,7 +339,7 @@ impl Kernel {
                 bm_cache,
                 sd_ok,
                 cached_battery_mv: battery_mv,
-                aa_deferred_at: None,
+                aa: DeferredAa::new(),
                 input_policy: input_policy::InputPolicyState::new(),
                 applied: AppliedSettings::new(),
                 day_stats,

@@ -621,7 +621,13 @@ impl ReaderApp {
                     max_w: self.text_w as u16,
                     max_h: self.text_area_h,
                 };
-                if work_queue::submit(self.epub.work_gen, task) {
+                // no generation yet means no book was ever opened here,
+                // so there is nothing for a result to belong to
+                if self
+                    .epub
+                    .work_gen
+                    .is_some_and(|g| work_queue::submit(g, task))
+                {
                     self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
                     return Ok(ScanResult::Dispatched {
                         resume_offset: resume,

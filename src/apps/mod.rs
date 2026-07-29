@@ -33,6 +33,17 @@ pub enum AppId {
 
 impl AppIdType for AppId {
     const HOME: Self = Self::Home;
+
+    // inverse of the `as u8` discriminant cast collect_session writes
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            1 => Self::Library,
+            2 => Self::Reader,
+            3 => Self::Settings,
+            4 => Self::Stats,
+            _ => Self::Home,
+        }
+    }
 }
 
 pub type Transition = crate::kernel::app::Transition<AppId>;
