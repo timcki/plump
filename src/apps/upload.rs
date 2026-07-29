@@ -71,6 +71,21 @@ const HOSTNAME_WIRE: [u8; 13] = [
 
 const MDNS_MULTICAST: [u8; 4] = [224, 0, 0, 251];
 
+const QTYPE_A: u16 = 1;
+const QTYPE_AAAA: u16 = 28;
+const QTYPE_NSEC: u16 = 47;
+const QTYPE_ANY: u16 = 255;
+const QCLASS_IN: u16 = 1;
+/// top bit of a question's class: "answer me directly"
+const MDNS_UNICAST_BIT: u16 = 0x8000;
+/// class IN with the cache-flush bit, for records we are authoritative for
+const MDNS_CLASS_FLUSH: u16 = 0x8001;
+const MDNS_TTL_SECS: u32 = 120;
+const MDNS_ANNOUNCEMENTS: u8 = 3;
+const MDNS_ANNOUNCE_GAP: Duration = Duration::from_secs(1);
+/// name + NSEC rdata (name again + bitmap) plus the 12-byte header
+const MDNS_RESP_MAX: usize = 64;
+
 const MAX_BOUNDARY_LEN: usize = 120;
 const WORK_BUF_SIZE: usize = 4096;
 
@@ -144,7 +159,11 @@ impl Endpoint {
         let ip = self.ip();
         match self {
             Self::SoftAp { joined: false, .. } => stack_fmt(buf, |w| {
-                let _ = write!(w, "WIFI:T:WPA;S:{};P:{};;", FALLBACK_SSID, FALLBACK_PASSWORD);
+                let _ = write!(
+                    w,
+                    "WIFI:T:WPA;S:{};P:{};;",
+                    FALLBACK_SSID, FALLBACK_PASSWORD
+                );
             }),
             _ => stack_fmt(buf, |w| {
                 let _ = write!(w, "http://{}.{}.{}.{}/", ip[0], ip[1], ip[2], ip[3]);
@@ -454,7 +473,8 @@ pub async fn run_upload_mode(
 
         let mut resources = embassy_net::StackResources::<4>::new();
         let net_config = embassy_net::Config::dhcpv4(Default::default());
-        let (stack, mut runner) = embassy_net::new(interfaces.sta, net_config, &mut resources, seed);
+        let (stack, mut runner) =
+            embassy_net::new(interfaces.sta, net_config, &mut resources, seed);
 
         match select3(
             runner.run(),
@@ -602,7 +622,11 @@ async fn serve_network<'stack, 'device>(
     screen: &mut UploadScreen<'_>,
 ) -> UploadExit {
     let ip = endpoint.ip();
-    let _ = stack.join_multicast_group(Ipv4Address::new(224, 0, 0, 251));
+    if let Err(e) = stack.join_multicast_group(Ipv4Address::from(MDNS_MULTICAST)) {
+        // without the group the IP layer drops every query before the
+        // socket sees it, and the responder looks like it is running
+        warn!("upload: mDNS multicast join failed: {:?}", e);
+    }
 
     let mut rx_buf = [0u8; TCP_RX_BUF_SIZE];
     let mut tx_buf = [0u8; TCP_TX_BUF_SIZE];
@@ -617,14 +641,27 @@ async fn serve_network<'stack, 'device>(
         &mut mdns_tx_meta,
         &mut mdns_tx_buf,
     );
-    let _ = mdns_socket.bind(MDNS_PORT);
+    if let Err(e) = mdns_socket.bind(MDNS_PORT) {
+        warn!("upload: mDNS bind failed: {:?}", e);
+    }
 
+    // the HTTP server is one future for the whole session, pinned here
+    // and re-polled through the select rather than rebuilt by it. built
+    // inside the select, it was dropped every time a sibling branch
+    // completed, taking the TcpSocket with it: an mDNS packet arriving
+    // during a browser's handshake reset the connection. pinning it
+    // costs nothing on top of what the select already reserved, whereas
+    // wrapping the branches in long-lived async blocks cost 13K of task
+    // future, which this device does not have
+    let mut http = core::pin::pin!(serve_http(stack, &mut rx_buf, &mut tx_buf, sd));
+
+    let mut announcer = Announcer::new();
     loop {
         match select(
             runner.run(),
             select4(
-                serve_one_request(stack, &mut rx_buf, &mut tx_buf, sd),
-                mdns_handle_one(&mut mdns_socket, ip),
+                http.as_mut(),
+                mdns_step(&mut mdns_socket, ip, &mut announcer),
                 dhcp_handle_one(&mut dhcp_socket),
                 wait_for_exit(mapper),
             ),
@@ -632,13 +669,7 @@ async fn serve_network<'stack, 'device>(
         .await
         {
             Either::First(never) => match never {},
-            Either::Second(Either4::First(event)) => match event {
-                ServerEvent::Uploaded { name } => info!("upload: file saved as '{}'", name),
-                ServerEvent::UploadFailed => warn!("upload: file upload failed"),
-                ServerEvent::Deleted { name } => info!("upload: deleted '{}'", name),
-                ServerEvent::DeleteFailed => warn!("upload: file delete failed"),
-                ServerEvent::Nothing => {}
-            },
+            Either::Second(Either4::First(())) => unreachable!("serve_http never returns"),
             Either::Second(Either4::Second(())) => {}
             Either::Second(Either4::Third(served)) => {
                 // the lease is the first moment the client can reach
@@ -654,6 +685,27 @@ async fn serve_network<'stack, 'device>(
                 }
             }
             Either::Second(Either4::Fourth(exit)) => return exit,
+        }
+    }
+}
+
+/// Serve HTTP requests until the session ends.
+///
+/// Never returns: the caller's exit arm is what ends the session, and
+/// a request that fails is logged and followed by the next accept.
+async fn serve_http(
+    stack: embassy_net::Stack<'_>,
+    rx_buf: &mut [u8],
+    tx_buf: &mut [u8],
+    sd: &SdStorage,
+) {
+    loop {
+        match serve_one_request(stack, rx_buf, tx_buf, sd).await {
+            ServerEvent::Uploaded { name } => info!("upload: file saved as '{}'", name),
+            ServerEvent::UploadFailed => warn!("upload: file upload failed"),
+            ServerEvent::Deleted { name } => info!("upload: deleted '{}'", name),
+            ServerEvent::DeleteFailed => warn!("upload: file delete failed"),
+            ServerEvent::Nothing => {}
         }
     }
 }
@@ -1177,95 +1229,331 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-async fn mdns_handle_one(socket: &mut UdpSocket<'_>, ip_octets: [u8; 4]) {
-    let mut pkt = [0u8; 256];
-    let (n, _remote) = match socket.recv_from(&mut pkt).await {
-        Ok(r) => r,
-        Err(_) => return,
+/// Answer one query, or send the announcement that has fallen due.
+///
+/// The query is decided inside the socket's own buffer: a query is
+/// read once and never needed again, and the second copy would be
+/// half a kilobyte of task future on a device that counts it.
+async fn mdns_step(socket: &mut UdpSocket<'_>, ip: [u8; 4], announcer: &mut Announcer) {
+    let decide =
+        |pkt: &[u8], meta: embassy_net::udp::UdpMetadata| (Answer::decide(pkt), meta.endpoint);
+
+    let (answer, from) = match announcer.deadline() {
+        Some(at) => match select(socket.recv_from_with(decide), Timer::at(at)).await {
+            Either::First(decided) => decided,
+            Either::Second(()) => {
+                announcer.fired();
+                send_answer(socket, Answer::Address, ip, Destination::Multicast).await;
+                debug!("upload: mDNS announcement for plump.local");
+                return;
+            }
+        },
+        None => socket.recv_from_with(decide).await,
     };
 
-    if !is_mdns_query_for_plump(&pkt[..n]) {
+    if matches!(answer, Answer::Ignore) {
         return;
     }
 
-    debug!("upload: mDNS query for plump.local -- responding");
-
-    let mut resp = [0u8; 64];
-    let len = build_mdns_response(&mut resp, ip_octets);
-
-    let mdns_dest = embassy_net::IpEndpoint::new(
-        embassy_net::IpAddress::Ipv4(Ipv4Address::from(MDNS_MULTICAST)),
-        MDNS_PORT,
+    // RFC 6762 5.4: a query with the unicast bit set wants the answer
+    // on its own port. macOS sets it on the first try, and answering
+    // only the group there is a plausible way for a name to look dead
+    let destination = if answer.unicast() {
+        Destination::Unicast(from)
+    } else {
+        Destination::Multicast
+    };
+    debug!(
+        "upload: mDNS query answered ({}, unicast={})",
+        answer.as_str(),
+        answer.unicast()
     );
-    let _ = socket.send_to(&resp[..len], mdns_dest).await;
+    send_answer(socket, answer, ip, destination).await;
 }
 
-fn is_mdns_query_for_plump(pkt: &[u8]) -> bool {
-    // DNS header (12) + qname + qtype (2) + qclass (2)
-    let min_len = 12 + HOSTNAME_WIRE.len() + 4;
-    if pkt.len() < min_len {
-        return false;
-    }
-
-    let flags = u16::from_be_bytes([pkt[2], pkt[3]]);
-    if flags & 0x8000 != 0 {
-        return false; // response, not query
-    }
-
-    let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]);
-    if qdcount < 1 {
-        return false;
-    }
-
-    // compare qname against HOSTNAME_WIRE (case-insensitive for labels)
-    let qname_end = 12 + HOSTNAME_WIRE.len();
-    let qname = &pkt[12..qname_end];
-
-    // verify label structure: first label length, second label length, NUL
-    if qname[0] != HOSTNAME_WIRE[0] {
-        return false;
-    }
-    let label1_len = qname[0] as usize;
-    if qname[1 + label1_len] != HOSTNAME_WIRE[1 + label1_len] {
-        return false;
-    }
-    let label2_len = qname[1 + label1_len] as usize;
-    if qname[1 + label1_len + 1 + label2_len] != 0 {
-        return false;
-    }
-
-    // case-insensitive label comparison
-    if !qname[1..1 + label1_len].eq_ignore_ascii_case(&HOSTNAME_WIRE[1..1 + label1_len]) {
-        return false;
-    }
-    let l2_start = 1 + label1_len + 1;
-    if !qname[l2_start..l2_start + label2_len]
-        .eq_ignore_ascii_case(&HOSTNAME_WIRE[l2_start..l2_start + label2_len])
-    {
-        return false;
-    }
-
-    let qtype = u16::from_be_bytes([pkt[qname_end], pkt[qname_end + 1]]);
-    let qclass = u16::from_be_bytes([pkt[qname_end + 2], pkt[qname_end + 3]]) & 0x7FFF;
-
-    (qtype == 1 || qtype == 255) && qclass == 1
+/// Where a response goes.
+#[derive(Clone, Copy)]
+enum Destination {
+    /// The group, so every resolver on the link can cache it.
+    Multicast,
+    /// Back to the querier, for a question that asked for that.
+    Unicast(embassy_net::IpEndpoint),
 }
 
-fn build_mdns_response(buf: &mut [u8], ip: [u8; 4]) -> usize {
+/// Unsolicited announcements (RFC 6762 8.3).
+///
+/// A responder that only ever answers questions is invisible to a
+/// resolver that has already given up asking, which is the state a
+/// laptop is in seconds after the device joins the network. A short
+/// burst of gratuitous records on startup gets the name cached before
+/// anyone looks for it.
+struct Announcer {
+    left: u8,
+    due: Instant,
+}
+
+impl Announcer {
+    fn new() -> Self {
+        Self {
+            left: MDNS_ANNOUNCEMENTS,
+            due: Instant::now(),
+        }
+    }
+
+    /// When the next announcement falls due, or `None` once the burst
+    /// is spent.
+    fn deadline(&self) -> Option<Instant> {
+        (self.left > 0).then_some(self.due)
+    }
+
+    fn fired(&mut self) {
+        self.left = self.left.saturating_sub(1);
+        self.due += MDNS_ANNOUNCE_GAP;
+    }
+}
+
+/// What a received message obliges us to send.
+///
+/// Decided from the whole question section rather than from the first
+/// question at a fixed offset: resolvers routinely ask for A and AAAA
+/// in one message, and put them in either order.
+#[derive(Clone, Copy)]
+enum Answer {
+    /// Nothing addressed to us.
+    Ignore,
+    /// Our A record.
+    Address,
+    /// We own the name but have no address of that family. NSEC says
+    /// so, which stops the client waiting out its IPv6 timeout.
+    NoIpv6,
+    /// Same as `Address` / `NoIpv6`, but the querier asked for the
+    /// answer on its own port.
+    AddressUnicast,
+    NoIpv6Unicast,
+}
+
+impl Answer {
+    fn decide(pkt: &[u8]) -> Self {
+        let mut reader = DnsReader::new(pkt);
+        let Some(header) = reader.header() else {
+            return Self::Ignore;
+        };
+        if header.is_response {
+            return Self::Ignore;
+        }
+
+        let mut found = Self::Ignore;
+        for _ in 0..header.questions {
+            let Some(q) = reader.question() else { break };
+            if !q.ours || q.class != QCLASS_IN {
+                continue;
+            }
+            match q.qtype {
+                QTYPE_A | QTYPE_ANY => {
+                    // an address answer beats a negative one, so it
+                    // wins whatever order the questions arrived in
+                    return if q.unicast {
+                        Self::AddressUnicast
+                    } else {
+                        Self::Address
+                    };
+                }
+                QTYPE_AAAA => {
+                    found = if q.unicast {
+                        Self::NoIpv6Unicast
+                    } else {
+                        Self::NoIpv6
+                    };
+                }
+                _ => {}
+            }
+        }
+        found
+    }
+
+    #[inline]
+    const fn unicast(self) -> bool {
+        matches!(self, Self::AddressUnicast | Self::NoIpv6Unicast)
+    }
+
+    #[inline]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ignore => "ignore",
+            Self::Address | Self::AddressUnicast => "A",
+            Self::NoIpv6 | Self::NoIpv6Unicast => "NSEC",
+        }
+    }
+}
+
+async fn send_answer(
+    socket: &mut UdpSocket<'_>,
+    answer: Answer,
+    ip: [u8; 4],
+    destination: Destination,
+) {
+    let mut resp = [0u8; MDNS_RESP_MAX];
+    let len = match answer {
+        Answer::Ignore => return,
+        Answer::Address | Answer::AddressUnicast => build_a_response(&mut resp, ip),
+        Answer::NoIpv6 | Answer::NoIpv6Unicast => build_nsec_response(&mut resp),
+    };
+
+    let endpoint = match destination {
+        Destination::Multicast => embassy_net::IpEndpoint::new(
+            embassy_net::IpAddress::Ipv4(Ipv4Address::from(MDNS_MULTICAST)),
+            MDNS_PORT,
+        ),
+        Destination::Unicast(endpoint) => endpoint,
+    };
+    if let Err(e) = socket.send_to(&resp[..len], endpoint).await {
+        debug!("upload: mDNS send failed: {:?}", e);
+    }
+}
+
+/// One question from the question section.
+struct Question {
+    /// The qname is exactly our hostname.
+    ours: bool,
+    qtype: u16,
+    class: u16,
+    /// The querier set the unicast-response bit.
+    unicast: bool,
+}
+
+struct DnsHeader {
+    is_response: bool,
+    questions: u16,
+}
+
+/// Cursor over a received DNS message: the read twin of [`DnsBuf`].
+///
+/// Names are walked label by label rather than addressed by offsets
+/// from the start of the packet, so a second question is reachable and
+/// a malformed one cannot read past the end of the buffer.
+struct DnsReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> DnsReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(slice)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        let bytes = self.take(2)?;
+        Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn header(&mut self) -> Option<DnsHeader> {
+        let _id = self.u16()?;
+        let flags = self.u16()?;
+        let questions = self.u16()?;
+        let _answers = self.u16()?;
+        let _authority = self.u16()?;
+        let _additional = self.u16()?;
+        Some(DnsHeader {
+            is_response: flags & 0x8000 != 0,
+            questions,
+        })
+    }
+
+    fn question(&mut self) -> Option<Question> {
+        let ours = self.match_hostname()?;
+        let qtype = self.u16()?;
+        let class = self.u16()?;
+        Some(Question {
+            ours,
+            qtype,
+            class: class & !MDNS_UNICAST_BIT,
+            unicast: class & MDNS_UNICAST_BIT != 0,
+        })
+    }
+
+    /// Consume one qname, reporting whether it is our hostname.
+    ///
+    /// Always consumes the whole name, match or not, so the cursor
+    /// lands on the type field either way and the next question stays
+    /// readable.
+    fn match_hostname(&mut self) -> Option<bool> {
+        // cursor into HOSTNAME_WIRE, which holds the same length-
+        // prefixed labels a qname does
+        let mut expect = 0usize;
+        let mut same = true;
+
+        loop {
+            let len = self.u8()? as usize;
+            if len & 0xC0 != 0 {
+                // a compression pointer; questions do not carry one,
+                // and following it would need the whole message
+                return None;
+            }
+            if len == 0 {
+                return Some(same && HOSTNAME_WIRE.get(expect) == Some(&0));
+            }
+
+            let label = self.take(len)?;
+            let matches_here = HOSTNAME_WIRE.get(expect) == Some(&(len as u8))
+                && HOSTNAME_WIRE
+                    .get(expect + 1..expect + 1 + len)
+                    .is_some_and(|want| label.eq_ignore_ascii_case(want));
+            same &= matches_here;
+            expect += 1 + len;
+        }
+    }
+}
+
+fn build_a_response(buf: &mut [u8], ip: [u8; 4]) -> usize {
     let mut w = DnsBuf::new(buf);
+    put_response_header(&mut w);
+    w.put(&HOSTNAME_WIRE); // name
+    w.put_u16(QTYPE_A);
+    w.put_u16(MDNS_CLASS_FLUSH); // CLASS IN, cache-flush
+    w.put_u32(MDNS_TTL_SECS);
+    w.put_u16(0x0004); // RDLENGTH
+    w.put(&ip); // RDATA (IPv4 address)
+    w.len()
+}
+
+/// NSEC saying the name exists but holds nothing except an A record.
+fn build_nsec_response(buf: &mut [u8]) -> usize {
+    // RDATA is the next owner name (ourselves, for a single record
+    // set) plus one type-bitmap window: window 0, one byte, bit 1 set
+    const TYPE_BITMAP: [u8; 3] = [0x00, 0x01, 0x40];
+
+    let mut w = DnsBuf::new(buf);
+    put_response_header(&mut w);
+    w.put(&HOSTNAME_WIRE);
+    w.put_u16(QTYPE_NSEC);
+    w.put_u16(MDNS_CLASS_FLUSH);
+    w.put_u32(MDNS_TTL_SECS);
+    w.put_u16((HOSTNAME_WIRE.len() + TYPE_BITMAP.len()) as u16);
+    w.put(&HOSTNAME_WIRE);
+    w.put(&TYPE_BITMAP);
+    w.len()
+}
+
+/// Header shared by every response we emit: no questions echoed, one
+/// authoritative answer.
+fn put_response_header(w: &mut DnsBuf<'_>) {
     w.put_u16(0x0000); // transaction ID
     w.put_u16(0x8400); // flags: response, authoritative
     w.put_u16(0x0000); // QDCOUNT
     w.put_u16(0x0001); // ANCOUNT
     w.put_u16(0x0000); // NSCOUNT
     w.put_u16(0x0000); // ARCOUNT
-    w.put(&HOSTNAME_WIRE); // name
-    w.put_u16(0x0001); // TYPE A
-    w.put_u16(0x8001); // CLASS IN, cache-flush
-    w.put_u32(120); // TTL 120s
-    w.put_u16(0x0004); // RDLENGTH
-    w.put(&ip); // RDATA (IPv4 address)
-    w.len()
 }
 
 /// Wait for an input that leaves the upload screen.
