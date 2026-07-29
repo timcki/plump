@@ -211,6 +211,33 @@ pub enum Transition<Id> {
     Home,
 }
 
+/// Where the app layer wants to be once a special mode returns.
+///
+/// A special mode owns the screen and the input channel for its whole
+/// run, so the scheduler cannot derive the next screen itself: the
+/// mode reports it. No constructor spells "stay here" and none spells
+/// `Pop` (a no-op at stack depth 1, which is where a tab-hosted mode
+/// lives), so a mode that returns cannot be immediately re-entered.
+#[must_use = "the scheduler applies a mode's exit; dropping it strands the mode"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModeExit<Id>(Transition<Id>);
+
+impl<Id: AppIdType> ModeExit<Id> {
+    /// Leave for `id`.
+    pub const fn to(id: Id) -> Self {
+        Self(Transition::Replace(id))
+    }
+
+    /// Leave for the home screen.
+    pub const fn home() -> Self {
+        Self(Transition::Home)
+    }
+
+    pub(crate) const fn transition(self) -> Transition<Id> {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Redraw {
     None,
@@ -800,7 +827,18 @@ pub trait AppLayer {
     // needs_special_mode() returns true. the screen half and SD are
     // passed from the kernel since special modes drive the EPD
     // and SD directly (e.g. wifi upload mode).
-    async fn run_special_mode(&mut self, _screen: &mut super::Screen, _sd: &SdStorage) {}
+    //
+    // the returned ModeExit is what moves the app layer off the mode;
+    // the scheduler applies it and would otherwise re-enter on the
+    // next pass, since needs_special_mode() is a query over state the
+    // mode itself does not change.
+    async fn run_special_mode(
+        &mut self,
+        _screen: &mut super::Screen,
+        _sd: &SdStorage,
+    ) -> ModeExit<Self::Id> {
+        ModeExit::home()
+    }
 
     // true when deferred input during EPD refresh should be
     // suppressed (e.g. quick menu overlay is open)

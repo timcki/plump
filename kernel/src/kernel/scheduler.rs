@@ -546,11 +546,21 @@ impl super::Kernel {
     // delegate to app layer for modes that bypass normal dispatch
     // (e.g. wifi upload); kernel passes hardware resources through
     async fn handle_special_mode<A: AppLayer>(&mut self, app_mgr: &mut A) {
-        app_mgr
+        let exit = app_mgr
             .run_special_mode(&mut self.screen, &self.svc.sd)
             .await;
 
-        app_mgr.apply_transition(Transition::Pop, &mut self.handle());
+        app_mgr.apply_transition(exit.transition(), &mut self.handle());
+
+        // post-condition: needs_special_mode() is a query over app-layer
+        // state the mode does not own, so a refused transition would put
+        // the loop straight back into the mode. ModeExit cannot spell a
+        // refusable one, but the launcher is free to decline any
+        // transition, so prove the mode is really over.
+        if app_mgr.needs_special_mode() {
+            log::warn!("special mode still active after its exit; forcing home");
+            app_mgr.apply_transition(Transition::Home, &mut self.handle());
+        }
         app_mgr.request_full_redraw();
         // a long special mode (wifi upload) must not be followed by an
         // immediate idle sleep computed from pre-upload activity

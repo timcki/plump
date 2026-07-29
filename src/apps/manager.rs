@@ -22,7 +22,7 @@ use crate::drivers::input::Event;
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
-use crate::kernel::app::{AppIdType, AppLayer};
+use crate::kernel::app::{AppIdType, AppLayer, ModeExit};
 use crate::kernel::{KernelHandle, Screen};
 use crate::kernel::bookmarks::BookmarkCache;
 use crate::kernel::config::SystemSettings;
@@ -120,6 +120,12 @@ pub struct AppManager {
     /// screens (`App::show_chrome() == true`). reader opts out and
     /// keeps its legacy chrome until chunk G.
     pub chrome: Chrome,
+
+    /// tab the upload screen was opened from, and the one Back returns
+    /// to. upload is a tab, so it is entered by `Replace` at stack
+    /// depth 1: there is nothing to pop, and the launcher is the only
+    /// place that remembers where the user was.
+    upload_return_tab: Tab,
 }
 
 /// map a (legacy) `AppId` to the `Tab` it represents in the new model,
@@ -218,6 +224,7 @@ impl AppManager {
             mapper,
             nav: AppNav::new(Tab::Home),
             chrome: Chrome::new(),
+            upload_return_tab: Tab::Home,
         }
     }
 
@@ -642,6 +649,12 @@ impl AppManager {
             self.sync_nav_from_launcher();
             log::debug!("app: {:?} -> {:?}", nav.from, nav.to);
 
+            // captured on the way in: once upload is active the tab it
+            // replaced is gone from the stack
+            if nav.to == AppId::Upload {
+                self.upload_return_tab = appid_to_tab(nav.from).unwrap_or(Tab::Home);
+            }
+
             if nav.from != AppId::Upload {
                 with_app!(nav.from, self, |app| app.save_state(k.bookmark_cache_mut()));
 
@@ -1035,7 +1048,7 @@ impl AppLayer for AppManager {
         self.launcher.active() == AppId::Upload
     }
 
-    async fn run_special_mode(&mut self, screen: &mut Screen, sd: &SdStorage) {
+    async fn run_special_mode(&mut self, screen: &mut Screen, sd: &SdStorage) -> ModeExit<AppId> {
         // Safety: WIFI is not owned by any other driver.  Upload mode
         // runs in isolation (the scheduler exits the main dispatch loop
         // first) and tears down the radio stack before returning.  The
@@ -1051,6 +1064,8 @@ impl AppLayer for AppManager {
             self.settings.wifi_config(),
         )
         .await;
+
+        ModeExit::to(tab_to_appid(self.upload_return_tab))
     }
 
     fn suppress_deferred_input(&self) -> bool {
