@@ -14,6 +14,7 @@ use crate::apps::{
     HDir, HResult, Launcher, Modal, PendingSetting, Redraw, Tab, Transition,
 };
 
+use crate::apps::upload::UploadExit;
 use crate::apps::widgets::quick_menu::{MAX_APP_ACTIONS, QuickMenuResult};
 use crate::apps::widgets::{ButtonFeedback, QuickMenu};
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
@@ -1055,17 +1056,22 @@ impl AppLayer for AppManager {
         // peripheral is not accessed again until the next upload session.
         let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
 
-        crate::apps::upload::run_upload_mode(
+        let exit = crate::apps::upload::run_upload_mode(
             wifi,
             screen,
             sd,
             self.settings.system_settings().ui_font_size_idx,
-            &*self.bumps,
+            &self.chrome,
+            &self.mapper,
             self.settings.wifi_config(),
         )
         .await;
 
-        ModeExit::to(tab_to_appid(self.upload_return_tab))
+        let tab = match exit {
+            UploadExit::Back => self.upload_return_tab,
+            UploadExit::Tab(tab) => tab,
+        };
+        ModeExit::to(tab_to_appid(tab))
     }
 
     fn suppress_deferred_input(&self) -> bool {

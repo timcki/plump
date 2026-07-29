@@ -17,6 +17,7 @@ use esp_radio::wifi::{
 };
 use log::{debug, info, warn};
 
+use crate::apps::Tab;
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::sdcard::SdStorage;
@@ -27,8 +28,9 @@ use crate::fonts::bitmap::BitmapFont;
 use crate::kernel::Screen;
 use crate::kernel::config::WifiConfig;
 use crate::kernel::tasks;
+use crate::ui::chrome::Chrome;
 use crate::ui::{
-    Alignment, BitmapLabel, ButtonFeedback, CONTENT_TOP, LARGE_MARGIN, Region, stack_fmt,
+    Alignment, BitmapLabel, CONTENT_TOP, LARGE_MARGIN, Painter, Region, Theme, stack_fmt,
 };
 
 const HEADING_X: u16 = LARGE_MARGIN;
@@ -37,7 +39,12 @@ const HEADING_W: u16 = SCREEN_W - HEADING_X * 2;
 const BODY_X: u16 = 24;
 const BODY_W: u16 = SCREEN_W - BODY_X * 2;
 const BODY_LINE_GAP: u16 = 10;
-const FOOTER_Y: u16 = SCREEN_H - 60;
+
+// the footer sits in the band the tab bar leaves, not at a hardcoded
+// offset from the panel edge
+const TAB_BAR_TOP: u16 = Theme::default_v1().content_bottom();
+const FOOTER_H: u16 = 28;
+const FOOTER_Y: u16 = TAB_BAR_TOP - FOOTER_H;
 
 const HTTP_200_HTML: &[u8] =
     b"HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";
@@ -85,9 +92,30 @@ const FALLBACK_SSID: &str = "PLUMP-X4";
 const FALLBACK_PASSWORD: &str = "plumpbooks";
 const FALLBACK_IP: [u8; 4] = dhcp::SERVER_IP;
 
+/// Why the upload screen stopped, and where the user expects to land.
+///
+/// Upload owns the input channel for its whole run, so every way out
+/// of it is decided here. `Back` and `Tab` differ only in destination,
+/// which is exactly what the `exit_requested` bool could not carry:
+/// it recorded that the user left, never where to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NetworkExit {
+pub enum UploadExit {
+    /// Back: return to the tab upload was opened from.
     Back,
+    /// Edge navigation: the user paged into a neighbouring tab.
+    Tab(Tab),
+}
+
+/// How far the configured-network attempt got.
+///
+/// One value for one outcome: the old `station_started` / `connected`
+/// / `got_ip` / `exit_requested` bools had 16 combinations, of which
+/// three were reachable.
+enum Station {
+    /// A session ran on the configured network and the user left.
+    Served(UploadExit),
+    /// Never became usable; host the fallback AP instead.
+    Failed,
 }
 
 /// Cursor-based DNS packet writer.  Appends bytes, u16, u32 without
@@ -127,16 +155,26 @@ struct UploadScreen<'a> {
     screen: &'a mut Screen,
     heading: &'static BitmapFont,
     body: &'static BitmapFont,
-    bumps: &'a ButtonFeedback,
+    /// the same chrome the dispatch loop draws. upload runs outside
+    /// that loop, so it paints the bars itself rather than dropping
+    /// them for the length of the session
+    chrome: &'a Chrome,
+    mapper: &'a ButtonMapper,
 }
 
 impl<'a> UploadScreen<'a> {
-    fn new(screen: &'a mut Screen, ui_font_size_idx: u8, bumps: &'a ButtonFeedback) -> Self {
+    fn new(
+        screen: &'a mut Screen,
+        ui_font_size_idx: u8,
+        chrome: &'a Chrome,
+        mapper: &'a ButtonMapper,
+    ) -> Self {
         Self {
             screen,
             heading: fonts::ui_heading_font(ui_font_size_idx),
             body: fonts::chrome_font(),
-            bumps,
+            chrome,
+            mapper,
         }
     }
 
@@ -148,7 +186,7 @@ impl<'a> UploadScreen<'a> {
             self.body,
             lines,
             footer,
-            self.bumps,
+            self.chrome,
             false,
         )
         .await;
@@ -162,25 +200,25 @@ impl<'a> UploadScreen<'a> {
             self.body,
             lines,
             footer,
-            self.bumps,
+            self.chrome,
             true,
         )
         .await;
     }
 
-    /// Show error message and wait for BACK button.
-    async fn show_error(&mut self, msg: &str) {
+    /// Show an error and wait for the user to leave.
+    async fn show_error(&mut self, msg: &str) -> UploadExit {
         render_screen(
             self.screen,
             self.heading,
             self.body,
             &[msg],
             Some("Press BACK to exit"),
-            self.bumps,
+            self.chrome,
             false,
         )
         .await;
-        drain_until_back().await;
+        wait_for_exit(self.mapper).await
     }
 }
 
@@ -268,17 +306,17 @@ pub async fn run_upload_mode(
     screen: &mut Screen,
     sd: &SdStorage,
     ui_font_size_idx: u8,
-    bumps: &ButtonFeedback,
+    chrome: &Chrome,
+    mapper: &ButtonMapper,
     wifi_cfg: &WifiConfig,
-) {
-    let mut screen = UploadScreen::new(screen, ui_font_size_idx, bumps);
+) -> UploadExit {
+    let mut screen = UploadScreen::new(screen, ui_font_size_idx, chrome, mapper);
 
     let radio = match esp_radio::init() {
         Ok(r) => r,
         Err(e) => {
             info!("upload: radio init failed: {:?}", e);
-            screen.show_error("Radio init failed!").await;
-            return;
+            return screen.show_error("Radio init failed!").await;
         }
     };
 
@@ -286,8 +324,7 @@ pub async fn run_upload_mode(
         Ok(pair) => pair,
         Err(e) => {
             info!("upload: wifi::new failed: {:?}", e);
-            screen.show_error("WiFi init failed!").await;
-            return;
+            return screen.show_error("WiFi init failed!").await;
         }
     };
 
@@ -297,9 +334,13 @@ pub async fn run_upload_mode(
     };
 
     let mut station_started = false;
-    let mut exit_requested = false;
 
-    if wifi_cfg.has_credentials() {
+    let station = 'station: {
+        if !wifi_cfg.has_credentials() {
+            info!("upload: no configured WiFi, starting fallback AP");
+            break 'station Station::Failed;
+        }
+
         let ssid = wifi_cfg.ssid();
         let mut msg_buf = [0u8; 64];
         let msg_len = stack_fmt(&mut msg_buf, |w| {
@@ -320,90 +361,80 @@ pub async fn run_upload_mode(
             Err(e) => warn!("upload: station config failed, falling back: {:?}", e),
         }
 
-        if station_started {
-            let deadline = Instant::now() + Duration::from_secs(STATION_DEADLINE_SECS);
-            info!(
-                "upload: trying configured WiFi '{}' for {}s",
-                ssid, STATION_DEADLINE_SECS
-            );
-            let connected = match select(
-                with_deadline(deadline, wifi_ctrl.connect_async()),
-                drain_until_back(),
-            )
-            .await
-            {
-                Either::First(Ok(Ok(()))) => true,
-                Either::First(Ok(Err(e))) => {
-                    warn!("upload: station association failed, falling back: {:?}", e);
-                    false
-                }
-                Either::First(Err(_)) => {
-                    warn!("upload: station association timed out, falling back");
-                    false
-                }
-                Either::Second(()) => {
-                    exit_requested = true;
-                    false
-                }
-            };
-
-            if connected && !exit_requested {
-                let mut resources = embassy_net::StackResources::<4>::new();
-                let net_config = embassy_net::Config::dhcpv4(Default::default());
-                let (stack, mut runner) =
-                    embassy_net::new(interfaces.sta, net_config, &mut resources, seed);
-
-                let got_ip = match select3(
-                    runner.run(),
-                    with_deadline(deadline, stack.wait_config_up()),
-                    drain_until_back(),
-                )
-                .await
-                {
-                    Either3::First(never) => match never {},
-                    Either3::Second(Ok(())) => true,
-                    Either3::Second(Err(_)) => {
-                        warn!("upload: station DHCP timed out, falling back");
-                        false
-                    }
-                    Either3::Third(()) => {
-                        exit_requested = true;
-                        false
-                    }
-                };
-
-                if got_ip && !exit_requested {
-                    let ip = stack
-                        .config_v4()
-                        .map(|cfg| cfg.address.address().octets())
-                        .unwrap_or([0, 0, 0, 0]);
-                    show_server_ready(&mut screen, ip).await;
-                    info!("upload: connected to '{}'", ssid);
-
-                    match select(
-                        wifi_ctrl.wait_for_event(WifiEvent::StaDisconnected),
-                        serve_network(stack, &mut runner, sd, ip, None),
-                    )
-                    .await
-                    {
-                        Either::First(()) => {
-                            warn!("upload: configured WiFi disconnected, falling back");
-                        }
-                        Either::Second(NetworkExit::Back) => exit_requested = true,
-                    }
-                }
-            }
+        if !station_started {
+            break 'station Station::Failed;
         }
-    } else {
-        info!("upload: no configured WiFi, starting fallback AP");
-    }
+
+        let deadline = Instant::now() + Duration::from_secs(STATION_DEADLINE_SECS);
+        info!(
+            "upload: trying configured WiFi '{}' for {}s",
+            ssid, STATION_DEADLINE_SECS
+        );
+        match select(
+            with_deadline(deadline, wifi_ctrl.connect_async()),
+            wait_for_exit(mapper),
+        )
+        .await
+        {
+            Either::First(Ok(Ok(()))) => {}
+            Either::First(Ok(Err(e))) => {
+                warn!("upload: station association failed, falling back: {:?}", e);
+                break 'station Station::Failed;
+            }
+            Either::First(Err(_)) => {
+                warn!("upload: station association timed out, falling back");
+                break 'station Station::Failed;
+            }
+            Either::Second(exit) => break 'station Station::Served(exit),
+        }
+
+        let mut resources = embassy_net::StackResources::<4>::new();
+        let net_config = embassy_net::Config::dhcpv4(Default::default());
+        let (stack, mut runner) = embassy_net::new(interfaces.sta, net_config, &mut resources, seed);
+
+        match select3(
+            runner.run(),
+            with_deadline(deadline, stack.wait_config_up()),
+            wait_for_exit(mapper),
+        )
+        .await
+        {
+            Either3::First(never) => match never {},
+            Either3::Second(Ok(())) => {}
+            Either3::Second(Err(_)) => {
+                warn!("upload: station DHCP timed out, falling back");
+                break 'station Station::Failed;
+            }
+            Either3::Third(exit) => break 'station Station::Served(exit),
+        }
+
+        let ip = stack
+            .config_v4()
+            .map(|cfg| cfg.address.address().octets())
+            .unwrap_or([0, 0, 0, 0]);
+        show_server_ready(&mut screen, ip).await;
+        info!("upload: connected to '{}'", ssid);
+
+        match select(
+            wifi_ctrl.wait_for_event(WifiEvent::StaDisconnected),
+            serve_network(stack, &mut runner, sd, ip, None, mapper),
+        )
+        .await
+        {
+            Either::First(()) => {
+                warn!("upload: configured WiFi disconnected, falling back");
+                Station::Failed
+            }
+            Either::Second(exit) => Station::Served(exit),
+        }
+    };
 
     if station_started {
         let _ = wifi_ctrl.stop_async().await;
     }
-    if exit_requested {
-        info!("upload: user exited during station setup/session");
-        return;
+    if let Station::Served(exit) = station {
+        info!("upload: leaving station session: {:?}", exit);
+        return exit;
     }
 
     let ap_config = AccessPointConfig::default()
@@ -413,13 +444,11 @@ pub async fn run_upload_mode(
         .with_max_connections(1);
     if let Err(e) = wifi_ctrl.set_config(&ModeConfig::AccessPoint(ap_config)) {
         warn!("upload: fallback AP config failed: {:?}", e);
-        screen.show_error("Fallback WiFi failed!").await;
-        return;
+        return screen.show_error("Fallback WiFi failed!").await;
     }
     if let Err(e) = wifi_ctrl.start_async().await {
         warn!("upload: fallback AP start failed: {:?}", e);
-        screen.show_error("Fallback WiFi failed!").await;
-        return;
+        return screen.show_error("Fallback WiFi failed!").await;
     }
 
     let net_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
@@ -451,9 +480,9 @@ pub async fn run_upload_mode(
     );
     if !dhcp::bind(&mut dhcp_socket) {
         warn!("upload: DHCP server bind failed");
-        screen.show_error("Fallback DHCP failed!").await;
+        let exit = screen.show_error("Fallback DHCP failed!").await;
         let _ = wifi_ctrl.stop_async().await;
-        return;
+        return exit;
     }
 
     info!(
@@ -470,9 +499,18 @@ pub async fn run_upload_mode(
             Some("Press BACK to exit"),
         )
         .await;
-    let _ = serve_network(stack, &mut runner, sd, FALLBACK_IP, Some(&mut dhcp_socket)).await;
+    let exit = serve_network(
+        stack,
+        &mut runner,
+        sd,
+        FALLBACK_IP,
+        Some(&mut dhcp_socket),
+        mapper,
+    )
+    .await;
     let _ = wifi_ctrl.stop_async().await;
     info!("upload: exiting, WiFi stopped");
+    exit
 }
 
 async fn show_server_ready(screen: &mut UploadScreen<'_>, ip: [u8; 4]) {
@@ -497,7 +535,8 @@ async fn serve_network<'stack, 'device>(
     sd: &SdStorage,
     ip: [u8; 4],
     mut dhcp_socket: Option<&mut UdpSocket<'_>>,
-) -> NetworkExit {
+    mapper: &ButtonMapper,
+) -> UploadExit {
     let _ = stack.join_multicast_group(Ipv4Address::new(224, 0, 0, 251));
 
     let mut rx_buf = [0u8; TCP_RX_BUF_SIZE];
@@ -522,7 +561,7 @@ async fn serve_network<'stack, 'device>(
                 serve_one_request(stack, &mut rx_buf, &mut tx_buf, sd),
                 mdns_handle_one(&mut mdns_socket, ip),
                 dhcp_handle_one(&mut dhcp_socket),
-                drain_until_back(),
+                wait_for_exit(mapper),
             ),
         )
         .await
@@ -536,7 +575,7 @@ async fn serve_network<'stack, 'device>(
                 ServerEvent::Nothing => {}
             },
             Either::Second(Either4::Second(())) | Either::Second(Either4::Third(())) => {}
-            Either::Second(Either4::Fourth(())) => return NetworkExit::Back,
+            Either::Second(Either4::Fourth(exit)) => return exit,
         }
     }
 }
@@ -1151,16 +1190,32 @@ fn build_mdns_response(buf: &mut [u8], ip: [u8; 4]) -> usize {
     w.len()
 }
 
-async fn drain_until_back() {
-    let mapper = ButtonMapper::new();
+/// Wait for an input that leaves the upload screen.
+///
+/// Takes the manager's mapper rather than minting one: a fresh
+/// `ButtonMapper::new()` is always the unswapped layout, so on a
+/// left-handed device the physical Back button mapped to `PrevJump`
+/// here and nothing could exit at all.
+///
+/// Edge navigation follows the same rule as the dispatch loop: upload
+/// consumes the jump actions but only leaves when the neighbouring tab
+/// exists, so Right on the last tab is a no-op instead of an exit.
+async fn wait_for_exit(mapper: &ButtonMapper) -> UploadExit {
     loop {
         let hw = tasks::INPUT_EVENTS.receive().await;
-        let ev = mapper.map_event(hw);
-        if matches!(
-            ev,
-            ActionEvent::Press(Action::Back) | ActionEvent::LongPress(Action::Back)
-        ) {
-            return;
+        let action = match mapper.map_event(hw) {
+            ActionEvent::Press(a) | ActionEvent::LongPress(a) | ActionEvent::Repeat(a) => a,
+            _ => continue,
+        };
+
+        let neighbour = match action {
+            Action::Back => return UploadExit::Back,
+            Action::PrevJump => Tab::Upload.left(),
+            Action::NextJump => Tab::Upload.right(),
+            _ => continue,
+        };
+        if let Some(tab) = neighbour {
+            return UploadExit::Tab(tab);
         }
     }
 }
@@ -1171,7 +1226,7 @@ async fn render_screen(
     body: &'static BitmapFont,
     lines: &[&str],
     footer: Option<&str>,
-    bumps: &ButtonFeedback,
+    chrome: &Chrome,
     full_refresh: bool,
 ) {
     let heading_h = heading.line_height;
@@ -1217,7 +1272,11 @@ async fn render_screen(
                 .unwrap();
         }
 
-        bumps.draw(s);
+        // same order the dispatch loop uses: chrome last, so the bars
+        // win over any content pixel that strays into them
+        let theme = Theme::default_v1();
+        let mut painter = Painter::new(s, &theme);
+        chrome.draw(&mut painter, fonts::chrome_font(), fonts::icon_font(2));
     };
 
     let result = if full_refresh {
