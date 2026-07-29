@@ -1,4 +1,4 @@
-// FNV-1a hash + BookId newtype.
+// FNV-1a hash.
 //
 // the codebase historically had three copies of the same hash function:
 // `kernel::bookmarks::fnv1a_icase` (case-folded, used by bookmarks),
@@ -13,44 +13,6 @@
 // (`fnv1a`) because the bundle file name is `_<hash>.BIN` and we want
 // it stable against the exact filename that opened the book. mixing
 // the two would silently re-key persisted data; keep them separate.
-
-/// Stable per-book identifier derived from the filename.
-///
-/// Wraps a `u32` so the hash flavour is documented at construction
-/// (`from_filename` is case-sensitive; `from_filename_icase` matches
-/// bookmark semantics). Methods that downstream want a raw `u32` can
-/// call `raw`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub struct BookId(pub u32);
-
-impl BookId {
-    pub const ZERO: Self = Self(0);
-
-    /// Case-sensitive hash. Matches the historical bundle naming
-    /// scheme (`smol_epub::cache::fnv1a`).
-    #[inline]
-    pub fn from_filename(name: &[u8]) -> Self {
-        Self(fnv1a(name))
-    }
-
-    /// Case-folded hash. Matches bookmark lookup semantics.
-    #[inline]
-    pub fn from_filename_icase(name: &[u8]) -> Self {
-        Self(fnv1a_icase(name))
-    }
-
-    #[inline]
-    pub fn raw(self) -> u32 {
-        self.0
-    }
-}
-
-impl From<u32> for BookId {
-    #[inline]
-    fn from(raw: u32) -> Self {
-        Self(raw)
-    }
-}
 
 /// FNV-1a, case-sensitive.
 #[inline]
@@ -90,17 +52,5 @@ mod tests {
     fn icase_folds_case() {
         assert_eq!(fnv1a_icase(b"FOO.epub"), fnv1a_icase(b"foo.EPUB"));
         assert_ne!(fnv1a(b"FOO.epub"), fnv1a(b"foo.EPUB"));
-    }
-
-    #[test]
-    fn book_id_constructors_differ_on_case() {
-        assert_ne!(
-            BookId::from_filename(b"Foo.epub"),
-            BookId::from_filename(b"foo.epub")
-        );
-        assert_eq!(
-            BookId::from_filename_icase(b"Foo.epub"),
-            BookId::from_filename_icase(b"foo.epub")
-        );
     }
 }

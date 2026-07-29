@@ -10,8 +10,11 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-// magic value to validate RTC session data: "PLPS" (PLuMP Session)
-const RTC_SESSION_MAGIC: u32 = 0x504C5053;
+// magic value to validate RTC session data: "PLPT" (PLuMP session,
+// layout rev 2). bumped when the struct layout changes so stale RTC
+// and SD copies from an older firmware are discarded instead of being
+// reinterpreted field-by-field.
+const RTC_SESSION_MAGIC: u32 = 0x504C5054;
 
 // max navigation stack depth (must match app::MAX_STACK_DEPTH)
 pub const MAX_NAV_STACK: usize = 4;
@@ -46,26 +49,12 @@ pub struct RtcSession {
     pub reader_font_size: u8,
     _reader_pad: [u8; 5],
 
-    // files state (8 bytes)
-    pub files_scroll: u16,
-    pub files_selected: u8,
-    pub files_total: u16,
-    _files_pad: [u8; 3],
-
     // home state (8 bytes)
     pub home_state: u8, // 0=Menu, 1=ShowBookmarks
     pub home_selected: u8,
     pub home_bm_selected: u8,
     pub home_bm_scroll: u8,
     _home_pad: [u8; 4],
-
-    // settings cache (16 bytes) - avoid SD reads on wake
-    pub settings_sleep_timeout: u16,
-    pub settings_ghost_clear: u8,
-    pub settings_book_font: u8,
-    pub settings_ui_font: u8,
-    pub settings_valid: u8,
-    _settings_pad: [u8; 10],
 
     // reserved (24 bytes)
     _reserved: [u8; 24],
@@ -94,10 +83,6 @@ impl RtcSession {
     #[inline]
     pub fn mark_valid(&mut self) {
         self.magic = RTC_SESSION_MAGIC;
-    }
-
-    pub fn clear(&mut self) {
-        self.magic = 0;
     }
 
     pub fn increment_wake_count(&mut self) {
@@ -140,16 +125,6 @@ impl RtcSession {
         rtc_write_session(self);
         // ensure magic is set (caller may have forgotten)
         rtc_write_magic(RTC_SESSION_MAGIC);
-    }
-
-    /// Clear RTC session data.
-    pub fn rtc_clear() {
-        rtc_write_magic(0);
-    }
-
-    /// Get wake count from RTC for debugging (doesn't consume session).
-    pub fn rtc_wake_count() -> u32 {
-        rtc_read_wake_count()
     }
 
     // ── SD-based session persistence ────────────────────────────
@@ -207,10 +182,6 @@ impl RtcSession {
         }
     }
 
-    /// Delete session file from SD (e.g. after successful cold boot).
-    pub fn clear_sd(sd: &crate::drivers::sdcard::SdStorage) {
-        let _ = sd.delete_in_plump(SESSION_FILE);
-    }
 }
 
 // RTC FAST persistent storage
@@ -247,13 +218,6 @@ fn rtc_write_magic(val: u32) {
     unsafe {
         let ptr = core::ptr::addr_of_mut!(RTC_SESSION);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).magic), val);
-    }
-}
-
-fn rtc_read_wake_count() -> u32 {
-    unsafe {
-        let ptr = core::ptr::addr_of!(RTC_SESSION);
-        core::ptr::read_volatile(core::ptr::addr_of!((*ptr).wake_count))
     }
 }
 

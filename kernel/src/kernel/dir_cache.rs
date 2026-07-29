@@ -133,27 +133,6 @@ impl DirCache {
         DirPage { total, count }
     }
 
-    pub fn invalidate(&mut self) {
-        self.valid = false;
-    }
-
-    pub fn next_untitled_epub(&self, from: usize) -> Option<(usize, crate::util::FixedStr<13>)> {
-        for i in from..self.count {
-            let e = &self.entries[i];
-            if e.has_real_title() || e.is_dir {
-                continue;
-            }
-            let name = e.name.as_bytes();
-            if name.len() >= 5
-                && name[name.len() - 5] == b'.'
-                && name[name.len() - 4..].eq_ignore_ascii_case(b"EPUB")
-            {
-                return Some((i, e.name));
-            }
-        }
-        None
-    }
-
     // look up the display title for a filename (case-insensitive)
     pub fn find_title(&self, filename: &[u8]) -> Option<&[u8]> {
         let name = core::str::from_utf8(filename).ok()?;
@@ -167,12 +146,6 @@ impl DirCache {
                     None
                 }
             })
-    }
-
-    pub fn set_entry_title(&mut self, index: usize, title: &[u8]) {
-        if index < self.count {
-            self.entries[index].set_title(title);
-        }
     }
 
     // update the in-RAM title for a filename (case-insensitive), so a

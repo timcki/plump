@@ -25,7 +25,7 @@ use crate::fonts;
 use crate::kernel::app::AppLayer;
 use crate::kernel::{KernelHandle, Screen};
 use crate::kernel::bookmarks::BookmarkCache;
-use crate::kernel::config::{SystemSettings, WifiConfig};
+use crate::kernel::config::SystemSettings;
 use crate::kernel::input_policy::SemanticInput;
 use crate::ui::chrome::Chrome;
 use crate::ui::{Painter, Region, Theme};
@@ -368,14 +368,6 @@ impl AppManager {
         session.home_selected = self.home.selected() as u8;
         session.home_bm_selected = self.home.bm_selected() as u8;
         session.home_bm_scroll = self.home.bm_scroll() as u8;
-
-        // save settings cache
-        let ss = self.settings.system_settings();
-        session.settings_sleep_timeout = ss.sleep_timeout;
-        session.settings_ghost_clear = ss.ghost_clear_every;
-        session.settings_book_font = ss.book_font_size_idx;
-        session.settings_ui_font = ss.ui_font_size_idx;
-        session.settings_valid = 1;
 
         log::debug!(
             "session: collected nav_depth={} active={:?}",
@@ -847,18 +839,8 @@ impl AppManager {
     }
 
     #[inline]
-    pub fn settings_loaded(&self) -> bool {
-        self.settings.is_loaded()
-    }
-
-    #[inline]
     pub fn settings_generation(&self) -> u32 {
         self.settings.generation()
-    }
-
-    #[inline]
-    pub fn wifi_config(&self) -> &crate::kernel::config::WifiConfig {
-        self.settings.wifi_config()
     }
 
     pub fn ghost_clear_every(&self) -> u32 {
@@ -924,10 +906,6 @@ impl AppLayer for AppManager {
 
     fn system_settings(&self) -> &SystemSettings {
         self.settings.system_settings()
-    }
-
-    fn settings_loaded(&self) -> bool {
-        self.settings.is_loaded()
     }
 
     fn settings_generation(&self) -> u32 {
@@ -1018,10 +996,6 @@ impl AppLayer for AppManager {
             AppId::Home => GrayscaleMode::Deferred,
             _ => GrayscaleMode::Disabled,
         }
-    }
-
-    fn wifi_config(&self) -> &WifiConfig {
-        self.settings.wifi_config()
     }
 
     fn load_eager_settings(&mut self, k: &mut KernelHandle<'_>) {

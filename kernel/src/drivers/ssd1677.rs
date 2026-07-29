@@ -14,7 +14,6 @@
 // and nothing powers down until deep sleep. sunlight mode overrides
 // this with ANALOG_OFF + CLOCK_OFF on every waveform
 
-use embedded_graphics_core::geometry::{OriginDimensions, Size};
 use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
 use esp_hal::delay::Delay;
@@ -27,15 +26,6 @@ pub const HEIGHT: u16 = 480;
 pub const SPI_FREQ_MHZ: u32 = 20;
 
 const POWER_OFF_TIME_MS: u32 = 200; // analog shutdown timeout
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub enum Rotation {
-    #[default]
-    Deg0,
-    Deg90,
-    Deg180,
-    Deg270,
-}
 
 #[allow(dead_code)]
 mod cmd {
@@ -155,7 +145,6 @@ pub struct DisplayDriver<SPI, DC, RST, BUSY> {
     dc: DC,
     rst: RST,
     busy: BUSY,
-    rotation: Rotation,
     power_is_on: bool,
     init_done: bool,
     initial_refresh: bool,
@@ -175,7 +164,6 @@ where
             dc,
             rst,
             busy,
-            rotation: Rotation::Deg270,
             power_is_on: false,
             init_done: false,
             initial_refresh: true,
@@ -218,7 +206,7 @@ where
         let mut y = py;
         while y < py + ph {
             let rows = max_rows.min(py + ph - y);
-            strip.begin_window(self.rotation, px, y, pw, rows);
+            strip.begin_window(px, y, pw, rows);
             draw(strip);
             self.send_data(strip.data());
             y += rows;
@@ -242,7 +230,7 @@ where
         let mut y = py;
         while y < py + ph {
             let rows = max_rows.min(py + ph - y);
-            strip.begin_window(self.rotation, px, y, pw, rows);
+            strip.begin_window(px, y, pw, rows);
             draw(strip);
 
             self.set_partial_ram_area(px, y, pw, rows);
@@ -282,7 +270,7 @@ where
         let mut y = py;
         while y < py + ph {
             let rows = max_rows.min(py + ph - y);
-            strip.begin_window(self.rotation, px, y, pw, rows);
+            strip.begin_window(px, y, pw, rows);
             draw(strip);
 
             // send the same rendered strip to both RAMs directly;
@@ -314,7 +302,7 @@ where
         let mut y = py;
         while y < py + ph {
             let rows = max_rows.min(py + ph - y);
-            strip.begin_window(self.rotation, px, y, pw, rows);
+            strip.begin_window(px, y, pw, rows);
             draw(strip);
 
             // LSB plane → BW RAM
@@ -358,12 +346,7 @@ where
     }
 
     fn transform_region(&self, x: u16, y: u16, w: u16, h: u16) -> (u16, u16, u16, u16) {
-        match self.rotation {
-            Rotation::Deg0 => (x, y, w, h),
-            Rotation::Deg90 => (WIDTH - y - h, x, h, w),
-            Rotation::Deg180 => (WIDTH - x - w, HEIGHT - y - h, w, h),
-            Rotation::Deg270 => (y, HEIGHT - x - w, h, w),
-        }
+        (y, HEIGHT - x - w, h, w)
     }
 
     // callers pass logical regions snapped to byte boundaries on both
@@ -821,17 +804,3 @@ where
     }
 }
 
-impl<SPI, DC, RST, BUSY, E> OriginDimensions for DisplayDriver<SPI, DC, RST, BUSY>
-where
-    SPI: SpiDevice<Error = E>,
-    DC: OutputPin,
-    RST: OutputPin,
-    BUSY: InputPin,
-{
-    fn size(&self) -> Size {
-        match self.rotation {
-            Rotation::Deg0 | Rotation::Deg180 => Size::new(WIDTH as u32, HEIGHT as u32),
-            Rotation::Deg90 | Rotation::Deg270 => Size::new(HEIGHT as u32, WIDTH as u32),
-        }
-    }
-}

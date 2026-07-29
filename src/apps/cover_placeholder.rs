@@ -1,6 +1,6 @@
 // deterministic geometric placeholder shapes for book covers.
 //
-// derived from `BookId` (FNV-1a of the filename), so the same book
+// derived from the book id (FNV-1a of the filename), so the same book
 // always gets the same placeholder across boots. six shapes x two
 // tones gives 12 distinct combinations - enough to feel non-uniform
 // across a library of ~100 books.

@@ -83,7 +83,6 @@ pub(crate) type VolMgr = AsyncVolumeManager<SdBlockDev, NullTimeSource, 4, 4, 1>
 
 pub(crate) struct SdStorageInner {
     pub(crate) mgr: VolMgr,
-    #[allow(dead_code)]
     pub(crate) vol: RawVolume,
     pub(crate) root: RawDirectory,
     /// Resolved data directory name ("_PLUMP" or legacy "_PULP").

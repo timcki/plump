@@ -7,7 +7,6 @@
 //   [16..48) filename [u8;32]
 
 use crate::drivers::sdcard::SdStorage;
-use crate::drivers::storage::TITLE_CAP;
 use crate::util::FixedStr;
 use crate::util::hash::fnv1a_icase;
 
@@ -101,31 +100,15 @@ impl BookmarkSlot {
 #[derive(Clone, Copy)]
 pub struct BmListEntry {
     pub filename: FixedStr<FILENAME_CAP>,
-    pub chapter: u16,
-    pub title: FixedStr<TITLE_CAP>,
 }
 
 impl BmListEntry {
     pub const EMPTY: Self = Self {
         filename: FixedStr::EMPTY,
-        chapter: 0,
-        title: FixedStr::EMPTY,
     };
 
     pub fn filename_str(&self) -> &str {
         self.filename.as_str()
-    }
-
-    pub fn display_name(&self) -> &str {
-        if !self.title.is_empty() {
-            self.title.as_str()
-        } else {
-            self.filename.as_str()
-        }
-    }
-
-    pub fn set_title(&mut self, s: &[u8]) {
-        self.title.set(s);
     }
 }
 
@@ -157,18 +140,10 @@ impl BookmarkCache {
         self.dirty
     }
 
-    pub fn is_loaded(&self) -> bool {
-        self.loaded
-    }
-
     pub fn ensure_loaded(&mut self, sd: &SdStorage) {
         if self.loaded {
             return;
         }
-        self.force_load(sd);
-    }
-
-    pub fn force_load(&mut self, sd: &SdStorage) {
         let mut buf = [0u8; FILE_LEN];
         let slot_count =
             match sd.read_file_start_in_dir(sd.data_dir(), BOOKMARK_FILE, &mut buf) {
@@ -220,8 +195,6 @@ impl BookmarkCache {
                 gens[count] = slot.generation;
                 out[count] = BmListEntry {
                     filename: slot.filename,
-                    chapter: slot.chapter,
-                    title: FixedStr::EMPTY,
                 };
                 count += 1;
             }
@@ -321,24 +294,6 @@ impl BookmarkCache {
             generation,
             core::str::from_utf8(filename).unwrap_or("?"),
         );
-    }
-
-    pub fn remove(&mut self, filename: &[u8]) {
-        if !self.loaded {
-            return;
-        }
-        let key = fnv1a_icase(filename);
-        if let Some(slot) = self.slots[..self.count]
-            .iter_mut()
-            .find(|s| s.valid && s.name_hash == key && s.matches_name(filename))
-        {
-            slot.valid = false;
-            self.dirty = true;
-            log::debug!(
-                "bookmark: removed {:?}",
-                core::str::from_utf8(filename).unwrap_or("?")
-            );
-        }
     }
 
     pub fn flush(&mut self, sd: &SdStorage) {

@@ -18,8 +18,5 @@ const THEME: Theme = Theme::default_v1();
 /// y where app content starts, below the new chrome top status bar.
 pub const CONTENT_TOP: u16 = THEME.top_bar_h + THEME.margin_sm;
 pub const LARGE_MARGIN: u16 = 16;
-pub const SECTION_GAP: u16 = 8;
-pub const TITLE_Y_OFFSET: u16 = 4;
-pub const TITLE_Y: u16 = CONTENT_TOP + TITLE_Y_OFFSET;
 pub const FULL_CONTENT_W: u16 = SCREEN_W - 2 * LARGE_MARGIN;
 pub const HEADER_W: u16 = 300;

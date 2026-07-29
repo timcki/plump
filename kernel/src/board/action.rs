@@ -23,26 +23,6 @@ pub enum ActionEvent {
     Repeat(Action),
 }
 
-impl ActionEvent {
-    pub fn action(self) -> Action {
-        match self {
-            Self::Press(a) | Self::Release(a) | Self::LongPress(a) | Self::Repeat(a) => a,
-        }
-    }
-
-    pub fn is_press(self) -> bool {
-        matches!(self, Self::Press(_))
-    }
-
-    pub fn is_repeat(self) -> bool {
-        matches!(self, Self::Repeat(_))
-    }
-
-    pub fn is_press_or_repeat(self) -> bool {
-        matches!(self, Self::Press(_) | Self::Repeat(_))
-    }
-}
-
 // portrait one-handed layout with optional button swap
 //
 // default layout (right-handed):

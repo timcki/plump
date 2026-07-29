@@ -18,7 +18,6 @@ use embassy_time::Instant;
 use crate::board::action::ActionEvent;
 use crate::drivers::input::Event;
 use crate::drivers::sdcard::SdStorage;
-#[allow(unused_imports)]
 use crate::drivers::strip::StripBuffer;
 use crate::kernel::input_policy::SemanticInput;
 use crate::kernel::nav::{HDir, HResult};
@@ -26,7 +25,7 @@ use crate::ui::Region;
 
 use super::KernelHandle;
 use super::bookmarks::BookmarkCache;
-use super::config::{SystemSettings, WifiConfig};
+use super::config::SystemSettings;
 
 pub const MAX_APP_ACTIONS: usize = 6;
 
@@ -264,10 +263,6 @@ impl AppContext {
 
     pub fn message(&self) -> &[u8] {
         &self.msg_buf[..self.msg_len]
-    }
-
-    pub fn message_str(&self) -> &str {
-        core::str::from_utf8(self.message()).unwrap_or("")
     }
 
     pub fn clear_message(&mut self) {
@@ -687,7 +682,6 @@ pub trait AppLayer {
 
     // system configuration
     fn system_settings(&self) -> &SystemSettings;
-    fn settings_loaded(&self) -> bool;
 
     /// Generation counter bumped whenever any `SystemSettings` field
     /// changes.  The kernel compares this against its last-seen value
@@ -711,7 +705,6 @@ pub trait AppLayer {
     /// frame and, if so, whether to fire it immediately or defer it
     /// to the next redraw-idle window. See `GrayscaleMode`.
     fn grayscale_mode(&self) -> GrayscaleMode;
-    fn wifi_config(&self) -> &WifiConfig;
 
     // boot-time init: load settings, populate caches, enter first app
     fn load_eager_settings(&mut self, k: &mut KernelHandle<'_>);

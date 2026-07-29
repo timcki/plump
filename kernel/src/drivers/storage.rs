@@ -56,7 +56,7 @@ impl DirEntry {
         }
     }
 
-    pub fn has_real_title(&self) -> bool {
+    fn has_real_title(&self) -> bool {
         !self.title.is_empty() && !self.title_humanized
     }
 
@@ -436,15 +436,6 @@ impl SdStorage {
         })
     }
 
-    /// Append data to an existing file (open + seek-to-end + write + close).
-    pub fn append_root_file(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
-        poll_once(async {
-            let mut guard = borrow(self)?;
-            let root = guard.root;
-            guard.append(root, name, data).await
-        })
-    }
-
     /// Delete a file from the root directory.
     pub fn delete_file(&self, name: &str) -> crate::error::Result<()> {
         poll_once(async {
@@ -714,18 +705,6 @@ impl SdStorage {
             let ts = guard.file_mtime(dir_h, name).await.ok();
             let _ = guard.mgr.close_dir(dir_h);
             ts.and_then(timestamp_to_day_key)
-        })
-    }
-
-    /// Get the size of a file in the data directory.
-    pub fn file_size_in_plump(&self, name: &str) -> crate::error::Result<u32> {
-        poll_once(async {
-            let mut guard = borrow(self)?;
-            let dir = guard.data_dir;
-            let dir_h = guard.open_dir(dir).await?;
-            let r = guard.file_size(dir_h, name).await;
-            let _ = guard.mgr.close_dir(dir_h);
-            r
         })
     }
 

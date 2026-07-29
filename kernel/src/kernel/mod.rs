@@ -50,7 +50,6 @@ use crate::drivers::sdcard::SdStorage;
 use crate::drivers::strip::StripBuffer;
 use crate::kernel::daystats::DayStats;
 use crate::kernel::dir_cache::DirCache;
-use crate::ui::Theme;
 
 // default ghost-clear interval (overridden by settings once loaded)
 pub const DEFAULT_GHOST_CLEAR_EVERY: u32 = 10;
@@ -170,9 +169,6 @@ pub struct Services {
     // generation-based diffing in the scheduler main loop
     pub(crate) applied: AppliedSettings,
 
-    // design tokens shared by chrome + apps; one instance per kernel
-    pub(crate) theme: Theme,
-
     // today's reading stats (pages + secs since calendar rollover).
     // owned static, loaded from `_PLUMP/DAYSTATS.BIN` at boot. mutated
     // by the active reader; flushed by housekeeping when dirty.
@@ -257,7 +253,6 @@ impl Kernel {
                 aa_deferred_at: None,
                 input_policy: input_policy::InputPolicyState::new(),
                 applied: AppliedSettings::new(),
-                theme: Theme::default_v1(),
                 day_stats,
                 today_key,
                 hk: HousekeepingDeadlines::starting_now(),
@@ -270,11 +265,6 @@ impl Kernel {
     #[inline]
     pub fn handle(&mut self) -> KernelHandle<'_> {
         self.svc.handle()
-    }
-
-    #[inline]
-    pub fn set_battery_mv(&mut self, mv: u16) {
-        self.svc.cached_battery_mv = mv;
     }
 }
 

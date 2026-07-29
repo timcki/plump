@@ -2,8 +2,7 @@
 //
 // AppId is defined here (the distro side); the kernel attempts to be
 // generic. Modal + the Tab / Nav type aliases are reserved for the
-// rebuild: chunks B.3+ migrate `on_event` away from `Transition<AppId>`
-// to `NavCmd<Tab, Modal>`.
+// rebuild: chunks B.3+ migrate `on_event` away from `Transition<AppId>`.
 
 pub mod cover_cache;
 pub mod cover_placeholder;
@@ -63,8 +62,6 @@ pub enum Modal {
     Reader,
 }
 
-pub type AppNavCmd = plump_kernel::kernel::nav::NavCmd<Tab, Modal>;
-pub type AppNavEvent = plump_kernel::kernel::nav::NavEvent<Tab, Modal>;
 pub type AppNavSlot = plump_kernel::kernel::nav::NavSlot<Tab, Modal>;
 pub type AppNav = plump_kernel::kernel::nav::Nav<Tab, Modal>;
 

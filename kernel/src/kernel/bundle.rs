@@ -11,9 +11,7 @@
 //   header    [0 .. 256)
 //   covers    [covers_offset  .. covers_offset  + covers_size)
 //   spine     [spine_offset   .. spine_offset   + spine_size)
-//   toc       [toc_offset     .. toc_offset     + toc_size)
 //   content   [content_offset .. content_offset + content_size)
-//   images    [images_offset  .. images_offset  + images_size)
 //   pageidx   [pageidx_offset .. pageidx_offset + pageidx_size)  <- tail
 //
 // byte-layout types have no I/O deps; at the bottom of the file a thin
@@ -26,9 +24,6 @@ use crate::util::FixedStr;
 
 /// subdirectory under `_PLUMP/` holding per-book bundles
 pub const BOOKS_DIR: &str = "BOOKS";
-
-/// recent-pointer filename in the data directory
-pub const RECENT_FILE: &str = "RECENT";
 
 /// compute a bundle filename for a given filename hash: `XXXXXXXX.BIN`
 ///
@@ -89,7 +84,7 @@ const OFF_HEADER_SIZE: usize = 6; // 2
 const OFF_SOURCE_SIZE: usize = 8; // 4
 const OFF_NAME_HASH: usize = 12; // 4
 const OFF_FLAGS: usize = 16; // 4
-const OFF_LAST_OPEN_GEN: usize = 20; // 4
+// 20..24 reserved (was last_open_gen)
 
 const OFF_TITLE_LEN: usize = 24; // 1
 const OFF_TITLE: usize = 25; // 80
@@ -106,22 +101,17 @@ const OFF_BM_FONT_IDX: usize = 160; // 1
 const OFF_BM_FLAGS: usize = 161; // 1
 // 162..168 pad
 
-const OFF_PAGES_READ: usize = 168; // 4
-const OFF_TIME_SPENT_SECS: usize = 172; // 4
-const OFF_SESSIONS: usize = 176; // 2
-const OFF_PROGRESS_PCT: usize = 178; // 1
-// 179 pad
+// 168..180 reserved (was pages_read / time_spent_secs / sessions /
+// progress_pct + 1 pad)
 
 const OFF_COVERS_OFFSET: usize = 180; // 4
 const OFF_COVERS_SIZE: usize = 184; // 4
 const OFF_SPINE_OFFSET: usize = 188; // 4
 const OFF_SPINE_SIZE: usize = 192; // 4
-const OFF_TOC_OFFSET: usize = 196; // 4
-const OFF_TOC_SIZE: usize = 200; // 4
+// 196..204 reserved (was toc_offset / toc_size)
 const OFF_CONTENT_OFFSET: usize = 204; // 4
 const OFF_CONTENT_SIZE: usize = 208; // 4
-const OFF_IMAGES_OFFSET: usize = 212; // 4
-const OFF_IMAGES_SIZE: usize = 216; // 4
+// 212..220 reserved (was images_offset / images_size)
 const OFF_PIDX_DIR_OFFSET: usize = 220; // 4
 const OFF_PIDX_DIR_SIZE: usize = 224; // 4
 const OFF_PIDX_FONT_IDX: usize = 228; // 1
@@ -310,7 +300,6 @@ pub struct BundleHeader {
     pub source_size: u32,
     pub name_hash: u32,
     pub flags: u32,
-    pub last_open_gen: u32,
 
     pub title: FixedStr<TITLE_CAP>,
     pub author: FixedStr<AUTHOR_CAP>,
@@ -323,21 +312,12 @@ pub struct BundleHeader {
     pub bm_font_idx: u8,
     pub bm_flags: u8,
 
-    pub pages_read: u32,
-    pub time_spent_secs: u32,
-    pub sessions: u16,
-    pub progress_pct: u8,
-
     pub covers_offset: u32,
     pub covers_size: u32,
     pub spine_offset: u32,
     pub spine_size: u32,
-    pub toc_offset: u32,
-    pub toc_size: u32,
     pub content_offset: u32,
     pub content_size: u32,
-    pub images_offset: u32,
-    pub images_size: u32,
     pub pidx_dir_offset: u32,
     pub pidx_dir_size: u32,
     pub pidx_data_offset: u32,
@@ -351,7 +331,6 @@ impl BundleHeader {
         source_size: 0,
         name_hash: 0,
         flags: 0,
-        last_open_gen: 0,
         title: FixedStr::EMPTY,
         author: FixedStr::EMPTY,
         chapter_count: 0,
@@ -361,20 +340,12 @@ impl BundleHeader {
         bm_byte_offset: 0,
         bm_font_idx: 0,
         bm_flags: 0,
-        pages_read: 0,
-        time_spent_secs: 0,
-        sessions: 0,
-        progress_pct: 0,
         covers_offset: 0,
         covers_size: 0,
         spine_offset: 0,
         spine_size: 0,
-        toc_offset: 0,
-        toc_size: 0,
         content_offset: 0,
         content_size: 0,
-        images_offset: 0,
-        images_size: 0,
         pidx_dir_offset: 0,
         pidx_dir_size: 0,
         pidx_data_offset: 0,
@@ -406,7 +377,6 @@ impl BundleHeader {
             source_size: r_u32(buf, OFF_SOURCE_SIZE),
             name_hash: r_u32(buf, OFF_NAME_HASH),
             flags: r_u32(buf, OFF_FLAGS),
-            last_open_gen: r_u32(buf, OFF_LAST_OPEN_GEN),
             title,
             author,
             chapter_count: r_u16(buf, OFF_CHAPTER_COUNT),
@@ -416,20 +386,12 @@ impl BundleHeader {
             bm_byte_offset: r_u32(buf, OFF_BM_BYTE_OFFSET),
             bm_font_idx: buf[OFF_BM_FONT_IDX],
             bm_flags: buf[OFF_BM_FLAGS],
-            pages_read: r_u32(buf, OFF_PAGES_READ),
-            time_spent_secs: r_u32(buf, OFF_TIME_SPENT_SECS),
-            sessions: r_u16(buf, OFF_SESSIONS),
-            progress_pct: buf[OFF_PROGRESS_PCT],
             covers_offset: r_u32(buf, OFF_COVERS_OFFSET),
             covers_size: r_u32(buf, OFF_COVERS_SIZE),
             spine_offset: r_u32(buf, OFF_SPINE_OFFSET),
             spine_size: r_u32(buf, OFF_SPINE_SIZE),
-            toc_offset: r_u32(buf, OFF_TOC_OFFSET),
-            toc_size: r_u32(buf, OFF_TOC_SIZE),
             content_offset: r_u32(buf, OFF_CONTENT_OFFSET),
             content_size: r_u32(buf, OFF_CONTENT_SIZE),
-            images_offset: r_u32(buf, OFF_IMAGES_OFFSET),
-            images_size: r_u32(buf, OFF_IMAGES_SIZE),
             pidx_dir_offset: r_u32(buf, OFF_PIDX_DIR_OFFSET),
             pidx_dir_size: r_u32(buf, OFF_PIDX_DIR_SIZE),
             pidx_data_offset: r_u32(buf, OFF_PIDX_DATA_OFFSET),
@@ -448,7 +410,6 @@ impl BundleHeader {
         w_u32(&mut out, OFF_SOURCE_SIZE, self.source_size);
         w_u32(&mut out, OFF_NAME_HASH, self.name_hash);
         w_u32(&mut out, OFF_FLAGS, self.flags);
-        w_u32(&mut out, OFF_LAST_OPEN_GEN, self.last_open_gen);
 
         encode_fixed(&mut out, OFF_TITLE_LEN, OFF_TITLE, TITLE_CAP, &self.title);
         encode_fixed(
@@ -467,21 +428,12 @@ impl BundleHeader {
         out[OFF_BM_FONT_IDX] = self.bm_font_idx;
         out[OFF_BM_FLAGS] = self.bm_flags;
 
-        w_u32(&mut out, OFF_PAGES_READ, self.pages_read);
-        w_u32(&mut out, OFF_TIME_SPENT_SECS, self.time_spent_secs);
-        w_u16(&mut out, OFF_SESSIONS, self.sessions);
-        out[OFF_PROGRESS_PCT] = self.progress_pct;
-
         w_u32(&mut out, OFF_COVERS_OFFSET, self.covers_offset);
         w_u32(&mut out, OFF_COVERS_SIZE, self.covers_size);
         w_u32(&mut out, OFF_SPINE_OFFSET, self.spine_offset);
         w_u32(&mut out, OFF_SPINE_SIZE, self.spine_size);
-        w_u32(&mut out, OFF_TOC_OFFSET, self.toc_offset);
-        w_u32(&mut out, OFF_TOC_SIZE, self.toc_size);
         w_u32(&mut out, OFF_CONTENT_OFFSET, self.content_offset);
         w_u32(&mut out, OFF_CONTENT_SIZE, self.content_size);
-        w_u32(&mut out, OFF_IMAGES_OFFSET, self.images_offset);
-        w_u32(&mut out, OFF_IMAGES_SIZE, self.images_size);
         w_u32(&mut out, OFF_PIDX_DIR_OFFSET, self.pidx_dir_offset);
         w_u32(&mut out, OFF_PIDX_DIR_SIZE, self.pidx_dir_size);
         w_u32(&mut out, OFF_PIDX_DATA_OFFSET, self.pidx_data_offset);
@@ -598,8 +550,6 @@ pub const COVER_VARIANT_SIZE: usize = 16;
 
 // raw_format values
 pub const RAW_FMT_NONE: u8 = 0;
-pub const RAW_FMT_JPEG: u8 = 1;
-pub const RAW_FMT_PNG: u8 = 2;
 
 // cover variant kinds. on-disk byte = discriminant.
 #[repr(u8)]
@@ -608,7 +558,6 @@ pub enum CoverKind {
     Tiny = 0,    // file-browser row icon
     Small = 1,   // grid / picker
     Card = 2,    // home recent card
-    Detail = 3,  // book info screen
     Mini = 4,    // home recent-row thumb (64x96)
 }
 
@@ -623,7 +572,6 @@ impl CoverKind {
             0 => Some(Self::Tiny),
             1 => Some(Self::Small),
             2 => Some(Self::Card),
-            3 => Some(Self::Detail),
             4 => Some(Self::Mini),
             _ => None,
         }
@@ -773,74 +721,6 @@ impl SpineEntry {
     #[inline]
     pub fn is_cached(&self) -> bool {
         self.flags & SPINE_FLAG_CACHED != 0
-    }
-}
-
-// ── image table + blobs ────────────────────────────────────────────
-//
-// layout inside the images section:
-//   [ImageEntry; count]  16 bytes each
-//   [image blob data; packed]
-//
-// count is recorded at the start of the section as u16 + pad.
-
-pub const IMAGE_TABLE_HDR_SIZE: usize = 4;
-pub const IMAGE_ENTRY_SIZE: usize = 20;
-
-// image status values (write one of these; never combine)
-pub const IMG_STATUS_NOT_ATTEMPTED: u16 = 0;
-pub const IMG_STATUS_READY: u16 = 1;
-pub const IMG_STATUS_UNSUPPORTED: u16 = 2;
-pub const IMG_STATUS_DECODE_FAILED: u16 = 3;
-pub const IMG_STATUS_TOO_LARGE: u16 = 4;
-
-#[derive(Clone, Copy)]
-pub struct ImageEntry {
-    pub path_hash: u32,
-    pub data_offset: u32, // within images section
-    pub data_size: u32,
-    pub width: u16,
-    pub height: u16,
-    pub status: u16,
-    pub _reserved: u16,
-}
-
-impl ImageEntry {
-    pub const EMPTY: Self = Self {
-        path_hash: 0,
-        data_offset: 0,
-        data_size: 0,
-        width: 0,
-        height: 0,
-        status: IMG_STATUS_NOT_ATTEMPTED,
-        _reserved: 0,
-    };
-
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < IMAGE_ENTRY_SIZE {
-            return None;
-        }
-        Some(Self {
-            path_hash: r_u32(buf, 0),
-            data_offset: r_u32(buf, 4),
-            data_size: r_u32(buf, 8),
-            width: r_u16(buf, 12),
-            height: r_u16(buf, 14),
-            status: r_u16(buf, 16),
-            _reserved: r_u16(buf, 18),
-        })
-    }
-
-    pub fn encode(&self) -> [u8; IMAGE_ENTRY_SIZE] {
-        let mut out = [0u8; IMAGE_ENTRY_SIZE];
-        w_u32(&mut out, 0, self.path_hash);
-        w_u32(&mut out, 4, self.data_offset);
-        w_u32(&mut out, 8, self.data_size);
-        w_u16(&mut out, 12, self.width);
-        w_u16(&mut out, 14, self.height);
-        w_u16(&mut out, 16, self.status);
-        w_u16(&mut out, 18, self._reserved);
-        out
     }
 }
 
@@ -1238,59 +1118,19 @@ impl LineRecord {
     }
 }
 
-// ── RECENT pointer file ────────────────────────────────────────────
-
-pub const RECENT_SIZE: usize = 16;
-pub const RECENT_MAGIC: [u8; 4] = *b"RCNT";
-pub const RECENT_VERSION: u16 = 1;
-
-#[derive(Clone, Copy)]
-pub struct Recent {
-    pub name_hash: u32,
-    pub last_open_gen: u32,
-}
-
-impl Recent {
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < RECENT_SIZE {
-            return None;
-        }
-        if buf[0..4] != RECENT_MAGIC {
-            return None;
-        }
-        if r_u16(buf, 4) != RECENT_VERSION {
-            return None;
-        }
-        Some(Self {
-            // 6..8 pad
-            name_hash: r_u32(buf, 8),
-            last_open_gen: r_u32(buf, 12),
-        })
-    }
-
-    pub fn encode(&self) -> [u8; RECENT_SIZE] {
-        let mut out = [0u8; RECENT_SIZE];
-        out[0..4].copy_from_slice(&RECENT_MAGIC);
-        w_u16(&mut out, 4, RECENT_VERSION);
-        // 6..8 pad
-        w_u32(&mut out, 8, self.name_hash);
-        w_u32(&mut out, 12, self.last_open_gen);
-        out
-    }
-}
-
 // ── compile-time layout asserts ────────────────────────────────────
 //
 // these catch off-by-one errors in the `OFF_*` constants if anyone
 // adds or reorders fields without updating the running total.
 
 const _: () = {
-    assert!(OFF_LAST_OPEN_GEN + 4 == OFF_TITLE_LEN);
+    assert!(OFF_FLAGS + 4 + 4 == OFF_TITLE_LEN);
     assert!(OFF_TITLE + TITLE_CAP == OFF_AUTHOR_LEN);
     assert!(OFF_AUTHOR + AUTHOR_CAP == OFF_CHAPTER_COUNT);
     assert!(OFF_SPINE_COUNT + 2 + 2 == OFF_BM_CHAPTER);
-    assert!(OFF_BM_FLAGS + 1 + 6 == OFF_PAGES_READ);
-    assert!(OFF_PROGRESS_PCT + 1 + 1 == OFF_COVERS_OFFSET);
+    assert!(OFF_BM_FLAGS + 1 + 6 + 12 == OFF_COVERS_OFFSET);
+    assert!(OFF_SPINE_SIZE + 4 + 8 == OFF_CONTENT_OFFSET);
+    assert!(OFF_CONTENT_SIZE + 4 + 8 == OFF_PIDX_DIR_OFFSET);
     assert!(OFF_PIDX_FONT_IDX < HEADER_SIZE);
     assert!(OFF_PIDX_DATA_OFFSET + 4 == OFF_PIDX_DATA_SIZE);
     assert!(OFF_PIDX_DATA_SIZE + 4 <= HEADER_SIZE);
@@ -1393,12 +1233,6 @@ pub fn write_at(
 ) -> crate::error::Result<()> {
     let n = bundle_file_name(name_hash);
     sd.write_at_in_plump_subdir(BOOKS_DIR, bundle_file_str(&n), offset, data)
-}
-
-/// overwrite the entire bundle with the given data (create/truncate)
-pub fn write_all(sd: &SdStorage, name_hash: u32, data: &[u8]) -> crate::error::Result<()> {
-    let n = bundle_file_name(name_hash);
-    sd.write_in_plump_subdir(BOOKS_DIR, bundle_file_str(&n), data)
 }
 
 /// delete the bundle file (no-op if already missing)
@@ -1550,42 +1384,6 @@ impl<'a> BundleFile<'a> {
             header,
             file_size,
         })
-    }
-
-    /// Create a fresh bundle file by writing `header` at offset 0.
-    /// Caller is responsible for populating section ranges in
-    /// `header` before invoking; typically `BundleHeader::EMPTY`
-    /// suffices for the first call.
-    pub fn create(
-        sd: &'a SdStorage,
-        name_hash: u32,
-        mut header: BundleHeader,
-    ) -> Result<Self, BundleError> {
-        header.name_hash = name_hash;
-        header.verify_layout()?;
-        write_header(sd, name_hash, &header)?;
-        let file_size = file_size(sd, name_hash)?;
-        Ok(Self {
-            sd,
-            name_hash,
-            header,
-            file_size,
-        })
-    }
-
-    /// Open an existing bundle, or create a fresh one when missing.
-    /// Returns `StaleVersion` when the on-disk version is wrong so
-    /// the caller can choose to delete and rebuild.
-    pub fn open_or_create(
-        sd: &'a SdStorage,
-        name_hash: u32,
-        on_create: BundleHeader,
-    ) -> Result<Self, BundleError> {
-        if exists(sd, name_hash) {
-            Self::open(sd, name_hash)
-        } else {
-            Self::create(sd, name_hash, on_create)
-        }
     }
 
     #[inline]
@@ -1741,19 +1539,6 @@ pub struct Section<'h, 'sd: 'h> {
 }
 
 impl<'h, 'sd> Section<'h, 'sd> {
-    #[inline]
-    pub fn id(&self) -> SectionId {
-        self.id
-    }
-
-    #[inline]
-    pub fn range(&self) -> SectionRange {
-        SectionRange {
-            offset: self.offset,
-            size: self.size,
-        }
-    }
-
     /// Write `data` at `rel` bytes from the start of this section.
     pub fn write_at(&mut self, rel: u32, data: &[u8]) -> Result<(), BundleError> {
         let len = data.len() as u32;
@@ -1828,22 +1613,6 @@ fn zero_fill(
     Ok(())
 }
 
-/// read the RECENT pointer from `_PLUMP/RECENT`; returns None when
-/// missing or invalid
-pub fn read_recent(sd: &SdStorage) -> Option<Recent> {
-    let mut buf = [0u8; RECENT_SIZE];
-    let n = sd.read_chunk_in_plump(RECENT_FILE, 0, &mut buf).ok()?;
-    if n < RECENT_SIZE {
-        return None;
-    }
-    Recent::decode(&buf)
-}
-
-/// write the RECENT pointer to `_PLUMP/RECENT`
-pub fn write_recent(sd: &SdStorage, recent: &Recent) -> crate::error::Result<()> {
-    let bytes = recent.encode();
-    sd.write_in_plump(RECENT_FILE, &bytes)
-}
 
 // ── host-runnable byte-layout tests ──────────────────────────────────
 //
@@ -2088,7 +1857,6 @@ mod tests {
             CoverKind::Tiny,
             CoverKind::Small,
             CoverKind::Card,
-            CoverKind::Detail,
             CoverKind::Mini,
         ] {
             assert_eq!(CoverKind::from_u8(k.as_u8()), Some(k));

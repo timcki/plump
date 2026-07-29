@@ -10,9 +10,8 @@
 // and blit primitives; widgets that need glyphs combine a Painter
 // with a font.
 //
-// chunk A lands this type behind unused call sites. methods used by
-// chrome widgets (chunks C/D) live here so the chrome can take a
-// single Painter and never touch StripBuffer directly.
+// chrome widgets take a single Painter and never touch StripBuffer
+// directly.
 
 use embedded_graphics::{
     pixelcolor::BinaryColor,
@@ -35,7 +34,7 @@ impl<'a> Painter<'a> {
     /// Construct a painter with the full screen region as its clip.
     ///
     /// Callers (scheduler) typically pass `BinaryColor::On` and the
-    /// kernel-owned theme. Apps narrow via `child(region)`.
+    /// kernel-owned theme.
     pub fn new(strip: &'a mut StripBuffer, theme: &'a Theme) -> Self {
         Self {
             strip,
@@ -53,30 +52,6 @@ impl<'a> Painter<'a> {
     #[inline]
     pub fn theme(&self) -> &Theme {
         self.theme
-    }
-
-    #[inline]
-    pub fn fg(&self) -> BinaryColor {
-        self.fg
-    }
-
-    #[inline]
-    pub fn bg(&self) -> BinaryColor {
-        self.fg.invert()
-    }
-
-    /// Re-borrow with a narrower clip, 8-px aligned for DMA safety.
-    ///
-    /// The new region is clamped to the current one; nothing outside
-    /// the parent's clip can be drawn through the child.
-    pub fn child(&mut self, region: Region) -> Painter<'_> {
-        let clipped = clamp(self.region, region).align8();
-        Painter {
-            strip: &mut *self.strip,
-            region: clipped,
-            fg: self.fg,
-            theme: self.theme,
-        }
     }
 
     /// Re-borrow with a different foreground color (same clip).
@@ -100,16 +75,6 @@ impl<'a> Painter<'a> {
 
     // raw drawing primitives
 
-    /// Fill the current clip with the foreground color.
-    pub fn fill(&mut self) {
-        self.fill_in(self.region, self.fg);
-    }
-
-    /// Fill the current clip with the background color.
-    pub fn clear(&mut self) {
-        self.fill_in(self.region, self.bg());
-    }
-
     /// Fill an arbitrary sub-region with a specific color. Region is
     /// clamped to the current clip before drawing.
     pub fn fill_in(&mut self, r: Region, color: BinaryColor) {
@@ -132,28 +97,6 @@ impl<'a> Painter<'a> {
         self.fill_in(r, self.fg);
     }
 
-    /// 1 px vertical line at column `x`, from `y0` (inclusive) to `y1`
-    /// (exclusive), in the foreground color.
-    pub fn hairline_v(&mut self, x: u16, y0: u16, y1: u16) {
-        if y1 <= y0 {
-            return;
-        }
-        let r = Region::new(x, y0, 1, y1 - y0);
-        self.fill_in(r, self.fg);
-    }
-
-    /// Stroke a rectangle outline at `r` with `stroke` px width in the
-    /// foreground color.
-    pub fn rect_stroke(&mut self, r: Region, stroke: u16) {
-        if stroke == 0 || r.w == 0 || r.h == 0 {
-            return;
-        }
-        let rect = Rectangle::new(r.top_left(), Size::new(r.w as u32, r.h as u32));
-        let _ = rect
-            .into_styled(PrimitiveStyle::with_stroke(self.fg, stroke as u32))
-            .draw(self.strip);
-    }
-
     /// Rounded rectangle, stroked or filled in the foreground color.
     ///
     /// On 1-bit e-paper at small radii the corners are barely visible;
@@ -172,14 +115,6 @@ impl<'a> Painter<'a> {
         let _ = RoundedRectangle::with_equal_corners(rect, Size::new(radius as u32, radius as u32))
             .into_styled(style)
             .draw(self.strip);
-    }
-
-    /// Pass-through to `StripBuffer::fill_solid` for callers that
-    /// need a specific clip rect outside the painter's region (rare).
-    pub fn fill_rect_raw(&mut self, r: Region, color: BinaryColor) {
-        let _ = self
-            .strip
-            .fill_solid(&Rectangle::new(r.top_left(), Size::new(r.w as u32, r.h as u32)), color);
     }
 
     /// True if `r` overlaps the current clip. Cheap pre-check for

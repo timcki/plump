@@ -12,26 +12,6 @@ pub enum Button {
     Power,
 }
 
-impl Button {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Button::Right => "Right",
-            Button::Left => "Left",
-            Button::Confirm => "Confirm",
-            Button::Back => "Back",
-            Button::VolUp => "Vol Up",
-            Button::VolDown => "Vol Down",
-            Button::Power => "Power",
-        }
-    }
-}
-
-impl core::fmt::Display for Button {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
 pub const DEFAULT_TOLERANCE: u16 = 150;
 
 // (center_mv, tolerance_mv, button)

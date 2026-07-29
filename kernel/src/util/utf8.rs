@@ -63,15 +63,6 @@ impl<'a> Utf8Iter<'a> {
         Self { data, pos: 0 }
     }
 
-    #[inline]
-    pub fn position(&self) -> usize {
-        self.pos
-    }
-
-    #[inline]
-    pub fn remaining(&self) -> &'a [u8] {
-        &self.data[self.pos..]
-    }
 }
 
 impl Iterator for Utf8Iter<'_> {

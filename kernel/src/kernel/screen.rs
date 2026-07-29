@@ -168,11 +168,6 @@ impl Screen {
     }
 
     #[inline]
-    pub fn needs_initial_refresh(&self) -> bool {
-        self.epd.needs_initial_refresh()
-    }
-
-    #[inline]
     pub fn set_sunlight_mode(&mut self, enabled: bool) {
         self.epd.set_sunlight_mode(enabled);
     }

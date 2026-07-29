@@ -1,7 +1,5 @@
-// status bar constants and stack-measurement utilities
+// stack-measurement utilities
 // system stats are emitted via log::info! in the scheduler
-
-pub const BAR_HEIGHT: u16 = 4;
 
 const STACK_PAINT_WORD: u32 = 0xDEAD_BEEF;
 
@@ -58,10 +56,6 @@ pub fn free_stack_bytes() -> usize {
     {
         0
     }
-}
-
-pub fn stack_high_water_mark() -> usize {
-    stack_hwm_detail().hwm
 }
 
 /// Result of a full canary scan of the stack region.

@@ -98,21 +98,6 @@ impl Error {
         Self { kind, source }
     }
 
-    #[inline]
-    pub const fn from_kind(kind: ErrorKind) -> Self {
-        Self { kind, source: "" }
-    }
-
-    pub const NO_CARD: Self = Self::from_kind(ErrorKind::NoCard);
-    pub const OPEN_VOLUME: Self = Self::from_kind(ErrorKind::OpenVolume);
-    pub const OPEN_DIR: Self = Self::from_kind(ErrorKind::OpenDir);
-    pub const OPEN_FILE: Self = Self::from_kind(ErrorKind::OpenFile);
-    pub const READ_FAILED: Self = Self::from_kind(ErrorKind::ReadFailed);
-    pub const WRITE_FAILED: Self = Self::from_kind(ErrorKind::WriteFailed);
-    pub const SEEK_FAILED: Self = Self::from_kind(ErrorKind::SeekFailed);
-    pub const DELETE_FAILED: Self = Self::from_kind(ErrorKind::DeleteFailed);
-    pub const DIR_FULL: Self = Self::from_kind(ErrorKind::DirFull);
-    pub const NOT_FOUND: Self = Self::from_kind(ErrorKind::NotFound);
 }
 
 impl Error {
@@ -132,19 +117,6 @@ impl Error {
             kind: self.kind,
             source,
         }
-    }
-
-    #[inline]
-    pub const fn with_kind(self, kind: ErrorKind) -> Self {
-        Self {
-            kind,
-            source: self.source,
-        }
-    }
-
-    #[inline]
-    pub const fn has_source(&self) -> bool {
-        !self.source.is_empty()
     }
 
     #[inline]

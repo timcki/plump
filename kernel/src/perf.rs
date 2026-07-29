@@ -59,16 +59,7 @@
 //! # Storage counters
 //!
 //! Critical-section-protected counters for SD I/O operations. Always callable
-//! (no-op stubs when `perf` is off). Use [`counters::snapshot`] and
-//! [`counters::delta`] for
-//! per-scope summaries inside `perf_event!`:
-//!
-//! ```ignore
-//! let snap = plump_kernel::perf::counters::snapshot();
-//! // ... work ...
-//! let d = plump_kernel::perf::counters::delta(&snap);
-//! perf_event!("storage", "page_load reads={} bytes_r={}", d.sd_reads, d.sd_bytes_read);
-//! ```
+//! (no-op stubs when `perf` is off).
 
 // ---------------------------------------------------------------------------
 // perf_event! — structured point event
@@ -211,23 +202,6 @@ impl Drop for TimingGuard {
 /// All functions are always callable. When `perf` is off, they are no-ops
 /// and the compiler optimises them away entirely.
 pub mod counters {
-    /// Snapshot of counter values at a point in time.
-    ///
-    /// When `perf` is off this is a ZST. Field access only compiles
-    /// inside [`perf_event!`] (which also compiles out), so this is safe.
-    #[cfg(feature = "perf")]
-    #[derive(Clone, Copy, Debug)]
-    pub struct Snapshot {
-        pub sd_reads: u32,
-        pub sd_writes: u32,
-        pub sd_bytes_read: u32,
-        pub sd_bytes_written: u32,
-    }
-
-    #[cfg(not(feature = "perf"))]
-    #[derive(Clone, Copy, Debug)]
-    pub struct Snapshot;
-
     // -- active counters (perf on) -----------------------------------------
     //
     // ESP32-C3 is RV32IMC (no 'A' atomic extension), so we use
@@ -235,7 +209,6 @@ pub mod counters {
     // The critical section is ~free on single-core (just disables interrupts).
 
     #[cfg(feature = "perf")]
-    #[allow(dead_code)]
     mod inner {
         use core::cell::Cell;
         use critical_section::Mutex;
@@ -251,16 +224,6 @@ pub mod counters {
                 let c = counter.borrow(cs);
                 c.set(c.get().wrapping_add(n));
             });
-        }
-
-        #[inline]
-        pub(super) fn load(counter: &Mutex<Cell<u32>>) -> u32 {
-            critical_section::with(|cs| counter.borrow(cs).get())
-        }
-
-        #[inline]
-        pub(super) fn store(counter: &Mutex<Cell<u32>>, val: u32) {
-            critical_section::with(|cs| counter.borrow(cs).set(val));
         }
     }
 
@@ -292,44 +255,6 @@ pub mod counters {
         inner::add(&inner::SD_BYTES_WRITTEN, n);
     }
 
-    /// Take a snapshot of current counter values.
-    #[cfg(feature = "perf")]
-    #[inline]
-    pub fn snapshot() -> Snapshot {
-        // single CS to get a consistent snapshot
-        critical_section::with(|cs| Snapshot {
-            sd_reads: inner::SD_READS.borrow(cs).get(),
-            sd_writes: inner::SD_WRITES.borrow(cs).get(),
-            sd_bytes_read: inner::SD_BYTES_READ.borrow(cs).get(),
-            sd_bytes_written: inner::SD_BYTES_WRITTEN.borrow(cs).get(),
-        })
-    }
-
-    /// Compute the delta between a previous snapshot and now.
-    #[cfg(feature = "perf")]
-    #[inline]
-    pub fn delta(before: &Snapshot) -> Snapshot {
-        let now = snapshot();
-        Snapshot {
-            sd_reads: now.sd_reads.wrapping_sub(before.sd_reads),
-            sd_writes: now.sd_writes.wrapping_sub(before.sd_writes),
-            sd_bytes_read: now.sd_bytes_read.wrapping_sub(before.sd_bytes_read),
-            sd_bytes_written: now.sd_bytes_written.wrapping_sub(before.sd_bytes_written),
-        }
-    }
-
-    /// Reset all counters to zero.
-    #[cfg(feature = "perf")]
-    #[inline]
-    pub fn reset() {
-        critical_section::with(|cs| {
-            inner::SD_READS.borrow(cs).set(0);
-            inner::SD_WRITES.borrow(cs).set(0);
-            inner::SD_BYTES_READ.borrow(cs).set(0);
-            inner::SD_BYTES_WRITTEN.borrow(cs).set(0);
-        });
-    }
-
     // -- stubs (perf off) --------------------------------------------------
 
     #[cfg(not(feature = "perf"))]
@@ -347,20 +272,4 @@ pub mod counters {
     #[cfg(not(feature = "perf"))]
     #[inline]
     pub fn add_sd_bytes_written(_n: u32) {}
-
-    #[cfg(not(feature = "perf"))]
-    #[inline]
-    pub fn snapshot() -> Snapshot {
-        Snapshot
-    }
-
-    #[cfg(not(feature = "perf"))]
-    #[inline]
-    pub fn delta(_before: &Snapshot) -> Snapshot {
-        Snapshot
-    }
-
-    #[cfg(not(feature = "perf"))]
-    #[inline]
-    pub fn reset() {}
 }

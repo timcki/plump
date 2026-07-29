@@ -57,15 +57,6 @@ pub enum BgWorkKind {
     DecodeImage = 1,
 }
 
-impl BgWorkKind {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Idle => "",
-            Self::DecodeImage => "IMG",
-        }
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BgStatus {
     pub kind: BgWorkKind,
@@ -82,17 +73,12 @@ impl BgStatus {
     pub const fn is_active(&self) -> bool {
         !matches!(self.kind, BgWorkKind::Idle)
     }
-
-    #[inline]
-    pub const fn is_active_for(&self, target_gen: u16) -> bool {
-        self.is_active() && self.generation == target_gen
-    }
 }
 
 static STATUS: Mutex<Cell<BgStatus>> = Mutex::new(Cell::new(BgStatus::IDLE));
 
 #[inline]
-pub fn status() -> BgStatus {
+fn status() -> BgStatus {
     critical_section::with(|cs| STATUS.borrow(cs).get())
 }
 
@@ -112,7 +98,7 @@ fn set_status(s: BgStatus) {
 static ACTIVE_GEN: Mutex<Cell<u16>> = Mutex::new(Cell::new(0));
 static GEN_COUNTER: Mutex<Cell<u16>> = Mutex::new(Cell::new(0));
 
-pub fn next_generation() -> u16 {
+fn next_generation() -> u16 {
     critical_section::with(|cs| {
         let c = GEN_COUNTER.borrow(cs);
         let g = c.get().wrapping_add(1);

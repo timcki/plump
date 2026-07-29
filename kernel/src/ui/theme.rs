@@ -1,14 +1,14 @@
 // design tokens for the unified UI.
 //
 // lives in the kernel because the scheduler-driven chrome pass and the
-// distro chrome widgets both need to see the same values. apps access
-// the live instance via `KernelHandle::theme()`.
+// distro chrome widgets both need to see the same values. apps read
+// the shared instance through `Painter::theme()`.
 //
 // values are mockup-derived (mockups/*.html). v1 is the only variant
 // shipping today; the struct is sized for future runtime theming
 // (light/dark, font scaling) without bumping disc layouts.
 
-use crate::board::{SCREEN_H, SCREEN_W};
+use crate::board::SCREEN_H;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
@@ -31,9 +31,6 @@ pub struct Theme {
     // tracked uppercase letter spacing for section captions, in px.
     // positive = expand; signed because future themes may compress.
     pub tracked_caption_px: i8,
-
-    // 1 to 2 px progress bar height in the reader footer
-    pub progress_bar_h: u16,
 }
 
 impl Theme {
@@ -50,7 +47,6 @@ impl Theme {
             top_bar_h: 28,
             bottom_bar_h: 64,
             tracked_caption_px: 3,
-            progress_bar_h: 2,
         }
     }
 
@@ -66,17 +62,6 @@ impl Theme {
         SCREEN_H - self.bottom_bar_h
     }
 
-    /// usable content height between top status and tab bar.
-    #[inline]
-    pub const fn content_h(&self) -> u16 {
-        self.content_bottom() - self.content_top()
-    }
-
-    /// usable content width with `margin_lg` left and right.
-    #[inline]
-    pub const fn content_w(&self) -> u16 {
-        SCREEN_W - 2 * self.margin_lg
-    }
 }
 
 impl Default for Theme {

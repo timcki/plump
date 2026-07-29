@@ -1,6 +1,5 @@
 // utility modules: small, reusable components without hardware dependencies
 
-pub mod debounce;
 mod fixed_str;
 pub mod hash;
 mod utf8;
