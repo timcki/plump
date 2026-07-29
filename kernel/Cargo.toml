@@ -28,4 +28,5 @@ critical-section.workspace    = true
 static_cell.workspace         = true
 nb.workspace                  = true
 log.workspace                 = true
+qrcodegen-no-heap.workspace   = true
 esp-alloc = { version = "0.9.0", features = ["internal-heap-stats"] }

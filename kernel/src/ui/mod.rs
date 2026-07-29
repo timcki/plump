@@ -6,6 +6,7 @@
 
 pub mod layout;
 pub mod painter;
+pub mod qr;
 pub mod stack_fmt;
 pub mod statusbar;
 pub mod theme;
@@ -13,6 +14,7 @@ mod widget;
 
 pub use layout::{CONTENT_TOP, FULL_CONTENT_W, HEADER_W, LARGE_MARGIN};
 pub use painter::Painter;
+pub use qr::QrSymbol;
 pub use stack_fmt::{StackFmt, stack_fmt};
 pub use statusbar::{StackHwmDetail, free_stack_bytes, paint_stack, stack_hwm_detail};
 pub use theme::Theme;

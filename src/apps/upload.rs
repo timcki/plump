@@ -30,7 +30,7 @@ use crate::kernel::config::WifiConfig;
 use crate::kernel::tasks;
 use crate::ui::chrome::Chrome;
 use crate::ui::{
-    Alignment, BitmapLabel, CONTENT_TOP, LARGE_MARGIN, Painter, Region, Theme, stack_fmt,
+    Alignment, BitmapLabel, CONTENT_TOP, LARGE_MARGIN, Painter, QrSymbol, Region, Theme, stack_fmt,
 };
 
 const HEADING_X: u16 = LARGE_MARGIN;
@@ -39,6 +39,8 @@ const HEADING_W: u16 = SCREEN_W - HEADING_X * 2;
 const BODY_X: u16 = 24;
 const BODY_W: u16 = SCREEN_W - BODY_X * 2;
 const BODY_LINE_GAP: u16 = 10;
+/// gap between the caption block and the QR below it
+const QR_GAP: u16 = 16;
 
 // the footer sits in the band the tab bar leaves, not at a hardcoded
 // offset from the panel edge
@@ -104,6 +106,51 @@ pub enum UploadExit {
     Back,
     /// Edge navigation: the user paged into a neighbouring tab.
     Tab(Tab),
+}
+
+/// How the device is reachable.
+///
+/// The screen text, the QR payload and the mDNS record all want the
+/// same fact; deriving it once means they cannot disagree about which
+/// network the user is being pointed at.
+#[derive(Clone, Copy)]
+enum Endpoint {
+    /// Joined the configured network.
+    Station { ip: [u8; 4] },
+    /// Hosting the fallback AP. A client with no lease cannot reach
+    /// the URL at all, so `joined` decides whether the screen offers
+    /// the join credential or the address.
+    SoftAp { ip: [u8; 4], joined: bool },
+}
+
+/// Fits `WIFI:T:WPA;S:PLUMP-X4;P:plumpbooks;;` and any dotted-quad URL.
+const QR_PAYLOAD_MAX: usize = 64;
+
+impl Endpoint {
+    #[inline]
+    const fn ip(&self) -> [u8; 4] {
+        match self {
+            Self::Station { ip } | Self::SoftAp { ip, .. } => *ip,
+        }
+    }
+
+    /// What the QR encodes: a join credential while the client is not
+    /// on the network yet, the address once it is.
+    ///
+    /// Phone cameras join a network straight from a `WIFI:` payload,
+    /// which saves typing a password that only exists to keep the
+    /// upload window closed to the rest of the street.
+    fn qr_payload(&self, buf: &mut [u8; QR_PAYLOAD_MAX]) -> usize {
+        let ip = self.ip();
+        match self {
+            Self::SoftAp { joined: false, .. } => stack_fmt(buf, |w| {
+                let _ = write!(w, "WIFI:T:WPA;S:{};P:{};;", FALLBACK_SSID, FALLBACK_PASSWORD);
+            }),
+            _ => stack_fmt(buf, |w| {
+                let _ = write!(w, "http://{}.{}.{}.{}/", ip[0], ip[1], ip[2], ip[3]);
+            }),
+        }
+    }
 }
 
 /// How far the configured-network attempt got.
@@ -178,46 +225,63 @@ impl<'a> UploadScreen<'a> {
         }
     }
 
-    /// Render lines with optional footer (partial refresh).
-    async fn show(&mut self, lines: &[&str], footer: Option<&str>) {
-        render_screen(
-            self.screen,
-            self.heading,
-            self.body,
-            lines,
-            footer,
-            self.chrome,
-            false,
+    /// Paint the ready screen for an endpoint: the instructions and
+    /// the QR that matches them, from one description of where the
+    /// device is.
+    async fn show_endpoint(&mut self, endpoint: &Endpoint, full_refresh: bool) {
+        let mut payload = [0u8; QR_PAYLOAD_MAX];
+        let payload_len = endpoint.qr_payload(&mut payload);
+        let payload_str = core::str::from_utf8(&payload[..payload_len]).unwrap_or("");
+        let qr = QrSymbol::encode(payload_str);
+        if qr.is_none() {
+            warn!("upload: no QR for {} byte payload", payload_len);
+        }
+
+        let ip = endpoint.ip();
+        let mut ip_buf = [0u8; 32];
+        let ip_len = stack_fmt(&mut ip_buf, |w| {
+            let _ = write!(w, "({}.{}.{}.{})", ip[0], ip[1], ip[2], ip[3]);
+        });
+        let ip_str = core::str::from_utf8(&ip_buf[..ip_len]).unwrap_or("");
+
+        let mut join_buf = [0u8; 64];
+        let join_len = stack_fmt(&mut join_buf, |w| {
+            let _ = write!(w, "{} / {}", FALLBACK_SSID, FALLBACK_PASSWORD);
+        });
+        let join_str = core::str::from_utf8(&join_buf[..join_len]).unwrap_or("");
+
+        let mut lines = [""; 2];
+        let count = match endpoint {
+            Endpoint::SoftAp { joined: false, .. } => {
+                lines[0] = "Scan to join, or connect to";
+                lines[1] = join_str;
+                2
+            }
+            _ => {
+                lines[0] = "http://plump.local/";
+                lines[1] = ip_str;
+                2
+            }
+        };
+
+        self.render(
+            &lines[..count],
+            Some("Press BACK to exit"),
+            qr.as_ref(),
+            full_refresh,
         )
         .await;
     }
 
     /// Render lines with optional footer (full refresh).
     async fn show_full(&mut self, lines: &[&str], footer: Option<&str>) {
-        render_screen(
-            self.screen,
-            self.heading,
-            self.body,
-            lines,
-            footer,
-            self.chrome,
-            true,
-        )
-        .await;
+        self.render(lines, footer, None, true).await;
     }
 
     /// Show an error and wait for the user to leave.
     async fn show_error(&mut self, msg: &str) -> UploadExit {
-        render_screen(
-            self.screen,
-            self.heading,
-            self.body,
-            &[msg],
-            Some("Press BACK to exit"),
-            self.chrome,
-            false,
-        )
-        .await;
+        self.render(&[msg], Some("Press BACK to exit"), None, false)
+            .await;
         wait_for_exit(self.mapper).await
     }
 }
@@ -412,12 +476,21 @@ pub async fn run_upload_mode(
             .config_v4()
             .map(|cfg| cfg.address.address().octets())
             .unwrap_or([0, 0, 0, 0]);
-        show_server_ready(&mut screen, ip).await;
+        let mut endpoint = Endpoint::Station { ip };
+        show_server_ready(&mut screen, &endpoint).await;
         info!("upload: connected to '{}'", ssid);
 
         match select(
             wifi_ctrl.wait_for_event(WifiEvent::StaDisconnected),
-            serve_network(stack, &mut runner, sd, ip, None, mapper),
+            serve_network(
+                stack,
+                &mut runner,
+                sd,
+                &mut endpoint,
+                None,
+                mapper,
+                &mut screen,
+            ),
         )
         .await
         {
@@ -489,23 +562,19 @@ pub async fn run_upload_mode(
         "upload: fallback AP '{}' ready at 192.168.4.1",
         FALLBACK_SSID
     );
-    screen
-        .show_full(
-            &[
-                "Join WiFi: PLUMP-X4",
-                "Password: plumpbooks",
-                "http://192.168.4.1",
-            ],
-            Some("Press BACK to exit"),
-        )
-        .await;
+    let mut endpoint = Endpoint::SoftAp {
+        ip: FALLBACK_IP,
+        joined: false,
+    };
+    screen.show_endpoint(&endpoint, true).await;
     let exit = serve_network(
         stack,
         &mut runner,
         sd,
-        FALLBACK_IP,
+        &mut endpoint,
         Some(&mut dhcp_socket),
         mapper,
+        &mut screen,
     )
     .await;
     let _ = wifi_ctrl.stop_async().await;
@@ -513,30 +582,26 @@ pub async fn run_upload_mode(
     exit
 }
 
-async fn show_server_ready(screen: &mut UploadScreen<'_>, ip: [u8; 4]) {
-    let mut ip_buf = [0u8; 48];
-    let ip_len = stack_fmt(&mut ip_buf, |w| {
-        let _ = write!(w, "({}.{}.{}.{})", ip[0], ip[1], ip[2], ip[3]);
-    });
-    let ip_str = core::str::from_utf8(&ip_buf[..ip_len]).unwrap_or("???");
+async fn show_server_ready(screen: &mut UploadScreen<'_>, endpoint: &Endpoint) {
+    let ip = endpoint.ip();
     info!(
         "upload: serving at http://plump.local/ ({}.{}.{}.{})",
         ip[0], ip[1], ip[2], ip[3]
     );
     log_heap("server ready");
-    screen
-        .show(&["http://plump.local/", ip_str], Some("Press BACK to exit"))
-        .await;
+    screen.show_endpoint(endpoint, false).await;
 }
 
 async fn serve_network<'stack, 'device>(
     stack: embassy_net::Stack<'stack>,
     runner: &mut embassy_net::Runner<'stack, WifiDevice<'device>>,
     sd: &SdStorage,
-    ip: [u8; 4],
+    endpoint: &mut Endpoint,
     mut dhcp_socket: Option<&mut UdpSocket<'_>>,
     mapper: &ButtonMapper,
+    screen: &mut UploadScreen<'_>,
 ) -> UploadExit {
+    let ip = endpoint.ip();
     let _ = stack.join_multicast_group(Ipv4Address::new(224, 0, 0, 251));
 
     let mut rx_buf = [0u8; TCP_RX_BUF_SIZE];
@@ -574,17 +639,30 @@ async fn serve_network<'stack, 'device>(
                 ServerEvent::DeleteFailed => warn!("upload: file delete failed"),
                 ServerEvent::Nothing => {}
             },
-            Either::Second(Either4::Second(())) | Either::Second(Either4::Third(())) => {}
+            Either::Second(Either4::Second(())) => {}
+            Either::Second(Either4::Third(served)) => {
+                // the lease is the first moment the client can reach
+                // the server, so the join credential stops being the
+                // useful thing to show
+                if served == dhcp::Served::Bound
+                    && let Endpoint::SoftAp { joined, .. } = endpoint
+                    && !*joined
+                {
+                    *joined = true;
+                    info!("upload: client bound, showing the address");
+                    screen.show_endpoint(endpoint, false).await;
+                }
+            }
             Either::Second(Either4::Fourth(exit)) => return exit,
         }
     }
 }
 
-async fn dhcp_handle_one(socket: &mut Option<&mut UdpSocket<'_>>) {
+async fn dhcp_handle_one(socket: &mut Option<&mut UdpSocket<'_>>) -> dhcp::Served {
     if let Some(socket) = socket.as_deref_mut() {
-        dhcp::handle_one(socket).await;
+        dhcp::handle_one(socket).await
     } else {
-        pending::<()>().await;
+        pending::<dhcp::Served>().await
     }
 }
 
@@ -1220,73 +1298,107 @@ async fn wait_for_exit(mapper: &ButtonMapper) -> UploadExit {
     }
 }
 
-async fn render_screen(
-    screen: &mut Screen,
-    heading: &'static BitmapFont,
-    body: &'static BitmapFont,
-    lines: &[&str],
-    footer: Option<&str>,
-    chrome: &Chrome,
-    full_refresh: bool,
-) {
-    let heading_h = heading.line_height;
-    let body_h = body.line_height;
-    let body_stride = body_h + BODY_LINE_GAP;
+impl UploadScreen<'_> {
+    /// Paint one upload screen: heading, caption lines, optional QR,
+    /// footer, chrome.
+    ///
+    /// The fonts and the chrome are shared references, so copying them
+    /// out leaves the screen as the only field the draw closure and
+    /// the refresh contend for.
+    async fn render(
+        &mut self,
+        lines: &[&str],
+        footer: Option<&str>,
+        qr: Option<&QrSymbol>,
+        full_refresh: bool,
+    ) {
+        let heading = self.heading;
+        let body = self.body;
+        let chrome = self.chrome;
 
-    let heading_region = Region::new(HEADING_X, CONTENT_TOP + 12, HEADING_W, heading_h);
+        let heading_h = heading.line_height;
+        let body_h = body.line_height;
+        let body_stride = body_h + BODY_LINE_GAP;
 
-    let body_area_top = CONTENT_TOP + 12 + heading_h + 40;
-    let body_area_bottom = FOOTER_Y.saturating_sub(20);
-    let body_area_h = body_area_bottom.saturating_sub(body_area_top);
-    let total_body_h = if lines.is_empty() {
-        0
-    } else {
-        (lines.len() as u16 - 1) * body_stride + body_h
-    };
-    let body_start_y = body_area_top + body_area_h.saturating_sub(total_body_h) / 2;
+        let heading_region = Region::new(HEADING_X, CONTENT_TOP + 12, HEADING_W, heading_h);
 
-    let footer_region = Region::new(BODY_X, FOOTER_Y, BODY_W, body_h);
+        let body_area_top = CONTENT_TOP + 12 + heading_h + 40;
+        let body_area_bottom = FOOTER_Y.saturating_sub(20);
+        let body_area_h = body_area_bottom.saturating_sub(body_area_top);
+        let total_body_h = if lines.is_empty() {
+            0
+        } else {
+            (lines.len() as u16 - 1) * body_stride + body_h
+        };
 
-    let draw = |s: &mut StripBuffer| {
-        BitmapLabel::new(heading_region, "Upload", heading)
-            .alignment(Alignment::CenterLeft)
-            .draw(s)
-            .unwrap();
-
-        for (i, line) in lines.iter().enumerate() {
-            if line.is_empty() {
-                continue;
+        // with a QR the text reads as its caption, so it sits at the top
+        // of the band and the symbol takes what is left; without one the
+        // text centres in the whole band as before
+        let (body_start_y, qr_region) = match qr {
+            Some(_) => {
+                let qr_top = body_area_top + total_body_h + QR_GAP;
+                let region = Region::new(
+                    BODY_X,
+                    qr_top,
+                    BODY_W,
+                    body_area_bottom.saturating_sub(qr_top),
+                );
+                (body_area_top, Some(region))
             }
-            let y = body_start_y + (i as u16) * body_stride;
-            let region = Region::new(BODY_X, y, BODY_W, body_h);
-            BitmapLabel::new(region, line, body)
-                .alignment(Alignment::Center)
+            None => (
+                body_area_top + body_area_h.saturating_sub(total_body_h) / 2,
+                None,
+            ),
+        };
+
+        let footer_region = Region::new(BODY_X, FOOTER_Y, BODY_W, body_h);
+
+        let draw = |s: &mut StripBuffer| {
+            BitmapLabel::new(heading_region, "Upload", heading)
+                .alignment(Alignment::CenterLeft)
                 .draw(s)
                 .unwrap();
+
+            for (i, line) in lines.iter().enumerate() {
+                if line.is_empty() {
+                    continue;
+                }
+                let y = body_start_y + (i as u16) * body_stride;
+                let region = Region::new(BODY_X, y, BODY_W, body_h);
+                BitmapLabel::new(region, line, body)
+                    .alignment(Alignment::Center)
+                    .draw(s)
+                    .unwrap();
+            }
+
+            if let Some(text) = footer {
+                BitmapLabel::new(footer_region, text, body)
+                    .alignment(Alignment::Center)
+                    .draw(s)
+                    .unwrap();
+            }
+
+            let theme = Theme::default_v1();
+            let mut painter = Painter::new(s, &theme);
+
+            if let (Some(symbol), Some(region)) = (qr, qr_region) {
+                symbol.draw(&mut painter, region);
+            }
+
+            // same order the dispatch loop uses: chrome last, so the
+            // bars win over any content pixel that strays into them
+            chrome.draw(&mut painter, fonts::chrome_font(), fonts::icon_font(2));
+        };
+
+        let result = if full_refresh {
+            self.screen.render_full(&draw).await
+        } else {
+            self.screen
+                .render_partial(Region::new(0, 0, SCREEN_W, SCREEN_H), &draw)
+                .await
+        };
+        if result.is_err() {
+            log::warn!("upload: EPD refresh timed out");
         }
-
-        if let Some(text) = footer {
-            BitmapLabel::new(footer_region, text, body)
-                .alignment(Alignment::Center)
-                .draw(s)
-                .unwrap();
-        }
-
-        // same order the dispatch loop uses: chrome last, so the bars
-        // win over any content pixel that strays into them
-        let theme = Theme::default_v1();
-        let mut painter = Painter::new(s, &theme);
-        chrome.draw(&mut painter, fonts::chrome_font(), fonts::icon_font(2));
-    };
-
-    let result = if full_refresh {
-        screen.render_full(&draw).await
-    } else {
-        screen
-            .render_partial(Region::new(0, 0, SCREEN_W, SCREEN_H), &draw)
-            .await
-    };
-    if result.is_err() {
-        log::warn!("upload: EPD refresh timed out");
     }
 }

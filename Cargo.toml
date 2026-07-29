@@ -19,6 +19,8 @@ static_cell      = "2.1.1"
 nb  = "1.1.0"
 log = "0.4.27"
 esp-alloc = { version = "0.9.0", features = ["internal-heap-stats"] }
+# no_std, zero deps, caller-supplied buffers (nayuki's generator)
+qrcodegen-no-heap = "1.8.1"
 
 [package]
 edition      = "2024"

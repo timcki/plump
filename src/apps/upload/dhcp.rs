@@ -43,23 +43,43 @@ pub fn bind(socket: &mut UdpSocket<'_>) -> bool {
     socket.bind(SERVER_PORT).is_ok()
 }
 
+/// What handling one datagram told us about the client.
+///
+/// The ACK is the first moment the client can actually reach the
+/// server, which is when the screen stops advertising the join
+/// credential and starts advertising the address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Served {
+    /// Nothing the caller needs to act on.
+    Nothing,
+    /// A client took the lease.
+    Bound,
+}
+
 /// Handle one DHCP datagram. Invalid and irrelevant packets are ignored.
-pub async fn handle_one(socket: &mut UdpSocket<'_>) {
+pub async fn handle_one(socket: &mut UdpSocket<'_>) -> Served {
     let mut request_buf = [0u8; 576];
     let Ok((len, _)) = socket.recv_from(&mut request_buf).await else {
-        return;
+        return Served::Nothing;
     };
     let Some(request) = parse_request(&request_buf[..len]) else {
-        return;
+        return Served::Nothing;
     };
     let Some(reply) = classify(&request) else {
-        return;
+        return Served::Nothing;
     };
 
     let mut response = [0u8; RESPONSE_LEN];
     build_response(&request, reply, &mut response);
     let destination = IpEndpoint::new(Ipv4Address::new(255, 255, 255, 255).into(), CLIENT_PORT);
-    let _ = socket.send_to(&response, destination).await;
+    if socket.send_to(&response, destination).await.is_err() {
+        return Served::Nothing;
+    }
+
+    match reply {
+        Reply::Ack => Served::Bound,
+        Reply::Offer | Reply::Nak => Served::Nothing,
+    }
 }
 
 fn parse_request(packet: &[u8]) -> Option<Request> {
