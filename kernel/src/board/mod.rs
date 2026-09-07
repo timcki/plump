@@ -54,6 +54,36 @@ pub(crate) static SD_CS_SLEEP: Mutex<RefCell<Option<raw_gpio::RawOutputPin>>> =
 
 static POWER_BTN: Mutex<RefCell<Option<Input<'static>>>> = Mutex::new(RefCell::new(None));
 
+// GPIO13 gates the battery latch MOSFET (crosspoint HalPowerManager,
+// "pre-sleep routines from the original firmware"): high keeps the
+// board powered, low with the pad held through deep sleep cuts
+// battery power to the whole board, SD card and panel included. the
+// pad's reset-default pull-up is what latches power while the power
+// button briefly feeds the MCU, so a cold boot needs nothing from the
+// firmware; driving it high here just makes the state explicit
+static BATTERY_LATCH: Mutex<RefCell<Option<raw_gpio::RawOutputPin>>> =
+    Mutex::new(RefCell::new(None));
+
+// pads frozen at their level across deep sleep: the latch (low), the
+// EPD reset and chip selects (high, so an isolated floating pad cannot
+// reset or select a peripheral while the MCU is asleep on USB power)
+const DEEP_SLEEP_HELD_PINS: [u8; 4] = [13, 5, 21, 12];
+
+/// Release the battery latch for deep sleep. On battery the board
+/// loses power the moment the pad goes low, so the caller must have
+/// finished every SD write and put the panel to sleep first. On USB
+/// power the MCU keeps running into deep sleep and wakes on GPIO3 as
+/// before; the held-low pad is released again at the next boot.
+pub fn battery_latch_off() {
+    use embedded_hal::digital::OutputPin;
+    critical_section::with(|cs| {
+        if let Some(pin) = BATTERY_LATCH.borrow_ref_mut(cs).as_mut() {
+            let _ = pin.set_low();
+        }
+    });
+    raw_gpio::hold_through_deep_sleep(&DEEP_SLEEP_HELD_PINS);
+}
+
 #[esp_hal::handler]
 fn gpio_handler() {
     critical_section::with(|cs| {
@@ -99,6 +129,18 @@ pub struct Board {
 
 impl Board {
     pub fn init(p: Peripherals) -> Self {
+        // a USB-powered wake arrives with the sleep-time pad holds
+        // still in force; drop them before any pin is configured
+        raw_gpio::release_deep_sleep_holds();
+        // safety: GPIO13 is free in DIO flash mode and used only as
+        // the battery latch; the pin is driven high (latched on) here
+        // and low only on the way into deep sleep
+        let latch = unsafe { raw_gpio::RawOutputPin::new(13) };
+        critical_section::with(|cs| {
+            BATTERY_LATCH.borrow_ref_mut(cs).replace(latch);
+        });
+        info!("power: battery latch GPIO13 driven high");
+
         let input = Self::init_input(&p);
         let (display, storage) = Self::init_spi_peripherals(p);
         Board {

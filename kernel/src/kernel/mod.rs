@@ -17,6 +17,7 @@ pub mod handle;
 pub mod input_policy;
 pub mod nav;
 pub mod plane_map;
+pub mod power_log;
 pub mod rtc_session;
 pub mod scheduler;
 pub mod screen;
@@ -183,6 +184,15 @@ pub struct Services {
     // exit); the idle-sleep deadline derives from it on demand
     pub(crate) last_activity: embassy_time::Instant,
 
+    // hardware input events since boot; logged at sleep entry so a
+    // phantom-press source keeping the idle timer alive shows up as
+    // an input count out of proportion to the pages read
+    pub(crate) input_events: u32,
+
+    // instant of the last panel access; the idle panel power-off
+    // deadline derives from it (timing::PANEL_IDLE_OFF_SECS)
+    pub(crate) last_refresh: embassy_time::Instant,
+
     // mirrored from applied.sleep_timeout; 0 disables idle sleep
     pub(crate) idle_timeout_mins: u16,
 }
@@ -345,6 +355,8 @@ impl Kernel {
                 today_key,
                 hk: HousekeepingDeadlines::starting_now(),
                 last_activity: embassy_time::Instant::now(),
+                input_events: 0,
+                last_refresh: embassy_time::Instant::now(),
                 idle_timeout_mins: 0,
             },
         }

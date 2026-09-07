@@ -64,6 +64,16 @@ impl PlaneMap {
         self.entries.iter().flatten().any(|(e, _)| e.intersects(r))
     }
 
+    /// Any gray codes anywhere. A windowed waveform scans the whole
+    /// panel, so codes outside its window matter as much as those
+    /// under it.
+    pub fn has_gray(&self) -> bool {
+        self.entries
+            .iter()
+            .flatten()
+            .any(|(_, s)| *s == PlaneState::GrayCodes)
+    }
+
     /// Gray-coded windows under `r`, each a valid revert target.
     pub fn gray_windows(&self, r: AlignedRegion) -> [Option<AlignedRegion>; CAP] {
         let mut out = [None; CAP];
@@ -195,85 +205,6 @@ fn merge_exact(a: AlignedRegion, b: AlignedRegion) -> Option<AlignedRegion> {
         return Some(a.union(b));
     }
     None
-}
-
-/// Pending deferred-AA work: rects driven to plain BW since their
-/// last gray pass. Kept as individual rects, never a bounding box:
-/// pulsing area that was not just re-driven stacks a second gray
-/// pulse on pixels already carrying theirs, which drifts them off
-/// level a little more on every pass (the darkening mist). On
-/// overflow an entry is dropped instead of widened; the cost is a
-/// patch of un-antialiased text until the next full pass.
-#[derive(Default)]
-pub struct AaQueue {
-    entries: [Option<AlignedRegion>; Self::CAP],
-}
-
-impl AaQueue {
-    const CAP: usize = 6;
-
-    pub const fn new() -> Self {
-        Self {
-            entries: [None; Self::CAP],
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.entries = [None; Self::CAP];
-    }
-
-    /// Queue `r` minus everything already queued. Entries stay
-    /// pairwise disjoint: each fire pulses every entry, so an overlap
-    /// (consecutive scroll marks share the previously selected row)
-    /// would pulse the shared pixels twice in one fire and drift them
-    /// dark. On overflow fragments are dropped, never widened.
-    pub fn push(&mut self, r: AlignedRegion) {
-        let mut frags: [Option<AlignedRegion>; 8] = [None; 8];
-        frags[0] = Some(r);
-        for e in self.entries.iter().flatten() {
-            let mut next: [Option<AlignedRegion>; 8] = [None; 8];
-            let mut n = 0;
-            for f in frags.iter().flatten() {
-                for piece in subtract_aligned(*f, *e).into_iter().flatten() {
-                    if n < next.len() {
-                        next[n] = Some(piece);
-                        n += 1;
-                    }
-                }
-            }
-            frags = next;
-        }
-        for f in frags.into_iter().flatten() {
-            if let Some(slot) = self.entries.iter_mut().find(|s| s.is_none()) {
-                *slot = Some(f);
-            }
-        }
-    }
-
-    /// Remove `r` from the queue: a gray pass just covered it, so
-    /// pulsing it again would stack.
-    pub fn subtract(&mut self, r: AlignedRegion) {
-        for i in 0..Self::CAP {
-            let Some(e) = self.entries[i] else {
-                continue;
-            };
-            if !e.intersects(r) {
-                continue;
-            }
-            self.entries[i] = None;
-            for frag in subtract_aligned(e, r).into_iter().flatten() {
-                // overflow drops the fragment: losing AA is safe,
-                // re-pulsing is not
-                if let Some(slot) = self.entries.iter_mut().find(|s| s.is_none()) {
-                    *slot = Some(frag);
-                }
-            }
-        }
-    }
-
-    pub fn take_next(&mut self) -> Option<AlignedRegion> {
-        self.entries.iter_mut().find_map(Option::take)
-    }
 }
 
 /// `a` minus `b` as up to four disjoint bands. Aligned inputs yield

@@ -204,18 +204,21 @@ impl super::Kernel {
         let boot_start = Instant::now();
 
         // log reset reason for debugging RTC session persistence
-        {
+        let reset_reason = {
             use esp_hal::rtc_cntl::{SocResetReason, reset_reason};
             use esp_hal::system::Cpu;
             let reason = reset_reason(Cpu::ProCpu);
             info!("boot: reset reason = {:?}", reason);
-            // on battery wake, brownout can produce SysBrownOut instead
-            // of CoreDeepSleep — we disable the detector before sleep to
-            // prevent this (see enter_sleep)
+            // on battery wake the power button feeds the MCU directly
+            // and the sag trips the brownout detector, so a battery
+            // wake reads SysBrownOut (or PowerOn once the latch is
+            // released in sleep) rather than CoreDeepSleep; the SD
+            // session copy covers both
             if matches!(reason, Some(SocResetReason::SysBrownOut)) {
                 info!("boot: WARNING brownout reset detected (RTC memory may be lost)");
             }
-        }
+            reason
+        };
 
         let t0 = Instant::now();
         self.svc.bm_cache.ensure_loaded(&self.svc.sd);
@@ -233,6 +236,16 @@ impl super::Kernel {
             ),
             None => info!("boot: no session (power-on or first boot)"),
         }
+        super::power_log::boot(
+            &self.svc.sd,
+            self.svc.sd_ok,
+            &reset_reason,
+            loaded_session
+                .as_ref()
+                .map_or("none", |(_, src)| src.as_str()),
+            loaded_session.as_ref().map(|(s, _)| s.wake_count()),
+            self.svc.cached_battery_mv,
+        );
 
         // load settings from SD
         let t0 = Instant::now();
@@ -503,6 +516,11 @@ impl super::Kernel {
                 continue;
             }
 
+            // nothing to draw: this is the only place the panel rails
+            // are dropped, so a pending redraw or armed AA fire (both
+            // handled above) never pays a booster start
+            self.power_off_panel_if_idle();
+
             // park until input, a worker result (only while the app
             // layer is waiting on one), or the earliest deadline. the
             // status-log cadence bounds the park at STATUS_INTERVAL_SECS,
@@ -516,6 +534,9 @@ impl super::Kernel {
                 deadline = deadline.min(d);
             }
             if let Some(d) = self.svc.aa.deadline() {
+                deadline = deadline.min(d);
+            }
+            if let Some(d) = self.panel_idle_off_due() {
                 deadline = deadline.min(d);
             }
 
@@ -565,6 +586,30 @@ impl super::Kernel {
         // a long special mode (wifi upload) must not be followed by an
         // immediate idle sleep computed from pre-upload activity
         self.svc.last_activity = Instant::now();
+        self.svc.last_refresh = Instant::now();
+    }
+
+    // drop the panel rails once nothing has been refreshed for
+    // PANEL_IDLE_OFF_SECS; the latch that makes consecutive page turns
+    // fast otherwise keeps the booster running for the whole awake
+    // session. runs only from the parked main loop, never mid-session
+    fn panel_idle_off_due(&self) -> Option<Instant> {
+        self.screen.panel_powered().then(|| {
+            self.svc.last_refresh + Duration::from_secs(super::timing::PANEL_IDLE_OFF_SECS)
+        })
+    }
+
+    fn power_off_panel_if_idle(&mut self) {
+        if self.panel_idle_off_due().is_some_and(|d| Instant::now() >= d) {
+            let t0 = Instant::now();
+            if self.screen.power_off_idle() {
+                info!(
+                    "display: panel rails off after {}s idle ({}ms)",
+                    super::timing::PANEL_IDLE_OFF_SECS,
+                    t0.elapsed().as_millis()
+                );
+            }
+        }
     }
 }
 
@@ -629,6 +674,7 @@ impl super::Services {
 
     fn handle_input<A: AppLayer>(&mut self, hw_event: Event, app_mgr: &mut A) -> AfterInput {
         self.last_activity = Instant::now();
+        self.input_events = self.input_events.wrapping_add(1);
 
         match self.resolve_input(hw_event, app_mgr, false) {
             InputResult::Sleep => AfterInput::Sleep,
@@ -933,6 +979,7 @@ impl super::Kernel {
             }
         } // 'render
 
+        svc.last_refresh = Instant::now();
         debug!(
             "render: end active={:?} pending_redraw={} sleep_requested={}",
             app_mgr.active(),
@@ -958,7 +1005,9 @@ impl super::Kernel {
     async fn fire_deferred_grayscale<A: AppLayer>(&mut self, app_mgr: &mut A) {
         let draw = |s: &mut StripBuffer| app_mgr.draw(s);
         let t0 = Instant::now();
-        if self.screen.grayscale_fresh(&draw).await.is_err() {
+        let res = self.screen.grayscale_fresh(&draw).await;
+        self.svc.last_refresh = Instant::now();
+        if res.is_err() {
             log::warn!(
                 "render: deferred grayscale_pass timed out, forcing full GC next frame"
             );
@@ -1060,6 +1109,7 @@ impl super::Services {
 
             if let Some(hw_event) = ev {
                 self.last_activity = Instant::now();
+                self.input_events = self.input_events.wrapping_add(1);
                 let suppress = app_mgr.suppress_deferred_input();
 
                 match self.resolve_input(hw_event, app_mgr, suppress) {
@@ -1152,6 +1202,16 @@ impl super::Kernel {
         info!(
             "sleep: session saved to RTC + SD ({}ms)",
             t0.elapsed().as_millis()
+        );
+        super::power_log::sleep(
+            &self.svc.sd,
+            self.svc.sd_ok,
+            reason,
+            &app_mgr.active(),
+            super::uptime_secs() as u64,
+            self.svc.input_events,
+            self.svc.cached_battery_mv,
+            session.wake_count(),
         );
 
         // let the active app drop transient heap (reader chapter cache,
@@ -1291,7 +1351,13 @@ impl super::Kernel {
         let mut sleep_config = RtcSleepConfig::deep();
         sleep_config.set_rtc_fastmem_pd_en(false); // keep RTC FAST powered
 
-        info!("mcu: entering deep sleep (power button to wake)");
+        // last step before the MCU goes down: on battery the board
+        // loses power right here (the vendor firmware's sleep does the
+        // same), so every SD write and the panel sleep above must be
+        // done; on USB the deep sleep below still runs and GPIO3 wakes
+        // it as before
+        info!("mcu: releasing battery latch (GPIO13 low), entering deep sleep (power button to wake)");
+        crate::board::battery_latch_off();
         rtc.sleep(&sleep_config, &[&rtcio]);
 
         // deep sleep resets the MCU; backstop if sleep returns
@@ -1336,9 +1402,17 @@ impl super::Services {
         let mins = (uptime / 60) % 60;
         let hrs = uptime / 3600;
         let hwm = crate::ui::stack_hwm_detail();
+        // idle seconds and the countdown to idle sleep make a phantom
+        // input source (a noisy ladder resetting the timer) visible
+        // as a countdown that never reaches zero
+        let now = Instant::now();
+        let idle_secs = now.saturating_duration_since(self.last_activity).as_secs();
+        let sleep_in = self
+            .idle_deadline()
+            .map(|d| d.saturating_duration_since(now).as_secs());
 
         info!(
-            "stats: heap {}/{}K peak {}K | stack free {}K hwm {}K | bat {}% {}.{}V | up {}:{:02} | SD:{}",
+            "stats: heap {}/{}K peak {}K | stack free {}K hwm {}K | bat {}% {}.{}V | up {}:{:02} | SD:{} | idle {}s sleep_in {}s inputs {}",
             stats.current_usage / 1024,
             stats.size / 1024,
             stats.max_usage / 1024,
@@ -1350,6 +1424,9 @@ impl super::Services {
             hrs,
             mins,
             if self.sd_ok { "ok" } else { "--" },
+            idle_secs,
+            sleep_in.unwrap_or(0),
+            self.input_events,
         );
 
         // one extra line each time the water mark grows: a real deep

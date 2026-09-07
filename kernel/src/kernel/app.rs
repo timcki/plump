@@ -196,9 +196,11 @@ pub enum GrayscaleMode {
     /// (Reader page turns) where the latency hides naturally.
     Immediate,
     /// Hold the grayscale pass until the screen has been redraw-idle
-    /// for `DEFERRED_GRAYSCALE_DELAY`. Best for screens with frequent
-    /// navigation (Home) where firing on every keypress would feel
-    /// sluggish.
+    /// for `DEFERRED_GRAYSCALE_DELAY`. The pass is always full-screen
+    /// and a windowed partial over the coded panel first neutralizes
+    /// it (full revert plus plane rewrite), so this suits screens
+    /// whose redraws are full-screen anyway; a list screen pays the
+    /// neutralize on every cursor move.
     Deferred,
 }
 

@@ -29,7 +29,8 @@ GPIO1  button row 1 ADC     GPIO7  SPI MISO
 GPIO2  button row 2 ADC     GPIO8  SPI SCK
 GPIO3  power button          GPIO10 SPI MOSI
 GPIO4  EPD DC               GPIO12 SD CS (raw register GPIO)
-GPIO5  EPD RST              GPIO21 EPD CS
+GPIO5  EPD RST              GPIO13 battery latch (raw register GPIO)
+                            GPIO21 EPD CS
 ```
 
 ---
@@ -126,7 +127,8 @@ Then every 5 seconds: heap usage, stack watermark, battery percentage, uptime, S
 │       │   ├── battery.rs          Li-ion discharge curve calibration
 │       │   ├── button.rs           physical Button enum, ADC ladder decoding
 │       │   ├── layout.rs           physical button position constants for feedback rendering
-│       │   └── raw_gpio.rs         register-level GPIO for SD CS (GPIO12, freed by DIO mode)
+│       │   └── raw_gpio.rs         register-level GPIO for SD CS (GPIO12) and the battery
+│       │                           latch (GPIO13), deep-sleep pad holds
 │       ├── drivers/
 │       │   ├── mod.rs              driver re-exports
 │       │   ├── ssd1677.rs          EPD display driver — 3-phase partial refresh, strip streaming
@@ -262,7 +264,9 @@ The display runs in **portrait mode** via 270° rotation of the physical 800×48
 
 **Full GC** runs the OTP full-clear waveform at a faked 90 °C (`0x1A ← 0x5A` with TEMP_LOAD cleared from CTRL2) so the controller picks the shortest high-temperature LUT: ~600 ms instead of ~1.6 s at room temperature (trick from CrossPoint Reader).
 
-**Panel power latching.** Every refresh path (DU, GC, grayscale) adds CLOCK_ON + ANALOG_ON to CTRL2 only when power is actually off, and nothing powers the panel down until deep sleep — subsequent page turns skip the ~100 ms booster start inside the waveform and the ~200 ms power-off wait after phase 3 (also from CrossPoint). Sunlight mode overrides this: its waveforms carry ANALOG_OFF + CLOCK_OFF so the panel powers off after every refresh to prevent UV-induced fading.
+**Whole-panel rule for custom LUTs.** The RAM window (0x44/0x45) only scopes RAM writes; a waveform scans every gate and drives every source from whatever the planes hold. The OTP DU treats plain content ({0,0}, {1,1}) as no-change, but the grayscale and revert LUTs treat only {0,0} that way, so AA gray codes must never sit in RAM while a windowed waveform runs (CrossPoint's driver enforces the same: `grayscaleRevert` before any `displayWindow`). `kernel/screen.rs` therefore runs gray passes full-screen only, and a windowed partial over a gray-coded panel first *neutralizes* it: full revert pass, then both planes rewritten with content and the screen marked stale. The reader page turn (full-screen window) is unaffected; a quick menu opened over an AA'd page costs one neutralize (~450 ms) and the page stays plain BW until the next turn. Only the reader uses AA; Home runs plain BW because every cursor move would otherwise pay the neutralize.
+
+**Panel power latching.** Every refresh path (DU, GC, grayscale) adds CLOCK_ON + ANALOG_ON to CTRL2 only when power is actually off, so consecutive page turns skip the ~100 ms booster start inside the waveform and the ~200 ms power-off wait after phase 3 (also from CrossPoint). The rails are dropped once nothing has been refreshed for `PANEL_IDLE_OFF_SECS` (30 s, from the parked main loop only) and at deep sleep, since a powered booster draws its quiescent current for the whole awake session. Sunlight mode overrides this: its waveforms carry ANALOG_OFF + CLOCK_OFF so the panel powers off after every refresh to prevent UV-induced fading.
 
 **Dirty-region tracking.** Apps call `ctx.mark_dirty(region)`; regions are unioned per frame. Partial DU or full GC issued accordingly. Coalesced redraw for batch updates (e.g., background title scanning) with a 50 ms window.
 
@@ -298,6 +302,8 @@ The kernel ships a built-in `FONT_9X18` mono font (embedded-graphics) for the bo
 /_PULP/                 app data directory
   SETTINGS.TXT          key=value config (sleep, fonts, theme, wifi)
   BKMK.BIN              bookmark cache (16 × 48 bytes, binary)
+  SESSION.BIN           sleep session copy (battery wakes lose RTC memory)
+  PWR.LOG               append-only boot / sleep power log
   TITLES.BIN            filename→title mapping (tab-separated text)
   <hash>.DAT            per-book epub chapter cache (v3 format)
 ```
@@ -328,14 +334,17 @@ Inline images in EPUBs are detected by `IMG_REF` markers in the stripped text. I
 ### Deep sleep
 
 Idle timeout or power long-press triggers sleep:
-1. Flush bookmarks to SD
-2. Send CMD0 to SD card (reduces idle current from ~150 µA to ~10 µA)
-3. Render sleep screen on EPD
-4. EPD deep sleep mode 1 (~3 µA, image retained)
-5. Save session to RTC FAST memory (survives deep sleep, ~1-2 µA extra)
-6. ESP32-C3 deep sleep (~5 µA), GPIO3 wake source
+1. Save session to RTC FAST memory and to `_PULP/SESSION.BIN`, append a line to `_PULP/PWR.LOG`
+2. Flush bookmarks to SD
+3. Send CMD0 to SD card (reduces idle current from ~150 µA to ~10 µA)
+4. Render sleep screen on EPD
+5. EPD deep sleep mode 1 (~3 µA, image retained)
+6. Release the battery latch: GPIO13 low, pad held through deep sleep (`board::battery_latch_off`). GPIO13 gates the board's battery-latch MOSFET (vendor firmware and CrossPoint do the same), so on battery the whole board, SD card and panel included, loses power here
+7. On USB power the MCU continues into ESP32-C3 deep sleep (~5 µA), GPIO3 wake source
 
-On wake: MCU resets, boot sequence runs, RTC session is restored → instant return to previous app state without SD reads for settings/navigation.
+On wake: the MCU resets and the boot sequence runs. On USB the RTC session is restored (instant return without SD reads); on battery the reset is a power-on, so the SD session copy provides the same resume one SD read later. `Board::init` releases the sleep-time pad holds and drives GPIO13 high again.
+
+`_PULP/PWR.LOG` (append-only text, one line per boot and per sleep entry: reset reason, session source, wake count, uptime, input count, battery mV) is the record to read back when battery life looks wrong; the 5 s stats line also carries `idle`, `sleep_in` and `inputs` so an input source that keeps resetting the idle timer shows up as a countdown that never reaches zero.
 
 ### Work queue
 

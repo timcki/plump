@@ -49,3 +49,9 @@ pub const COALESCE_WINDOW_MS: u64 = 50;
 
 // battery read interval (seconds)
 pub const BATTERY_INTERVAL_SECS: u64 = 30;
+
+// panel rails stay latched on between refreshes so page turns skip
+// the ~100ms booster start; after this long without a refresh they
+// are dropped, since the powered booster draws its quiescent current
+// for the whole awake session otherwise (todo.md item 10)
+pub const PANEL_IDLE_OFF_SECS: u64 = 30;

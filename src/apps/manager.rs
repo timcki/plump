@@ -997,10 +997,14 @@ impl AppLayer for AppManager {
                     GrayscaleMode::Disabled
                 }
             }
-            // home has frequent up/down navigation; defer AA so each
-            // keypress stays snappy and the final settled view picks
-            // up the AA pass.
-            AppId::Home => GrayscaleMode::Deferred,
+            // home used Deferred AA, but AA is a whole-panel affair
+            // (see kernel/screen.rs): every selection move would first
+            // neutralize the codes (full revert + plane rewrite, ~450ms
+            // before the row even moves) and then re-gray the whole
+            // screen after the idle window. the windowed passes this
+            // used to run are what darkened everything except the
+            // selected row. plain BW keeps navigation at one DU
+            AppId::Home => GrayscaleMode::Disabled,
             _ => GrayscaleMode::Disabled,
         }
     }

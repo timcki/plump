@@ -16,16 +16,31 @@
 // only exist on Settled, which only exists after the wave is consumed,
 // and the driver tokens the session carries (see drivers/ssd1677.rs)
 // make the same order unrepresentable one layer down
+//
+// whole-panel rule for custom LUTs: the RAM window set before a
+// waveform only scopes the RAM writes. the controller scans every
+// gate and drives every source from whatever the planes hold, so a
+// waveform "over a window" is really a waveform over the whole panel
+// in which the area outside the window is expected to sit in a
+// no-change LUT state. the OTP DU has two of those ({0,0} and {1,1},
+// plain content), the gray and revert LUTs only one ({0,0}). AA codes
+// therefore never coexist with a windowed waveform: gray passes are
+// always full-screen, and a windowed partial over a gray-coded panel
+// first neutralizes the codes (full revert, planes rewritten with
+// content). crosspoint enforces the same rule (grayscaleRevert before
+// displayWindow); the windowed gray/revert passes this file used to
+// run re-pulsed every AA edge on the panel per session, which is the
+// progressive darkening of home and the quick menu surroundings
 
 use core::marker::PhantomData;
 
-use embassy_time::TimeoutError;
+use embassy_time::{Instant, TimeoutError};
 use esp_hal::delay::Delay;
 
 use crate::board::{Epd, SCREEN_H, SCREEN_W};
 use crate::drivers::ssd1677::{Driven, Phase1, Window};
 use crate::drivers::strip::StripBuffer;
-use crate::kernel::plane_map::{AaQueue, PlaneMap, SessionOutcome};
+use crate::kernel::plane_map::{PlaneMap, SessionOutcome};
 use crate::ui::{AlignedRegion, Region};
 
 pub struct Screen {
@@ -38,12 +53,10 @@ pub struct Screen {
     // area absent from the map is in sync: delta DUs are safe there
     planes: PlaneMap,
 
-    // rects driven to plain BW since their last AA pass; the deferred
-    // fire pulses exactly these. only just-re-driven pixels may take
-    // gray pulses: the LUT lightens pixels the BW waveform just drove
-    // black, so re-pulsing an area already carrying its gray drives
-    // it further off level
-    pending_aa: AaQueue,
+    // something was driven to plain BW since the last AA pass, so a
+    // deferred fire has work. the fire is always full-screen (see the
+    // whole-panel rule above), so no rect bookkeeping is needed
+    aa_pending: bool,
 
     // partial refreshes since the last full GC; the scheduler promotes
     // to a full clear once this reaches ghost_clear_every
@@ -85,18 +98,18 @@ pub struct Settled<'s, M> {
 
 /// A planned partial refresh.
 ///
-/// The revert obligation is part of the type: when AA gray codes
-/// underlie the region, the only way to obtain a [`Wave`] is through
+/// The revert obligation is part of the type: when AA gray codes are
+/// on the panel, the only way to obtain a [`Wave`] is through
 /// [`PendingRevert::proceed`], which runs the revert wave first. A
 /// call site cannot forget the revert and re-drive straight over
 /// intermediate grays (the page-turn mottle) or start phase 1 over
 /// the codes the revert reads.
 pub enum PartialPlan<'s> {
-    /// No gray codes under the region; phase 1 is written and the DU
+    /// No gray codes on the panel; phase 1 is written and the DU
     /// waveform is already running.
     Ready(Wave<'s, Du>),
-    /// Gray codes underlie the region; call
-    /// [`PendingRevert::proceed`] to revert them and start the DU.
+    /// Gray codes are on the panel; call [`PendingRevert::proceed`]
+    /// to revert them and start the DU.
     RevertFirst(PendingRevert<'s>),
 }
 
@@ -108,17 +121,29 @@ pub struct PendingRevert<'s> {
 }
 
 impl<'s> PendingRevert<'s> {
-    /// Revert grays under the region to their rails, then write
-    /// phase 1 and start the DU. A revert timeout degrades gracefully:
-    /// the next frame is promoted to a full GC and the partial still
-    /// runs, since its inv_red re-drive keeps the content correct.
+    /// Revert the panel's grays to their rails, then write phase 1
+    /// and start the DU.
+    ///
+    /// A full-screen partial reverts in place and re-drives via
+    /// inv_red (the reader page turn). A windowed partial cannot run
+    /// while codes sit anywhere in RAM (whole-panel rule), so it
+    /// neutralizes first: full revert, then both planes rewritten
+    /// with content, after which the window is re-driven like any
+    /// stale area. A revert timeout degrades gracefully: the next
+    /// frame is promoted to a full GC and the partial still runs,
+    /// since its inv_red re-drive keeps the content correct.
     pub async fn proceed<F>(self, draw: &F) -> Result<Wave<'s, Du>, PartialRejected>
     where
         F: Fn(&mut StripBuffer),
     {
         let PendingRevert { screen, region } = self;
         crate::perf_begin!(_t0);
-        match screen.revert_windows(region).await {
+        let res = if region == FULL_REGION {
+            screen.revert_windows(region).await
+        } else {
+            screen.neutralize_gray(draw).await
+        };
+        match res {
             Ok(true) => {
                 crate::perf_event!("render", "revert wave_ms={}", _t0.elapsed().as_millis());
             }
@@ -149,10 +174,29 @@ impl Screen {
             strip,
             delay,
             planes: PlaneMap::new(),
-            pending_aa: AaQueue::new(),
+            aa_pending: false,
             partials: 0,
             force_gc: false,
         }
+    }
+
+    /// True while the panel holds AA gray levels (codes in RAM).
+    #[inline]
+    pub fn gray_coded(&self) -> bool {
+        self.planes.has_gray()
+    }
+
+    /// Drop the panel's analog rails after an idle stretch. The next
+    /// refresh pays the ~100ms booster start inside its waveform; a
+    /// panel left powered draws the booster's quiescent current for
+    /// the whole awake session. No-op when already off.
+    pub fn power_off_idle(&mut self) -> bool {
+        self.epd.power_off()
+    }
+
+    #[inline]
+    pub fn panel_powered(&self) -> bool {
+        self.epd.is_powered()
     }
 
     /// True when the next refresh should be a full GC: either enough
@@ -184,15 +228,15 @@ impl Screen {
         self.epd.enter_deep_sleep();
     }
 
-    // snap AA grays under `region` back to their rails: one wave per
-    // gray-coded window (usually one), so a small partial does not
-    // strip AA from the rest of the screen and never drives outside
-    // the tracked codes. the intersection of aligned regions is
-    // aligned, so the physical window cannot snap outward onto planes
-    // holding content, which the revert LUT would misdrive (white
-    // content reads {1,1}, its drive-black state). the codes in RAM
-    // stay valid (the pass writes nothing), so the map survives for
-    // the following session's closer
+    // snap AA grays under `region` back to their rails, one wave per
+    // gray-coded window. gray entries only ever cover the full screen
+    // now (gray passes are full-screen), so this runs at most one
+    // full revert; the intersection is kept so a stale fragment map
+    // cannot widen the window onto planes holding content, which the
+    // revert LUT would misdrive (white content reads {1,1}, its
+    // drive-black state). the codes in RAM stay valid (the pass
+    // writes nothing), so the map survives for the following
+    // session's closer
     async fn revert_windows(&mut self, region: AlignedRegion) -> Result<bool, TimeoutError> {
         let mut ran = false;
         for w in self.planes.gray_windows(region).into_iter().flatten() {
@@ -207,6 +251,35 @@ impl Screen {
             ran = true;
         }
         Ok(ran)
+    }
+
+    // leave the gray-coded state before a windowed waveform: revert
+    // the whole panel to its rails, then rewrite both planes with the
+    // current content so nothing in RAM reads as a drive state to the
+    // OTP DU outside the window that follows. the panel then shows
+    // the previous frame at its rails while the planes hold the new
+    // one, which is exactly the Stale contract, so the full screen is
+    // marked stale and the following partial re-drives its window via
+    // inv_red instead of a delta against planes equal to itself
+    async fn neutralize_gray<F>(&mut self, draw: &F) -> Result<bool, TimeoutError>
+    where
+        F: Fn(&mut StripBuffer),
+    {
+        let t0 = Instant::now();
+        let res = self.revert_windows(FULL_REGION).await;
+        let revert_ms = t0.elapsed().as_millis();
+        // the FrameWritten token is deliberately not kicked: this is
+        // a RAM state change, not a refresh
+        let _ = self.epd.write_full_frame(self.strip, &mut self.delay, draw);
+        self.planes.clear();
+        let _ = self.planes.apply(FULL_REGION, SessionOutcome::Abandoned);
+        log::info!(
+            "screen: neutralize gray (windowed partial over AA) revert_ms={} total_ms={} ok={}",
+            revert_ms,
+            t0.elapsed().as_millis(),
+            res.is_ok()
+        );
+        res
     }
 
     /// Partial DU refresh, waiting inline on the busy pin. Falls back
@@ -238,12 +311,12 @@ impl Screen {
     /// When the region overlaps panel area the RAM planes no longer
     /// describe, the write goes through inv_red so the waveform
     /// re-drives every pixel it covers from a known state instead of
-    /// computing a delta against a stale plane; and when those planes
-    /// hold AA gray codes, the plan comes back as
+    /// computing a delta against a stale plane; and when the planes
+    /// hold AA gray codes anywhere, the plan comes back as
     /// [`PartialPlan::RevertFirst`], whose only path to a [`Wave`]
-    /// runs the revert pass. Callers cannot skip the revert or start
-    /// phase 1 over codes; recovery stays scoped to the requested
-    /// region and the caller never tracks plane state.
+    /// runs the revert pass (or, for a windowed region, the full
+    /// neutralize). Callers cannot skip the revert or start phase 1
+    /// over codes, and never track plane state themselves.
     pub fn plan_partial<F>(
         &mut self,
         region: Region,
@@ -261,14 +334,12 @@ impl Screen {
         // instead of the old masks parking fake white in both planes
         let r = AlignedRegion::snap(region);
 
-        if self
-            .planes
-            .gray_windows(r)
-            .iter()
-            .any(|w| w.is_some())
-        {
-            // phase 1 must not run yet: it would overwrite the codes
-            // the revert wave reads as its index
+        // any codes anywhere, not just under r: a windowed DU scans
+        // the whole panel, so codes outside the window would be
+        // driven too (whole-panel rule). phase 1 must not run yet
+        // either way: it would overwrite the codes the revert wave
+        // reads as its index
+        if self.planes.has_gray() {
             return Ok(PartialPlan::RevertFirst(PendingRevert {
                 screen: self,
                 region: r,
@@ -312,7 +383,7 @@ impl Screen {
 
         let driven = self.epd.partial_start_du(written);
         self.partials = self.partials.saturating_add(1);
-        self.pending_aa.push(r);
+        self.aa_pending = true;
 
         Ok(Wave {
             screen: self,
@@ -335,8 +406,7 @@ impl Screen {
         // the whole screen correctly stays marked for re-drive. gray
         // loss is moot: the running GC wipes the panel gray anyway
         let _ = self.planes.apply(FULL_REGION, SessionOutcome::Abandoned);
-        self.pending_aa.clear();
-        self.pending_aa.push(FULL_REGION);
+        self.aa_pending = true;
         Wave {
             screen: self,
             driven,
@@ -385,39 +455,26 @@ impl Screen {
         if self.planes.apply(FULL_REGION, SessionOutcome::Grayed) {
             self.force_ghost_clear();
         }
-        self.pending_aa.clear();
+        self.aa_pending = false;
         if res.is_err() {
             self.force_ghost_clear();
         }
         res
     }
 
-    /// Grayscale AA pass over everything driven to plain BW since the
-    /// last pass. Used by the deferred fire: one pass per pending
-    /// rect, never their bounding box, whose slop would re-pulse
-    /// areas that already carry their gray and drive them off level.
-    /// No-op when nothing was refreshed.
+    /// Deferred grayscale AA pass: full-screen when anything was
+    /// driven to plain BW since the last pass, no-op otherwise. Always
+    /// full-screen because the gray LUT has a single no-change state
+    /// ({0,0}); any plain content left in RAM outside a smaller window
+    /// would take a gray pulse along with it (whole-panel rule).
     pub async fn grayscale_fresh<F>(&mut self, draw: &F) -> Result<(), TimeoutError>
     where
         F: Fn(&mut StripBuffer),
     {
-        while let Some(region) = self.pending_aa.take_next() {
-            let r = region.get();
-            let Some(win) = self.epd.region_state(r.x, r.y, r.w, r.h) else {
-                continue;
-            };
-            let res = self.epd.grayscale_pass(self.strip, &win, draw).await;
-            // the planes were rewritten with codes before the wave
-            // started, so the region is gray-coded even on timeout
-            if self.planes.apply(region, SessionOutcome::Grayed) {
-                self.force_ghost_clear();
-            }
-            if res.is_err() {
-                self.force_ghost_clear();
-                return res;
-            }
+        if !self.aa_pending {
+            return Ok(());
         }
-        Ok(())
+        self.grayscale_full(draw).await
     }
 }
 
@@ -494,20 +551,31 @@ impl Settled<'_, Du> {
         }
     }
 
-    /// Grayscale AA pass over this refresh's region instead of phase 3.
+    /// Grayscale AA pass over this refresh instead of phase 3.
     ///
     /// The gray LUT states are short relative pulses that lighten
     /// pixels the BW frame just drove black, and `{0,0}` is literally
     /// "no change", so the pass leaves the panel holding intermediate
-    /// levels only the codes now in RAM describe. The region is
-    /// tracked as gray-coded: the next partial touching it reverts the
-    /// grays to their rails and re-drives via inv_red, the starting
-    /// state the DU transitions assume. On timeout the pass is
-    /// additionally promoted to a full GC.
+    /// levels only the codes now in RAM describe. The screen is
+    /// tracked as gray-coded: the next partial reverts the grays to
+    /// their rails and re-drives via inv_red, the starting state the
+    /// DU transitions assume. On timeout the pass is additionally
+    /// promoted to a full GC.
+    ///
+    /// Only a full-screen session takes the pass (whole-panel rule);
+    /// a windowed one closes with a plain phase 3 and stays BW.
     pub async fn grayscale<F>(self, draw: &F) -> Result<(), TimeoutError>
     where
         F: Fn(&mut StripBuffer),
     {
+        if self.region != FULL_REGION {
+            log::debug!(
+                "screen: AA skipped for windowed session {:?}",
+                self.region.get()
+            );
+            self.sync_red(draw);
+            return Ok(());
+        }
         let s = self.screen;
         let res = s
             .epd
@@ -516,9 +584,7 @@ impl Settled<'_, Du> {
         if s.planes.apply(self.region, SessionOutcome::Grayed) {
             s.force_ghost_clear();
         }
-        // this region just took its gray; a later deferred fire over
-        // a queued rect covering it would stack a second pulse
-        s.pending_aa.subtract(self.region);
+        s.aa_pending = false;
         if res.is_err() {
             s.force_ghost_clear();
         }

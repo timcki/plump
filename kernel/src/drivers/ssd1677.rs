@@ -781,15 +781,31 @@ where
         self.kick(ctrl2::CUSTOM_LUT);
     }
 
+    /// Drop the analog rails and clock (ANALOG_OFF + CLOCK_OFF as a
+    /// standalone activation, ~200ms). Returns whether anything was
+    /// done; the next `kick` re-adds the power-up bits. The latch is
+    /// what makes page turns skip the booster start, so this is for
+    /// idle stretches and sleep, never between consecutive refreshes.
+    pub(crate) fn power_off(&mut self) -> bool {
+        if self.power != PanelPower::On {
+            return false;
+        }
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
+        self.send_data(&[0x83]);
+        self.send_command(cmd::MASTER_ACTIVATION);
+        self.wait_busy(POWER_OFF_TIME_MS);
+        self.power = PanelPower::Off;
+        true
+    }
+
+    #[inline]
+    pub(crate) fn is_powered(&self) -> bool {
+        self.power == PanelPower::On
+    }
+
     // mode 1: image retained, ~3 uA; requires hw reset to wake
     pub(crate) fn enter_deep_sleep(&mut self) {
-        if self.power == PanelPower::On {
-            self.send_command(cmd::DISPLAY_UPDATE_CONTROL_2);
-            self.send_data(&[0x83]);
-            self.send_command(cmd::MASTER_ACTIVATION);
-            self.wait_busy(POWER_OFF_TIME_MS);
-            self.power = PanelPower::Off;
-        }
+        self.power_off();
 
         self.send_command(cmd::DEEP_SLEEP);
         self.send_data(&[0x01]);
