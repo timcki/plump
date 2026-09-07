@@ -44,9 +44,8 @@ impl TabBar {
             return;
         }
 
-        // clear + hairline along the top edge
+        // clear the bar behind the icons
         p.fill_in(bar, BinaryColor::Off);
-        p.hairline_h(bar.y, bar.x + theme.margin_lg, bar.x + bar.w - theme.margin_lg);
 
         let slot_w = bar.w / SLOTS as u16;
         for (i, tab) in Tab::ORDER.iter().copied().enumerate() {
@@ -90,4 +89,3 @@ impl TabBar {
     }
 
 }
-

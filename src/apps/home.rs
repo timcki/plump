@@ -53,9 +53,7 @@ const MAX_ITEMS: usize = 1 + MAX_RECENT_ROWS;
 // layout regions are content-area relative; the manager paints the
 // shared chrome (top status bar) over y < CONTENT_TOP, and the tab
 // bar over y >= SCREEN_H - theme.bottom_bar_h.
-const CONTINUE_CAPTION_REGION: Region =
-    Region::new(LARGE_MARGIN, CONTENT_TOP, FULL_CONTENT_W, CAPTION_H);
-const CARD_Y: u16 = CONTENT_TOP + CAPTION_H + CAPTION_GAP;
+const CARD_Y: u16 = CONTENT_TOP;
 const CARD_REGION: Region = Region::new(CARD_X, CARD_Y, CARD_W, CARD_H);
 const RECENT_CAPTION_Y: u16 = CARD_Y + CARD_H + CAPTION_GAP * 2;
 const RECENT_CAPTION_REGION: Region =
@@ -415,11 +413,9 @@ impl App<AppId> for HomeApp {
         let font = self.ui_fonts.body;
         let heading = self.ui_fonts.heading;
 
-        // section captions
+        // section caption
         let theme = plump_kernel::ui::Theme::default_v1();
         let mut painter = plump_kernel::ui::Painter::new(strip, &theme);
-        SectionLabel::new(CONTINUE_CAPTION_REGION, "CONTINUE READING")
-            .draw(&mut painter, font);
         if self.recent_row_count > 0 {
             SectionLabel::new(RECENT_CAPTION_REGION, "RECENT").draw(&mut painter, font);
         }

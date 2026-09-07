@@ -126,7 +126,7 @@ impl<'a> BookRow<'a> {
             region.w.saturating_sub(COVER_PAD + TEXT_INDENT + reserve),
             region.h,
         );
-        font.draw_aligned(strip, title_region, self.title, Alignment::CenterLeft, fg);
+        draw_truncated_title(strip, font, title_region, self.title, fg);
 
         if let Some(text) = self.trailing {
             let trailing_region = Region::new(
@@ -138,4 +138,28 @@ impl<'a> BookRow<'a> {
             font.draw_aligned(strip, trailing_region, text, Alignment::CenterRight, fg);
         }
     }
+}
+
+fn draw_truncated_title(
+    strip: &mut StripBuffer,
+    font: &BitmapFont,
+    region: Region,
+    title: &str,
+    fg: BinaryColor,
+) {
+    let cut = font.truncate_len(title, region.w);
+    if cut >= title.len() {
+        font.draw_aligned(strip, region, title, Alignment::CenterLeft, fg);
+        return;
+    }
+
+    let mut buf = [0u8; 68];
+    let mut n = cut.min(buf.len() - 3);
+    while n > 0 && !title.is_char_boundary(n) {
+        n -= 1;
+    }
+    buf[..n].copy_from_slice(&title.as_bytes()[..n]);
+    buf[n..n + 3].copy_from_slice("…".as_bytes());
+    let truncated = core::str::from_utf8(&buf[..n + 3]).unwrap_or(title);
+    font.draw_aligned(strip, region, truncated, Alignment::CenterLeft, fg);
 }
