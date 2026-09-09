@@ -166,7 +166,7 @@ Then every 5 seconds: heap usage, stack watermark, battery percentage, uptime, S
 │       ├── manager.rs              AppManager - AppLayer impl, dispatch,
 │       │                           lifecycle, Chrome state refresh
 │       ├── home.rs                 Continue-reading card + Recent list
-│       ├── library.rs              filter chips + 2x3 cover grid + pager
+│       ├── library.rs              scrollable book list + count caption
 │       ├── cover_placeholder.rs    deterministic shape covers
 │       ├── cover_cache.rs          bundle Cover variant read / write
 │       ├── settings.rs             grouped settings (Reading / Display /

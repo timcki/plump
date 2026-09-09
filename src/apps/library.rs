@@ -1,24 +1,27 @@
-// Library tab: paginated list of every book on the card, one BookRow
+// Library tab: scrollable list of every book on the card, one BookRow
 // per entry (mini cover on the left, title next to it) so it matches
-// the home RECENT list exactly. successor to the 2x3 cover grid,
-// whose filter chips are gone for now (broken rendering + confusing
-// navigation).
+// the home RECENT list exactly. successor to the paged list, which in
+// turn replaced the 2x3 cover grid (filter chips are gone for now:
+// broken rendering + confusing navigation).
+//
+// a caption above the list shows the book count on the left and, once
+// the list overflows the screen, the visible range on the right.
 //
 // navigation:
-//   Up / Down: move the selection; crossing the top/bottom edge flips
-//     to the previous/next page.
-//   Left / Right: previous/next page directly; on the first/last page
-//     yields AtEdge so the manager switches tabs (chunk E).
+//   Up / Down: move the selection one row; the window scrolls by one
+//     row when the selection crosses its top/bottom edge.
+//   Left / Right: not handled here; the manager's default AtEdge
+//     switches to the neighbouring tab (chunk E).
 //   Select: push Reader for the highlighted book.
 
 use core::fmt::Write as _;
 
 use embedded_graphics::pixelcolor::BinaryColor;
 
-use plump_kernel::ui::{Region, Theme};
+use plump_kernel::ui::{Painter, Region, StackFmt, Theme};
 
 use crate::apps::widgets::{BOOK_ROW_H, BookRow};
-use crate::apps::{App, AppContext, AppId, BgBudget, BgOutcome, HDir, HResult, Transition};
+use crate::apps::{App, AppContext, AppId, BgBudget, BgOutcome, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::storage::DirEntry;
@@ -26,39 +29,56 @@ use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::kernel::KernelHandle;
 use crate::kernel::work_queue::DecodedImage;
-use crate::ui::{Alignment, BitmapDynLabel, CONTENT_TOP, FULL_CONTENT_W, LARGE_MARGIN};
+use crate::ui::{Alignment, CONTENT_TOP, FULL_CONTENT_W, LARGE_MARGIN, SectionLabel};
 
-const ROWS_PER_PAGE: usize = 6;
+const VISIBLE_ROWS: usize = 6;
 const ROW_GAP: u16 = 4;
 const ROW_STRIDE: u16 = BOOK_ROW_H + ROW_GAP;
-const LIST_TOP: u16 = CONTENT_TOP;
 
-const FOOTER_H: u16 = 22;
-const FOOTER_Y: u16 = SCREEN_H - Theme::default_v1().bottom_bar_h - FOOTER_H;
+const CAPTION_H: u16 = 16;
+const CAPTION_GAP: u16 = 8;
+const CAPTION_REGION: Region = Region::new(LARGE_MARGIN, CONTENT_TOP, FULL_CONTENT_W, CAPTION_H);
+
+const LIST_TOP: u16 = CONTENT_TOP + CAPTION_H + CAPTION_GAP;
+const LIST_BOTTOM: u16 = Theme::default_v1().content_bottom();
+const _: () = assert!(LIST_TOP + VISIBLE_ROWS as u16 * ROW_STRIDE - ROW_GAP <= LIST_BOTTOM);
 
 const CONTENT_REGION: Region = Region::new(0, CONTENT_TOP, SCREEN_W, SCREEN_H - CONTENT_TOP);
 
-fn row_region(i: usize) -> Region {
+fn row_region(slot: usize) -> Region {
     Region::new(
         LARGE_MARGIN,
-        LIST_TOP + i as u16 * ROW_STRIDE,
+        LIST_TOP + slot as u16 * ROW_STRIDE,
         FULL_CONTENT_W,
         BOOK_ROW_H,
     )
 }
 
+// pending SD work for the visible window, run from background_step
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Load {
+    Idle,
+    // the window moved; rows still in view are shifted, the rest read
+    Window,
+    // reread every row (entering the tab, resuming, waking)
+    Full,
+}
+
 pub struct LibraryApp {
-    selected: usize, // row index within the current page
-    page: usize,
-    entries: [Option<DirEntry>; ROWS_PER_PAGE],
-    covers: [Option<DecodedImage>; ROWS_PER_PAGE],
+    selected: usize, // absolute index into the directory listing
+    scroll: usize,   // absolute index of the first visible row
+    // scroll offset the window below was loaded at; differs from
+    // `scroll` between a move and its background reload
+    window_start: usize,
+    window_count: usize,
+    entries: [Option<DirEntry>; VISIBLE_ROWS],
+    covers: [Option<DecodedImage>; VISIBLE_ROWS],
     // cached page count per row from the book's layout index; 0 =
     // unknown (never opened, or not indexed yet)
-    pages: [u32; ROWS_PER_PAGE],
-    page_count: usize,
+    pages: [u32; VISIBLE_ROWS],
     total: usize,
     ui_fonts: fonts::UiFonts,
-    needs_load: bool,
+    load: Load,
 }
 
 impl Default for LibraryApp {
@@ -71,14 +91,15 @@ impl LibraryApp {
     pub fn new() -> Self {
         Self {
             selected: 0,
-            page: 0,
-            entries: [const { None }; ROWS_PER_PAGE],
-            covers: [const { None }; ROWS_PER_PAGE],
-            pages: [0; ROWS_PER_PAGE],
-            page_count: 0,
+            scroll: 0,
+            window_start: 0,
+            window_count: 0,
+            entries: [const { None }; VISIBLE_ROWS],
+            covers: [const { None }; VISIBLE_ROWS],
+            pages: [0; VISIBLE_ROWS],
             total: 0,
             ui_fonts: fonts::UiFonts::for_size(0),
-            needs_load: true,
+            load: Load::Full,
         }
     }
 
@@ -86,102 +107,158 @@ impl LibraryApp {
         self.ui_fonts = fonts::UiFonts::for_size(idx);
     }
 
-    /// Total pages. At least 1 so the footer always reads
-    /// "page 1 of 1" even on an empty library.
-    fn total_pages(&self) -> usize {
-        self.total.div_ceil(ROWS_PER_PAGE).max(1)
+    fn clear_slot(&mut self, slot: usize) {
+        self.entries[slot] = None;
+        self.covers[slot] = None;
+        self.pages[slot] = 0;
     }
 
-    fn load_page(&mut self, k: &mut KernelHandle<'_>) {
-        self.entries = [const { None }; ROWS_PER_PAGE];
-        // drop old covers before loading new ones so
-        // load_cover_variant_for has a free heap window
-        self.covers = [const { None }; ROWS_PER_PAGE];
-        self.pages = [0; ROWS_PER_PAGE];
-        self.page_count = 0;
-        self.total = 0;
+    /// Read directory entry `index` plus its mini cover and cached
+    /// page count into `slot`. Returns false past the end of the list.
+    fn load_slot(&mut self, k: &mut KernelHandle<'_>, slot: usize, index: usize) -> bool {
+        // drop the old cover first so load_cover_variant_for has a
+        // free heap window
+        self.clear_slot(slot);
+        let mut scratch = [DirEntry::EMPTY; 1];
+        let Ok(page) = k.dir_page(index, &mut scratch) else {
+            return false;
+        };
+        self.total = page.total;
+        if page.count == 0 {
+            return false;
+        }
+        let entry = scratch[0];
+        self.covers[slot] = crate::apps::cover_cache::load_cover_variant_for(
+            k,
+            entry.name.as_bytes(),
+            plump_kernel::kernel::bundle::CoverKind::Mini,
+        );
+        let name_hash = plump_kernel::util::hash::fnv1a(entry.name.as_bytes());
+        self.pages[slot] =
+            plump_kernel::kernel::bundle::cached_total_pages(k.sd(), name_hash).unwrap_or(0);
+        self.entries[slot] = Some(entry);
+        true
+    }
 
+    fn load_window(&mut self, k: &mut KernelHandle<'_>) {
         let _ = k.ensure_dir_cache_loaded();
 
-        let mut scratch = [DirEntry::EMPTY; ROWS_PER_PAGE];
-        let dirpage = match k.dir_page(self.page * ROWS_PER_PAGE, &mut scratch) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        self.total = dirpage.total;
-        self.page_count = dirpage.count;
-        for (i, entry) in scratch.iter().take(dirpage.count).enumerate() {
-            self.covers[i] = crate::apps::cover_cache::load_cover_variant_for(
-                k,
-                entry.name.as_bytes(),
-                plump_kernel::kernel::bundle::CoverKind::Mini,
-            );
-            let name_hash = plump_kernel::util::hash::fnv1a(entry.name.as_bytes());
-            self.pages[i] =
-                plump_kernel::kernel::bundle::cached_total_pages(k.sd(), name_hash)
-                    .unwrap_or(0);
-            self.entries[i] = Some(*entry);
+        // files may have come or gone since the last load (upload tab,
+        // card swap): refresh the total and clamp before reading rows
+        let mut none: [DirEntry; 0] = [];
+        if let Ok(page) = k.dir_page(0, &mut none) {
+            self.total = page.total;
         }
-        if self.selected >= self.page_count {
-            self.selected = self.page_count.saturating_sub(1);
+        self.selected = self.selected.min(self.total.saturating_sub(1));
+        self.scroll = self.scroll.min(self.total.saturating_sub(VISIBLE_ROWS));
+        self.scroll_into_view();
+
+        let delta = self.scroll as isize - self.window_start as isize;
+        let (first, last) = match (self.load, delta) {
+            // one row down: keep rows 1.. and read the new bottom row
+            (Load::Window, 1) => {
+                self.entries.rotate_left(1);
+                self.covers.rotate_left(1);
+                self.pages.rotate_left(1);
+                (VISIBLE_ROWS - 1, VISIBLE_ROWS)
+            }
+            // one row up: keep rows ..N-1 and read the new top row
+            (Load::Window, -1) => {
+                self.entries.rotate_right(1);
+                self.covers.rotate_right(1);
+                self.pages.rotate_right(1);
+                (0, 1)
+            }
+            (Load::Window, 0) => (VISIBLE_ROWS, VISIBLE_ROWS),
+            _ => (0, VISIBLE_ROWS),
+        };
+        // a rotated slot may hold a stale cover from before the shift;
+        // load_slot drops it before allocating the replacement
+        for slot in first..last {
+            self.load_slot(k, slot, self.scroll + slot);
+        }
+        self.window_start = self.scroll;
+        self.window_count = self.total.saturating_sub(self.scroll).min(VISIBLE_ROWS);
+        for slot in self.window_count..VISIBLE_ROWS {
+            self.clear_slot(slot);
+        }
+        self.load = Load::Idle;
+    }
+
+    fn scroll_into_view(&mut self) {
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + VISIBLE_ROWS {
+            self.scroll = self.selected + 1 - VISIBLE_ROWS;
+        }
+    }
+
+    /// Apply a selection change: scroll the window if the new row is
+    /// off screen (the redraw waits for the background reload so the
+    /// panel never paints the old rows under the new state), else mark
+    /// just the two rows that swap highlight.
+    fn moved_from(&mut self, old: usize, ctx: &mut AppContext) {
+        if old == self.selected {
+            return;
+        }
+        let old_scroll = self.scroll;
+        self.scroll_into_view();
+        if self.scroll != old_scroll {
+            self.load = Load::Window;
+        } else if self.load == Load::Idle {
+            ctx.mark_dirty(row_region(old - self.scroll));
+            ctx.mark_dirty(row_region(self.selected - self.scroll));
         }
     }
 
     fn move_up(&mut self, ctx: &mut AppContext) {
-        if self.selected > 0 {
-            ctx.mark_dirty(row_region(self.selected));
-            self.selected -= 1;
-            ctx.mark_dirty(row_region(self.selected));
-        } else if self.page > 0 {
-            // every page before the last is full, so the bottom row
-            // always exists on the previous page. no dirty mark here:
-            // background_step marks after the reload, so the panel
-            // never paints the old page's rows under the new state
-            self.page -= 1;
-            self.selected = ROWS_PER_PAGE - 1;
-            self.needs_load = true;
-        }
+        let old = self.selected;
+        self.selected = self.selected.saturating_sub(1);
+        self.moved_from(old, ctx);
     }
 
     fn move_down(&mut self, ctx: &mut AppContext) {
-        if self.selected + 1 < self.page_count {
-            ctx.mark_dirty(row_region(self.selected));
+        let old = self.selected;
+        if self.selected + 1 < self.total {
             self.selected += 1;
-            ctx.mark_dirty(row_region(self.selected));
-        } else if self.page + 1 < self.total_pages() {
-            // dirty mark deferred to background_step, after the reload
-            self.page += 1;
-            self.selected = 0;
-            self.needs_load = true;
         }
-    }
-
-    /// Left = previous page, right = next page. AtEdge on the
-    /// first/last page hands the gesture back for a tab switch.
-    fn move_page(&mut self, dir: HDir, _ctx: &mut AppContext) -> HResult {
-        match dir {
-            HDir::Right if self.page + 1 < self.total_pages() => self.page += 1,
-            HDir::Left if self.page > 0 => self.page -= 1,
-            _ => return HResult::AtEdge,
-        }
-        // keep the row index; load_page clamps it on short last pages.
-        // the dirty mark waits for background_step so the render never
-        // races the reload and paints the previous page's entries
-        self.needs_load = true;
-        HResult::Consumed
+        self.moved_from(old, ctx);
     }
 
     fn select(&mut self, ctx: &mut AppContext) -> Transition {
-        // between a page change and its reload the entries still hold
-        // the previous page; opening one would launch the wrong book
-        if self.needs_load {
+        // between a move and its reload the window still holds the
+        // previous rows; opening one would launch the wrong book
+        if self.load != Load::Idle {
             return Transition::None;
         }
-        if let Some(entry) = self.entries.get(self.selected).and_then(|e| e.as_ref()) {
+        let slot = self.selected - self.window_start;
+        if let Some(entry) = self.entries.get(slot).and_then(|e| e.as_ref()) {
             ctx.set_message(entry.name.as_bytes());
             Transition::Push(AppId::Reader)
         } else {
             Transition::None
+        }
+    }
+
+    fn draw_caption(&self, strip: &mut StripBuffer, font: &'static fonts::bitmap::BitmapFont) {
+        let theme = Theme::default_v1();
+        let mut painter = Painter::new(strip, &theme);
+
+        let mut count = StackFmt::<16>::new();
+        let _ = match self.total {
+            1 => write!(count, "1 book"),
+            n => write!(count, "{} books", n),
+        };
+        SectionLabel::new(CAPTION_REGION, count.as_str()).draw(&mut painter, font);
+
+        if self.total > VISIBLE_ROWS {
+            let mut range = StackFmt::<24>::new();
+            let first = self.scroll + 1;
+            let last = (self.scroll + VISIBLE_ROWS).min(self.total);
+            let _ = write!(range, "{}\u{2013}{} of {}", first, last, self.total);
+            SectionLabel::new(CAPTION_REGION, range.as_str())
+                .right_aligned()
+                .draw(&mut painter, font);
         }
     }
 }
@@ -189,15 +266,15 @@ impl LibraryApp {
 impl App<AppId> for LibraryApp {
     fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
         self.selected = 0;
-        self.page = 0;
-        self.needs_load = true;
+        self.scroll = 0;
+        self.load = Load::Full;
         ctx.mark_dirty(CONTENT_REGION);
     }
 
     fn on_resume(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
-        // keep page + selection so backing out of a book returns to
+        // keep scroll + selection so backing out of a book returns to
         // the same spot; reload in case files or covers changed
-        self.needs_load = true;
+        self.load = Load::Full;
         ctx.mark_dirty(CONTENT_REGION);
     }
 
@@ -212,7 +289,7 @@ impl App<AppId> for LibraryApp {
             log::info!("library: pre-sleep freed ~{}B mini-thumbs", freed_bytes);
         }
         // reload covers on wake
-        self.needs_load = true;
+        self.load = Load::Full;
     }
 
     fn background_step(
@@ -221,11 +298,10 @@ impl App<AppId> for LibraryApp {
         k: &mut KernelHandle<'_>,
         _budget: BgBudget,
     ) -> BgOutcome {
-        if !self.needs_load {
+        if self.load == Load::Idle {
             return BgOutcome::Idle;
         }
-        self.load_page(k);
-        self.needs_load = false;
+        self.load_window(k);
         ctx.mark_dirty(CONTENT_REGION);
         BgOutcome::Progress { more: false }
     }
@@ -245,21 +321,19 @@ impl App<AppId> for LibraryApp {
         }
     }
 
-    fn on_horizontal(&mut self, dir: HDir, ctx: &mut AppContext) -> HResult {
-        self.move_page(dir, ctx)
-    }
-
     fn draw(&self, strip: &mut StripBuffer) {
         let font = self.ui_fonts.body;
 
-        for i in 0..self.page_count {
-            let Some(entry) = self.entries[i].as_ref() else {
+        self.draw_caption(strip, font);
+
+        for slot in 0..self.window_count {
+            let Some(entry) = self.entries[slot].as_ref() else {
                 continue;
             };
             // page count from the cached layout index; hidden until
             // the book has been opened and indexed at least once
-            let mut pages = crate::ui::stack_fmt::StackFmt::<16>::new();
-            match self.pages[i] {
+            let mut pages = StackFmt::<16>::new();
+            match self.pages[slot] {
                 0 => {}
                 1 => {
                     let _ = write!(pages, "1 page");
@@ -268,26 +342,23 @@ impl App<AppId> for LibraryApp {
                     let _ = write!(pages, "{} pages", n);
                 }
             }
-            BookRow::new(row_region(i), entry.display_name())
-                .cover(self.covers[i].as_ref())
+            BookRow::new(row_region(slot), entry.display_name())
+                .cover(self.covers[slot].as_ref())
                 .trailing(pages.as_str())
-                .selected(self.selected == i)
+                .selected(self.selected == self.window_start + slot)
                 .draw(strip, font);
         }
 
-        if self.page_count == 0 {
-            let center_y = LIST_TOP + (FOOTER_Y - LIST_TOP - font.line_height) / 2;
+        if self.window_count == 0 {
+            let center_y = LIST_TOP + (LIST_BOTTOM - LIST_TOP - font.line_height) / 2;
             let center = Region::new(LARGE_MARGIN, center_y, FULL_CONTENT_W, font.line_height);
-            font.draw_aligned(strip, center, "No books on the card", Alignment::Center, BinaryColor::On);
+            font.draw_aligned(
+                strip,
+                center,
+                "No books on the card",
+                Alignment::Center,
+                BinaryColor::On,
+            );
         }
-
-        // pagination footer: "page X of N"
-        let mut footer = BitmapDynLabel::<24>::new(
-            Region::new(LARGE_MARGIN, FOOTER_Y, SCREEN_W - 2 * LARGE_MARGIN, FOOTER_H),
-            font,
-        )
-        .alignment(Alignment::Center);
-        let _ = write!(footer, "page {} of {}", self.page + 1, self.total_pages());
-        footer.draw(strip).ok();
     }
 }
