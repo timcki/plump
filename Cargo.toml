@@ -1,5 +1,7 @@
 [workspace]
 members = [".", "kernel"]
+# vendored crate with a local patch; a path dependency, not a member
+exclude = ["vendor/embedded-sdmmc-rs"]
 
 [workspace.dependencies]
 esp-hal  = { version = "1.0.0", features = ["esp32c3", "log-04", "unstable"] }
@@ -12,7 +14,7 @@ embedded-hal-async = "1.0.0"
 embedded-hal-bus   = "0.3.0"
 embedded-graphics-core = "0.4.1"
 embedded-graphics      = "0.8.2"
-embedded-sdmmc = { git = "https://github.com/hansmrtn/embedded-sdmmc-rs", branch = "async", features = ["async"] }
+embedded-sdmmc = { path = "vendor/embedded-sdmmc-rs", features = ["async"] }
 smol-epub      = { path = "../smol-epub", features = ["async"] }
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
