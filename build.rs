@@ -87,8 +87,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-// font families to rasterise. tuple is (constant prefix, subdirectory,
-// base weight keyword). Bookerly + Atkinson supply reader fonts
+// font families to rasterise. Bookerly + Atkinson supply reader fonts
 // (selectable); Inter supplies every UI surface; Phosphor supplies the
 // icon glyphs for tab bar + panel rows.
 //
@@ -96,29 +95,65 @@ use std::path::{Path, PathBuf};
 // "Regular" rasterisation. Bookerly/Atkinson/Inter pick the canonical
 // Regular TTF; Phosphor only ships Bold, so we treat its Bold file as
 // the Regular variant and skip emitting separate Bold/Italic sets.
-const FAMILIES: &[(&str, &str, &str)] = &[
-    ("BOOKERLY", "Bookerly", "Regular"),
-    ("ATKINSON", "Atkinson", "Regular"),
-    ("INTER", "Inter", "Regular"),
-    ("PHOSPHOR", "Phosphor", "Bold"),
-];
+struct FamilySpec {
+    prefix: &'static str,
+    dir: &'static str,
+    // filename keyword for the file treated as the "Regular" rasterisation
+    base_weight: &'static str,
+    body: [f32; 5],
+    heading: [f32; 5],
+}
 
-// body sizes (px): 0=XSmall 1=Small 2=Medium 3=Large 4=XLarge
-const BODY_PX: [(f32, &str); 5] = [
-    (16.0, "XSMALL"),
-    (19.0, "SMALL"),
-    (23.0, "MEDIUM"),
-    (28.0, "LARGE"),
-    (35.0, "XLARGE"),
-];
+// size tiers: 0=XSmall 1=Small 2=Medium 3=Large 4=XLarge
+const TIERS: [&str; 5] = ["XSMALL", "SMALL", "MEDIUM", "LARGE", "XLARGE"];
 
-// Heading sizes scale proportionally
-const HEADING_PX: [(f32, &str); 5] = [
-    (23.0, "XSMALL"),
-    (27.0, "SMALL"),
-    (32.0, "MEDIUM"),
-    (38.0, "LARGE"),
-    (46.0, "XLARGE"),
+// px ladders are per family, not shared. the panel is a GDEQ0426T82
+// (4.26" 800x480 = 219 PPI), so 1 pt is 3.04 px and body text lives in
+// the 16-36 px range where unhinted rasterisation is very sensitive to
+// the exact ppem: at one size a stem lands on a pixel boundary and
+// renders solid, one px either side it straddles two columns and
+// smears into grays. the size that lands well differs per face, so
+// forcing one number on all of them guarantees some are on a bad one.
+//
+// values chosen by measuring, per face and per candidate px, the
+// fraction of vertical-stroke ink that rasterises solid rather than
+// smeared, plus how close the x-height lands to a whole pixel. each
+// tier holds its x-height across families so switching reader font
+// doesn't change apparent size, and no tier moved unless the sharper
+// value was a clear win. Bookerly Medium sits at 22 where Atkinson
+// wants 23 - that disagreement is the whole reason these are split.
+//
+// Phosphor is an icon font (private-use codepoints, no ASCII to
+// measure) and rides the Inter ladder so icons scale with UI text.
+const FAMILIES: &[FamilySpec] = &[
+    FamilySpec {
+        prefix: "BOOKERLY",
+        dir: "Bookerly",
+        base_weight: "Regular",
+        body: [16.0, 19.0, 22.0, 28.0, 35.0],
+        heading: [22.0, 27.0, 32.0, 38.0, 46.0],
+    },
+    FamilySpec {
+        prefix: "ATKINSON",
+        dir: "Atkinson",
+        base_weight: "Regular",
+        body: [16.0, 19.0, 23.0, 28.0, 35.0],
+        heading: [23.0, 27.0, 32.0, 38.0, 46.0],
+    },
+    FamilySpec {
+        prefix: "INTER",
+        dir: "Inter",
+        base_weight: "Regular",
+        body: [17.0, 18.0, 24.0, 28.0, 36.0],
+        heading: [24.0, 27.0, 33.0, 39.0, 46.0],
+    },
+    FamilySpec {
+        prefix: "PHOSPHOR",
+        dir: "Phosphor",
+        base_weight: "Bold",
+        body: [17.0, 18.0, 24.0, 28.0, 36.0],
+        heading: [24.0, 27.0, 33.0, 39.0, 46.0],
+    },
 ];
 
 // ASCII range (direct-indexed)
@@ -392,21 +427,22 @@ fn generate_bitmap_fonts() {
     .unwrap();
     writeln!(out).unwrap();
 
-    for (prefix, dirname, base_weight) in FAMILIES {
-        let dir = assets.join(dirname);
+    for fam in FAMILIES {
+        let prefix = fam.prefix;
+        let dir = assets.join(fam.dir);
         println!("cargo:rerun-if-changed={}", dir.display());
 
-        let regular = find_ttf(&dir, base_weight);
+        let regular = find_ttf(&dir, fam.base_weight);
         // only emit bold / italic when the family ships its own
         // dedicated regular file (i.e. base_weight is "Regular").
         // Phosphor only has Bold; reusing it as bold / italic would
         // bloat the binary with duplicate bitmaps.
-        let bold = if *base_weight == "Regular" {
+        let bold = if fam.base_weight == "Regular" {
             find_ttf(&dir, "Bold")
         } else {
             None
         };
-        let italic = if *base_weight == "Regular" {
+        let italic = if fam.base_weight == "Regular" {
             find_ttf(&dir, "Italic")
         } else {
             None
@@ -433,7 +469,7 @@ fn generate_bitmap_fonts() {
         emit_or_stub_set(
             &mut out,
             regular.as_deref(),
-            prefix,
+            fam,
             "REGULAR",
             true,
             &ext_codepoints,
@@ -442,7 +478,7 @@ fn generate_bitmap_fonts() {
         emit_or_stub_set(
             &mut out,
             bold.as_deref(),
-            prefix,
+            fam,
             "BOLD",
             false,
             &ext_codepoints,
@@ -450,7 +486,7 @@ fn generate_bitmap_fonts() {
         emit_or_stub_set(
             &mut out,
             italic.as_deref(),
-            prefix,
+            fam,
             "ITALIC",
             false,
             &ext_codepoints,
@@ -461,11 +497,12 @@ fn generate_bitmap_fonts() {
 fn emit_or_stub_set(
     out: &mut fs::File,
     path: Option<&Path>,
-    family_prefix: &str,
+    fam: &FamilySpec,
     style_prefix: &str,
     include_heading: bool,
     ext_codepoints: &[u32],
 ) {
+    let family_prefix = fam.prefix;
     if let Some(p) = path {
         let data = fs::read(p).unwrap();
         let font = fontdue::Font::from_bytes(data.as_slice(), fontdue::FontSettings::default())
@@ -474,7 +511,7 @@ fn emit_or_stub_set(
             "cargo:warning=font: rasterising {} as {family_prefix}_{style_prefix}",
             p.file_name().unwrap().to_string_lossy(),
         );
-        for (px, suffix) in &BODY_PX {
+        for (px, suffix) in fam.body.iter().zip(TIERS) {
             emit_font(
                 out,
                 &font,
@@ -484,7 +521,7 @@ fn emit_or_stub_set(
             );
         }
         if include_heading {
-            for (px, suffix) in &HEADING_PX {
+            for (px, suffix) in fam.heading.iter().zip(TIERS) {
                 emit_font(
                     out,
                     &font,
@@ -495,11 +532,11 @@ fn emit_or_stub_set(
             }
         }
     } else {
-        for (_px, suffix) in &BODY_PX {
+        for suffix in TIERS {
             emit_stub(out, &format!("{family_prefix}_{style_prefix}_BODY_{suffix}"));
         }
         if include_heading {
-            for (_px, suffix) in &HEADING_PX {
+            for suffix in TIERS {
                 emit_stub(
                     out,
                     &format!("{family_prefix}_{style_prefix}_HEADING_{suffix}"),
