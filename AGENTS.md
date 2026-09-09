@@ -191,6 +191,11 @@ Then every 5 seconds: heap usage, stack watermark, battery percentage, uptime, S
 ├── ld/                             vendored linker chain: pinned stack +
 │                                   single contiguous heap (linkall.x,
 │                                   esp32c3-plump.x, stack-plump.x)
+├── vendor/
+│   └── embedded-sdmmc-rs/          hansmrtn async fork of embedded-sdmmc
+│                                   with a local patch (FAT32 directory
+│                                   walk stops at the end marker); see
+│                                   PLUMP-VENDOR.md inside
 ├── assets/
 │   ├── fonts/                      TTF files (regular, bold, italic)
 │   └── upload.html                 web UI for WiFi upload mode
@@ -392,3 +397,4 @@ Font-dependent widgets go in `src/apps/widgets/`. Font-independent primitives go
 - **Dirty-region tracking.** Always call `ctx.mark_dirty(region)` with the tightest possible region. The renderer only refreshes the dirty area. Full-screen redraws are expensive (~600ms for GC).
 - **Yield for fairness.** Long-running sync work should intersperse `embassy_futures::yield_now().await` calls to let other tasks run.
 - **poll_once is sacred.** Only use it for operations that are guaranteed to complete in a single poll (sync SPI). If the future could pend, it will panic.
+- **One file open per read session.** Every `open_file_in_dir` scans the directory on SD, so a caller that needs several pieces of one file goes through `SdStorage::with_file_in_plump_subdir` (or `bundle::with_reader` for bundles) and does its reads on the open `FileReader`. The data dir and its subdirs (`BOOKS`, `STATS`) are opened once and cached in `SdStorageInner`; only `Scope::Named` opens a directory per call.

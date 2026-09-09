@@ -48,10 +48,19 @@ impl DirCache {
             return Ok(());
         }
 
+        let t0 = embassy_time::Instant::now();
         let count = sd.list_root_files(&mut self.entries)?;
         self.count = count;
         sort_entries(&mut self.entries, self.count);
+        let scan_ms = t0.elapsed().as_millis();
+        let t1 = embassy_time::Instant::now();
         self.load_titles(sd);
+        log::info!(
+            "dir cache: {} entries, root scan {}ms, titles {}ms",
+            count,
+            scan_ms,
+            t1.elapsed().as_millis()
+        );
         for i in 0..self.count {
             self.entries[i].humanize_sfn();
         }
@@ -76,6 +85,7 @@ impl DirCache {
                 Err(_) => return,
             };
             if n == 0 {
+                log::info!("dir cache: TITLES.BIN {} bytes", offset);
                 break;
             }
             offset += n as u32;

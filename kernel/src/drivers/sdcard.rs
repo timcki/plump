@@ -22,6 +22,7 @@ use embedded_sdmmc::{
 use log::info;
 
 use crate::board::SdSpiDevice;
+use crate::util::FixedStr;
 
 // sync BlockDevice -> AsyncBlockDevice adapter
 //
@@ -76,7 +77,13 @@ impl TimeSource for NullTimeSource {
 
 pub type SyncSdCard = SdCard<SdSpiDevice, esp_hal::delay::Delay>;
 pub(crate) type SdBlockDev = BlockDeviceAdapter<SyncSdCard>;
-pub(crate) type VolMgr = AsyncVolumeManager<SdBlockDev, NullTimeSource, 4, 4, 1>;
+// directory budget: root + data dir + cached subdirs + one transient
+// open for Scope::Named or an uncached subdir
+pub(crate) type VolMgr = AsyncVolumeManager<SdBlockDev, NullTimeSource, 8, 4, 1>;
+
+// subdirectory handles kept open alongside the data dir (BOOKS,
+// STATS, ...); names longer than the FixedStr are never cached
+pub(crate) const SUB_HANDLES: usize = 4;
 
 // persistent volume manager state, held behind RefCell for interior
 // mutability (AsyncVolumeManager requires &mut self)
@@ -87,6 +94,11 @@ pub(crate) struct SdStorageInner {
     pub(crate) root: RawDirectory,
     /// Resolved data directory name ("_PLUMP" or legacy "_PULP").
     pub(crate) data_dir: &'static str,
+    /// data directory handle, opened on first use and kept for the
+    /// device lifetime: every directory open scans its parent on SD
+    pub(crate) data_handle: Option<RawDirectory>,
+    /// subdirectories of the data dir, same lifetime, keyed by name
+    pub(crate) sub_handles: [Option<(FixedStr<12>, RawDirectory)>; SUB_HANDLES],
 }
 
 // holds a persistently-mounted AsyncVolumeManager with volume 0 and
@@ -137,7 +149,7 @@ impl SdStorage {
     // directory open for the device lifetime
     pub async fn mount(sd: SyncSdCard) -> Self {
         let adapter = BlockDeviceAdapter(sd);
-        let mut mgr = AsyncVolumeManager::new(adapter, NullTimeSource);
+        let mut mgr: VolMgr = AsyncVolumeManager::new_with_limits(adapter, NullTimeSource, 5000);
 
         let vol = match mgr.open_raw_volume(VolumeIdx(0)).await {
             Ok(v) => v,
@@ -163,6 +175,8 @@ impl SdStorage {
                 vol,
                 root,
                 data_dir: crate::drivers::storage::PLUMP_DIR,
+                data_handle: None,
+                sub_handles: [None; SUB_HANDLES],
             })),
         }
     }
@@ -192,6 +206,7 @@ impl SdStorage {
         if let Some(ref cell) = self.inner {
             let mut guard = cell.borrow_mut();
             let inner = &mut *guard;
+            inner.drop_dir_handles();
             let _ = inner.mgr.close_dir(inner.root);
             poll_once(async {
                 let _ = inner.mgr.close_volume(inner.vol).await;

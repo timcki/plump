@@ -371,19 +371,86 @@ impl SdStorageInner {
             .map_err(|_| Error::new(ErrorKind::OpenDir, "open_dir"))
     }
 
-    async fn open_subdir(
-        &mut self,
-        d1: &str,
-        d2: &str,
-    ) -> crate::error::Result<(RawDirectory, RawDirectory)> {
-        let mid = self.open_dir(d1).await?;
-        match self.mgr.open_dir(mid, d2).await {
-            Ok(sub) => Ok((mid, sub)),
-            Err(_) => {
-                let _ = self.mgr.close_dir(mid);
-                Err(Error::new(ErrorKind::OpenDir, "open_subdir"))
+    /// The data directory, opened once and kept for the device
+    /// lifetime.
+    async fn data_handle(&mut self) -> crate::error::Result<RawDirectory> {
+        if let Some(dir) = self.data_handle {
+            return Ok(dir);
+        }
+        let dir = self.open_dir(self.data_dir).await?;
+        self.data_handle = Some(dir);
+        Ok(dir)
+    }
+
+    /// A subdirectory of the data dir. The bool says whether the
+    /// handle is cached; an uncached one (table full, name too long)
+    /// belongs to the caller, who closes it after use.
+    async fn sub_handle(&mut self, name: &str) -> crate::error::Result<(RawDirectory, bool)> {
+        for (cached, dir) in self.sub_handles.iter().flatten() {
+            if cached.as_str() == name {
+                return Ok((*dir, true));
             }
         }
+        let parent = self.data_handle().await?;
+        let dir = self
+            .mgr
+            .open_dir(parent, name)
+            .await
+            .map_err(|_| Error::new(ErrorKind::OpenDir, "sub_handle"))?;
+        if name.len() <= 12
+            && let Some(free) = self.sub_handles.iter_mut().find(|s| s.is_none())
+        {
+            *free = Some((FixedStr::from_bytes(name.as_bytes()), dir));
+            return Ok((dir, true));
+        }
+        Ok((dir, false))
+    }
+
+    /// Close every cached directory handle (data dir change, halt).
+    pub(crate) fn drop_dir_handles(&mut self) {
+        if let Some(dir) = self.data_handle.take() {
+            let _ = self.mgr.close_dir(dir);
+        }
+        for slot in self.sub_handles.iter_mut() {
+            if let Some((_, dir)) = slot.take() {
+                let _ = self.mgr.close_dir(dir);
+            }
+        }
+    }
+}
+
+/// Read-only handle to an open file, valid inside
+/// [`SdStorage::with_file_in_plump_subdir`]. Each `read_at` is one seek
+/// plus one read on the already-open file, so a caller that needs
+/// several pieces of one file pays the directory lookup once.
+pub struct FileReader<'a> {
+    inner: &'a mut SdStorageInner,
+    raw: RawFile,
+}
+
+impl FileReader<'_> {
+    /// File size in bytes.
+    pub fn len(&self) -> u32 {
+        self.inner.mgr.file_length(self.raw).unwrap_or(0)
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Read `buf.len()` bytes at `offset`; returns the count actually
+    /// read (short at end of file).
+    pub fn read_at(&mut self, offset: u32, buf: &mut [u8]) -> crate::error::Result<usize> {
+        self.inner
+            .mgr
+            .file_seek_from_start(self.raw, offset)
+            .map_err(|_| Error::new(ErrorKind::SeekFailed, "FileReader::read_at"))?;
+        let n = poll_once(self.inner.mgr.read(self.raw, buf))
+            .map_err(|_| Error::new(ErrorKind::ReadFailed, "FileReader::read_at"))?;
+        crate::perf::counters::inc_sd_reads();
+        crate::perf::counters::add_sd_bytes_read(n as u32);
+        Ok(n)
     }
 }
 
@@ -495,19 +562,16 @@ impl SdStorage {
         let mut guard = borrow(self)?;
         let inner = &mut *guard;
 
-        // root stays open for the device lifetime, so only the
-        // directories opened here are closed here
-        let (dir, mid, close_dir) = match scope {
-            Scope::Root => (inner.root, None, false),
-            Scope::Named(d) => (inner.open_dir(d).await?, None, true),
-            Scope::Data => {
-                let dd = inner.data_dir;
-                (inner.open_dir(dd).await?, None, true)
-            }
+        // root, the data dir and its cached subdirs stay open for the
+        // device lifetime, so only a directory opened here is closed
+        // here
+        let (dir, close_dir) = match scope {
+            Scope::Root => (inner.root, false),
+            Scope::Named(d) => (inner.open_dir(d).await?, true),
+            Scope::Data => (inner.data_handle().await?, false),
             Scope::DataSub(sub) => {
-                let dd = inner.data_dir;
-                let (mid, leaf) = inner.open_subdir(dd, sub).await?;
-                (leaf, Some(mid), true)
+                let (dir, cached) = inner.sub_handle(sub).await?;
+                (dir, !cached)
             }
         };
 
@@ -515,9 +579,6 @@ impl SdStorage {
 
         if close_dir {
             let _ = inner.mgr.close_dir(dir);
-        }
-        if let Some(mid) = mid {
-            let _ = inner.mgr.close_dir(mid);
         }
         result
     }
@@ -676,6 +737,7 @@ impl SdStorage {
     pub async fn ensure_plump_dir_async(&self) -> crate::error::Result<()> {
         let mut guard = borrow(self)?;
         let inner = &mut *guard;
+        inner.drop_dir_handles();
 
         // Try the current name first.
         if let Ok(dir) = inner.mgr.open_dir(inner.root, PLUMP_DIR).await {
@@ -826,6 +888,36 @@ impl SdStorage {
         poll_once(self.with_scope(Scope::DataSub(dir), async |inner, sub| {
             inner.read_chunk(sub, name, offset, buf).await
         }))
+    }
+
+    /// Open a file in <data_dir>/<dir>/ once and run `f` against it;
+    /// the file closes on every exit path. Use this over repeated
+    /// `read_chunk_in_plump_subdir` calls when several reads target one
+    /// file: each of those pays the directory lookup again.
+    pub fn with_file_in_plump_subdir<T>(
+        &self,
+        dir: &str,
+        name: &str,
+        f: impl FnOnce(&mut FileReader<'_>) -> crate::error::Result<T>,
+    ) -> crate::error::Result<T> {
+        poll_once(
+            self.with_scope(Scope::DataSub(dir), async move |inner, sub| {
+                let raw = inner
+                    .mgr
+                    .open_file_in_dir(sub, name, Mode::ReadOnly)
+                    .await
+                    .map_err(|_| Error::new(ErrorKind::OpenFile, "with_file_in_plump_subdir"))?;
+                let result = {
+                    let mut reader = FileReader {
+                        inner: &mut *inner,
+                        raw,
+                    };
+                    f(&mut reader)
+                };
+                let _ = inner.mgr.close_file(raw).await;
+                result
+            }),
+        )
     }
 
     /// Get the size of a file in <data_dir>/<dir>/.

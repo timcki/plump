@@ -116,8 +116,8 @@ impl LibraryApp {
     /// Read directory entry `index` plus its mini cover and cached
     /// page count into `slot`. Returns false past the end of the list.
     fn load_slot(&mut self, k: &mut KernelHandle<'_>, slot: usize, index: usize) -> bool {
-        // drop the old cover first so load_cover_variant_for has a
-        // free heap window
+        // drop the old cover first so the bundle read has a free heap
+        // window
         self.clear_slot(slot);
         let mut scratch = [DirEntry::EMPTY; 1];
         let Ok(page) = k.dir_page(index, &mut scratch) else {
@@ -134,14 +134,17 @@ impl LibraryApp {
             plump_kernel::kernel::bundle::CoverKind::Mini,
         );
         let name_hash = plump_kernel::util::hash::fnv1a(entry.name.as_bytes());
-        self.pages[slot] =
-            plump_kernel::kernel::bundle::cached_total_pages(k.sd(), name_hash).unwrap_or(0);
+        let book = crate::apps::cover_cache::load_library_entry(k, name_hash);
+        self.covers[slot] = book.cover;
+        self.pages[slot] = book.total_pages.unwrap_or(0);
         self.entries[slot] = Some(entry);
         true
     }
 
     fn load_window(&mut self, k: &mut KernelHandle<'_>) {
+        let t0 = embassy_time::Instant::now();
         let _ = k.ensure_dir_cache_loaded();
+        let dir_ms = t0.elapsed().as_millis();
 
         // files may have come or gone since the last load (upload tab,
         // card swap): refresh the total and clamp before reading rows
@@ -174,9 +177,20 @@ impl LibraryApp {
         };
         // a rotated slot may hold a stale cover from before the shift;
         // load_slot drops it before allocating the replacement
+        let t1 = embassy_time::Instant::now();
         for slot in first..last {
             self.load_slot(k, slot, self.scroll + slot);
         }
+        log::info!(
+            "library: window {}..{} of {} loaded in {}ms (dir cache {}ms, {} rows {}ms)",
+            self.scroll,
+            self.scroll + VISIBLE_ROWS.min(self.total.saturating_sub(self.scroll)),
+            self.total,
+            t0.elapsed().as_millis(),
+            dir_ms,
+            last - first,
+            t1.elapsed().as_millis(),
+        );
         self.window_start = self.scroll;
         self.window_count = self.total.saturating_sub(self.scroll).min(VISIBLE_ROWS);
         for slot in self.window_count..VISIBLE_ROWS {

@@ -15,8 +15,10 @@
 
 use alloc::vec::Vec;
 
+use plump_kernel::drivers::storage::FileReader;
 use plump_kernel::kernel::bundle::{
-    self, BundleError, BundleFile, CoverKind, CoverVariant, CoversHeader, SectionId, SectionRange,
+    self, BundleError, BundleFile, BundleHeader, CoverKind, CoverVariant, CoversHeader, SectionId,
+    SectionRange,
 };
 use plump_kernel::util::hash;
 
@@ -142,50 +144,86 @@ pub fn save_cover_variants(
     Ok(())
 }
 
-/// Read the variant matching `prefer`; falls back to the first
-/// available variant of any kind when the preferred one is missing.
-pub fn load_cover_variant(
-    k: &mut KernelHandle<'_>,
-    name_hash: u32,
-    prefer: CoverKind,
-) -> Option<DecodedImage> {
-    let mut bf = BundleFile::open(k.sd(), name_hash).ok()?;
-    if !bf.header().has_flag(bundle::FLAG_COVERS_READY) {
+// variant table read in one go with the covers header. writers store
+// two variants today (Card + Mini); entries past the fourth are not
+// consulted.
+const MAX_VARIANTS: usize = 4;
+const TABLE_MAX: usize = bundle::COVERS_HDR_SIZE + MAX_VARIANTS * bundle::COVER_VARIANT_SIZE;
+
+struct VariantTable {
+    range: SectionRange,
+    buf: [u8; TABLE_MAX],
+    len: usize,
+    count: usize,
+}
+
+impl VariantTable {
+    fn entries(&self) -> impl Iterator<Item = CoverVariant> + '_ {
+        (0..self.count).filter_map(move |i| {
+            let start = bundle::COVERS_HDR_SIZE + i * bundle::COVER_VARIANT_SIZE;
+            let end = start + bundle::COVER_VARIANT_SIZE;
+            if end > self.len {
+                return None;
+            }
+            CoverVariant::decode(&self.buf[start..end])
+        })
+    }
+
+    /// The variant of kind `prefer`, else the first one of any kind.
+    fn pick(&self, prefer: CoverKind) -> Option<CoverVariant> {
+        let mut chosen = None;
+        for v in self.entries() {
+            if v.kind == prefer {
+                return Some(v);
+            }
+            if chosen.is_none() {
+                chosen = Some(v);
+            }
+        }
+        chosen
+    }
+}
+
+/// Covers header plus variant table of an open bundle, fetched with a
+/// single read. None when covers aren't ready or the section is short.
+fn variant_table_in(r: &mut FileReader<'_>, hdr: &BundleHeader) -> Option<VariantTable> {
+    if !hdr.has_flag(bundle::FLAG_COVERS_READY) {
         return None;
     }
-    let range = bf.section(SectionId::Covers)?;
+    let range = hdr.section(SectionId::Covers)?;
     if range.size < (bundle::COVERS_HDR_SIZE + bundle::COVER_VARIANT_SIZE) as u32 {
         return None;
     }
-
-    let mut hdr_buf = [0u8; bundle::COVERS_HDR_SIZE];
-    let section = bf.section_mut(SectionId::Covers).ok()?;
-    section.read_at(0, &mut hdr_buf).ok()?;
-    let covers_hdr = CoversHeader::decode(&hdr_buf)?;
-    if covers_hdr.variant_count == 0 {
+    let mut buf = [0u8; TABLE_MAX];
+    let want = (range.size as usize).min(TABLE_MAX);
+    let len = r.read_at(range.offset, &mut buf[..want]).ok()?;
+    if len < bundle::COVERS_HDR_SIZE {
         return None;
     }
+    let covers_hdr = CoversHeader::decode(&buf[..bundle::COVERS_HDR_SIZE])?;
+    Some(VariantTable {
+        range,
+        buf,
+        len,
+        count: covers_hdr.variant_count as usize,
+    })
+}
 
-    let mut var_buf = [0u8; bundle::COVER_VARIANT_SIZE];
-    let mut chosen: Option<CoverVariant> = None;
-    for i in 0..covers_hdr.variant_count as u32 {
-        let rel = bundle::COVERS_HDR_SIZE as u32 + i * bundle::COVER_VARIANT_SIZE as u32;
-        if section.read_at(rel, &mut var_buf).is_err() {
-            continue;
-        }
-        let Some(v) = CoverVariant::decode(&var_buf) else {
-            continue;
-        };
-        if v.kind == prefer {
-            chosen = Some(v);
-            break;
-        }
-        if chosen.is_none() {
-            chosen = Some(v);
-        }
-    }
-    let variant = chosen?;
+/// The `prefer` variant (or the first available) of an open bundle:
+/// one read for the table, one for the bitmap.
+fn read_cover_in(
+    r: &mut FileReader<'_>,
+    hdr: &BundleHeader,
+    prefer: CoverKind,
+) -> Option<DecodedImage> {
+    let table = variant_table_in(r, hdr)?;
+    let variant = table.pick(prefer)?;
     if variant.width == 0 || variant.height == 0 {
+        return None;
+    }
+    // the bitmap must lie inside the recorded section
+    let data_end = variant.data_offset.checked_add(variant.data_size)?;
+    if data_end > table.range.size {
         return None;
     }
 
@@ -193,7 +231,12 @@ pub fn load_cover_variant(
     let mut data = Vec::new();
     data.try_reserve_exact(data_len).ok()?;
     data.resize(data_len, 0);
-    section.read_at(variant.data_offset, &mut data).ok()?;
+    let n = r
+        .read_at(table.range.offset + variant.data_offset, &mut data)
+        .ok()?;
+    if n < data_len {
+        return None;
+    }
 
     Some(DecodedImage {
         width: variant.width,
@@ -203,43 +246,50 @@ pub fn load_cover_variant(
     })
 }
 
+/// Read the variant matching `prefer`; falls back to the first
+/// available variant of any kind when the preferred one is missing.
+pub fn load_cover_variant(
+    k: &mut KernelHandle<'_>,
+    name_hash: u32,
+    prefer: CoverKind,
+) -> Option<DecodedImage> {
+    bundle::with_reader(k.sd(), name_hash, |r| {
+        Ok(bundle::read_header_in(r).and_then(|hdr| read_cover_in(r, &hdr, prefer)))
+    })
+    .ok()
+    .flatten()
+}
+
 /// True iff the bundle has a variant of the given kind.
 pub fn has_cover_variant(k: &mut KernelHandle<'_>, name_hash: u32, kind: CoverKind) -> bool {
-    let Ok(mut bf) = BundleFile::open(k.sd(), name_hash) else {
-        return false;
-    };
-    if !bf.header().has_flag(bundle::FLAG_COVERS_READY) {
-        return false;
-    }
-    let Some(range) = bf.section(SectionId::Covers) else {
-        return false;
-    };
-    if range.size < (bundle::COVERS_HDR_SIZE + bundle::COVER_VARIANT_SIZE) as u32 {
-        return false;
-    }
-    let mut hdr_buf = [0u8; bundle::COVERS_HDR_SIZE];
-    let Ok(section) = bf.section_mut(SectionId::Covers) else {
-        return false;
-    };
-    if section.read_at(0, &mut hdr_buf).is_err() {
-        return false;
-    }
-    let Some(covers_hdr) = CoversHeader::decode(&hdr_buf) else {
-        return false;
-    };
-    let mut var_buf = [0u8; bundle::COVER_VARIANT_SIZE];
-    for i in 0..covers_hdr.variant_count as u32 {
-        let rel = bundle::COVERS_HDR_SIZE as u32 + i * bundle::COVER_VARIANT_SIZE as u32;
-        if section.read_at(rel, &mut var_buf).is_err() {
-            continue;
-        }
-        if let Some(v) = CoverVariant::decode(&var_buf)
-            && v.kind == kind
-        {
-            return true;
-        }
-    }
-    false
+    bundle::with_reader(k.sd(), name_hash, |r| {
+        Ok(bundle::read_header_in(r)
+            .and_then(|hdr| variant_table_in(r, &hdr))
+            .is_some_and(|table| table.entries().any(|v| v.kind == kind)))
+    })
+    .unwrap_or(false)
+}
+
+/// Everything a library row shows from the bundle, read in a single
+/// file session: the mini cover and the cached page count.
+#[derive(Default)]
+pub struct LibraryEntry {
+    pub cover: Option<DecodedImage>,
+    /// None until the book has been opened and indexed at least once
+    pub total_pages: Option<u32>,
+}
+
+pub fn load_library_entry(k: &mut KernelHandle<'_>, name_hash: u32) -> LibraryEntry {
+    bundle::with_reader(k.sd(), name_hash, |r| {
+        let Some(hdr) = bundle::read_header_in(r) else {
+            return Ok(LibraryEntry::default());
+        };
+        Ok(LibraryEntry {
+            cover: read_cover_in(r, &hdr, CoverKind::Mini),
+            total_pages: bundle::total_pages_in(r, &hdr),
+        })
+    })
+    .unwrap_or_default()
 }
 
 /// Filename-keyed wrapper around `load_cover_variant`.

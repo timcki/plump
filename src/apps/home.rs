@@ -184,8 +184,16 @@ impl HomeApp {
     }
 
     pub fn load_recent(&mut self, k: &mut KernelHandle<'_>) {
+        let t0 = embassy_time::Instant::now();
         self.load_card(k);
+        let card_ms = t0.elapsed().as_millis();
+        let t1 = embassy_time::Instant::now();
         self.load_recent_rows(k);
+        log::info!(
+            "home: load card {}ms rows {}ms",
+            card_ms,
+            t1.elapsed().as_millis()
+        );
         self.rebuild_item_count();
     }
 

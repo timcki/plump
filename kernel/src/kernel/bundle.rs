@@ -18,6 +18,7 @@
 // io module wraps SdStorage to read/write bundle bytes by name_hash.
 
 use crate::drivers::sdcard::SdStorage;
+use crate::drivers::storage::FileReader;
 use crate::util::FixedStr;
 
 // ── on-disk layout: directory + filename ───────────────────────────
@@ -884,6 +885,29 @@ pub fn read_header(sd: &SdStorage, name_hash: u32) -> Option<BundleHeader> {
     BundleHeader::decode(&buf)
 }
 
+/// open the bundle once and run `f` against it. the free `read_at`
+/// pays a directory lookup per call; a session pays it once, so use
+/// this whenever a caller reads several pieces of one bundle (header,
+/// then a section). fails when the bundle is missing.
+pub fn with_reader<T>(
+    sd: &SdStorage,
+    name_hash: u32,
+    f: impl FnOnce(&mut FileReader<'_>) -> crate::error::Result<T>,
+) -> crate::error::Result<T> {
+    let n = bundle_file_name(name_hash);
+    sd.with_file_in_plump_subdir(BOOKS_DIR, bundle_file_str(&n), f)
+}
+
+/// decode the header of an open bundle; None when short or invalid
+pub fn read_header_in(r: &mut FileReader<'_>) -> Option<BundleHeader> {
+    let mut buf = [0u8; HEADER_SIZE];
+    let nread = r.read_at(0, &mut buf).ok()?;
+    if nread < HEADER_SIZE {
+        return None;
+    }
+    BundleHeader::decode(&buf)
+}
+
 /// sum the cached per-chapter page counts from the PidxDir section.
 /// the on-disk `LayoutIdxHeader.total_pages` field is never stamped
 /// with a real value, so the chapter dir entries are the source of
@@ -894,7 +918,17 @@ pub fn read_header(sd: &SdStorage, name_hash: u32) -> Option<BundleHeader> {
 /// settings change, and as a lower bound while a book is still being
 /// indexed in the background.
 pub fn cached_total_pages(sd: &SdStorage, name_hash: u32) -> Option<u32> {
-    let hdr = read_header(sd, name_hash)?;
+    with_reader(sd, name_hash, |r| {
+        Ok(read_header_in(r).and_then(|hdr| total_pages_in(r, &hdr)))
+    })
+    .ok()
+    .flatten()
+}
+
+/// `cached_total_pages` for an open bundle whose header is already
+/// decoded, so a caller reading the cover in the same session pays no
+/// second file open
+pub fn total_pages_in(r: &mut FileReader<'_>, hdr: &BundleHeader) -> Option<u32> {
     if !hdr.has_flag(FLAG_PAGEIDX_READY) {
         return None;
     }
@@ -906,7 +940,7 @@ pub fn cached_total_pages(sd: &SdStorage, name_hash: u32) -> Option<u32> {
     // validate the PIDX stamp (magic + format) before trusting the
     // entries; a mismatched key still yields a usable approximation
     let mut hbuf = [0u8; PAGEIDX_HDR_V2_SIZE];
-    let n = read_at(sd, name_hash, dir.offset, &mut hbuf).ok()?;
+    let n = r.read_at(dir.offset, &mut hbuf).ok()?;
     if n < PAGEIDX_HDR_V2_SIZE {
         return None;
     }
@@ -923,10 +957,8 @@ pub fn cached_total_pages(sd: &SdStorage, name_hash: u32) -> Option<u32> {
     while i < n_entries {
         let batch = (n_entries - i).min(BATCH);
         let bytes = batch * CHAPTER_LAYOUT_DIR_SIZE;
-        let off = dir.offset
-            + PAGEIDX_HDR_V2_SIZE as u32
-            + (i * CHAPTER_LAYOUT_DIR_SIZE) as u32;
-        let n = read_at(sd, name_hash, off, &mut buf[..bytes]).ok()?;
+        let off = dir.offset + PAGEIDX_HDR_V2_SIZE as u32 + (i * CHAPTER_LAYOUT_DIR_SIZE) as u32;
+        let n = r.read_at(off, &mut buf[..bytes]).ok()?;
         if n < bytes {
             return None;
         }
