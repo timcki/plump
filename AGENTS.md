@@ -15,7 +15,7 @@ The codebase splits into a **kernel** (hardware drivers, scheduling, storage) an
 | MCU | ESP32-C3, single-core RISC-V RV32IMC, 160 MHz |
 | RAM | 400 KB DRAM; ~160 KB heap in a single contiguous region (pinned stack top → end of bootloader-reclaimed RAM), TLSF allocator |
 | Stack | 58 KB pinned right after .bss (see `ld/stack-plump.x`), painted with `0xDEAD_BEEF` canary at boot, high-water-mark logged every 5s |
-| Display | SSD1677 mono e-paper, 800×480 physical, displayed in portrait (480×800) via 270° rotation |
+| Display | SSD1677 mono e-paper (GDEQ0426T82, 4.26"), 800×480 physical = **219 PPI**, displayed in portrait (480×800) via 270° rotation. 1 pt = 3.04 px; the portrait page is 55.6 × 92.7 mm |
 | Storage | microSD over shared SPI bus (400 kHz probe → 20 MHz run), FAT32 |
 | Input | 2 ADC resistance ladders (GPIO1, GPIO2) + power button (GPIO3 IRQ) |
 | Battery | Li-ion via ADC, 100K/100K divider on GPIO0 |
@@ -296,7 +296,9 @@ Two ADC resistance ladders at 100 Hz (adaptive: fast when active, 50 ms slow whe
 
 ### Font pipeline
 
-`build.rs` rasterizes TTF files via fontdue at compile time into 1-bit bitmaps. Five sizes (XSmall through XLarge), three styles (Regular, Bold, Italic). ASCII glyphs (0x20–0x7E) are direct-indexed; extended Unicode (Latin-1, punctuation, currency, math, arrows) is binary-searched. Book and UI font sizes are independently configurable and hot-swappable.
+`build.rs` rasterizes TTF files via fontdue at compile time into 2-bit (4-level) bitmaps. Five size tiers (XSmall through XLarge), three styles (Regular, Bold, Italic). ASCII glyphs (0x20–0x7E) are direct-indexed; extended Unicode (Latin-1, punctuation, currency, math, arrows) is binary-searched. Book and UI font sizes are independently configurable and hot-swappable.
+
+**Per-family px ladders.** Each family in `FAMILIES` carries its own `body` / `heading` px arrays rather than sharing one table. At 219 PPI body text sits in the 16–36 px range, where unhinted rasterization is very sensitive to the exact ppem: at one size a stem lands on a pixel boundary and renders solid, one px either side it straddles two columns and smears into grays. The size that lands well differs per face, so a shared table guarantees some faces sit on a bad one — Bookerly's Medium is 22 px where Atkinson's is 23 px. Tiers were picked by measuring, per face and per candidate px, the fraction of vertical-stroke ink that rasterizes solid plus how close the x-height falls to a whole pixel; each tier holds its x-height across families so switching reader font doesn't change apparent size. Phosphor (icons, no ASCII to measure) rides the Inter ladder.
 
 The kernel ships a built-in `FONT_9X18` mono font (embedded-graphics) for the boot console and sleep screen — works with zero fontdue, zero TTFs.
 
