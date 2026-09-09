@@ -15,8 +15,13 @@ use embedded_graphics::primitives::{PrimitiveStyle, Rectangle, RoundedRectangle}
 use plump_kernel::util::FixedStr;
 
 use crate::apps::recent::{self, RecentRecord};
+use crate::apps::widgets::sheet::{ICON_LIST, ICON_PLAY};
 use crate::apps::widgets::{BOOK_ROW_H, BookRow};
-use crate::apps::{App, AppContext, AppId, BgBudget, BgOutcome, RECENT_FILE, Transition};
+use crate::apps::{
+    App, AppContext, AppId, BgBudget, BgOutcome, MSG_TAG_OPEN_CONTENTS, RECENT_FILE, Transition,
+};
+use crate::kernel::QuickAction;
+use crate::ui::StackFmt;
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::battery;
@@ -49,6 +54,15 @@ const ROW_W: u16 = FULL_CONTENT_W;
 
 // 1 card + N rows.
 const MAX_ITEMS: usize = 1 + MAX_RECENT_ROWS;
+
+// quick menu rows for the most recent book. the manager lends them
+// to every main-screen tab, so their ids sit above any app's own
+pub(crate) const QA_CONTINUE: u8 = 0xE1;
+pub(crate) const QA_CONTENTS: u8 = 0xE2;
+
+pub(crate) const fn is_resume_action(id: u8) -> bool {
+    matches!(id, QA_CONTINUE | QA_CONTENTS)
+}
 
 // layout regions are content-area relative; the manager paints the
 // shared chrome (top status bar) over y < CONTENT_TOP, and the tab
@@ -114,6 +128,9 @@ pub struct HomeApp {
 
     needs_load: bool,
     bat_pct: u8,
+
+    qa_buf: [QuickAction; 2],
+    qa_count: usize,
 }
 
 impl Default for HomeApp {
@@ -139,6 +156,8 @@ impl HomeApp {
             recent_row_covers: [const { None }; MAX_RECENT_ROWS],
             needs_load: false,
             bat_pct: 0,
+            qa_buf: [QuickAction::trigger(0, "", ""); 2],
+            qa_count: 0,
         }
     }
 
@@ -284,9 +303,36 @@ impl HomeApp {
         if self.selected >= self.item_count {
             self.selected = 0;
         }
+        self.rebuild_quick_actions();
     }
 
-    fn has_recent(&self) -> bool {
+    // menu rows: resume the last book, or jump into its contents
+    fn rebuild_quick_actions(&mut self) {
+        self.qa_count = 0;
+        if !self.has_recent() {
+            return;
+        }
+        let mut pct = StackFmt::<8>::new();
+        let _ = write!(pct, "{}%", self.recent_progress);
+        self.qa_buf[0] = QuickAction::trigger(QA_CONTINUE, "Continue reading", "Open")
+            .with_icon(ICON_PLAY)
+            .with_value(pct.as_str());
+        self.qa_buf[1] = QuickAction::trigger(QA_CONTENTS, "Contents", "Open").with_icon(ICON_LIST);
+        self.qa_count = 2;
+    }
+
+    /// Push the reader on the most recent book; `tag` rides along
+    /// (contents sheet on ready).
+    fn open_recent(&self, ctx: &mut AppContext, tag: u8) -> Transition {
+        if !self.has_recent() {
+            return Transition::None;
+        }
+        ctx.set_message(self.recent_book.as_bytes());
+        ctx.set_message_tag(tag);
+        Transition::Push(AppId::Reader)
+    }
+
+    pub(crate) fn has_recent(&self) -> bool {
         !self.recent_book.is_empty()
     }
 
@@ -413,6 +459,37 @@ impl App<AppId> for HomeApp {
             ActionEvent::Press(Action::Select) => self.open_book(ctx),
             _ => Transition::None,
         }
+    }
+
+    fn quick_actions(&self) -> &[QuickAction] {
+        &self.qa_buf[..self.qa_count]
+    }
+
+    fn on_quick_trigger(&mut self, id: u8, ctx: &mut AppContext) -> Transition {
+        match id {
+            QA_CONTINUE => self.open_recent(ctx, 0),
+            QA_CONTENTS => self.open_recent(ctx, MSG_TAG_OPEN_CONTENTS),
+            _ => Transition::None,
+        }
+    }
+
+    fn menu_title(&self) -> &str {
+        if self.has_recent() {
+            self.recent_display_title()
+        } else {
+            "Home"
+        }
+    }
+
+    fn menu_meta(&self, out: &mut StackFmt<64>) {
+        if !self.has_recent() {
+            return;
+        }
+        let author = self.recent_author_str();
+        if !author.is_empty() {
+            let _ = write!(out, "{} \u{00B7} ", author);
+        }
+        let _ = write!(out, "{}% read", self.recent_progress);
     }
 
     fn draw(&self, strip: &mut StripBuffer) {

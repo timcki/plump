@@ -181,7 +181,10 @@ Then every 5 seconds: heap usage, stack watermark, battery percentage, uptime, S
 │       └── widgets/
 │           ├── mod.rs              widget re-exports
 │           ├── bitmap_label.rs     proportional text labels
-│           ├── quick_menu.rs       power-button overlay menu
+│           ├── sheet.rs            bottom sheet: frame, header, row
+│           │                       groups, hints (menu + contents)
+│           ├── quick_menu.rs       Menu-button sheet (app actions +
+│           │                       clear ghosting, go home / sleep)
 │           ├── button_feedback.rs  legacy bumps (drawn only when chrome
 │           │                       is hidden)
 │           ├── selectable_row.rs   inverted-color selection highlight

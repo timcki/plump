@@ -78,3 +78,7 @@ pub type AppNavSlot = plump_kernel::kernel::nav::NavSlot<Tab, Modal>;
 pub type AppNav = plump_kernel::kernel::nav::Nav<Tab, Modal>;
 
 pub use plump_kernel::kernel::nav::{HDir, HResult};
+
+/// message tag on a reader push: open the contents sheet once the
+/// book is ready (home menu "Contents")
+pub const MSG_TAG_OPEN_CONTENTS: u8 = 1;

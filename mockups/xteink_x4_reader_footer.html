@@ -1,0 +1,118 @@
+<title>Pulp Reader Footer</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Lora:ital,wght@0,400;0,500;0,600;1,400&display=swap');
+
+:root {
+  --ground: #141414;
+  --frame: #1c1c1c;
+  --paper: #f6f4ee;
+  --ink: #181818;
+  --ink-25: rgba(24,24,24,0.25);
+  --ink-12: rgba(24,24,24,0.12);
+  --label: #d9d6cc;
+}
+body { background: var(--ground); color: var(--label); margin: 0; font-family: 'Atkinson Hyperlegible', system-ui, sans-serif; }
+.wrap { max-width: 1120px; margin: 0 auto; padding: 2rem 1rem 2.5rem; }
+h2.sec { font-size: 13px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; opacity: 0.6; margin: 0 0 14px; }
+
+/* footer strips at 2x panel scale (480 px wide panel -> 480 px strip at 1 css px per panel px) */
+.opts { display: grid; grid-template-columns: repeat(auto-fit, minmax(480px, 1fr)); gap: 22px 28px; margin-bottom: 2.5rem; }
+.opt { display: flex; flex-direction: column; gap: 8px; }
+.opt .lab { font-size: 13px; font-weight: 500; margin: 0; }
+.opt .lab small { display: block; font-weight: 400; opacity: 0.6; font-size: 11.5px; margin-top: 3px; line-height: 1.45; max-width: 56ch; }
+.strip { background: var(--paper); color: var(--ink); width: 480px; border-radius: 6px; padding: 14px 16px 12px; box-sizing: border-box; font-size: 15px; }
+.strip .txt { font-family: 'Lora', Georgia, serif; font-size: 18px; line-height: 1.5; opacity: 0.35; overflow: hidden; height: 27px; white-space: nowrap; text-overflow: ellipsis; }
+.ft { display: flex; align-items: center; gap: 12px; border-top: 1.5px solid var(--ink-25); margin-top: 12px; padding-top: 12px; font-size: 14px; }
+.ft .t { opacity: 0.75; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.ft .c { opacity: 0.75; font-variant-numeric: tabular-nums; margin-left: auto; white-space: nowrap; }
+.ft .c small { opacity: 0.6; font-size: 12px; margin-left: 6px; }
+
+/* A: fixed-width bar between title and counter */
+.bar { flex: none; width: 96px; height: 3px; background: var(--ink-25); border-radius: 1.5px; overflow: hidden; }
+.bar > b { display: block; height: 100%; background: var(--ink); }
+
+/* B: chapter rail, one tick per chapter, filled up to the current one */
+.rail { flex: none; display: flex; gap: 2px; height: 5px; }
+.rail > i { display: block; width: 8px; height: 100%; background: var(--ink-25); border-radius: 1px; }
+.rail > i.done { background: var(--ink); }
+.rail > i.now { background: var(--ink); opacity: 0.55; }
+
+/* C: bar under the counter only */
+.stack { margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.stack .bar { width: 100%; }
+
+/* D: position marker riding the divider line */
+.ftd { position: relative; }
+.ftd .mk { position: absolute; top: -13.5px; height: 3px; width: 36px; background: var(--ink); border-radius: 1.5px; }
+
+/* full frame */
+.frame { display: flex; justify-content: center; }
+.un { display: flex; flex-direction: column; align-items: center; gap: 9px; }
+.lab { font-size: 13px; color: var(--label); font-weight: 500; margin: 0; text-align: center; }
+.lab small { display: block; font-weight: 400; opacity: 0.6; font-size: 11px; margin-top: 2px; }
+.dv { background: var(--frame); padding: 7px; border-radius: 22px; }
+.sc { background: var(--paper); color: var(--ink); width: 340px; height: 567px; border-radius: 14px; display: flex; flex-direction: column; padding: 12px 18px 11px; box-sizing: border-box; overflow: hidden; }
+.rd-bd { flex: 1; font-family: 'Lora', Georgia, serif; font-size: 13.5px; line-height: 1.58; text-align: justify; hyphens: auto; overflow: hidden; }
+.rd-bd p { margin: 0 0 0.7em; }
+.sc .ft { font-size: 10px; border-top-width: 1px; margin-top: 9px; padding-top: 9px; gap: 9px; }
+.sc .bar { width: 64px; height: 2px; }
+.sc .ft .c small { font-size: 9px; }
+</style>
+
+<h2 style="position:absolute;left:-9999px">Four options for the pulp-os reader footer with the chapter progress bar moved onto the title line, shown as enlarged footer strips, plus one full Xteink X4 frame with the recommended option in context.</h2>
+
+<div class="wrap">
+  <h2 class="sec">Footer at panel scale, one line</h2>
+  <div class="opts">
+
+    <div class="opt">
+      <p class="lab">A · Inline bar<small>Title, a fixed 96 px bar, counter. The bar is the chapter position, the counter is the book position: the two figures the current footer already shows, on one line. Recommended.</small></p>
+      <div class="strip">
+        <div class="txt">something she could not quite name: not a pet, not a child, not a program.</div>
+        <div class="ft"><span class="t">Exhalation</span><span class="bar"><b style="width:43%"></b></span><span class="c">124 / 322</span></div>
+      </div>
+    </div>
+
+    <div class="opt">
+      <p class="lab">B · Chapter rail<small>One tick per chapter, filled through the chapters read, the current one half-tone. Shows where you are in the book's structure, not just in its pages. Loses meaning past about 24 chapters, so it needs a fallback to A.</small></p>
+      <div class="strip">
+        <div class="txt">something she could not quite name: not a pet, not a child, not a program.</div>
+        <div class="ft"><span class="t">Exhalation</span><span class="rail"><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><i class="now"></i><i></i><i></i><i></i><i></i><i></i><i></i></span><span class="c">124 / 322<small>5 / 11</small></span></div>
+      </div>
+    </div>
+
+    <div class="opt">
+      <p class="lab">C · Bar under the counter<small>The bar takes the counter's width and sits beneath it, so the title line stays pure text. Two lines on the right, one on the left; the cleanest title, the busiest corner.</small></p>
+      <div class="strip">
+        <div class="txt">something she could not quite name: not a pet, not a child, not a program.</div>
+        <div class="ft" style="align-items:flex-end"><span class="t">Exhalation</span><span class="stack"><span class="c" style="margin-left:0">124 / 322</span><span class="bar"><b style="width:38%"></b></span></span></div>
+      </div>
+    </div>
+
+    <div class="opt">
+      <p class="lab">D · Marker on the rule<small>No bar at all. The divider above the footer becomes the track and a short filled segment rides it at the book position. Zero extra height; the subtlest, and the one most likely to be missed on a first read.</small></p>
+      <div class="strip">
+        <div class="txt">something she could not quite name: not a pet, not a child, not a program.</div>
+        <div class="ft ftd"><span class="mk" style="left:38%"></span><span class="t">Exhalation</span><span class="c">124 / 322</span></div>
+      </div>
+    </div>
+
+  </div>
+
+  <h2 class="sec">A in context</h2>
+  <div class="frame">
+    <div class="un">
+      <p class="lab">Reader<small>no top bar; footer is one line</small></p>
+      <div class="dv"><div class="sc">
+        <div class="rd-bd">
+          <p>Ana had been working at Blue Gamma for a year when the first digients were released to the public. The launch party was held on a rooftop in the Mission, and she remembered the way the evening light had caught the towers downtown, gilding them for a few minutes before the fog came in.</p>
+          <p>Jax was the first one she had trained herself. He had started as a generic mascot, one of a thousand identical instances, and in the months since he had become something she could not quite name: not a pet, not a child, not a program.</p>
+          <p>The forum threads that night were full of screenshots. Owners compared the words their digients had learned, the games they had invented, the small refusals that felt, to everyone posting, like the beginnings of a will.</p>
+          <p>Derek stopped by her desk on the way out. He had the look he wore when he was about to ask for something and had already decided how he would take a refusal.</p>
+          <p>"Ana. Do you have a minute for the Origami people?"</p>
+        </div>
+        <div class="ft"><span class="t">Exhalation</span><span class="bar"><b style="width:43%"></b></span><span class="c">124 / 322</span></div>
+      </div></div>
+    </div>
+  </div>
+</div>

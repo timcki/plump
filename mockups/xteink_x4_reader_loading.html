@@ -1,0 +1,198 @@
+<title>Pulp Reader Loading</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Lora:ital,wght@0,400;0,500;0,600;1,400&display=swap');
+
+:root {
+  --ground: #141414;
+  --frame: #1c1c1c;
+  --paper: #f6f4ee;
+  --ink: #181818;
+  --ink-25: rgba(24,24,24,0.25);
+  --ink-12: rgba(24,24,24,0.12);
+  --label: #d9d6cc;
+}
+body { background: var(--ground); color: var(--label); margin: 0; font-family: 'Atkinson Hyperlegible', system-ui, sans-serif; }
+
+h1 { font-size: 15px; font-weight: 500; text-align: center; margin: 2.2rem 1rem 0.4rem; letter-spacing: 0.01em; }
+h1 small { display: block; font-weight: 400; opacity: 0.55; font-size: 12px; margin-top: 4px; }
+.fr { padding: 1.4rem 1rem 1rem; display: flex; justify-content: center; gap: 22px; flex-wrap: wrap; }
+.un { display: flex; flex-direction: column; align-items: center; gap: 9px; }
+.lab { font-size: 13px; color: var(--label); font-weight: 500; margin: 0; text-align: center; max-width: 340px; }
+.lab small { display: block; font-weight: 400; opacity: 0.6; font-size: 11px; margin-top: 2px; line-height: 1.45; }
+.dv { background: var(--frame); padding: 7px; border-radius: 22px; }
+.sc { background: var(--paper); color: var(--ink); width: 340px; height: 567px; border-radius: 14px; display: flex; flex-direction: column; padding: 15px 18px 11px; box-sizing: border-box; position: relative; overflow: hidden; }
+.sc.sm { width: 240px; height: 400px; border-radius: 10px; padding: 11px 13px 8px; }
+.note { max-width: 62ch; margin: 0 auto 2.5rem; padding: 0 1rem; font-size: 12.5px; line-height: 1.55; opacity: 0.75; }
+.note b { font-weight: 700; }
+
+/* reader footer, as it lands on the page: title, chapter bar, counter */
+.ft { margin-top: auto; display: flex; align-items: center; gap: 9px; font-size: 10px; opacity: 0.75; }
+.ft .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ft .bar { flex: none; width: 64px; height: 2px; background: var(--ink-25); border-radius: 1px; overflow: hidden; }
+.ft .bar > b { display: block; height: 100%; background: var(--ink); }
+.ft .c { margin-left: auto; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sm .ft { font-size: 7.5px; gap: 6px; }
+.sm .ft .bar { width: 46px; }
+
+/* the text area above the footer */
+.pg { flex: 1; display: flex; flex-direction: column; align-items: center; text-align: center; min-height: 0; }
+
+/* cover thumb: the cached 112x160 card variant, or the placeholder */
+.cv { width: 79px; height: 113px; background: var(--ink); border-radius: 1px; position: relative; flex: none; }
+.cv.lt { background: #d8d2bd; }
+.cv.ph { background: var(--paper); border: 1px solid var(--ink); box-sizing: border-box; }
+.cv::after { content: ''; position: absolute; background: var(--paper); width: 30%; aspect-ratio: 1; border-radius: 50%; top: 28%; left: 35%; }
+.cv.lt::after { background: var(--ink); width: 14%; height: 60%; border-radius: 0; top: 20%; left: 43%; }
+.cv.ph::after { background: var(--ink); width: 40%; height: 40%; border-radius: 0; top: 30%; left: 30%; transform: rotate(45deg); }
+.sm .cv { width: 56px; height: 80px; }
+
+.ti { font-family: 'Lora', Georgia, serif; font-weight: 600; font-size: 17px; line-height: 1.22; margin: 0; text-wrap: balance; max-width: 250px; }
+.sm .ti { font-size: 12px; max-width: 180px; }
+.au { font-size: 11px; opacity: 0.65; margin: 6px 0 0; }
+.sm .au { font-size: 8px; margin-top: 4px; }
+.rule { width: 24px; height: 1px; background: var(--ink); margin: 16px 0 14px; opacity: 0.6; }
+.sm .rule { margin: 11px 0 9px; }
+.rs { font-size: 10.5px; opacity: 0.7; font-variant-numeric: tabular-nums; margin: 0; }
+.rs i { font-family: 'Lora', Georgia, serif; font-style: italic; opacity: 1; }
+.sm .rs { font-size: 7.5px; }
+
+/* stage row: the only thing that repaints while the book opens */
+.st { margin-top: auto; width: 100%; padding-bottom: 14px; }
+.st .cap { display: flex; justify-content: space-between; font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; font-weight: 700; opacity: 0.55; margin-bottom: 6px; font-variant-numeric: tabular-nums; }
+.st .bar { height: 2px; background: var(--ink-25); border-radius: 1px; overflow: hidden; }
+.st .bar > b { display: block; height: 100%; background: var(--ink); }
+.sm .st { padding-bottom: 10px; }
+.sm .st .cap { font-size: 6.5px; margin-bottom: 4px; }
+
+/* option B: title page, type as the hero */
+.tp { flex: 1; display: flex; flex-direction: column; align-items: center; text-align: center; min-height: 0; }
+.tp .ti { font-size: 24px; font-weight: 500; line-height: 1.18; max-width: 270px; margin-top: 64px; }
+.tp .au { font-size: 12px; margin-top: 12px; }
+.tp .cap2 { font-size: 9px; letter-spacing: 0.22em; text-transform: uppercase; font-weight: 700; opacity: 0.5; margin: 44px 0 8px; }
+.tp .ch { font-family: 'Lora', Georgia, serif; font-style: italic; font-size: 14px; margin: 0; max-width: 250px; }
+.tp .pos { font-size: 10.5px; opacity: 0.7; margin: 8px 0 0; font-variant-numeric: tabular-nums; }
+
+/* option C: quiet page */
+.qt { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.qt .cap { font-size: 9px; letter-spacing: 0.22em; text-transform: uppercase; font-weight: 700; opacity: 0.5; margin-bottom: 10px; }
+.qt .bar { width: 120px; height: 2px; background: var(--ink-25); border-radius: 1px; overflow: hidden; }
+.qt .bar > b { display: block; height: 100%; background: var(--ink); }
+</style>
+
+<h1>Book loading screen<small>Three directions. The footer is painted first in every one and stays for the page, so the first page only replaces the text area.</small></h1>
+
+<div class="fr">
+
+  <div class="un">
+    <div class="dv"><div class="sc">
+      <div class="pg">
+        <div style="height:74px"></div>
+        <div class="cv"></div>
+        <p class="ti" style="margin-top:22px">Exhalation</p>
+        <p class="au">Ted Chiang</p>
+        <div class="rule"></div>
+        <p class="rs">Chapter 5 of 11 &middot; 38% read</p>
+        <div class="st">
+          <div class="cap"><span>Building pages</span><span>75%</span></div>
+          <div class="bar"><b style="width:75%"></b></div>
+        </div>
+      </div>
+      <div class="ft"><span class="t">Exhalation</span><span class="bar"><b style="width:38%"></b></span><span class="c">124 / 322</span></div>
+    </div></div>
+    <p class="lab">A &middot; Plate<small>Cover, title, author and where you left off, painted once. The stage caption and hairline bar sit low and are the only thing that repaints, so a stage change costs a 40 px strip instead of the whole page. Recommended.</small></p>
+  </div>
+
+  <div class="un">
+    <div class="dv"><div class="sc">
+      <div class="tp">
+        <p class="ti">Exhalation</p>
+        <p class="au">Ted Chiang</p>
+        <p class="cap2">Resuming at</p>
+        <p class="ch">The Merchant and the Alchemist&rsquo;s Gate</p>
+        <p class="pos">Chapter 5 of 11 &middot; page 124 of 322</p>
+        <div class="st">
+          <div class="cap"><span>Building pages</span><span>75%</span></div>
+          <div class="bar"><b style="width:75%"></b></div>
+        </div>
+      </div>
+      <div class="ft"><span class="t">Exhalation</span><span class="bar"><b style="width:38%"></b></span><span class="c">124 / 322</span></div>
+    </div></div>
+    <p class="lab">B &middot; Title page<small>No cover; the book&rsquo;s own face carries it. Title large, author, then the chapter you are returning to by name. The most bookish, but the chapter name is only known after the contents parse, so it lands a stage late.</small></p>
+  </div>
+
+  <div class="un">
+    <div class="dv"><div class="sc">
+      <div class="qt">
+        <p class="cap">Building pages</p>
+        <div class="bar"><b style="width:75%"></b></div>
+      </div>
+      <div class="ft"><span class="t">Exhalation</span><span class="bar"><b style="width:38%"></b></span><span class="c">124 / 322</span></div>
+    </div></div>
+    <p class="lab">C &middot; Quiet<small>The empty page with its footer and one small caption. Least ink, calmest, and honest about a warm open that lasts under a second. Says nothing about the book beyond the footer.</small></p>
+  </div>
+
+</div>
+
+<h1 style="margin-top:1rem">Option A in its other states<small>Fresh book with a placeholder cover, a cold open caching chapters, and a plain text file.</small></h1>
+
+<div class="fr">
+
+  <div class="un">
+    <div class="dv"><div class="sc sm">
+      <div class="pg">
+        <div style="height:52px"></div>
+        <div class="cv ph"></div>
+        <p class="ti" style="margin-top:16px">The Left Hand of Darkness</p>
+        <p class="au">Ursula K. Le Guin</p>
+        <div class="rule"></div>
+        <p class="rs">First open &middot; 21 chapters</p>
+        <div class="st">
+          <div class="cap"><span>Reading contents</span><span>40%</span></div>
+          <div class="bar"><b style="width:40%"></b></div>
+        </div>
+      </div>
+      <div class="ft"><span class="t">The Left Hand of Darkness</span><span class="c">1/21</span></div>
+    </div></div>
+    <p class="lab">Fresh book<small>No cached cover yet: the library&rsquo;s placeholder shape stands in. The resume line says it is a first open.</small></p>
+  </div>
+
+  <div class="un">
+    <div class="dv"><div class="sc sm">
+      <div class="pg">
+        <div style="height:52px"></div>
+        <div class="cv lt"></div>
+        <p class="ti" style="margin-top:16px">Piranesi</p>
+        <p class="au">Susanna Clarke</p>
+        <div class="rule"></div>
+        <p class="rs">Chapter 2 of 7 &middot; 14% read</p>
+        <div class="st">
+          <div class="cap"><span>Caching chapters &middot; 3 of 7</span><span>62%</span></div>
+          <div class="bar"><b style="width:62%"></b></div>
+        </div>
+      </div>
+      <div class="ft"><span class="t">Piranesi</span><span class="bar"><b style="width:14%"></b></span><span class="c">2/7</span></div>
+    </div></div>
+    <p class="lab">Cold open<small>Chapter caching is the one slow stage; its count rides on the caption and only the bar and caption repaint as chapters land.</small></p>
+  </div>
+
+  <div class="un">
+    <div class="dv"><div class="sc sm">
+      <div class="pg">
+        <div style="height:52px"></div>
+        <div class="cv ph"></div>
+        <p class="ti" style="margin-top:16px">NOTES.TXT</p>
+        <div class="rule"></div>
+        <p class="rs">Page 3 &middot; 12 KB</p>
+        <div class="st">
+          <div class="cap"><span>Opening page</span><span>90%</span></div>
+          <div class="bar"><b style="width:90%"></b></div>
+        </div>
+      </div>
+      <div class="ft"><span class="t">NOTES.TXT</span><span class="c">3/18</span></div>
+    </div></div>
+    <p class="lab">Plain text<small>No metadata: filename as the title, size in place of the author, page as the resume line.</small></p>
+  </div>
+
+</div>
+
+<p class="note"><b>Repaint economy.</b> Today every stage change marks the whole text area dirty, so a cold open flashes the page six or seven times. In all three options the composition above the stage row is painted once, when the title is known (the OPF parse, about a quarter of the way in; until then the previous screen stays), and later stages mark only the stage row. The footer is drawn on the loading screen already, in its final place, so when the first page lands the footer pixels do not change.</p>

@@ -22,6 +22,8 @@ use crate::drivers::strip::StripBuffer;
 use crate::kernel::input_policy::SemanticInput;
 use crate::kernel::nav::{HDir, HResult};
 use crate::ui::Region;
+use crate::ui::stack_fmt::StackFmt;
+use crate::util::FixedStr;
 
 use super::KernelHandle;
 use super::bookmarks::BookmarkCache;
@@ -109,6 +111,10 @@ pub struct QuickAction {
     pub id: u8,
     pub label: &'static str,
     pub kind: QuickActionKind,
+    /// lead glyph in the sheet's first column (Phosphor codepoint)
+    pub icon: Option<char>,
+    /// short right-aligned text for trigger rows ("5 / 11", "62%")
+    pub value: FixedStr<20>,
 }
 
 impl QuickAction {
@@ -122,6 +128,8 @@ impl QuickAction {
             id,
             label,
             kind: QuickActionKind::Cycle { value, options },
+            icon: None,
+            value: FixedStr::EMPTY,
         }
     }
 
@@ -130,7 +138,19 @@ impl QuickAction {
             id,
             label,
             kind: QuickActionKind::Trigger { display },
+            icon: None,
+            value: FixedStr::EMPTY,
         }
+    }
+
+    pub const fn with_icon(mut self, icon: char) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    pub fn with_value(mut self, value: &str) -> Self {
+        self.value.set(value.as_bytes());
+        self
     }
 }
 
@@ -279,6 +299,7 @@ struct Loading {
 pub struct AppContext {
     msg_buf: [u8; MSG_BUF_SIZE],
     msg_len: usize,
+    msg_tag: u8,
     redraw: PendingRedraw,
 
     // loading indicator; kernel-level so any app can use it.
@@ -299,6 +320,7 @@ impl AppContext {
         Self {
             msg_buf: [0u8; MSG_BUF_SIZE],
             msg_len: 0,
+            msg_tag: 0,
             redraw: PendingRedraw::None,
             loading: None,
         }
@@ -308,14 +330,26 @@ impl AppContext {
         let len = data.len().min(MSG_BUF_SIZE);
         self.msg_buf[..len].copy_from_slice(&data[..len]);
         self.msg_len = len;
+        self.msg_tag = 0;
     }
 
     pub fn message(&self) -> &[u8] {
         &self.msg_buf[..self.msg_len]
     }
 
+    /// Small out-of-band hint travelling with the message (set after
+    /// `set_message`, cleared with it); distros define the values.
+    pub fn set_message_tag(&mut self, tag: u8) {
+        self.msg_tag = tag;
+    }
+
+    pub fn message_tag(&self) -> u8 {
+        self.msg_tag
+    }
+
     pub fn clear_message(&mut self) {
         self.msg_len = 0;
+        self.msg_tag = 0;
     }
 
     pub fn request_full_redraw(&mut self) {
@@ -495,9 +529,28 @@ pub trait App<Id> {
         &[]
     }
 
-    fn on_quick_trigger(&mut self, _id: u8, _ctx: &mut AppContext) {}
+    /// Run a quick-menu trigger. May navigate (home's Continue
+    /// reading pushes the reader).
+    fn on_quick_trigger(&mut self, _id: u8, _ctx: &mut AppContext) -> Transition<Id> {
+        Transition::None
+    }
 
     fn on_quick_cycle_update(&mut self, _id: u8, _value: u8, _ctx: &mut AppContext) {}
+
+    /// Title the quick menu sheet shows for this app (book title in
+    /// the reader and on home). Empty falls back to "Menu".
+    fn menu_title(&self) -> &str {
+        ""
+    }
+
+    /// Meta line under the sheet title (position in the book).
+    fn menu_meta(&self, _out: &mut StackFmt<64>) {}
+
+    /// True while the app owns the Menu button (an open overlay of
+    /// its own that Menu should close instead of opening the menu).
+    fn captures_menu(&self) -> bool {
+        false
+    }
 
     fn draw(&self, strip: &mut StripBuffer);
 
@@ -732,6 +785,12 @@ pub trait AppLayer {
     /// Default implementation is a no-op returning `Transition::None`.
     fn dispatch_semantic(&mut self, _input: SemanticInput) -> Transition<Self::Id> {
         Transition::None
+    }
+
+    /// True once when the app layer asked for sleep (quick menu Sleep
+    /// row); the scheduler treats it like the power long-press.
+    fn take_sleep_request(&mut self) -> bool {
+        false
     }
 
     fn apply_transition(&mut self, t: Transition<Self::Id>, k: &mut KernelHandle<'_>);

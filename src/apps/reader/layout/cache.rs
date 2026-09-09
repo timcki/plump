@@ -436,3 +436,50 @@ fn open_bundle_for_write<'a>(
     }
 }
 
+
+/// Page count per spine chapter from the layout directory, 0 for a
+/// chapter that has no layout yet; `out` is sized by the caller.
+/// Returns false when the bundle has no page index at all. One file
+/// session: header, then the directory entries in batches.
+pub fn chapter_page_counts(k: &mut KernelHandle<'_>, name_hash: u32, out: &mut [u16]) -> bool {
+    for v in out.iter_mut() {
+        *v = 0;
+    }
+    bundle::with_reader(k.sd(), name_hash, |r| {
+        let Some(hdr) = bundle::read_header_in(r) else {
+            return Ok(false);
+        };
+        if !hdr.has_flag(bundle::FLAG_PAGEIDX_READY) {
+            return Ok(false);
+        }
+        let Some(dir) = hdr.section(SectionId::PidxDir) else {
+            return Ok(false);
+        };
+        let avail = (dir.size as usize).saturating_sub(bundle::PAGEIDX_HDR_V2_SIZE)
+            / bundle::CHAPTER_LAYOUT_DIR_SIZE;
+        let n = out.len().min(hdr.spine_count as usize).min(avail);
+        const BATCH: usize = 20;
+        let mut buf = [0u8; BATCH * bundle::CHAPTER_LAYOUT_DIR_SIZE];
+        let mut i = 0usize;
+        while i < n {
+            let batch = (n - i).min(BATCH);
+            let bytes = batch * bundle::CHAPTER_LAYOUT_DIR_SIZE;
+            let off = dir.offset
+                + bundle::PAGEIDX_HDR_V2_SIZE as u32
+                + (i * bundle::CHAPTER_LAYOUT_DIR_SIZE) as u32;
+            let got = r.read_at(off, &mut buf[..bytes])?;
+            if got < bytes {
+                break;
+            }
+            for j in 0..batch {
+                let rec = &buf[j * bundle::CHAPTER_LAYOUT_DIR_SIZE..(j + 1) * bundle::CHAPTER_LAYOUT_DIR_SIZE];
+                if let Some(d) = bundle::ChapterLayoutDir::decode(rec) {
+                    out[i + j] = d.page_count;
+                }
+            }
+            i += batch;
+        }
+        Ok(true)
+    })
+    .unwrap_or(false)
+}

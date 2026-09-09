@@ -37,5 +37,7 @@ _heap_start = _stack_start;
 _heap_end = ORIGIN(dram2_seg) + LENGTH(dram2_seg);
 
 ASSERT(_stack_start <= ORIGIN(dram2_seg), "pinned stack overlaps dram2_seg")
-ASSERT(_heap_end - _heap_start >= 160K, "merged heap smaller than expected; check .bss growth")
+/* 158K: the reader's per-chapter page counts and the sheet menu's
+   text buffers (2026-09) took ~1 KB of .bss from the original 160K */
+ASSERT(_heap_end - _heap_start >= 158K, "merged heap smaller than expected; check .bss growth")
 ASSERT(SIZEOF(.dram2_uninit) == 0, "dram2 statics exist; they would sit inside the merged heap")

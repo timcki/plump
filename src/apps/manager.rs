@@ -4,7 +4,7 @@
 // loading indicator is drawn between app content and overlays so it
 // sits on top of page content but under quick menu and button bumps
 
-use crate::apps::home::HomeApp;
+use crate::apps::home::{self, HomeApp};
 use crate::apps::library::LibraryApp;
 use crate::apps::reader::ReaderApp;
 use crate::apps::settings::SettingsApp;
@@ -15,7 +15,9 @@ use crate::apps::{
 };
 
 use crate::apps::upload::UploadExit;
-use crate::apps::widgets::quick_menu::{MAX_APP_ACTIONS, QuickMenuResult};
+use crate::apps::widgets::quick_menu::{
+    MAX_APP_ACTIONS, MenuContext, QuickAction, QuickMenuResult,
+};
 use crate::apps::widgets::{ButtonFeedback, QuickMenu};
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
 use crate::board::{SCREEN_H, SCREEN_W};
@@ -127,6 +129,9 @@ pub struct AppManager {
     /// depth 1: there is nothing to pop, and the launcher is the only
     /// place that remembers where the user was.
     upload_return_tab: Tab,
+
+    // set by the quick menu's Sleep row, drained by the scheduler
+    sleep_requested: bool,
 }
 
 /// map a (legacy) `AppId` to the `Tab` it represents in the new model,
@@ -226,6 +231,7 @@ impl AppManager {
             nav: AppNav::new(Tab::Home),
             chrome: Chrome::new(),
             upload_return_tab: Tab::Home,
+            sleep_requested: false,
         }
     }
 
@@ -474,12 +480,58 @@ impl AppManager {
         true
     }
 
-    /// Open the quick menu for the active app.
+    /// Open the quick menu for the active app. every main-screen
+    /// tab borrows home's header and resume rows, so the last book
+    /// is one press away from anywhere; the reader has its own.
     fn open_quick_menu(&mut self) {
         let active = self.launcher.active();
-        let actions: &[_] = with_app!(active, self, |app| app.quick_actions());
-        self.quick_menu.show(actions);
+        let borrow_home =
+            active != AppId::Home && active != AppId::Reader && self.home.has_recent();
+        let mut meta = crate::ui::StackFmt::<64>::new();
+        let mut combined = [QuickAction::trigger(0, "", ""); MAX_APP_ACTIONS];
+        let mut n = 0;
+        if borrow_home {
+            self.home.menu_meta(&mut meta);
+            for a in self.home.quick_actions() {
+                combined[n] = *a;
+                n += 1;
+            }
+        } else {
+            with_app_ref!(active, self, |app| app.menu_meta(&mut meta));
+        }
+        let own: &[QuickAction] = with_app_ref!(active, self, |app| app.quick_actions());
+        for a in own.iter().take(MAX_APP_ACTIONS - n) {
+            combined[n] = *a;
+            n += 1;
+        }
+        let title: &str = if borrow_home {
+            self.home.menu_title()
+        } else {
+            with_app_ref!(active, self, |app| app.menu_title())
+        };
+        self.quick_menu.show(
+            &combined[..n],
+            MenuContext {
+                title,
+                meta: meta.as_str(),
+                on_home: active == AppId::Home,
+            },
+        );
         self.launcher.ctx.mark_dirty(self.quick_menu.region());
+    }
+
+    /// Menu goes to the app while it owns an overlay of its own (the
+    /// reader's contents sheet closes on Menu instead of opening the
+    /// menu over it).
+    fn forward_menu_to_app(&mut self) -> Option<Transition> {
+        let active = self.launcher.active();
+        let captures = with_app_ref!(active, self, |app| app.captures_menu());
+        if !captures {
+            return None;
+        }
+        Some(with_app!(active, self, |app| {
+            app.on_event(ActionEvent::Press(Action::Menu), &mut self.launcher.ctx)
+        }))
     }
 
     /// Close the quick menu, propagating any changed cycle values
@@ -500,6 +552,8 @@ impl AppManager {
             SemanticInput::MenuTap => {
                 if self.quick_menu.open {
                     self.close_quick_menu();
+                } else if let Some(t) = self.forward_menu_to_app() {
+                    return t;
                 } else {
                     self.open_quick_menu();
                 }
@@ -518,6 +572,9 @@ impl AppManager {
         }
 
         if matches!(event, ActionEvent::Press(Action::Menu)) {
+            if let Some(t) = self.forward_menu_to_app() {
+                return t;
+            }
             self.open_quick_menu();
             return Transition::None;
         }
@@ -595,18 +652,28 @@ impl AppManager {
                 Transition::Home
             }
 
+            QuickMenuResult::Sleep => {
+                self.close_quick_menu();
+                self.sleep_requested = true;
+                Transition::None
+            }
+
             QuickMenuResult::AppTrigger(id) => {
                 let active = self.launcher.active();
                 self.close_quick_menu();
 
+                // resume rows lent to a tab go back to home
+                if active != AppId::Home && home::is_resume_action(id) {
+                    return self.home.on_quick_trigger(id, &mut self.launcher.ctx);
+                }
+
                 with_app!(active, self, |app| {
-                    app.on_quick_trigger(id, &mut self.launcher.ctx);
+                    let t = app.on_quick_trigger(id, &mut self.launcher.ctx);
                     // Save app state after trigger (e.g. font change
                     // may invalidate the reader's current page offset).
                     app.save_state(bm_cache);
-                });
-
-                Transition::None
+                    t
+                })
             }
         }
     }
@@ -811,7 +878,8 @@ impl AppManager {
 
         let chrome = fonts::chrome_font();
         self.reader.set_chrome_font(chrome);
-        self.quick_menu.set_chrome_font(chrome);
+        self.reader.set_ui_font_size(ui_idx);
+        self.quick_menu.set_ui_font_size(ui_idx);
         self.bumps.set_chrome_font(fonts::button_label_font());
     }
 
@@ -861,6 +929,10 @@ impl AppManager {
 
 impl AppLayer for AppManager {
     type Id = AppId;
+
+    fn take_sleep_request(&mut self) -> bool {
+        core::mem::take(&mut self.sleep_requested)
+    }
 
     #[inline]
     fn active(&self) -> AppId {

@@ -11,6 +11,7 @@ pub mod format;
 pub mod list;
 pub mod quick_menu;
 pub mod selectable_row;
+pub mod sheet;
 
 pub use bitmap_label::{BitmapDynLabel, BitmapLabel};
 pub use book_row::{BOOK_ROW_H, BookRow};

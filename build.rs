@@ -313,6 +313,8 @@ fn extended_codepoints() -> Vec<u32> {
         0x25A1, // □ white square
         0x25CF, // ● black circle
         0x25CB, // ○ white circle
+        0x25C0, // ◀ black left-pointing triangle (menu hints)
+        0x25B6, // ▶ black right-pointing triangle (menu hints)
         0x2605, // ★ black star
         0x2606, // ☆ white star
         0x2713, // ✓ check mark
@@ -344,6 +346,9 @@ fn extended_codepoints() -> Vec<u32> {
         0xE06C, // arrow-right
         0xE138, // caret-left
         0xE13A, // caret-right
+        0xE330, // moon
+        0xE6EE, // text-aa
+        0xE3D0, // play
     ];
     cps.extend_from_slice(phosphor_icons);
 

@@ -642,6 +642,10 @@ impl super::Services {
                 }
                 let suppressed_before = app_mgr.suppress_deferred_input();
                 let t = app_mgr.dispatch_event(ev, &mut *self.bm_cache);
+                if app_mgr.take_sleep_request() {
+                    info!("app layer: sleep requested");
+                    return InputResult::Sleep;
+                }
                 if t != Transition::None {
                     InputResult::Transition(t)
                 } else if app_mgr.suppress_deferred_input() != suppressed_before {
