@@ -12,17 +12,18 @@
 // fits its rows (sheet S / M) or filling the screen to the top margin
 // (sheet L).
 
-use core::fmt::Write as _;
-
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{CornerRadii, PrimitiveStyle, Rectangle, RoundedRectangle};
+use embedded_graphics::primitives::{PrimitiveStyle, RoundedRectangle};
 
 use crate::board::layout::{CX_BACK, CX_CONFIRM, CX_LEFT, CX_RIGHT};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::{self, bitmap::BitmapFont};
-use crate::ui::{Alignment, Region, StackFmt};
+use crate::ui::Region;
+
+use super::row::{self, RowEdges, RowFonts};
+pub use super::row::{ICON_BOOKMARK, RowLead, RowSpec, ValueChip, draw_ellipsized};
 
 pub const SHEET_MARGIN: u16 = 20;
 pub const SHEET_X: u16 = SHEET_MARGIN;
@@ -34,30 +35,23 @@ pub const SHEET_BOTTOM: u16 = SCREEN_H - SHEET_MARGIN;
 const PAD: u16 = 12;
 const HEADER_H: u16 = 30;
 const META_H: u16 = 24;
-pub const ROW_H: u16 = 44;
+pub use super::row::ROW_H;
 const GROUP_GAP: u16 = 10;
 const HINT_H: u16 = 26;
 
 const R_SHEET: u32 = 10;
-const R_GROUP: u32 = 6;
 const BORDER_W: u32 = 2;
 
-// row cells: lead column (icon or chapter number), text, value
-const CELL_PAD: u16 = 12;
-const LEAD_W: u16 = 28;
 const CELL_GAP: u16 = 10;
 
-// position bar under the title of the chapter being read
-const BAR_W: u16 = 120;
-const BAR_H: u16 = 3;
-
-pub const ICON_BOOKMARK: char = '\u{E0EA}';
 pub const ICON_LIST: char = '\u{E2F2}';
 pub const ICON_ERASER: char = '\u{E21E}';
 pub const ICON_HOUSE: char = '\u{E2C2}';
 pub const ICON_MOON: char = '\u{E330}';
 pub const ICON_TEXT_AA: char = '\u{E6EE}';
 pub const ICON_PLAY: char = '\u{E3D0}';
+pub const ICON_ARROWS_CLOCKWISE: char = '\u{E094}';
+pub const ICON_TRASH: char = '\u{E4A6}';
 
 /// Fonts a sheet draws with: heading for the title, body for rows,
 /// the chrome font for the meta line, values and hints, and the
@@ -71,6 +65,16 @@ pub struct SheetFonts {
 }
 
 impl SheetFonts {
+    /// The three faces a row needs. `text` is the default voice for a
+    /// row; callers pass a book face per row through `RowSpec`.
+    pub fn rows(&self) -> RowFonts {
+        RowFonts {
+            text: self.body,
+            small: self.small,
+            icon: self.icon,
+        }
+    }
+
     pub fn for_ui(idx: u8) -> Self {
         Self {
             title: fonts::ui_heading_font(idx),
@@ -195,26 +199,6 @@ impl SheetGeom {
     }
 }
 
-/// What sits in the lead column of a row.
-#[derive(Clone, Copy)]
-pub enum RowLead {
-    None,
-    Icon(char),
-    Number(u16),
-    /// bookmark glyph: the chapter being read
-    Bookmark,
-}
-
-pub struct RowSpec<'a> {
-    pub lead: RowLead,
-    pub text: &'a str,
-    pub text_font: &'static BitmapFont,
-    pub value: &'a str,
-    pub selected: bool,
-    /// (done, total): draws a position bar under the text
-    pub progress: Option<(u32, u32)>,
-}
-
 fn rounded(strip: &mut StripBuffer, r: Region, radius: u32, style: PrimitiveStyle<BinaryColor>) {
     RoundedRectangle::with_equal_corners(r.to_rect(), Size::new(radius, radius))
         .into_styled(style)
@@ -284,21 +268,14 @@ pub fn draw_header(
 /// Hairline outline around each row group.
 pub fn draw_groups(strip: &mut StripBuffer, geom: &SheetGeom) {
     for g in 0..2 {
-        if let Some(r) = geom.group_region(g)
-            && r.intersects(strip.logical_window())
-        {
-            rounded(
-                strip,
-                r,
-                R_GROUP,
-                PrimitiveStyle::with_stroke(BinaryColor::On, 1),
-            );
+        if let Some(r) = geom.group_region(g) {
+            row::draw_group_outline(strip, r);
         }
     }
 }
 
-/// One row: hairline above it inside its group, inverted fill when
-/// selected, lead glyph, ellipsized text, right-aligned value.
+/// One row of the sheet. The sheet decides the rectangle and where
+/// the row sits in its group; `row::draw` decides everything inside.
 pub fn draw_row(
     strip: &mut StripBuffer,
     geom: &SheetGeom,
@@ -306,132 +283,11 @@ pub fn draw_row(
     fonts: &SheetFonts,
     spec: &RowSpec<'_>,
 ) {
-    let row = geom.row_region(i);
-    if !row.intersects(strip.logical_window()) {
-        return;
-    }
-
-    let first_in_group = i == 0 || geom.group_break == Some(i - 1);
-    let last_in_group = geom.group_break == Some(i) || i + 1 == geom.rows;
-    if !first_in_group {
-        Rectangle::new(
-            Point::new((row.x + 1) as i32, row.y as i32),
-            Size::new((row.w - 2) as u32, 1),
-        )
-        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-        .draw(strip)
-        .ok();
-    }
-
-    // the selected row fills its whole cell, from the line above to
-    // the line below and edge to edge inside the outline; the outer
-    // corners take the outline's radius so the fill never pokes out
-    let fg = if spec.selected {
-        let cell = Rectangle::new(
-            Point::new((row.x + 1) as i32, (row.y + 1) as i32),
-            Size::new((row.w - 2) as u32, (row.h - 1) as u32),
-        );
-        let r = Size::new(R_GROUP - 1, R_GROUP - 1);
-        let z = Size::zero();
-        let radii = CornerRadii {
-            top_left: if first_in_group { r } else { z },
-            top_right: if first_in_group { r } else { z },
-            bottom_right: if last_in_group { r } else { z },
-            bottom_left: if last_in_group { r } else { z },
-        };
-        RoundedRectangle::new(cell, radii)
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-            .draw(strip)
-            .ok();
-        BinaryColor::Off
-    } else {
-        BinaryColor::On
+    let edges = RowEdges {
+        first: i == 0 || geom.group_break == Some(i - 1),
+        last: geom.group_break == Some(i) || i + 1 == geom.rows,
     };
-
-    // lead column
-    let lead_r = Region::new(row.x + CELL_PAD, row.y, LEAD_W, row.h);
-    let glyph = match spec.lead {
-        RowLead::None => None,
-        RowLead::Icon(ch) => Some(ch),
-        RowLead::Bookmark => Some(ICON_BOOKMARK),
-        RowLead::Number(n) => {
-            let mut s = StackFmt::<8>::new();
-            let _ = write!(s, "{}", n);
-            fonts
-                .small
-                .draw_aligned(strip, lead_r, s.as_str(), Alignment::CenterRight, fg);
-            None
-        }
-    };
-    if let Some(ch) = glyph {
-        let mut buf = [0u8; 4];
-        let s = ch.encode_utf8(&mut buf);
-        fonts
-            .icon
-            .draw_aligned(strip, lead_r, s, Alignment::CenterRight, fg);
-    }
-
-    // value, right aligned, reserves its measured width
-    let value_w = if spec.value.is_empty() {
-        0
-    } else {
-        fonts.small.measure_str(spec.value)
-    };
-    if value_w > 0 {
-        let value_r = Region::new(row.x + row.w - CELL_PAD - value_w, row.y, value_w, row.h);
-        fonts
-            .small
-            .draw_aligned(strip, value_r, spec.value, Alignment::CenterRight, fg);
-    }
-
-    // text, with the position bar below it for the chapter being read
-    let text_x = row.x + CELL_PAD + LEAD_W + CELL_GAP;
-    let text_w = (row.x + row.w - CELL_PAD)
-        .saturating_sub(text_x)
-        .saturating_sub(if value_w > 0 { value_w + CELL_GAP } else { 0 });
-    match spec.progress {
-        None => {
-            draw_ellipsized(
-                strip,
-                spec.text_font,
-                Region::new(text_x, row.y, text_w, row.h),
-                spec.text,
-                fg,
-            );
-        }
-        Some((done, total)) => {
-            let text_h = row.h - BAR_H - 10;
-            draw_ellipsized(
-                strip,
-                spec.text_font,
-                Region::new(text_x, row.y + 2, text_w, text_h),
-                spec.text,
-                fg,
-            );
-            let bar_y = row.y + row.h - BAR_H - 7;
-            let bar_w = BAR_W.min(text_w);
-            // track: 1 px line, fill: full height up to the position
-            Rectangle::new(
-                Point::new(text_x as i32, (bar_y + BAR_H / 2) as i32),
-                Size::new(bar_w as u32, 1),
-            )
-            .into_styled(PrimitiveStyle::with_fill(fg))
-            .draw(strip)
-            .ok();
-            let filled = if total == 0 {
-                0
-            } else {
-                ((bar_w as u32 * done.min(total)) / total).max(1) as u16
-            };
-            Rectangle::new(
-                Point::new(text_x as i32, bar_y as i32),
-                Size::new(filled as u32, BAR_H as u32),
-            )
-            .into_styled(PrimitiveStyle::with_fill(fg))
-            .draw(strip)
-            .ok();
-        }
-    }
+    row::draw(strip, geom.row_region(i), edges, &fonts.rows(), spec);
 }
 
 /// Where a hint sits on the footer line: centred over the bezel
@@ -511,27 +367,3 @@ pub fn draw_tracked(
     }
 }
 
-/// Left-aligned, vertically centred text cut with an ellipsis when it
-/// overflows `region`.
-pub fn draw_ellipsized(
-    strip: &mut StripBuffer,
-    font: &BitmapFont,
-    region: Region,
-    text: &str,
-    fg: BinaryColor,
-) {
-    let cut = font.truncate_len(text, region.w);
-    if cut >= text.len() {
-        font.draw_aligned(strip, region, text, Alignment::CenterLeft, fg);
-        return;
-    }
-    let mut buf = [0u8; 96];
-    let mut n = cut.min(buf.len() - 3);
-    while n > 0 && !text.is_char_boundary(n) {
-        n -= 1;
-    }
-    buf[..n].copy_from_slice(&text.as_bytes()[..n]);
-    buf[n..n + 3].copy_from_slice("\u{2026}".as_bytes());
-    let cut_text = core::str::from_utf8(&buf[..n + 3]).unwrap_or(text);
-    font.draw_aligned(strip, region, cut_text, Alignment::CenterLeft, fg);
-}

@@ -20,7 +20,7 @@ use plump_kernel::kernel::bundle::{
     self, BundleError, BundleFile, BundleHeader, CoverKind, CoverVariant, CoversHeader, SectionId,
     SectionRange,
 };
-use plump_kernel::util::hash;
+use plump_kernel::util::{FixedStr, hash};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::kernel::KernelHandle;
@@ -270,23 +270,76 @@ pub fn has_cover_variant(k: &mut KernelHandle<'_>, name_hash: u32, kind: CoverKi
     .unwrap_or(false)
 }
 
-/// Everything a library row shows from the bundle, read in a single
-/// file session: the mini cover and the cached page count.
+/// Everything a book row or the continue-reading card shows from the
+/// bundle, read in a single file session: the cover, the author, and
+/// where the reader left off.
+///
+/// One open per book. Every `open_file_in_dir` walks `BOOKS/`, so a
+/// caller that wants the cover *and* the position asks once rather
+/// than twice.
 #[derive(Default)]
-pub struct LibraryEntry {
+pub struct BookEntry {
     pub cover: Option<DecodedImage>,
+    pub author: FixedStr<{ bundle::AUTHOR_CAP }>,
     /// None until the book has been opened and indexed at least once
     pub total_pages: Option<u32>,
+    /// stored page number of the bookmark, 1-based
+    pub page: u16,
+    /// bookmark chapter, 0-based
+    pub chapter: u16,
+    pub chapter_count: u16,
+    pub has_bookmark: bool,
 }
 
-pub fn load_library_entry(k: &mut KernelHandle<'_>, name_hash: u32) -> LibraryEntry {
+impl BookEntry {
+    /// How far in, as a percentage. Pages when the book has been
+    /// indexed, chapters when it has not: a chapter fraction is coarse
+    /// but it is never a lie, and it is what the header alone knows.
+    pub fn progress_pct(&self) -> Option<u8> {
+        if !self.has_bookmark {
+            return None;
+        }
+        match self.total_pages {
+            Some(total) if total > 0 && self.page > 0 => {
+                Some(((self.page as u32 * 100) / total).min(100) as u8)
+            }
+            _ if self.chapter_count > 0 => Some(
+                ((self.chapter as u32 * 100) / self.chapter_count as u32).min(100) as u8,
+            ),
+            _ => None,
+        }
+    }
+
+    /// (done, total) for a position bar, in whichever unit
+    /// `progress_pct` could resolve.
+    pub fn position(&self) -> Option<(u32, u32)> {
+        match self.total_pages {
+            Some(total) if total > 0 && self.page > 0 => Some((self.page as u32, total)),
+            _ if self.chapter_count > 0 => {
+                Some((self.chapter as u32, self.chapter_count as u32))
+            }
+            _ => None,
+        }
+    }
+}
+
+pub fn load_book_entry(
+    k: &mut KernelHandle<'_>,
+    name_hash: u32,
+    prefer: CoverKind,
+) -> BookEntry {
     bundle::with_reader(k.sd(), name_hash, |r| {
         let Some(hdr) = bundle::read_header_in(r) else {
-            return Ok(LibraryEntry::default());
+            return Ok(BookEntry::default());
         };
-        Ok(LibraryEntry {
-            cover: read_cover_in(r, &hdr, CoverKind::Mini),
+        Ok(BookEntry {
+            cover: read_cover_in(r, &hdr, prefer),
+            author: hdr.author,
             total_pages: bundle::total_pages_in(r, &hdr),
+            page: hdr.bm_page_hint,
+            chapter: hdr.bm_chapter,
+            chapter_count: hdr.chapter_count,
+            has_bookmark: hdr.has_valid_bookmark(),
         })
     })
     .unwrap_or_default()

@@ -17,7 +17,7 @@ pub use crate::kernel::app::{MAX_APP_ACTIONS, QuickAction, QuickActionKind};
 use crate::ui::stack_fmt::StackFmt;
 use crate::ui::{wrap_next, wrap_prev};
 
-use super::sheet::{self, HintSlot, RowLead, RowSpec, SheetFonts, SheetGeom};
+use super::sheet::{self, HintSlot, RowLead, RowSpec, SheetFonts, SheetGeom, ValueChip};
 
 const NUM_CORE: usize = 2;
 const MAX_ITEMS: usize = MAX_APP_ACTIONS + NUM_CORE;
@@ -330,7 +330,9 @@ impl QuickMenu {
                     text_font: fonts.body,
                     value: val.as_str(),
                     selected,
+                    sub: "",
                     progress: None,
+                    chip: ValueChip::None,
                 },
             );
         }
