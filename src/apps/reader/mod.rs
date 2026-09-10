@@ -1320,6 +1320,52 @@ impl ReaderApp {
         &self.stats
     }
 
+    #[inline]
+    pub fn has_book(&self) -> bool {
+        !self.filename.is_empty()
+    }
+
+    /// Describe the open book to the sleep card. Runs before
+    /// `on_pre_sleep`, so the TOC and stats are still in memory.
+    pub fn fill_sleep_card(&self, card: &mut crate::apps::widgets::SleepCard) {
+        let author = if self.is_epub {
+            let n = (self.epub.meta.author_len as usize).min(self.epub.meta.author.len());
+            core::str::from_utf8(&self.epub.meta.author[..n]).unwrap_or("")
+        } else {
+            ""
+        };
+        card.set_book(self.display_name(), author, self.filename.as_bytes());
+        card.set_progress(self.progress_pct());
+        card.set_stats(self.stats.pages, self.stats.time_secs);
+
+        if self.pg.fully_indexed && self.pg.total_pages > 0 {
+            card.set_chapter_pages(self.pg.page as u32 + 1, self.pg.total_pages as u32);
+        }
+        if !self.is_epub {
+            // a txt book is one chapter: its pages are the book's
+            if self.pg.fully_indexed && self.pg.total_pages > 0 {
+                card.set_book_pages(self.pg.page as u32 + 1, self.pg.total_pages as u32);
+            }
+            return;
+        }
+        if let Some((page, total)) = self.book_position() {
+            card.set_book_pages(page, total);
+        }
+        // chapter numbering follows the contents sheet: TOC entries
+        // when there is a TOC, spine items otherwise
+        let ch = self.epub.chapter;
+        match self.epub.toc.as_ref().filter(|t| !t.is_empty()) {
+            Some(toc) => {
+                let entries = &toc.entries[..toc.len()];
+                if let Some(i) = entries.iter().position(|e| e.spine_idx == ch) {
+                    card.set_chapter_title(entries[i].title_str());
+                    card.set_chapter_number(i as u16 + 1, toc.len() as u16);
+                }
+            }
+            None => card.set_chapter_number(ch + 1, self.epub.spine.len() as u16),
+        }
+    }
+
     // transition to error state with consistent handling
     fn enter_error(&mut self, ctx: &mut AppContext, e: Error) {
         if self.stats_pause_clock() {

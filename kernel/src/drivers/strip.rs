@@ -394,47 +394,98 @@ impl StripBuffer {
         }
     }
 
-    fn fill_physical_rect(&mut self, px0: u16, py0: u16, px1: u16, py1: u16, black: bool) {
-        let c = Region::new(px0, py0, px1 - px0, py1 - py0).clip(self.win);
-        if c.w == 0 || c.h == 0 {
+    /// Flatten a logical region in whatever mode the strip is in: a
+    /// plain fill in Bw, both planes cleared to {0,0} (no change) in
+    /// GrayDual, so nothing blitted underneath earlier in the same
+    /// pass keeps a gray waveform. overlays painted over gray content
+    /// (the sleep card over the wallpaper) call this before drawing.
+    pub fn fill_flat(&mut self, r: Region, black: bool) {
+        let size = self.size();
+        let sw = size.width as u16;
+        let sh = size.height as u16;
+        let lx0 = r.x.min(sw);
+        let ly0 = r.y.min(sh);
+        let lx1 = r.x.saturating_add(r.w).min(sw);
+        let ly1 = r.y.saturating_add(r.h).min(sh);
+        if lx0 >= lx1 || ly0 >= ly1 {
             return;
         }
+        let (px0, py0, px1, py1) = (ly0, HEIGHT - lx1, ly1, HEIGHT - lx0);
+        match self.gray_mode {
+            GrayMode::Bw => self.fill_physical_rect(px0, py0, px1, py1, black),
+            GrayMode::GrayDual => self.clear_planes_physical(px0, py0, px1, py1),
+        }
+    }
 
-        let lx0 = (c.x - self.win.x) as usize;
-        let lx1 = (c.x + c.w - self.win.x) as usize;
-        let ly0 = (c.y - self.win.y) as usize;
-        let ly1 = (c.y + c.h - self.win.y) as usize;
+    // local (window-relative) pixel bounds of a physical rect, None
+    // when it misses the current strip window
+    fn clip_physical(
+        &self,
+        px0: u16,
+        py0: u16,
+        px1: u16,
+        py1: u16,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let c = Region::new(px0, py0, px1 - px0, py1 - py0).clip(self.win);
+        if c.w == 0 || c.h == 0 {
+            return None;
+        }
+        Some((
+            (c.x - self.win.x) as usize,
+            (c.x + c.w - self.win.x) as usize,
+            (c.y - self.win.y) as usize,
+            (c.y + c.h - self.win.y) as usize,
+        ))
+    }
+
+    fn fill_physical_rect(&mut self, px0: u16, py0: u16, px1: u16, py1: u16, black: bool) {
+        let Some((lx0, lx1, ly0, ly1)) = self.clip_physical(px0, py0, px1, py1) else {
+            return;
+        };
         let rb = self.row_bytes as usize;
+        fill_bits(&mut self.buf, rb, lx0, lx1, ly0, ly1, !black);
+    }
 
-        let first_byte = lx0 / 8;
-        let last_byte = (lx1 - 1) / 8;
-        let first_mask: u8 = 0xFF >> (lx0 & 7);
-        let last_mask: u8 = 0xFF << (7 - ((lx1 - 1) & 7));
+    fn clear_planes_physical(&mut self, px0: u16, py0: u16, px1: u16, py1: u16) {
+        let Some((lx0, lx1, ly0, ly1)) = self.clip_physical(px0, py0, px1, py1) else {
+            return;
+        };
+        let rb = self.row_bytes as usize;
+        fill_bits(&mut self.buf, rb, lx0, lx1, ly0, ly1, false);
+        fill_bits(&mut self.gray_buf, rb, lx0, lx1, ly0, ly1, false);
+    }
+}
 
-        // duplicated per polarity so the edge ops inline (a shared fn
-        // pointer defeated devirtualization) and the interior uses a
-        // word-wise slice fill instead of per-byte checked stores
-        if black {
-            for ly in ly0..ly1 {
-                let row = ly * rb;
-                if first_byte == last_byte {
-                    self.buf[row + first_byte] &= !(first_mask & last_mask);
-                } else {
-                    self.buf[row + first_byte] &= !first_mask;
-                    self.buf[row + first_byte + 1..row + last_byte].fill(0x00);
-                    self.buf[row + last_byte] &= !last_mask;
-                }
+// set or clear every bit of a local pixel rect in a row-major 1bpp
+// buffer. duplicated per polarity so the edge ops inline (a shared fn
+// pointer defeated devirtualization) and the interior uses a
+// word-wise slice fill instead of per-byte checked stores
+fn fill_bits(buf: &mut [u8], rb: usize, lx0: usize, lx1: usize, ly0: usize, ly1: usize, set: bool) {
+    let first_byte = lx0 / 8;
+    let last_byte = (lx1 - 1) / 8;
+    let first_mask: u8 = 0xFF >> (lx0 & 7);
+    let last_mask: u8 = 0xFF << (7 - ((lx1 - 1) & 7));
+
+    if set {
+        for ly in ly0..ly1 {
+            let row = ly * rb;
+            if first_byte == last_byte {
+                buf[row + first_byte] |= first_mask & last_mask;
+            } else {
+                buf[row + first_byte] |= first_mask;
+                buf[row + first_byte + 1..row + last_byte].fill(0xFF);
+                buf[row + last_byte] |= last_mask;
             }
-        } else {
-            for ly in ly0..ly1 {
-                let row = ly * rb;
-                if first_byte == last_byte {
-                    self.buf[row + first_byte] |= first_mask & last_mask;
-                } else {
-                    self.buf[row + first_byte] |= first_mask;
-                    self.buf[row + first_byte + 1..row + last_byte].fill(0xFF);
-                    self.buf[row + last_byte] |= last_mask;
-                }
+        }
+    } else {
+        for ly in ly0..ly1 {
+            let row = ly * rb;
+            if first_byte == last_byte {
+                buf[row + first_byte] &= !(first_mask & last_mask);
+            } else {
+                buf[row + first_byte] &= !first_mask;
+                buf[row + first_byte + 1..row + last_byte].fill(0x00);
+                buf[row + last_byte] &= !last_mask;
             }
         }
     }

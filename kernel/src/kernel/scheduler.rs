@@ -1230,7 +1230,7 @@ impl super::Kernel {
             t0.elapsed().as_millis()
         );
 
-        self.enter_sleep(reason, sleep_start).await;
+        self.enter_sleep(&*app_mgr, reason, sleep_start).await;
     }
 
     // flush bookmarks, render sleep screen, enter MCU deep sleep;
@@ -1238,7 +1238,7 @@ impl super::Kernel {
     //
     // uses a custom sleep config that keeps RTC FAST memory powered
     // so session state survives the sleep cycle (~1-2µA extra)
-    async fn enter_sleep(&mut self, reason: &str, sleep_start: Instant) {
+    async fn enter_sleep<A: AppLayer>(&mut self, app_mgr: &A, reason: &str, sleep_start: Instant) {
         use embedded_graphics::mono_font::MonoTextStyle;
         use embedded_graphics::mono_font::ascii::FONT_9X18;
         use embedded_graphics::pixelcolor::BinaryColor;
@@ -1278,7 +1278,9 @@ impl super::Kernel {
             use super::sleep_image::CHUNK_COUNT;
 
             // blit all 6 chunks each strip call; blit_2bpp clips to the
-            // current strip window so only the overlapping chunk draws pixels
+            // current strip window so only the overlapping chunk draws
+            // pixels. the app layer's overlay (sleep card) paints on
+            // top in the same pass
             let draw = |s: &mut StripBuffer| {
                 for i in 0..CHUNK_COUNT {
                     s.blit_2bpp(
@@ -1292,6 +1294,7 @@ impl super::Kernel {
                         true,
                     );
                 }
+                app_mgr.draw_sleep_overlay(s);
             };
 
             // Establish the base black/white image first, then overlay the
@@ -1315,6 +1318,17 @@ impl super::Kernel {
                 "sleep: wallpaper grayscale overlay ({}ms)",
                 t1.elapsed().as_millis()
             );
+        } else if app_mgr.has_sleep_overlay() {
+            // no wallpaper: the overlay alone on plain paper, with the
+            // same two passes so its glyphs are anti-aliased
+            info!("sleep: rendering sleep overlay on plain paper...");
+            let draw = |s: &mut StripBuffer| app_mgr.draw_sleep_overlay(s);
+            if self.screen.render_full(&draw).await.is_err() {
+                log::warn!("sleep: overlay base refresh timed out, continuing");
+            }
+            if self.screen.grayscale_full(&draw).await.is_err() {
+                log::warn!("sleep: overlay grayscale pass timed out, continuing");
+            }
         } else {
             // fallback: simple text sleep screen
             info!("sleep: rendering fallback sleep text screen...");

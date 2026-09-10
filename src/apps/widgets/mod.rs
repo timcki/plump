@@ -12,6 +12,7 @@ pub mod list;
 pub mod quick_menu;
 pub mod selectable_row;
 pub mod sheet;
+pub mod sleep_card;
 
 pub use bitmap_label::{BitmapDynLabel, BitmapLabel};
 pub use book_row::{BOOK_ROW_H, BookRow};
@@ -20,3 +21,4 @@ pub use format::{draw_position_indicator, fmt_percent, fmt_position};
 pub use list::ListSelection;
 pub use quick_menu::QuickMenu;
 pub use selectable_row::SelectableRow;
+pub use sleep_card::SleepCard;

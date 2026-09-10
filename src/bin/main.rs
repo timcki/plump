@@ -19,7 +19,7 @@ use plump::apps::manager::AppManager;
 use plump::apps::reader::ReaderApp;
 use plump::apps::settings::SettingsApp;
 use plump::apps::stats::StatsApp;
-use plump::apps::widgets::{ButtonFeedback, QuickMenu};
+use plump::apps::widgets::{ButtonFeedback, QuickMenu, SleepCard};
 use plump::board::action::ButtonMapper;
 use plump::board::{Board, speed_up_spi};
 use plump::drivers::battery;
@@ -45,6 +45,7 @@ static READER: ConstStaticCell<ReaderApp> = ConstStaticCell::new(ReaderApp::new(
 static LAUNCHER: ConstStaticCell<Launcher> = ConstStaticCell::new(Launcher::new());
 static QUICK_MENU: ConstStaticCell<QuickMenu> = ConstStaticCell::new(QuickMenu::new());
 static BUMPS: ConstStaticCell<ButtonFeedback> = ConstStaticCell::new(ButtonFeedback::new());
+static SLEEP_CARD: ConstStaticCell<SleepCard> = ConstStaticCell::new(SleepCard::new());
 static DIR_CACHE: ConstStaticCell<DirCache> = ConstStaticCell::new(DirCache::new());
 static BM_CACHE: ConstStaticCell<BookmarkCache> = ConstStaticCell::new(BookmarkCache::new());
 static DAY_STATS: ConstStaticCell<DayStats> = ConstStaticCell::new(DayStats::EMPTY);
@@ -166,6 +167,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         STATS.init(StatsApp::new()),
         QUICK_MENU.take(),
         BUMPS.take(),
+        SLEEP_CARD.take(),
         ButtonMapper::new(),
     );
 

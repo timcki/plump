@@ -332,6 +332,36 @@ impl HomeApp {
         Transition::Push(AppId::Reader)
     }
 
+    /// Filename of the book on the continue-reading card.
+    pub fn recent_filename(&self) -> &[u8] {
+        self.recent_book.as_bytes()
+    }
+
+    /// Title of the first recent row after the card's book, for the
+    /// sleep card's "next" line once a book is finished.
+    pub fn next_recent_title(&self) -> Option<&str> {
+        self.recent_rows
+            .iter()
+            .take(self.recent_row_count)
+            .find(|r| r.valid)
+            .map(|r| r.display_name())
+    }
+
+    /// Describe the continue-reading book to the sleep card when the
+    /// reader is not on the stack; false when there is no such book.
+    pub fn fill_sleep_card(&self, card: &mut crate::apps::widgets::SleepCard) -> bool {
+        if !self.has_recent() {
+            return false;
+        }
+        card.set_book(
+            self.recent_display_title(),
+            self.recent_author_str(),
+            self.recent_book.as_bytes(),
+        );
+        card.set_progress(self.recent_progress);
+        true
+    }
+
     pub(crate) fn has_recent(&self) -> bool {
         !self.recent_book.is_empty()
     }

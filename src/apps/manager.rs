@@ -18,7 +18,7 @@ use crate::apps::upload::UploadExit;
 use crate::apps::widgets::quick_menu::{
     MAX_APP_ACTIONS, MenuContext, QuickAction, QuickMenuResult,
 };
-use crate::apps::widgets::{ButtonFeedback, QuickMenu};
+use crate::apps::widgets::{ButtonFeedback, QuickMenu, SleepCard};
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::input::Event;
@@ -111,6 +111,10 @@ pub struct AppManager {
 
     pub quick_menu: &'static mut QuickMenu,
     pub bumps: &'static mut ButtonFeedback,
+
+    // filled right before the active app drops its heap for sleep,
+    // painted by the kernel's sleep passes through `draw_sleep_overlay`
+    pub sleep_card: &'static mut SleepCard,
 
     pub mapper: ButtonMapper,
 
@@ -216,6 +220,7 @@ impl AppManager {
         stats: &'static mut StatsApp,
         quick_menu: &'static mut QuickMenu,
         bumps: &'static mut ButtonFeedback,
+        sleep_card: &'static mut SleepCard,
         mapper: ButtonMapper,
     ) -> Self {
         Self {
@@ -227,6 +232,7 @@ impl AppManager {
             stats,
             quick_menu,
             bumps,
+            sleep_card,
             mapper,
             nav: AppNav::new(Tab::Home),
             chrome: Chrome::new(),
@@ -344,8 +350,60 @@ impl AppManager {
     // wallpaper allocator has room. wake path rebuilds state from SD
     // via `restore_state`, so dropping here is correctness-safe.
     pub fn on_active_pre_sleep(&mut self, k: &mut KernelHandle<'_>) {
+        // the sleep card copies what it needs while the reader still
+        // holds its TOC and stats, and the cover read happens while
+        // the SD card is still awake
+        self.fill_sleep_card(k);
         let active = self.launcher.active();
         with_app!(active, self, |app| app.on_pre_sleep(k));
+    }
+
+    fn fill_sleep_card(&mut self, k: &mut KernelHandle<'_>) {
+        let card = &mut *self.sleep_card;
+        card.clear();
+        let mut filename = plump_kernel::util::FixedStr::<32>::EMPTY;
+        if self.launcher.contains(AppId::Reader) && self.reader.has_book() {
+            self.reader.fill_sleep_card(card);
+            filename.set(self.reader.filename_bytes());
+        } else if self.home.fill_sleep_card(card) {
+            filename.set(self.home.recent_filename());
+        }
+        if !card.is_set() {
+            log::info!("sleep card: no book to show");
+            return;
+        }
+        card.set_fonts(fonts::ReaderFont::from_idx(
+            self.settings.system_settings().reader_font,
+        ));
+        if let Some(next) = self.home.next_recent_title() {
+            card.set_next(next);
+        }
+        if !card.has_stats() {
+            if let Some(s) = crate::apps::stats::ReadingStats::load(k, filename.as_str()) {
+                card.set_stats(s.pages, s.time_secs);
+            }
+        }
+        // the Card variant scaled down beats the Mini one blown up; the
+        // loader hands back whichever variant the bundle has
+        match crate::apps::cover_cache::load_cover_variant_for(
+            k,
+            filename.as_bytes(),
+            plump_kernel::kernel::bundle::CoverKind::Card,
+        ) {
+            Some(img) => {
+                let ok = card.set_cover(&img);
+                log::info!(
+                    "sleep card: cover {}x{} stride {} {}",
+                    img.width,
+                    img.height,
+                    img.stride,
+                    if ok { "copied" } else { "does not fit, placeholder" }
+                );
+            }
+            None => log::info!("sleep card: no cover in bundle, placeholder"),
+        }
+        card.set_battery(crate::drivers::battery::battery_percentage(k.battery_mv()));
+        log::info!("sleep card: filled for {}", filename.as_str());
     }
 
     // collect session state to RTC memory struct before sleep
@@ -1099,6 +1157,14 @@ impl AppLayer for AppManager {
 
     fn on_active_pre_sleep(&mut self, k: &mut KernelHandle<'_>) {
         AppManager::on_active_pre_sleep(self, k);
+    }
+
+    fn has_sleep_overlay(&self) -> bool {
+        self.sleep_card.is_set()
+    }
+
+    fn draw_sleep_overlay(&self, strip: &mut StripBuffer) {
+        self.sleep_card.draw(strip);
     }
 
     fn flush_deferred_persistence(

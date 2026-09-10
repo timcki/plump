@@ -183,6 +183,9 @@ Then every 5 seconds: heap usage, stack watermark, battery percentage, uptime, S
 │           ├── bitmap_label.rs     proportional text labels
 │           ├── sheet.rs            bottom sheet: frame, header, row
 │           │                       groups, hints (menu + contents)
+│           ├── sleep_card.rs       continue-reading card painted over
+│           │                       the sleep wallpaper (time left,
+│           │                       battery)
 │           ├── quick_menu.rs       Menu-button sheet (app actions +
 │           │                       clear ghosting, go home / sleep)
 │           ├── button_feedback.rs  legacy bumps (drawn only when chrome
@@ -347,10 +350,12 @@ Idle timeout or power long-press triggers sleep:
 1. Save session to RTC FAST memory and to `_PULP/SESSION.BIN`, append a line to `_PULP/PWR.LOG`
 2. Flush bookmarks to SD
 3. Send CMD0 to SD card (reduces idle current from ~150 µA to ~10 µA)
-4. Render sleep screen on EPD
+4. Render sleep screen on EPD: the `SLEEP.BMP` wallpaper (4-level gray, two passes) with the distro's sleep card over it via `AppLayer::draw_sleep_overlay`, the card alone on plain paper when there is no wallpaper, the mono "(sleep)" text when there is no book either
 5. EPD deep sleep mode 1 (~3 µA, image retained)
 6. Release the battery latch: GPIO13 low, pad held through deep sleep (`board::battery_latch_off`). GPIO13 gates the board's battery-latch MOSFET (vendor firmware and CrossPoint do the same), so on battery the whole board, SD card and panel included, loses power here
 7. On USB power the MCU continues into ESP32-C3 deep sleep (~5 µA), GPIO3 wake source
+
+The sleep card is filled by `AppManager::fill_sleep_card` inside `on_active_pre_sleep`, before the active app drops its heap: title, author, chapter and page position from the reader (or the RECENT record when the reader is off the stack), this book's pace from its stats file (seconds per page, needing 10 pages and 5 minutes of history) for the time left in chapter and book, battery, and the bundle's Card cover box-filtered into an 84×126 fixed buffer. The card paints inside both wallpaper passes: `StripBuffer::fill_flat` clears the wallpaper's gray codes under it in the grayscale pass so its glyph edges are anti-aliased on flat paper.
 
 On wake: the MCU resets and the boot sequence runs. On USB the RTC session is restored (instant return without SD reads); on battery the reset is a power-on, so the SD session copy provides the same resume one SD read later. `Board::init` releases the sleep-time pad holds and drives GPIO13 high again.
 

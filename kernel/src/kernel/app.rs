@@ -854,6 +854,21 @@ pub trait AppLayer {
     /// heap to make room for the sleep wallpaper allocator.
     fn on_active_pre_sleep(&mut self, k: &mut KernelHandle<'_>);
 
+    /// True when `draw_sleep_overlay` has something to paint. With no
+    /// wallpaper and no overlay the kernel falls back to its mono
+    /// sleep text.
+    fn has_sleep_overlay(&self) -> bool {
+        false
+    }
+
+    /// Paint over the sleep screen. Runs inside both sleep passes (the
+    /// BW base and the grayscale overlay) after the wallpaper blit, so
+    /// 2bpp glyphs get anti-aliased edges for free; anything drawn
+    /// over gray content must `fill_flat` its region first. Called
+    /// after `on_active_pre_sleep`, so implementations draw from state
+    /// that survives the app's heap drop.
+    fn draw_sleep_overlay(&self, _strip: &mut StripBuffer) {}
+
     /// Flush deferred persistence for all app singletons.
     ///
     /// Dispatches to every app (not just the active one) so that
