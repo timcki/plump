@@ -5,6 +5,9 @@
 
 use core::fmt::Write as _;
 
+use embedded_graphics::pixelcolor::BinaryColor;
+
+use crate::apps::widgets::row::{self, RowFonts, RowGroup, RowLead, RowSpec, ValueChip};
 use crate::apps::{App, AppContext, AppId, Transition};
 use crate::board::action::ActionEvent;
 use crate::board::{SCREEN_H, SCREEN_W};
@@ -12,13 +15,17 @@ use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::kernel::KernelHandle;
 use crate::ui::{
-    Alignment, BitmapDynLabel, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, LARGE_MARGIN, Region,
+    Alignment, BitmapLabel, CONTENT_TOP, FULL_CONTENT_W, LARGE_MARGIN, Region, SectionLabel,
     StackFmt,
 };
 
 const MAX_BOOKS: usize = 20;
 
-const STATS_DIR: &str = "STATS";
+/// Directory entries read per pass. One `DirEntry` is ~84 bytes, so
+/// this is the trade between passes over the cache and stack.
+const PAGE: usize = 20;
+
+pub const STATS_DIR: &str = "STATS";
 
 // ── BookStats ────────────────────────────────────────────────────────
 
@@ -106,18 +113,6 @@ impl BookStats {
     }
 }
 
-// ── time formatting ──────────────────────────────────────────────────
-
-fn fmt_compact_duration<const N: usize>(secs: u32, buf: &mut BitmapDynLabel<N>) {
-    let hours = secs / 3600;
-    let mins = (secs % 3600) / 60;
-    if hours > 0 {
-        let _ = write!(buf, "{}h {}m", hours, mins);
-    } else {
-        let _ = write!(buf, "{}m", mins);
-    }
-}
-
 // ── parsing ──────────────────────────────────────────────────────────
 
 impl ReadingStats {
@@ -178,7 +173,7 @@ pub struct StatsApp {
     loaded: bool,
     ui_fonts: fonts::UiFonts,
     // top 3 books by time_secs, indices into `books`.
-    top_books: [usize; 3],
+    top_books: [usize; TOP_N],
     top_count: usize,
     // today's reading (refreshed in background_step from kernel.day_stats).
     today_pages: u16,
@@ -187,6 +182,13 @@ pub struct StatsApp {
     total_pages: u32,
     total_time: u32,
     total_books: u16,
+    /// sessions across every book, for the lifetime group's sub line
+    total_sessions: u32,
+    /// books with a file on the card, which is not the same number as
+    /// books that have ever been opened
+    on_card: u16,
+    /// a book's title is set in the book's own face
+    book_font: &'static fonts::bitmap::BitmapFont,
 }
 
 impl Default for StatsApp {
@@ -203,14 +205,23 @@ impl StatsApp {
             book_count: 0,
             loaded: false,
             ui_fonts: uf,
-            top_books: [0; 3],
+            top_books: [0; TOP_N],
             top_count: 0,
             today_pages: 0,
             today_secs: 0,
             total_pages: 0,
             total_time: 0,
             total_books: 0,
+            total_sessions: 0,
+            on_card: 0,
+            book_font: fonts::body_font(fonts::ReaderFont::Bookerly.family(), 1),
         }
+    }
+
+    /// A book's title is set in the book's own face, the way the
+    /// reader's contents sheet sets a chapter's.
+    pub fn set_reader_font(&mut self, font: fonts::ReaderFont) {
+        self.book_font = fonts::body_font(font.family(), 1);
     }
 
     pub fn set_ui_font_size(&mut self, idx: u8) {
@@ -222,6 +233,8 @@ impl StatsApp {
         self.total_pages = 0;
         self.total_time = 0;
         self.total_books = 0;
+        self.total_sessions = 0;
+        self.on_card = 0;
         self.top_count = 0;
 
         if k.ensure_dir_cache_loaded().is_err() {
@@ -229,45 +242,58 @@ impl StatsApp {
             return;
         }
 
-        let mut entries = [crate::drivers::storage::DirEntry::EMPTY; 128];
-        let page = k
-            .dir_page(0, &mut entries)
-            .unwrap_or(crate::drivers::storage::DirPage { total: 0, count: 0 });
-
+        // paged rather than one 128-entry buffer: a DirEntry is ~84
+        // bytes, so the old frame was 10.7 KB of stack, the largest on
+        // the device, and all of it to look at one field per entry
+        let mut page = [crate::drivers::storage::DirEntry::EMPTY; PAGE];
         let mut buf = [0u8; 128];
-        for entry in entries.iter().take(page.count) {
-            if self.book_count >= MAX_BOOKS {
+        let mut offset = 0usize;
+        while let Ok(res) = k.dir_page(offset, &mut page) {
+            if res.count == 0 {
                 break;
             }
-            if entry.is_dir {
-                continue;
+            if offset == 0 {
+                self.on_card = res.total as u16;
             }
-            let fname = entry.name_str();
-            let n = match k
-                .sd()
-                .read_chunk_in_plump_subdir(STATS_DIR, fname, 0, &mut buf)
-            {
-                Ok(n) if n > 0 => n,
-                _ => continue,
-            };
+            for entry in page.iter().take(res.count) {
+                if self.book_count >= MAX_BOOKS {
+                    break;
+                }
+                if entry.is_dir {
+                    continue;
+                }
+                let fname = entry.name_str();
+                let n = match k
+                    .sd()
+                    .read_chunk_in_plump_subdir(STATS_DIR, fname, 0, &mut buf)
+                {
+                    Ok(n) if n > 0 => n,
+                    _ => continue,
+                };
 
-            let idx = self.book_count;
-            self.books[idx] = BookStats::EMPTY;
-            self.books[idx].filename.set(fname.as_bytes());
-            self.books[idx].title.set(entry.display_name().as_bytes());
-            self.books[idx].stats = ReadingStats::parse(&buf[..n]);
+                let idx = self.book_count;
+                self.books[idx] = BookStats::EMPTY;
+                self.books[idx].filename.set(fname.as_bytes());
+                self.books[idx].title.set(entry.display_name().as_bytes());
+                self.books[idx].stats = ReadingStats::parse(&buf[..n]);
 
-            if self.books[idx].stats.is_empty() {
-                continue;
+                if self.books[idx].stats.is_empty() {
+                    continue;
+                }
+
+                self.total_pages += self.books[idx].stats.pages;
+                self.total_time += self.books[idx].stats.time_secs;
+                self.total_sessions += self.books[idx].stats.sessions as u32;
+                self.total_books += 1;
+                self.book_count += 1;
             }
-
-            self.total_pages += self.books[idx].stats.pages;
-            self.total_time += self.books[idx].stats.time_secs;
-            self.total_books += 1;
-            self.book_count += 1;
+            offset += res.count;
+            if offset >= res.total || self.book_count >= MAX_BOOKS {
+                break;
+            }
         }
 
-        // sort top 3 books by time_secs descending (insertion-style;
+        // sort the top books by time_secs descending (insertion-style;
         // book_count is small).
         for i in 0..self.book_count {
             let t = self.books[i].stats.time_secs;
@@ -279,14 +305,14 @@ impl StatsApp {
                     break;
                 }
             }
-            if pos < 3 {
+            if pos < TOP_N {
                 // shift right, insert.
-                let end = self.top_count.min(2);
+                let end = self.top_count.min(TOP_N - 1);
                 for j in (pos..end).rev() {
                     self.top_books[j + 1] = self.top_books[j];
                 }
                 self.top_books[pos] = i;
-                if self.top_count < 3 {
+                if self.top_count < TOP_N {
                     self.top_count += 1;
                 }
             }
@@ -333,167 +359,318 @@ impl App<AppId> for StatsApp {
 
     fn draw(&self, strip: &mut StripBuffer) {
         let body = self.ui_fonts.body;
-        let heading = self.ui_fonts.heading;
-
-        // captions + metric rows, top-to-bottom.
-        let mut y = CONTENT_TOP;
-
-        // TODAY caption + two big numbers.
-        draw_caption(strip, body, y, "TODAY");
-        y += CAPTION_H + 4;
-        draw_metric_row_two(strip, heading, body, y, self.today_pages as u32, "PAGES",
-            self.today_secs, "READING");
-        y += METRIC_ROW_H + SECTION_GAP_BIG;
-
-        // LIFETIME caption + three big numbers.
-        draw_caption(strip, body, y, "LIFETIME");
-        y += CAPTION_H + 4;
-        draw_metric_row_three(strip, heading, body, y,
-            self.total_books as u32, "BOOKS",
-            self.total_pages, "PAGES",
-            self.total_time / 3600, "TOTAL");
-        y += METRIC_ROW_H + SECTION_GAP_BIG;
-
-        // MOST TIME SPENT caption + top 3 rows.
-        draw_caption(strip, body, y, "MOST TIME SPENT");
-        y += CAPTION_H + 4;
-        for i in 0..self.top_count {
-            let book_idx = self.top_books[i];
-            let book = &self.books[book_idx];
-            draw_top_book_row(strip, body, y, book.display_name(), book.stats.time_secs);
-            y += TOP_ROW_H + 4;
-        }
+        let chrome = fonts::chrome_font();
+        let theme = plump_kernel::ui::Theme::default_v1();
+        let row_fonts = RowFonts {
+            text: body,
+            small: chrome,
+            icon: fonts::icon_font(1),
+        };
 
         if !self.loaded {
-            // small "loading" hint at bottom; the chrome already shows
-            // the user we're on the Stats tab.
-            let r = Region::new(LARGE_MARGIN, y, FULL_CONTENT_W, body.line_height);
+            let r = Region::new(LARGE_MARGIN, CONTENT_TOP, FULL_CONTENT_W, body.line_height);
             BitmapLabel::new(r, "Loading...", body)
                 .alignment(Alignment::CenterLeft)
                 .draw(strip)
                 .unwrap();
-        } else if self.book_count == 0 && self.today_pages == 0 {
-            let r = Region::new(LARGE_MARGIN, y + 8, FULL_CONTENT_W, body.line_height);
-            BitmapLabel::new(r, "No reading yet", body)
-                .alignment(Alignment::CenterLeft)
-                .draw(strip)
-                .unwrap();
+            return;
         }
+
+        let mut y = CONTENT_TOP;
+
+        // ── today: the reason to open this screen, so it keeps its
+        // figures. three bordered cells at heading scale, not three
+        // loose numerals at three times body size
+        y = self.draw_caption(strip, &theme, y, "TODAY", "");
+        self.draw_today(strip, y);
+        y += FIG_H + CAPTION_LEAD;
+
+        // ── lifetime: rows, which is what a record looks like
+        y = self.draw_caption(strip, &theme, y, "LIFETIME", "");
+        let life = RowGroup::new(LARGE_MARGIN, y, FULL_CONTENT_W, 3, row::ROW_H);
+        life.draw_outline(strip);
+
+        let mut books_v = ValueBuf::new();
+        let _ = write!(books_v, "{}", self.total_books);
+        let mut books_sub = SubBuf::new();
+        if self.on_card > 0 {
+            let _ = write!(books_sub, "{} on the card", self.on_card);
+        }
+        life.draw_row(
+            strip,
+            0,
+            &row_fonts,
+            &RowSpec::label("Books read", books_v.as_str(), body).with_sub(books_sub.as_str()),
+        );
+
+        let mut pages_v = ValueBuf::new();
+        write_grouped(&mut pages_v, self.total_pages);
+        life.draw_row(
+            strip,
+            1,
+            &row_fonts,
+            &RowSpec::label("Pages turned", pages_v.as_str(), body),
+        );
+
+        let mut time_v = ValueBuf::new();
+        write_long_duration(&mut time_v, self.total_time);
+        let mut time_sub = SubBuf::new();
+        if self.total_sessions > 0 {
+            let _ = write!(time_sub, "across {} sessions", self.total_sessions);
+        }
+        life.draw_row(
+            strip,
+            2,
+            &row_fonts,
+            &RowSpec::label("Time reading", time_v.as_str(), body).with_sub(time_sub.as_str()),
+        );
+        y = life.bottom() + CAPTION_LEAD;
+
+        // ── most time spent: the same row every other list uses, with
+        // the bars comparing the books to the longest of them rather
+        // than to the lifetime total, which at this scale would leave
+        // three indistinguishable slivers
+        if self.top_count == 0 {
+            self.draw_empty(strip, y);
+            return;
+        }
+        y = self.draw_caption(strip, &theme, y, "MOST TIME SPENT", "");
+        let longest = self.books[self.top_books[0]].stats.time_secs.max(1);
+        let top = RowGroup::new(
+            LARGE_MARGIN,
+            y,
+            FULL_CONTENT_W,
+            self.top_count,
+            TOP_ROW_H,
+        );
+        top.draw_outline(strip);
+        for i in 0..self.top_count {
+            let book = &self.books[self.top_books[i]];
+            let mut value = ValueBuf::new();
+            write_duration(&mut value, book.stats.time_secs);
+            let mut sub = SubBuf::new();
+            if book.stats.sessions > 0 {
+                let _ = write!(sub, "{} sessions", book.stats.sessions);
+            }
+            if book.stats.pages > 0 {
+                if !sub.as_str().is_empty() {
+                    let _ = sub.write_str(" \u{00B7} ");
+                }
+                let _ = write!(sub, "{} pages", book.stats.pages);
+            }
+            top.draw_row(
+                strip,
+                i,
+                &row_fonts,
+                &RowSpec {
+                    lead: RowLead::Number(i as u16 + 1),
+                    text: book.display_name(),
+                    text_font: self.book_font,
+                    value: value.as_str(),
+                    selected: false,
+                    sub: sub.as_str(),
+                    progress: Some((book.stats.time_secs, longest)),
+                    chip: ValueChip::None,
+                },
+            );
+        }
+    }
+}
+
+impl StatsApp {
+    /// Tracked caption, its lead gap above and its pad below. Returns
+    /// the y the group under it starts at.
+    fn draw_caption(
+        &self,
+        strip: &mut StripBuffer,
+        theme: &plump_kernel::ui::Theme,
+        y: u16,
+        left: &str,
+        right: &str,
+    ) -> u16 {
+        let caption_h = self.ui_fonts.body.line_height;
+        let r = Region::new(LARGE_MARGIN, y, FULL_CONTENT_W, caption_h);
+        let mut p = plump_kernel::ui::Painter::new(strip, theme);
+        SectionLabel::new(r, left).draw(&mut p, self.ui_fonts.body);
+        if !right.is_empty() {
+            SectionLabel::new(r, right)
+                .right_aligned()
+                .draw(&mut p, fonts::chrome_font());
+        }
+        y + caption_h + CAPTION_PAD
+    }
+
+    /// Three bordered cells: the count, the time, and the pace between
+    /// them. A rate with nothing behind it prints as an em dash rather
+    /// than a zero, which would read as a measurement.
+    fn draw_today(&self, strip: &mut StripBuffer, y: u16) {
+        let heading = self.ui_fonts.heading;
+        let chrome = fonts::chrome_font();
+        let cell_w = (FULL_CONTENT_W - 2 * FIG_GAP) / 3;
+
+        let mut pages = ValueBuf::new();
+        let _ = write!(pages, "{}", self.today_pages);
+
+        let mut time = ValueBuf::new();
+        if self.today_secs > 0 {
+            write_duration(&mut time, self.today_secs);
+        } else {
+            let _ = time.write_str("\u{2014}");
+        }
+
+        let mut pace = ValueBuf::new();
+        match self.pace_secs_per_page() {
+            Some(secs) => write_pace(&mut pace, secs),
+            None => {
+                let _ = pace.write_str("\u{2014}");
+            }
+        }
+
+        for (i, (value, label)) in [
+            (pages.as_str(), "PAGES"),
+            (time.as_str(), "READING"),
+            (pace.as_str(), "A PAGE"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let x = LARGE_MARGIN + i as u16 * (cell_w + FIG_GAP);
+            let cell = Region::new(x, y, cell_w, FIG_H);
+            row::draw_group_outline(strip, cell);
+            heading.draw_aligned(
+                strip,
+                Region::new(x + FIG_PAD, y + FIG_PAD, cell_w - 2 * FIG_PAD, heading.line_height),
+                value,
+                Alignment::CenterLeft,
+                BinaryColor::On,
+            );
+            chrome.draw_aligned(
+                strip,
+                Region::new(
+                    x + FIG_PAD,
+                    y + FIG_H - FIG_PAD - chrome.line_height,
+                    cell_w - 2 * FIG_PAD,
+                    chrome.line_height,
+                ),
+                label,
+                Alignment::CenterLeft,
+                BinaryColor::On,
+            );
+        }
+    }
+
+    /// Seconds a page took today. Needs enough of a sample to mean
+    /// something: the same floor the sleep card's pace uses.
+    fn pace_secs_per_page(&self) -> Option<u32> {
+        if self.today_pages < MIN_PACE_PAGES || self.today_secs < MIN_PACE_SECS {
+            return None;
+        }
+        Some(self.today_secs / self.today_pages as u32)
+    }
+
+    fn draw_empty(&self, strip: &mut StripBuffer, y: u16) {
+        let line = Region::new(LARGE_MARGIN, y + 24, FULL_CONTENT_W, self.book_font.line_height);
+        self.book_font.draw_aligned(
+            strip,
+            line,
+            "No reading recorded yet.",
+            Alignment::Center,
+            BinaryColor::On,
+        );
+        let chrome = fonts::chrome_font();
+        chrome.draw_aligned(
+            strip,
+            Region::new(
+                LARGE_MARGIN,
+                y + 24 + self.book_font.line_height + 4,
+                FULL_CONTENT_W,
+                chrome.line_height,
+            ),
+            "Open a book and this page fills itself in.",
+            Alignment::Center,
+            BinaryColor::On,
+        );
     }
 }
 
 // ── layout helpers ──────────────────────────────────────────────────
 
-const CAPTION_H: u16 = 14;
-const METRIC_ROW_H: u16 = 56;
-const TOP_ROW_H: u16 = 44;
-const SECTION_GAP_BIG: u16 = 14;
+// a caption sits close to the group it labels and far from the one
+// above it
+const CAPTION_LEAD: u16 = 13;
+const CAPTION_PAD: u16 = 6;
 
-fn draw_caption(
-    strip: &mut StripBuffer,
-    font: &'static crate::fonts::bitmap::BitmapFont,
-    y: u16,
-    text: &str,
-) {
-    let r = Region::new(LARGE_MARGIN, y, FULL_CONTENT_W, CAPTION_H);
-    BitmapLabel::new(r, text, font)
-        .alignment(Alignment::CenterLeft)
-        .draw(strip)
-        .unwrap();
-}
+// today's three cells
+const FIG_H: u16 = 62;
+const FIG_GAP: u16 = 10;
+const FIG_PAD: u16 = 10;
 
-fn draw_metric_row_two(
-    strip: &mut StripBuffer,
-    big_font: &'static crate::fonts::bitmap::BitmapFont,
-    small_font: &'static crate::fonts::bitmap::BitmapFont,
-    y: u16,
-    v1: u32,
-    l1: &str,
-    secs: u32,
-    l2: &str,
-) {
-    let col_w = FULL_CONTENT_W / 2;
-    // left: number / label.
-    let r_num1 = Region::new(LARGE_MARGIN, y, col_w, big_font.line_height);
-    let mut buf1 = BitmapDynLabel::<16>::new(r_num1, big_font).alignment(Alignment::CenterLeft);
-    let _ = write!(buf1, "{}", v1);
-    buf1.draw(strip).ok();
-    let r_lbl1 = Region::new(
-        LARGE_MARGIN,
-        y + big_font.line_height,
-        col_w,
-        small_font.line_height,
-    );
-    BitmapLabel::new(r_lbl1, l1, small_font)
-        .alignment(Alignment::CenterLeft)
-        .draw(strip)
-        .unwrap();
+// a book row here carries a title, a sub line and a bar
+const TOP_ROW_H: u16 = 62;
 
-    // right: hh:mm / label.
-    let r_num2 = Region::new(LARGE_MARGIN + col_w, y, col_w, big_font.line_height);
-    let mut buf2 = BitmapDynLabel::<16>::new(r_num2, big_font).alignment(Alignment::CenterLeft);
-    fmt_compact_duration(secs, &mut buf2);
-    buf2.draw(strip).ok();
-    let r_lbl2 = Region::new(
-        LARGE_MARGIN + col_w,
-        y + big_font.line_height,
-        col_w,
-        small_font.line_height,
-    );
-    BitmapLabel::new(r_lbl2, l2, small_font)
-        .alignment(Alignment::CenterLeft)
-        .draw(strip)
-        .unwrap();
-}
+/// Books in the most-time-spent list. Six is what the band holds
+/// under the two figure groups now that the tab bar is gone; the
+/// screen used to show three and end in a third of a page of blank
+/// paper.
+const TOP_N: usize = 6;
 
-fn draw_metric_row_three(
-    strip: &mut StripBuffer,
-    big_font: &'static crate::fonts::bitmap::BitmapFont,
-    small_font: &'static crate::fonts::bitmap::BitmapFont,
-    y: u16,
-    v1: u32,
-    l1: &str,
-    v2: u32,
-    l2: &str,
-    v3_h: u32,
-    l3: &str,
-) {
-    let col_w = FULL_CONTENT_W / 3;
-    let cells: [(u32, &str, bool); 3] = [(v1, l1, false), (v2, l2, false), (v3_h, l3, true)];
-    for (i, (v, lbl, hrs)) in cells.iter().enumerate() {
-        let x = LARGE_MARGIN + i as u16 * col_w;
-        let r_num = Region::new(x, y, col_w, big_font.line_height);
-        let mut buf = BitmapDynLabel::<16>::new(r_num, big_font).alignment(Alignment::CenterLeft);
-        if *hrs {
-            let _ = write!(buf, "{}h", v);
-        } else {
-            let _ = write!(buf, "{}", v);
-        }
-        buf.draw(strip).ok();
-        let r_lbl = Region::new(x, y + big_font.line_height, col_w, small_font.line_height);
-        BitmapLabel::new(r_lbl, lbl, small_font)
-            .alignment(Alignment::CenterLeft)
-            .draw(strip)
-            .unwrap();
+/// A pace under this much of a sample is noise, so the cell says
+/// nothing rather than reporting it.
+const MIN_PACE_PAGES: u16 = 5;
+const MIN_PACE_SECS: u32 = 120;
+
+type ValueBuf = StackFmt<20>;
+type SubBuf = StackFmt<40>;
+
+// ── formatting ──────────────────────────────────────────────────────
+
+/// `1h 12m`, or minutes alone under the hour.
+fn write_duration(out: &mut impl core::fmt::Write, secs: u32) {
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    if hours > 0 {
+        let _ = write!(out, "{}h {}m", hours, mins);
+    } else {
+        let _ = write!(out, "{}m", mins);
     }
 }
 
-fn draw_top_book_row(
-    strip: &mut StripBuffer,
-    font: &'static crate::fonts::bitmap::BitmapFont,
-    y: u16,
-    title: &str,
-    secs: u32,
-) {
-    let title_w = FULL_CONTENT_W * 3 / 4;
-    let time_w = FULL_CONTENT_W - title_w;
-    let title_r = Region::new(LARGE_MARGIN, y, title_w, TOP_ROW_H);
-    BitmapLabel::new(title_r, title, font)
-        .alignment(Alignment::CenterLeft)
-        .draw(strip)
-        .unwrap();
-    let time_r = Region::new(LARGE_MARGIN + title_w, y, time_w, TOP_ROW_H);
-    let mut buf = BitmapDynLabel::<16>::new(time_r, font).alignment(Alignment::CenterRight);
-    fmt_compact_duration(secs, &mut buf);
-    buf.draw(strip).ok();
+/// A lifetime total, where minutes stopped mattering: `187h`.
+fn write_long_duration(out: &mut impl core::fmt::Write, secs: u32) {
+    let hours = secs / 3600;
+    if hours > 0 {
+        let _ = write!(out, "{}h", hours);
+    } else {
+        let _ = write!(out, "{}m", secs / 60);
+    }
+}
+
+/// Seconds a page, as `1m 32s` or `48s`.
+fn write_pace(out: &mut impl core::fmt::Write, secs: u32) {
+    if secs >= 60 {
+        let _ = write!(out, "{}m {}s", secs / 60, secs % 60);
+    } else {
+        let _ = write!(out, "{}s", secs);
+    }
+}
+
+/// Thousands separated, so a five-figure page count stays readable:
+/// `4,728`. No allocation and no float, which rules out the usual
+/// tricks.
+fn write_grouped(out: &mut impl core::fmt::Write, mut n: u32) {
+    // at most 10 digits in a u32, so 4 groups of 3
+    let mut groups = [0u32; 4];
+    let mut count = 0;
+    loop {
+        groups[count] = n % 1000;
+        n /= 1000;
+        count += 1;
+        if n == 0 || count == groups.len() {
+            break;
+        }
+    }
+    let _ = write!(out, "{}", groups[count - 1]);
+    for i in (0..count - 1).rev() {
+        let _ = write!(out, ",{:03}", groups[i]);
+    }
 }

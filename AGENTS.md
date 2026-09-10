@@ -157,9 +157,9 @@ Then every 5 seconds: heap usage, stack watermark, battery percentage, uptime, S
 │   │   └── bitmap.rs              BitmapFont struct, glyph lookup, string drawing
 │   ├── ui/
 │   │   ├── mod.rs                  unified re-exports + chrome
-│   │   └── chrome/                 top status, tab bar, panel, section
-│   │                               label, filter chip (font-aware
-│   │                               widgets layered on the kernel Painter)
+│   │   └── chrome/                 top bar (THE navigation: nameplate +
+│   │                               two named arms + battery), panel,
+│   │                               section label, filter chip
 │   └── apps/
 │       ├── mod.rs                  AppId, Modal, Tab + Nav aliases
 │       ├── tab.rs                  Tab enum, neighbour helpers, icon
@@ -169,8 +169,14 @@ Then every 5 seconds: heap usage, stack watermark, battery percentage, uptime, S
 │       ├── library.rs              scrollable book list + count caption
 │       ├── cover_placeholder.rs    deterministic shape covers
 │       ├── cover_cache.rs          bundle Cover variant read / write
-│       ├── settings.rs             grouped settings (Reading / Display /
-│       │                           System) via VISUAL_TO_LOGICAL reorder
+│       ├── settings/
+│       │   ├── mod.rs              grouped settings (Reading / Display /
+│       │   │                       System): input state machine, draw
+│       │   ├── model.rs            one declaration per setting (label,
+│       │   │                       Domain, get/set onto SystemSettings)
+│       │   ├── layout.rs           where the rows land, Damage
+│       │   └── cache.rs            per-book cache sheet: picker,
+│       │                           Rebuild / Forget, bounded clear
 │       ├── stats.rs                Today / Lifetime / Most time spent
 │       ├── upload.rs               WiFi HTTP upload server + mDNS
 │       ├── reader/
@@ -180,6 +186,9 @@ Then every 5 seconds: heap usage, stack watermark, battery percentage, uptime, S
 │       │   └── images.rs           inline image decode + dithering
 │       └── widgets/
 │           ├── mod.rs              widget re-exports
+│           ├── row.rs              THE list row (lead / title + sub or
+│           │                       bar / value) + RowGroup; every list
+│           │                       on the device draws through it
 │           ├── bitmap_label.rs     proportional text labels
 │           ├── sheet.rs            bottom sheet: frame, header, row
 │           │                       groups, hints (menu + contents)
@@ -298,7 +307,17 @@ Two ADC resistance ladders at 100 Hz (adaptive: fast when active, 50 ms slow whe
 
 ### Navigation
 
+**Five tab screens on a line with Home in the middle**: `Upload · Settings · HOME · Library · Stats`. Right walks out through the books, Left out through the device, and nothing is more than two presses from Home. `Tab::left`/`right` return `Option` — the line does not wrap, and both ends are visible in the chrome because the missing arm is simply absent.
+
+**There is no bottom bar.** Five icon slots that could not be pressed (no touch on this device) were 64 px of an 800 px display drawing a control that does not exist. The top bar is the navigation instead: one cluster in the left corner reading `<- settings  home  library ->`, all lowercase with the current screen bold at body size, the battery in the far corner, and a hairline under it. `bottom_bar_h` is 8 (a margin), `top_bar_h` is 40, and every screen's row height derives from `Theme::content_bottom()` — so the 56 px reclaimed went into cover padding on Home and the Library and a sixth book on Stats. The reader is unaffected: it sizes its page from `SCREEN_H` and its own pads, never from the chrome constants, so no cached page index moved.
+
+No per-screen figure lives in the bar, and Home carries no caption at all — card, hairline, four rows. Today's reading lives only on Stats (which reads it off the kernel), the book count in the library's caption, the firmware version in Settings' About group.
+
 4-deep stack in `Launcher<Id>`. Transitions: `Push` (new app, suspend current), `Pop` (resume previous), `Replace` (swap current), `Home` (reset to home). Push degrades to Replace when stack is full. Each transition calls `on_suspend` / `on_exit` / `on_enter` / `on_resume` lifecycle methods on the affected apps.
+
+### Two voices
+
+A book's title is set in the **book's own face** (`fonts::body_font(reader_font.family(), tier)`, or `heading_font` for the home card); everything the device says about itself is set in the **UI face** (`ui_body_font` / `ui_heading_font` / `chrome_font`). This holds on every screen, not just inside the reader: the reader's contents sheet, home's card and recent list, and the stats book list all take the reader's family, so switching reader font changes how books are named everywhere. `AppManager::propagate_fonts` pushes it to each screen that names a book. Design: mockups/xteink_x4_tab_screens_v2.html.
 
 ### Font pipeline
 
@@ -320,6 +339,10 @@ The kernel ships a built-in `FONT_9X18` mono font (embedded-graphics) for the bo
   TITLES.BIN            filename→title mapping (tab-separated text)
   <hash>.DAT            per-book epub chapter cache (v3 format)
 ```
+
+### Per-book cache, and clearing it
+
+A book's derived bytes are the bundle (`_PLUMP/BOOKS/<H8>.BIN`) and its image directory (`_PLUMP/_HHHHHHH/`, one dithered figure per file), both keyed by the case-sensitive `fnv1a` of the filename. Its irreplaceable bytes are the bookmark slot, `_PLUMP/STATS/<filename>` and the RECENT record, keyed by the filename itself. Settings > Book Cache is where that splits into two actions: **Rebuild cache** drops the derived bytes on one press, **Forget book** adds the rest behind a second. Sizes come from `SdStorage::measure_plump_subdir`; clearing is `purge_plump_subdir` in `PURGE_BATCH`-sized passes then `remove_plump_subdir`, which closes the cached `sub_handles` entry first because FAT will not unlink an open directory. Design: mockups/xteink_x4_settings_book_cache.html.
 
 ### Bookmark system
 
@@ -392,12 +415,16 @@ The kernel doesn't change at all.
 
 Font-dependent widgets go in `src/apps/widgets/`. Font-independent primitives go in `kernel/src/ui/`. If a widget only uses `Region`, `Alignment`, `StripBuffer`, and `BinaryColor`, it belongs in the kernel. If it needs `BitmapFont`, it belongs in the distro.
 
+**Before writing a list, don't.** `widgets/row.rs` is the one list row and every list draws through it: the reader's menu and contents sheets, home's recent list, the settings screen, the stats book list, the book-cache picker. A screen that needs a list uses `RowGroup` (a stack of equal-height rows in one outline) or, inside a sheet, `SheetGeom`; both call `row::draw`, so the anatomy has a single definition. Adding a row capability means adding a field to `RowSpec`, not a second row.
+
 ## How to add a new setting
 
 1. Add the field to `SystemSettings` in `kernel/src/kernel/config.rs`
 2. Add the key to `apply_setting()` and `write_settings_txt()` in the same file
-3. Add UI in `src/apps/settings.rs`
+3. Add a `SettingId` variant, its `label`/`domain`/`get`/`set` arms and a `ROWS` entry in `src/apps/settings/model.rs`
 4. If it needs to propagate to apps, add handling in `AppManager::propagate_settings()`
+
+A row that opens a surface instead of stepping a value takes `Domain::Action` (inert `get`/`set`, `Activation::Open`) and owns its own state on `SettingsApp`; the manager draws such a sheet after the shared chrome, since the top bar wins the painter's algorithm over app content. `Book Cache` is the worked example.
 
 ---
 

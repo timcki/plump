@@ -1,5 +1,9 @@
-// chrome: persistent top status bar + bottom tab bar plus reusable
-// surface widgets (panel, section label, filter chip).
+// chrome: the persistent top bar, which is the navigation, plus
+// reusable surface widgets (panel, section label, filter chip).
+//
+// there is no bottom bar any more: five icon slots that could not be
+// pressed became two named arms either side of a nameplate, in the
+// strip that was already being drawn. see `top_status`.
 //
 // chrome widgets live in the distro because they need bitmap fonts
 // (UI text, eventual icon font). they compose `Painter` (clipping +
@@ -10,65 +14,38 @@
 pub mod filter_chip;
 pub mod panel;
 pub mod section_label;
-pub mod tab_bar;
 pub mod top_status;
 
 pub use filter_chip::FilterChip;
 pub use panel::{Panel, PanelRow, RowAccessory};
 pub use section_label::SectionLabel;
-pub use tab_bar::TabBar;
-pub use top_status::TopStatus;
+pub use top_status::{TopFonts, TopStatus};
 
 use plump_kernel::ui::Painter;
 
 use crate::apps::Tab;
-use crate::fonts::bitmap::BitmapFont;
 
-/// Convenience wrapper that draws both the top status bar and the
-/// bottom tab bar in one call. Reader opts out via `App::show_chrome`.
+/// The persistent chrome. One bar now, at the top; the reader opts
+/// out of it entirely and paints its own footer instead.
 pub struct Chrome {
     pub top: TopStatus,
-    pub tabs: TabBar,
 }
 
 impl Chrome {
     pub const fn new() -> Self {
         Self {
             top: TopStatus::new(),
-            tabs: TabBar::new(Tab::Home),
         }
     }
 
     /// Update the live state from the kernel + nav before drawing.
-    pub fn refresh(
-        &mut self,
-        today_pages: u16,
-        today_secs: u32,
-        battery_pct: u8,
-        active_tab: Tab,
-    ) {
-        self.top.today_pages = today_pages;
-        self.top.today_secs = today_secs;
+    pub fn refresh(&mut self, battery_pct: u8, active_tab: Tab) {
         self.top.battery_pct = battery_pct;
-        self.tabs.active = active_tab;
+        self.top.active = active_tab;
     }
 
-    /// Paint just the top status bar (today's stats + battery).
-    /// Reader uses this and skips `draw_tabs` because it paints its
-    /// own progress footer instead.
-    pub fn draw_top(&self, p: &mut Painter<'_>, text_font: &BitmapFont) {
-        self.top.draw(p, text_font);
-    }
-
-    /// Paint just the bottom tab bar (5 Phosphor icons).
-    pub fn draw_tabs(&self, p: &mut Painter<'_>, icon_font: &BitmapFont) {
-        self.tabs.draw(p, icon_font);
-    }
-
-    /// Convenience: draw top and tabs in one call.
-    pub fn draw(&self, p: &mut Painter<'_>, text_font: &BitmapFont, icon_font: &BitmapFont) {
-        self.draw_top(p, text_font);
-        self.draw_tabs(p, icon_font);
+    pub fn draw_top(&self, p: &mut Painter<'_>, fonts: &TopFonts) {
+        self.top.draw(p, fonts);
     }
 }
 

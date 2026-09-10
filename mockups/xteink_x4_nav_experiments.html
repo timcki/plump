@@ -1,0 +1,313 @@
+<title>Pulp Navigation Experiments</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Lora:ital,wght@0,400;0,500;0,600;1,400&display=swap');
+
+:root {
+  --ground: #141414;
+  --frame: #1c1c1c;
+  --paper: #f6f4ee;
+  --ink: #181818;
+  --ink-25: rgba(24,24,24,0.25);
+  --ink-12: rgba(24,24,24,0.12);
+  --label: #d9d6cc;
+  --amber: #d9c37a;
+}
+body { background: var(--ground); color: var(--label); margin: 0; font-family: 'Atkinson Hyperlegible', system-ui, sans-serif; }
+
+h1 { font-size: 15px; font-weight: 500; text-align: center; margin: 2.8rem 1rem 0.5rem; letter-spacing: 0.01em; }
+h1 small { display: block; font-weight: 400; opacity: 0.55; font-size: 12px; margin-top: 6px; max-width: 74ch; margin-left: auto; margin-right: auto; line-height: 1.55; }
+h2.sec { font-size: 12px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; opacity: 0.5; margin: 2.4rem 0 14px; }
+.wrap { max-width: 1060px; margin: 0 auto; padding: 0 1rem; }
+.note { max-width: 78ch; margin: 0 auto 2.2rem; padding: 0 1rem; font-size: 12.5px; line-height: 1.65; }
+.note p { margin: 0 0 11px; opacity: 0.82; }
+.note b { font-weight: 700; opacity: 1; }
+.note em { font-style: normal; color: var(--amber); }
+.note code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+
+/* ── the top bar, at 1:1 panel scale: 480 wide, 28 tall ───────── */
+.bars { display: flex; flex-direction: column; gap: 14px; margin-bottom: 8px; }
+.brow { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
+.hold { background: var(--paper); color: var(--ink); width: 480px; flex: none; border-radius: 5px; overflow: hidden; }
+.tbar { height: 28px; display: flex; align-items: center; padding: 0 16px; border-bottom: 1px solid var(--ink-12); font-size: 13px; box-sizing: border-box; }
+.tbar .nm { letter-spacing: 0.18em; text-transform: uppercase; font-weight: 700; }
+.tbar .info { opacity: 0.55; margin-left: 9px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tbar .sp { flex: 1; min-width: 12px; }
+.tbar .nb { opacity: 0.55; white-space: nowrap; }
+.tbar .nb i { font-style: normal; opacity: 0.7; }
+.tbar .bat { margin-left: 16px; opacity: 0.6; font-variant-numeric: tabular-nums; }
+.brow .cap { font-size: 11.5px; opacity: 0.6; line-height: 1.5; flex: 1; min-width: 200px; }
+.brow .cap b { opacity: 1; font-weight: 700; color: var(--label); }
+
+/* anatomy callout */
+.anat { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; margin: 6px 0 2.6rem; }
+.anat dl { flex: 1; min-width: 280px; margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 7px 14px; font-size: 12.5px; line-height: 1.55; }
+.anat dt { font-weight: 700; color: var(--amber); white-space: nowrap; }
+.anat dd { margin: 0; opacity: 0.78; }
+
+/* ── rejected forms, compressed ───────────────────────────────── */
+.also { display: flex; gap: 18px; flex-wrap: wrap; }
+.also .one { background: var(--paper); color: var(--ink); width: 232px; border-radius: 5px; overflow: hidden; flex: none; }
+.also .one .mini { height: 30px; display: flex; align-items: center; justify-content: center; border-top: 1px solid var(--ink-12); font-size: 8px; letter-spacing: 0.16em; text-transform: uppercase; font-weight: 700; position: relative; }
+.also .one .fill { padding: 8px 10px; }
+.also .one .fill .l { height: 3px; background: var(--ink-12); border-radius: 2px; margin-bottom: 5px; }
+.also .one .fill .l.k { background: var(--ink-25); width: 55%; }
+.also .cur { padding: 0 8px; }
+.also .nb2 { opacity: 0.35; font-weight: 400; }
+.also .rail { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; display: flex; }
+.also .rail > i { flex: 1; border-top: 1px solid var(--ink-25); }
+.also .rail > i.on { background: var(--ink); border-top-color: var(--ink); }
+.also .spine { position: absolute; right: 5px; top: 4px; bottom: 4px; width: 6px; display: flex; flex-direction: column; gap: 2px; }
+.also .spine > i { flex: 1; border: 1px solid var(--ink-25); border-radius: 1px; box-sizing: border-box; }
+.also .spine > i.on { background: var(--ink); border-color: var(--ink); }
+.also p { font-size: 11px; opacity: 0.6; line-height: 1.5; margin: 7px 0 0; }
+.also p b { opacity: 0.95; font-weight: 700; }
+.alsowrap { display: flex; flex-direction: column; width: 232px; }
+
+/* ── full frames ──────────────────────────────────────────────── */
+.fr { display: flex; justify-content: center; gap: 22px; flex-wrap: wrap; padding: 1rem 0 0.5rem; align-items: flex-start; }
+.un { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.un > .lab { font-size: 13px; font-weight: 500; margin: 0; text-align: center; max-width: 300px; }
+.un > .lab small { display: block; font-weight: 400; opacity: 0.6; font-size: 11px; margin-top: 3px; line-height: 1.5; }
+.dv { background: var(--frame); padding: 7px; border-radius: 20px; }
+/* 0.625 css px per device px: 480x800 -> 300x500 */
+.sc { background: var(--paper); color: var(--ink); width: 300px; height: 500px; border-radius: 13px; display: flex; flex-direction: column; overflow: hidden; box-sizing: border-box; }
+.sc .tbar { height: 17px; font-size: 8px; padding: 0 10px; }
+.sc .tbar .nm { letter-spacing: 0.16em; }
+.sc .tbar .info { margin-left: 5px; }
+.sc .tbar .bat { margin-left: 9px; }
+.bd { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 0 10px 5px; }
+.card2 { display: flex; gap: 8px; border: 2px solid var(--ink); border-radius: 5px; padding: 7px; height: 115px; box-sizing: border-box; flex: none; }
+.cv { background: var(--ink); position: relative; border-radius: 1px; flex: none; width: 70px; height: 100px; }
+.cv.sm { width: 40px; height: 60px; }
+.cv.lt { background: #d8d2bd; }
+.cv::after { content: ''; position: absolute; background: var(--paper); width: 30%; aspect-ratio: 1; border-radius: 50%; top: 28%; left: 35%; }
+.cv.lt::after { background: var(--ink); width: 14%; height: 60%; border-radius: 0; top: 20%; left: 43%; }
+.cw { display: flex; flex-direction: column; flex: 1; min-width: 0; justify-content: center; }
+.cw .ti { font-family: 'Lora', Georgia, serif; font-size: 13px; font-weight: 600; margin: 0; line-height: 1.2; }
+.cw .au { font-size: 8.5px; opacity: 0.65; margin: 2px 0 8px; }
+.cw .cbar { height: 4px; border: 1px solid var(--ink); border-radius: 2px; box-sizing: border-box; overflow: hidden; }
+.cw .cbar > b { display: block; height: 100%; background: var(--ink); border-radius: 1px; }
+.cw .cm { display: flex; justify-content: space-between; margin-top: 4px; font-size: 8px; opacity: 0.65; }
+.sep-rule { display: flex; justify-content: center; padding: 8px 0; }
+.sep-rule > i { display: block; width: 15px; height: 1px; background: var(--ink); opacity: 0.55; }
+.gr { border: 1px solid var(--ink-25); border-radius: 5px; overflow: hidden; flex: none; }
+.rw { display: grid; grid-template-columns: 40px 1fr auto; align-items: center; column-gap: 8px; padding: 0 7px; border-bottom: 1px solid var(--ink-12); box-sizing: border-box; }
+.rw:last-child { border-bottom: none; }
+.rw .ttl { font-family: 'Lora', Georgia, serif; font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rw .sub { display: block; font-size: 7.5px; opacity: 0.6; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rw .rbar { height: 4px; border: 1px solid var(--ink); border-radius: 2px; box-sizing: border-box; overflow: hidden; margin-top: 4px; width: 58%; }
+.rw .rbar > b { display: block; height: 100%; background: var(--ink); border-radius: 1px; }
+.rw .v { font-size: 8px; opacity: 0.6; font-variant-numeric: tabular-nums; }
+.rw .n { font-size: 7.5px; opacity: 0.5; text-align: center; }
+.kwline { font-size: 7.5px; letter-spacing: 0.22em; text-transform: uppercase; font-weight: 700; opacity: 0.5; display: flex; justify-content: space-between; padding: 6px 2px 5px; }
+.figs { display: flex; gap: 6px; }
+.fig { flex: 1; border: 1px solid var(--ink-25); border-radius: 5px; padding: 5px 7px; }
+.fig .v2 { font-size: 14px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+.fig .l2 { font-size: 6px; letter-spacing: 0.16em; text-transform: uppercase; font-weight: 700; opacity: 0.5; margin-top: 4px; }
+
+/* table */
+.bud { max-width: 900px; margin: 1rem auto 2.8rem; padding: 0 1rem; overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+caption { text-align: left; font-size: 11.5px; opacity: 0.6; padding: 0 0 9px; line-height: 1.5; }
+th, td { text-align: right; padding: 6px 0 6px 16px; border-bottom: 1px solid rgba(217,214,204,0.14); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; padding-left: 0; }
+th { font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; font-weight: 700; opacity: 0.5; }
+td.ok { color: var(--amber); }
+tr.now td { opacity: 0.5; }
+.rules { max-width: 78ch; margin: 0.4rem auto 3rem; padding: 0 1rem; font-size: 12.5px; line-height: 1.6; }
+.rules li { margin-bottom: 10px; opacity: 0.82; }
+.rules b { font-weight: 700; opacity: 1; }
+.rules code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+</style>
+
+<h1>Navigation, reconsidered<small>The bottom bar goes. The top bar &mdash; which is drawn on every screen already and is half empty &mdash; takes over: where you are, what a Right press gets you, one fact about this screen, and the battery.</small></h1>
+
+<div class="note">
+  <p><b>A row of five equal slots is the touch idiom.</b> It exists on phones because you need five tap targets of equal weight. This device has none: the bar cannot be pressed and never could. It was drawing a control that does not exist, in 64 px of an 800 px display, forever, to carry a little over two bits.</p>
+  <p><b>The top bar meanwhile is genuinely half empty.</b> <code>TopStatus::draw</code> writes one string on the left &mdash; <em>today &middot; 47 pages &middot; 1h 12m</em> &mdash; and a battery percentage on the right, reserving the whole width in between for a line that uses about half of it. It has no border either: the code clears it to paper and stops.</p>
+  <p><b>So the bar that cannot be pressed goes, and the strip that was already there starts earning its keep.</b> Four zones on one 28 px line, in the vocabulary the rest of the device already uses.</p>
+</div>
+
+<div class="wrap">
+  <h2 class="sec">The top bar, one line, five screens</h2>
+  <div class="bars">
+
+    <div class="brow">
+      <div class="hold"><div class="tbar">
+        <span class="nm">Home</span><span class="info">today &middot; 47 pages &middot; 1h 12m</span>
+        <span class="sp"></span>
+        <span class="nb">Library <i>&#9654;</i></span><span class="bat">87%</span>
+      </div></div>
+      <p class="cap"><b>Home.</b> Today's reading keeps its slot, on the one screen where it is ambient rather than redundant. Nothing to the left of Home, and nothing on the bar pretending otherwise.</p>
+    </div>
+
+    <div class="brow">
+      <div class="hold"><div class="tbar">
+        <span class="nm">Library</span><span class="info">9 books &middot; 4.5 MB cached</span>
+        <span class="sp"></span>
+        <span class="nb">Stats <i>&#9654;</i></span><span class="bat">87%</span>
+      </div></div>
+      <p class="cap"><b>Library.</b> The count you asked for, where it costs nothing: it was the redundant half of Home's old caption and it is the useful half of this one.</p>
+    </div>
+
+    <div class="brow">
+      <div class="hold"><div class="tbar">
+        <span class="nm">Stats</span><span class="info">23 books tracked</span>
+        <span class="sp"></span>
+        <span class="nb">Settings <i>&#9654;</i></span><span class="bat">87%</span>
+      </div></div>
+      <p class="cap"><b>Stats.</b> Books ever opened, which is the one figure the screen below does not already carry &mdash; it counts stats files, not files on the card.</p>
+    </div>
+
+    <div class="brow">
+      <div class="hold"><div class="tbar">
+        <span class="nm">Settings</span><span class="info">v0.1.0</span>
+        <span class="sp"></span>
+        <span class="nb">Upload <i>&#9654;</i></span><span class="bat">87%</span>
+      </div></div>
+      <p class="cap"><b>Settings.</b> The firmware version, free from <code>CARGO_PKG_VERSION</code> at compile time, and the one thing a settings screen is always asked for.</p>
+    </div>
+
+    <div class="brow">
+      <div class="hold"><div class="tbar">
+        <span class="nm">Upload</span><span class="info">pulp.local &middot; serving</span>
+        <span class="sp"></span>
+        <span class="nb"><i>&#9664;</i> Settings</span><span class="bat">87%</span>
+      </div></div>
+      <p class="cap"><b>Upload, the far end.</b> No next screen exists, so the neighbour flips to the one behind and the chevron turns around. The arrow always names the button that gets you there, so the end of the line reads as an end.</p>
+    </div>
+
+  </div>
+
+  <div class="anat">
+    <dl>
+      <dt>Name</dt><dd>Tracked uppercase, the weight every caption and hint on the device is set in. The only bold thing on the bar.</dd>
+      <dt>Fact</dt><dd>One per screen, after a <code>&middot;</code>, at the same 55% as a sheet's meta line. Chosen so it is never something visible below it.</dd>
+      <dt>Neighbour</dt><dd>Sentence case, not a label but a name. <code>&#9654;</code> for the next screen, <code>&#9664;</code> on the last one where only a previous exists.</dd>
+      <dt>Battery</dt><dd>Far right on every screen, unmoved, because it is the one thing you look for rather than read.</dd>
+      <dt>Hairline</dt><dd>Under the bar, at 12% ink. Neither bar has ever had an edge on any screen; both get one.</dd>
+    </dl>
+  </div>
+
+  <h2 class="sec">Also tried, and why they lost</h2>
+  <div class="also">
+    <div class="alsowrap">
+      <div class="one">
+        <div class="fill"><div class="l k"></div><div class="l"></div><div class="l"></div></div>
+        <div class="mini"><span class="nb2">Stats</span><span class="cur">Settings</span><span class="nb2">Upload</span></div>
+      </div>
+      <p><b>The strip.</b> Both neighbours named at the bottom. Teaches best of any option, but spends 32 px saying what the top bar can say in zero.</p>
+    </div>
+    <div class="alsowrap">
+      <div class="one">
+        <div class="fill"><div class="l k"></div><div class="l"></div><div class="l"></div></div>
+        <div class="mini"><span style="position:absolute;left:70%;transform:translateX(-50%);top:4px">Settings</span><span class="rail"><i></i><i></i><i></i><i class="on"></i><i></i></span></div>
+      </div>
+      <p><b>The ruler.</b> The label rides its own tick, so its position is the indicator. Prettiest, and a name that lands somewhere different every time is the hardest to re-find.</p>
+    </div>
+    <div class="alsowrap">
+      <div class="one" style="position:relative">
+        <div class="fill" style="padding-right:18px"><div class="l k"></div><div class="l"></div><div class="l"></div><div class="l"></div></div>
+        <div class="spine"><i></i><i></i><i></i><i class="on"></i><i></i></div>
+        <div class="mini" style="border:none;opacity:0.25">spine on the edge</div>
+      </div>
+      <p><b>The spine.</b> Five bands down the right edge. Costs width instead of height and is the one nobody understands unprompted. Still the most fun to build.</p>
+    </div>
+  </div>
+
+</div>
+
+<h1>What the 56 px buys<small>Home, Library and Stats with no bottom bar. The content band goes from 700 to 756, and it all goes into the rows.</small></h1>
+
+<div class="fr">
+
+  <div class="un">
+    <div class="dv"><div class="sc">
+      <div class="tbar"><span class="nm">Home</span><span class="info">today &middot; 47 pages</span><span class="sp"></span><span class="nb">Library <i>&#9654;</i></span><span class="bat">87%</span></div>
+      <div class="bd">
+        <div class="kwline"><span>Continue reading</span><span></span></div>
+        <div class="card2">
+          <div class="cv"></div>
+          <div class="cw"><p class="ti">Exhalation</p><p class="au">Ted Chiang</p><div class="cbar"><b style="width:38%"></b></div><div class="cm"><span>chapter 5 of 11 &middot; 38%</span><span>2h 40m left</span></div></div>
+        </div>
+        <div class="sep-rule"><i></i></div>
+        <div class="gr">
+          <div class="rw" style="height:85px"><span class="cv sm lt"></span><span class="t"><span class="ttl">Pachinko</span><span class="sub">Min Jin Lee</span><span class="rbar"><b style="width:62%"></b></span></span><span class="v"></span></div>
+          <div class="rw" style="height:85px"><span class="cv sm"></span><span class="t"><span class="ttl">The MANIAC</span><span class="sub">Benjam&iacute;n Labatut</span><span class="rbar"><b style="width:100%"></b></span></span><span class="v"></span></div>
+          <div class="rw" style="height:85px"><span class="cv sm"></span><span class="t"><span class="ttl">Foundation</span><span class="sub">Isaac Asimov</span><span class="rbar"><b style="width:100%"></b></span></span><span class="v"></span></div>
+          <div class="rw" style="height:85px"><span class="cv sm lt"></span><span class="t"><span class="ttl">Sea of Tranquility</span><span class="sub">Emily St. John Mandel</span><span class="rbar"><b style="width:21%"></b></span></span><span class="v"></span></div>
+        </div>
+      </div>
+    </div></div>
+    <p class="lab">Home<small>Rows at 136 with <b>20 px</b> around every cover, from 13 today. The card, the rule and four books now fill the screen to the bottom edge with nothing left over.</small></p>
+  </div>
+
+  <div class="un">
+    <div class="dv"><div class="sc">
+      <div class="tbar"><span class="nm">Library</span><span class="info">9 books</span><span class="sp"></span><span class="nb">Stats <i>&#9654;</i></span><span class="bat">87%</span></div>
+      <div class="bd">
+        <div class="kwline"><span>All books</span><span>1&ndash;6 of 9</span></div>
+        <div class="gr">
+          <div class="rw" style="height:76px"><span class="cv sm"></span><span class="t"><span class="ttl">Exhalation</span><span class="sub">Ted Chiang</span><span class="rbar"><b style="width:38%"></b></span></span><span class="v">322 pages</span></div>
+          <div class="rw" style="height:76px"><span class="cv sm lt"></span><span class="t"><span class="ttl">Foundation</span><span class="sub">Isaac Asimov</span><span class="rbar"><b style="width:100%"></b></span></span><span class="v">255 pages</span></div>
+          <div class="rw" style="height:76px"><span class="cv sm"></span><span class="t"><span class="ttl">Pachinko</span><span class="sub">Min Jin Lee</span><span class="rbar"><b style="width:62%"></b></span></span><span class="v">490 pages</span></div>
+          <div class="rw" style="height:76px"><span class="cv sm lt"></span><span class="t"><span class="ttl">Piranesi</span><span class="sub">Susanna Clarke</span></span><span class="v">245 pages</span></div>
+          <div class="rw" style="height:76px"><span class="cv sm"></span><span class="t"><span class="ttl">Sea of Tranquility</span><span class="sub">Emily St. John Mandel</span><span class="rbar"><b style="width:21%"></b></span></span><span class="v">259 pages</span></div>
+          <div class="rw" style="height:76px"><span class="cv sm"></span><span class="t"><span class="ttl">The Left Hand of Darkness</span><span class="sub">Ursula K. Le Guin</span></span><span class="v">304 pages</span></div>
+        </div>
+      </div>
+    </div></div>
+    <p class="lab">Library<small>Six rows at 121 with <b>12 px</b> around each cover, from 8. A seventh still does not fit &mdash; it would put the padding back to 4, which is where this all started.</small></p>
+  </div>
+
+  <div class="un">
+    <div class="dv"><div class="sc">
+      <div class="tbar"><span class="nm">Stats</span><span class="info">23 books tracked</span><span class="sp"></span><span class="nb">Settings <i>&#9654;</i></span><span class="bat">87%</span></div>
+      <div class="bd">
+        <div class="kwline"><span>Today</span><span>Wed</span></div>
+        <div class="figs">
+          <div class="fig"><div class="v2">47</div><div class="l2">Pages</div></div>
+          <div class="fig"><div class="v2">1h 12m</div><div class="l2">Reading</div></div>
+          <div class="fig"><div class="v2">1m 32s</div><div class="l2">A page</div></div>
+        </div>
+        <div class="kwline" style="padding-top:11px"><span>Lifetime</span></div>
+        <div class="gr">
+          <div class="rw" style="height:38px;grid-template-columns:1fr auto"><span class="t"><span class="ttl" style="font-family:inherit;font-size:9.5px">Books read</span></span><span class="v" style="font-size:11px;font-weight:700;opacity:0.9">23</span></div>
+          <div class="rw" style="height:38px;grid-template-columns:1fr auto"><span class="t"><span class="ttl" style="font-family:inherit;font-size:9.5px">Pages turned</span></span><span class="v" style="font-size:11px;font-weight:700;opacity:0.9">4,728</span></div>
+          <div class="rw" style="height:38px;grid-template-columns:1fr auto"><span class="t"><span class="ttl" style="font-family:inherit;font-size:9.5px">Time reading</span></span><span class="v" style="font-size:11px;font-weight:700;opacity:0.9">187h</span></div>
+        </div>
+        <div class="kwline" style="padding-top:11px"><span>Most time spent</span></div>
+        <div class="gr">
+          <div class="rw" style="height:44px;grid-template-columns:14px 1fr auto"><span class="n">1</span><span class="t"><span class="ttl">Foundation</span><span class="sub">Isaac Asimov &middot; 34 sessions</span><span class="rbar" style="width:70%"><b style="width:100%"></b></span></span><span class="v">12h 32m</span></div>
+          <div class="rw" style="height:44px;grid-template-columns:14px 1fr auto"><span class="n">2</span><span class="t"><span class="ttl">Exhalation</span><span class="sub">Ted Chiang &middot; 41 sessions</span><span class="rbar" style="width:70%"><b style="width:76%"></b></span></span><span class="v">9h 32m</span></div>
+          <div class="rw" style="height:44px;grid-template-columns:14px 1fr auto"><span class="n">3</span><span class="t"><span class="ttl">Pachinko</span><span class="sub">Min Jin Lee &middot; 22 sessions</span><span class="rbar" style="width:70%"><b style="width:66%"></b></span></span><span class="v">8h 14m</span></div>
+          <div class="rw" style="height:44px;grid-template-columns:14px 1fr auto"><span class="n">4</span><span class="t"><span class="ttl">The MANIAC</span><span class="sub">Benjam&iacute;n Labatut &middot; 19 sessions</span><span class="rbar" style="width:70%"><b style="width:54%"></b></span></span><span class="v">6h 47m</span></div>
+          <div class="rw" style="height:44px;grid-template-columns:14px 1fr auto"><span class="n">5</span><span class="t"><span class="ttl">The Left Hand of Darkness</span><span class="sub">Ursula K. Le Guin &middot; 12 sessions</span><span class="rbar" style="width:70%"><b style="width:40%"></b></span></span><span class="v">5h 03m</span></div>
+          <div class="rw" style="height:44px;grid-template-columns:14px 1fr auto"><span class="n">6</span><span class="t"><span class="ttl">Piranesi</span><span class="sub">Susanna Clarke &middot; 8 sessions</span><span class="rbar" style="width:70%"><b style="width:29%"></b></span></span><span class="v">3h 38m</span></div>
+        </div>
+      </div>
+    </div></div>
+    <p class="lab">Stats<small>The 56 px turn into a sixth and seventh book here, or one more of anything the screen later wants. This is the screen the old bar was costing the most.</small></p>
+  </div>
+
+</div>
+
+<div class="bud">
+  <table>
+    <caption>The content band is 800 minus the 36 px top and an 8 px bottom margin, where the tab bar used to sit. Home is costed with the card at 184 and the short rule at 27; the library with its 24 px caption. Cover padding is the figure that has driven every complaint about these screens.</caption>
+    <thead><tr><th>Bottom</th><th>Band</th><th>Home row</th><th>Home pad</th><th>Library row</th><th>Library pad</th><th>Stats books</th></tr></thead>
+    <tbody>
+      <tr class="now"><td>Icon row, 64 px</td><td>700</td><td>122</td><td>13</td><td>112</td><td>8</td><td>5</td></tr>
+      <tr><td>Nothing, 8 px margin</td><td>756</td><td>136</td><td class="ok">20</td><td>121</td><td class="ok">12</td><td class="ok">7</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<ol class="rules">
+  <li><b>The chevron names a button, not a direction on a map.</b> <code>&#9654;</code> means &ldquo;press Right&rdquo;. On Upload, where no next screen exists, the neighbour becomes the previous one and the arrow turns around rather than disappearing &mdash; so the far end of the line still tells you how to get off it.</li>
+  <li><b>The fact is never something the screen already says.</b> Books on the card go on Library, where the list does not total itself; books ever <em>opened</em> go on Stats, where it is the one figure the page below omits; the version goes on Settings. Today's reading stays on Home and nowhere else, which is also the one place it was not slightly odd.</li>
+  <li><b>Nothing replaces the position indicator, and nothing needs to.</b> A named neighbour implies a sequence more clearly than five dots do, and the order is five items long. There is no <code>4 / 5</code> anywhere: it would be the count problem again, telling you something the name already told you.</li>
+  <li><b>The honest cost is a cold start.</b> Nothing on screen says how many screens there are or that Left and Right are what move between them &mdash; you learn it in a press, but you do learn it rather than see it. That is the whole of what the 64 px was buying, and it is why the strip was the recommendation before you overruled it.</li>
+  <li><b>Everything below moves up by 56 px.</b> <code>Theme::bottom_bar_h</code> goes from 64 to 8 and <code>content_bottom()</code> follows, so every screen's layout arithmetic and its compile-time assertions re-derive from one constant. The reader is unaffected: it never drew the tab bar.</li>
+  <li><b>Two things are being deleted, not moved.</b> <code>TabBar</code> and <code>Tab::icon</code>, and with them the five Phosphor codepoints in <code>build.rs</code> that nothing else uses &mdash; house, books, chart-bar, gear-six and cloud-arrow-up. The icon font stays for the sheets.</li>
+</ol>

@@ -15,8 +15,8 @@ use embedded_graphics::primitives::{PrimitiveStyle, Rectangle, RoundedRectangle}
 use plump_kernel::util::FixedStr;
 
 use crate::apps::recent::{self, RecentRecord};
+use crate::apps::widgets::row::{self, RowFonts, RowGroup, RowLead, RowSpec, ValueChip};
 use crate::apps::widgets::sheet::{ICON_LIST, ICON_PLAY};
-use crate::apps::widgets::{BOOK_ROW_H, BookRow};
 use crate::apps::{
     App, AppContext, AppId, BgBudget, BgOutcome, MSG_TAG_OPEN_CONTENTS, RECENT_FILE, Transition,
 };
@@ -30,27 +30,23 @@ use crate::fonts;
 use crate::kernel::KernelHandle;
 use crate::kernel::bookmarks::{self, BmListEntry};
 use crate::ui::{
-    Alignment, BitmapDynLabel, CONTENT_TOP, FULL_CONTENT_W, LARGE_MARGIN, Region, SectionLabel,
+    Alignment, CONTENT_TOP, FULL_CONTENT_W, LARGE_MARGIN, Region,
 };
-
-// section caption strip height.
-const CAPTION_H: u16 = 16;
-const CAPTION_GAP: u16 = 8;
 
 // continue-reading card.
 const CARD_X: u16 = LARGE_MARGIN;
 const CARD_W: u16 = FULL_CONTENT_W;
-const CARD_H: u16 = 180;
-const CARD_PAD: u16 = 14;
-const CARD_PROGRESS_H: u16 = 5;
+// the Card cover variant is 112x160, so the card is that plus its
+// padding: at 180 with 14 of pad the inner height was 152 and the
+// guard below threw every cover away, which is why the card has been
+// drawing text on its own
+const CARD_PAD: u16 = 12;
+const CARD_H: u16 = crate::apps::cover_cache::CARD_THUMB_H + 2 * CARD_PAD;
+const CARD_PROGRESS_H: u16 = row::BAR_H;
 
-// recent list. row geometry (height, cover, indents) lives in the
-// shared BookRow widget, which the library list reuses.
-const MAX_RECENT_ROWS: usize = 3;
-const ROW_GAP: u16 = 4;
-const ROW_STRIDE: u16 = BOOK_ROW_H + ROW_GAP;
-const ROW_X: u16 = LARGE_MARGIN;
-const ROW_W: u16 = FULL_CONTENT_W;
+// recent list: one outlined group of cover rows, the same component
+// the library and the reader's contents sheet draw.
+const MAX_RECENT_ROWS: usize = 4;
 
 // 1 card + N rows.
 const MAX_ITEMS: usize = 1 + MAX_RECENT_ROWS;
@@ -69,25 +65,67 @@ pub(crate) const fn is_resume_action(id: u8) -> bool {
 // bar over y >= SCREEN_H - theme.bottom_bar_h.
 const CARD_Y: u16 = CONTENT_TOP;
 const CARD_REGION: Region = Region::new(CARD_X, CARD_Y, CARD_W, CARD_H);
-const RECENT_CAPTION_Y: u16 = CARD_Y + CARD_H + CAPTION_GAP * 2;
-const RECENT_CAPTION_REGION: Region =
-    Region::new(LARGE_MARGIN, RECENT_CAPTION_Y, FULL_CONTENT_W, CAPTION_H);
-const FIRST_ROW_Y: u16 = RECENT_CAPTION_Y + CAPTION_H + CAPTION_GAP;
+
+// between the card and the list: a 24 px hairline, centred. the same
+// rule the reader's loading plate sets between an author and a resume
+// line, and 10 px cheaper than the caption it replaces -- which was
+// carrying one word plus a count of rows you can see and count.
+const RULE_W: u16 = 24;
+const RULE_LEAD: u16 = 13;
+const RULE_GAP: u16 = 13;
+const RULE_Y: u16 = CARD_Y + CARD_H + RULE_LEAD;
+const RULE_REGION: Region = Region::new(LARGE_MARGIN, RULE_Y, FULL_CONTENT_W, 1);
+const FIRST_ROW_Y: u16 = RULE_Y + 1 + RULE_GAP;
 
 const CONTENT_REGION: Region = Region::new(0, CONTENT_TOP, SCREEN_W, SCREEN_H - CONTENT_TOP);
 
-fn row_region(i: usize) -> Region {
-    Region::new(ROW_X, FIRST_ROW_Y + i as u16 * ROW_STRIDE, ROW_W, BOOK_ROW_H)
+/// Row height: the band left under the card, divided by the rows that
+/// go in it. With the tab bar gone this comes out at 136, which is
+/// 20 px of air above and below every cover; it was 4 px when this
+/// screen first felt cramped.
+const ROW_H: u16 = (LIST_BOTTOM - FIRST_ROW_Y - 1) / MAX_RECENT_ROWS as u16;
+const LIST_BOTTOM: u16 = plump_kernel::ui::Theme::default_v1().content_bottom();
+
+/// The recent list as one group. Sized to the rows it holds, so a
+/// card with two bookmarks behind it does not leave an empty frame.
+fn recent_group(rows: usize) -> RowGroup {
+    RowGroup::new(LARGE_MARGIN, FIRST_ROW_Y, FULL_CONTENT_W, rows, ROW_H)
 }
 
-// recent list entry (filename + display title + progress placeholder).
-// progress comes from bundle headers in a follow-up; today rows show
-// only the title so the structural rewrite stays bounded.
+fn row_region(i: usize) -> Region {
+    recent_group(MAX_RECENT_ROWS).row_region(i)
+}
+
+// both of these were true by accident and then quietly stopped being:
+// the card's inner height fell under the cover variant it asks for, so
+// the guard meant for legacy 200x240 covers threw away every current
+// one and the card drew text alone for weeks. checked at compile time
+// now, because nothing at runtime complains.
+const _: () = assert!(
+    CARD_H - 2 * CARD_PAD >= crate::apps::cover_cache::CARD_THUMB_H,
+    "card is shorter than the Card cover variant it loads"
+);
+const _: () = assert!(
+    FIRST_ROW_Y + row::RowGroup::height(MAX_RECENT_ROWS, ROW_H) <= LIST_BOTTOM,
+    "card plus recent list overflows the content band"
+);
+const _: () = assert!(
+    ROW_H >= row::COVER_H + 12,
+    "recent rows crowd their covers"
+);
+
+// recent list entry. the author and the position come from the same
+// bundle session that reads the row's cover, so a row costs one file
+// open rather than two.
 #[derive(Clone, Copy)]
 struct RecentRow {
     filename: FixedStr<32>,
     title: FixedStr<64>,
+    author: FixedStr<40>,
     progress_pct: u8,
+    /// (done, total) in pages when the book has been indexed, in
+    /// chapters when it has not
+    position: Option<(u32, u32)>,
     valid: bool,
 }
 
@@ -95,7 +133,9 @@ impl RecentRow {
     const EMPTY: Self = Self {
         filename: FixedStr::EMPTY,
         title: FixedStr::EMPTY,
+        author: FixedStr::EMPTY,
         progress_pct: 0,
+        position: None,
         valid: false,
     };
 
@@ -112,6 +152,10 @@ pub struct HomeApp {
     selected: usize,
     item_count: usize,
     ui_fonts: fonts::UiFonts,
+    /// the card's title, in the reader's family at heading scale
+    book_title: &'static fonts::bitmap::BitmapFont,
+    /// a recent row's title, matching the contents sheet
+    book_row: &'static fonts::bitmap::BitmapFont,
 
     // active book (the card)
     recent_book: FixedStr<32>,
@@ -119,6 +163,10 @@ pub struct HomeApp {
     recent_author: FixedStr<64>,
     recent_progress: u8,
     recent_stats_time: u32,
+    /// bookmark chapter (1-based for display) and the book's count,
+    /// from the bundle header the cover read already opens
+    recent_chapter: u16,
+    recent_chapter_count: u16,
     recent_cover: Option<crate::kernel::work_queue::DecodedImage>,
 
     // recent list (3 most-recent bookmarks after the card)
@@ -128,6 +176,8 @@ pub struct HomeApp {
 
     needs_load: bool,
     bat_pct: u8,
+    /// books on the card, for the empty card's one line
+    library_count: u16,
 
     qa_buf: [QuickAction; 2],
     qa_count: usize,
@@ -145,17 +195,22 @@ impl HomeApp {
             selected: 0,
             item_count: 1,
             ui_fonts: fonts::UiFonts::for_size(0),
+            book_title: fonts::heading_font(fonts::ReaderFont::Bookerly.family(), 0),
+            book_row: fonts::body_font(fonts::ReaderFont::Bookerly.family(), 1),
             recent_book: FixedStr::EMPTY,
             recent_title: FixedStr::EMPTY,
             recent_author: FixedStr::EMPTY,
             recent_progress: 0,
             recent_stats_time: 0,
+            recent_chapter: 0,
+            recent_chapter_count: 0,
             recent_cover: None,
             recent_rows: [RecentRow::EMPTY; MAX_RECENT_ROWS],
             recent_row_count: 0,
             recent_row_covers: [const { None }; MAX_RECENT_ROWS],
             needs_load: false,
             bat_pct: 0,
+            library_count: 0,
             qa_buf: [QuickAction::trigger(0, "", ""); 2],
             qa_count: 0,
         }
@@ -163,6 +218,14 @@ impl HomeApp {
 
     pub fn set_ui_font_size(&mut self, idx: u8) {
         self.ui_fonts = fonts::UiFonts::for_size(idx);
+    }
+
+    /// A book's title is set in the book's own face, the way the
+    /// reader's contents sheet sets a chapter's. The device speaks in
+    /// the UI face; only the book speaks in this one.
+    pub fn set_reader_font(&mut self, font: fonts::ReaderFont) {
+        self.book_title = fonts::heading_font(font.family(), 0);
+        self.book_row = fonts::body_font(font.family(), 1);
     }
 
     // RTC session accessors (no inner state machine any more; bookmark
@@ -205,6 +268,7 @@ impl HomeApp {
     pub fn load_recent(&mut self, k: &mut KernelHandle<'_>) {
         let t0 = embassy_time::Instant::now();
         self.load_card(k);
+        self.load_library_count(k);
         let card_ms = t0.elapsed().as_millis();
         let t1 = embassy_time::Instant::now();
         self.load_recent_rows(k);
@@ -232,21 +296,44 @@ impl HomeApp {
             } else {
                 self.recent_stats_time = 0;
             }
+            // one session: the cover, and the position the card's meta
+            // line reads from the same header
+            let entry = crate::apps::cover_cache::load_book_entry(
+                k,
+                plump_kernel::util::hash::fnv1a(self.recent_book.as_bytes()),
+                plump_kernel::kernel::bundle::CoverKind::Card,
+            );
             // discard oversized covers from legacy single-variant bundles
             // (200x240) -- the reader re-decodes both variants at proper
             // size on next open. without this guard the old image would
             // overflow the card by ~88 px vertical.
             const CARD_INNER_H: u16 = CARD_H - 2 * CARD_PAD;
-            self.recent_cover = crate::apps::cover_cache::load_cover_variant_for(
-                k,
-                self.recent_book.as_bytes(),
-                plump_kernel::kernel::bundle::CoverKind::Card,
-            )
-            .filter(|img| img.height <= CARD_INNER_H);
+            self.recent_chapter = entry.chapter;
+            self.recent_chapter_count = entry.chapter_count;
+            // RECENT's own percentage is written by the reader on every
+            // turn, so it beats the header's page hint; fall back to
+            // the header for a book whose record predates it
+            if self.recent_progress == 0 {
+                self.recent_progress = entry.progress_pct().unwrap_or(0);
+            }
+            self.recent_cover = entry.cover.filter(|img| img.height <= CARD_INNER_H);
         } else {
             self.recent_stats_time = 0;
             self.recent_cover = None;
+            self.recent_chapter = 0;
+            self.recent_chapter_count = 0;
         }
+    }
+
+    /// Books on the card. The directory cache is already loaded for
+    /// the library, so this is a RAM read.
+    fn load_library_count(&mut self, k: &mut KernelHandle<'_>) {
+        self.library_count = if k.ensure_dir_cache_loaded().is_ok() {
+            let mut page = [crate::drivers::storage::DirEntry::EMPTY; 1];
+            k.dir_page(0, &mut page).map(|p| p.total as u16).unwrap_or(0)
+        } else {
+            0
+        };
     }
 
     fn load_recent_rows(&mut self, k: &mut KernelHandle<'_>) {
@@ -275,14 +362,18 @@ impl HomeApp {
             if let Some(title) = k.dir_cache_mut().find_title(entry.filename.as_bytes()) {
                 row.title.set(title);
             }
-            row.progress_pct = 0; // chunk I follow-up: read from bundle header
-            row.valid = true;
-            self.recent_rows[out] = row;
-            self.recent_row_covers[out] = crate::apps::cover_cache::load_cover_variant_for(
+            // one bundle session per row: cover, author and position
+            let book = crate::apps::cover_cache::load_book_entry(
                 k,
-                entry.filename.as_bytes(),
+                plump_kernel::util::hash::fnv1a(entry.filename.as_bytes()),
                 plump_kernel::kernel::bundle::CoverKind::Mini,
             );
+            row.author = book.author;
+            row.progress_pct = book.progress_pct().unwrap_or(0);
+            row.position = book.position();
+            row.valid = true;
+            self.recent_rows[out] = row;
+            self.recent_row_covers[out] = book.cover;
             out += 1;
         }
         self.recent_row_count = out;
@@ -398,6 +489,20 @@ impl HomeApp {
         }
     }
 
+    /// Time left in the book, extrapolated from what it has already
+    /// cost at the fraction it has already covered.
+    ///
+    /// Needs a real fraction and a real history behind it: under 5% or
+    /// five minutes the ratio is noise, so the card says nothing
+    /// rather than guessing. Same guard the sleep card's pace uses.
+    fn time_left_secs(&self) -> Option<u32> {
+        let pct = self.recent_progress as u32;
+        if !(5..100).contains(&pct) || self.recent_stats_time < 300 {
+            return None;
+        }
+        Some(self.recent_stats_time.saturating_mul(100 - pct) / pct)
+    }
+
     /// Set the filename to open on the next Reader push.
     fn open_book(&self, ctx: &mut AppContext) -> Transition {
         let name = if self.selected == 0 {
@@ -410,7 +515,13 @@ impl HomeApp {
             row.filename.as_str()
         };
         if name.is_empty() {
-            return Transition::None;
+            // the empty card points at the library, so the press it
+            // invites does something
+            return if self.selected == 0 {
+                Transition::Replace(AppId::Library)
+            } else {
+                Transition::None
+            };
         }
         ctx.set_message(name.as_bytes());
         Transition::Push(AppId::Reader)
@@ -465,6 +576,7 @@ impl App<AppId> for HomeApp {
         }
         let old_count = self.item_count;
         self.load_card(k);
+        self.load_library_count(k);
         self.load_recent_rows(k);
         self.rebuild_item_count();
         self.needs_load = false;
@@ -531,8 +643,12 @@ impl App<AppId> for HomeApp {
         // section caption
         let theme = plump_kernel::ui::Theme::default_v1();
         let mut painter = plump_kernel::ui::Painter::new(strip, &theme);
+        // between the card and the list, the rule. no caption over
+        // the card: it is the only thing up there and it says what it
+        // is, and today's reading belongs to the Stats screen
         if self.recent_row_count > 0 {
-            SectionLabel::new(RECENT_CAPTION_REGION, "RECENT").draw(&mut painter, font);
+            let x = RULE_REGION.x + (RULE_REGION.w.saturating_sub(RULE_W)) / 2;
+            painter.hairline_h(RULE_REGION.y, x, x + RULE_W);
         }
 
         // card
@@ -588,7 +704,15 @@ impl App<AppId> for HomeApp {
             let title_y = CARD_Y + CARD_PAD + 16;
             let title_region = Region::new(text_x, title_y, text_w, heading_h);
             let title = self.recent_display_title();
-            draw_truncated(strip, heading, title_region, title, text_w, text_align, card_fg);
+            draw_truncated(
+                strip,
+                self.book_title,
+                title_region,
+                title,
+                text_w,
+                text_align,
+                card_fg,
+            );
 
             // author
             let author = self.recent_author_str();
@@ -598,68 +722,123 @@ impl App<AppId> for HomeApp {
                 draw_truncated(strip, font, author_region, author, text_w, text_align, card_fg);
             }
 
-            // progress bar
+            // the same tube the rows and the sleep card draw
             let bar_y = CARD_Y + CARD_H - CARD_PAD - CARD_PROGRESS_H - line_h - 6;
-            let bar_w = text_w as u32;
-            let filled = (bar_w * self.recent_progress as u32) / 100;
-            let bar_rect = Rectangle::new(
-                Point::new(text_x as i32, bar_y as i32),
-                Size::new(bar_w, CARD_PROGRESS_H as u32),
+            row::draw_tube_bar(
+                strip,
+                Region::new(text_x, bar_y, text_w, CARD_PROGRESS_H),
+                self.recent_progress as u32,
+                100,
+                card_fg,
             );
-            RoundedRectangle::with_equal_corners(bar_rect, Size::new(3, 3))
-                .into_styled(PrimitiveStyle::with_stroke(card_fg, 1))
-                .draw(strip)
-                .ok();
-            if filled > 0 {
-                RoundedRectangle::with_equal_corners(
-                    Rectangle::new(
-                        Point::new(text_x as i32, bar_y as i32),
-                        Size::new(filled, CARD_PROGRESS_H as u32),
-                    ),
-                    Size::new(3, 3),
-                )
-                .into_styled(PrimitiveStyle::with_fill(card_fg))
-                .draw(strip)
-                .ok();
+
+            // meta line: where you are on the left, what is left of the
+            // book on the right, in the chrome font both sides
+            let chrome = fonts::chrome_font();
+            let meta_y = bar_y + CARD_PROGRESS_H + 4;
+            let meta_r = Region::new(text_x, meta_y, text_w, line_h);
+
+            let mut left = StackFmt::<40>::new();
+            if self.recent_chapter_count > 0 {
+                let _ = write!(
+                    left,
+                    "chapter {} of {}",
+                    self.recent_chapter.saturating_add(1),
+                    self.recent_chapter_count
+                );
+                if self.recent_progress > 0 {
+                    let _ = write!(left, " \u{00B7} {}%", self.recent_progress);
+                }
+            } else if self.recent_progress > 0 {
+                let _ = write!(left, "{}% read", self.recent_progress);
+            }
+            if !left.as_str().is_empty() {
+                chrome.draw_aligned(strip, meta_r, left.as_str(), text_align, card_fg);
             }
 
-            // stats text
-            let pct_y = bar_y + CARD_PROGRESS_H + 4;
-            let pct_region = Region::new(text_x, pct_y, text_w, line_h);
-            let mut pct_buf = BitmapDynLabel::<32>::new(pct_region, font)
-                .alignment(text_align)
-                .inverted(card_selected);
-            if self.recent_stats_time > 0 {
-                let hours = self.recent_stats_time / 3600;
-                let mins = (self.recent_stats_time % 3600) / 60;
-                if hours > 0 {
-                    let _ = write!(pct_buf, "{}h {}m", hours, mins);
-                } else {
-                    let _ = write!(pct_buf, "{}m", mins);
+            let mut right = StackFmt::<20>::new();
+            match self.time_left_secs() {
+                Some(secs) => {
+                    write_duration(&mut right, secs);
+                    let _ = right.write_str(" left");
                 }
-            } else {
-                let _ = write!(pct_buf, "{}% read", self.recent_progress);
+                None if self.recent_stats_time > 0 => {
+                    write_duration(&mut right, self.recent_stats_time)
+                }
+                None => {}
             }
-            pct_buf.draw(strip).ok();
+            // with no cover the text block is centred, and a
+            // right-aligned second half would read as a stray figure
+            if !right.as_str().is_empty() && matches!(text_align, Alignment::TopLeft) {
+                chrome.draw_aligned(
+                    strip,
+                    meta_r,
+                    right.as_str(),
+                    Alignment::CenterRight,
+                    card_fg,
+                );
+            }
         } else {
-            let center_y = CARD_Y + (CARD_H - line_h) / 2;
-            let center = Region::new(inner_x, center_y, inner_w, line_h);
-            font.draw_aligned(strip, center, "No book opened yet", Alignment::Center, card_fg);
+            // the card is still the press target, so it keeps its frame
+            // and says where the press goes
+            let chrome = fonts::chrome_font();
+            let title_h = self.book_title.line_height;
+            let top = CARD_Y + (CARD_H - title_h - line_h) / 2;
+            self.book_title.draw_aligned(
+                strip,
+                Region::new(inner_x, top, inner_w, title_h),
+                "Nothing open yet",
+                Alignment::Center,
+                card_fg,
+            );
+            let mut hint = StackFmt::<48>::new();
+            match self.library_count {
+                0 => {
+                    let _ = hint.write_str("No books on the card");
+                }
+                1 => {
+                    let _ = hint.write_str("One book is waiting in the library");
+                }
+                n => {
+                    let _ = write!(hint, "{} books are waiting in the library", n);
+                }
+            }
+            chrome.draw_aligned(
+                strip,
+                Region::new(inner_x, top + title_h + 2, inner_w, line_h),
+                hint.as_str(),
+                Alignment::Center,
+                card_fg,
+            );
         }
 
-        // recent rows
+        // recent rows: one group, the same row the library and the
+        // reader's contents sheet draw
+        let group = recent_group(self.recent_row_count);
+        group.draw_outline(strip);
+        let row_fonts = RowFonts {
+            text: self.book_row,
+            small: fonts::chrome_font(),
+            icon: fonts::icon_font(1),
+        };
         for i in 0..self.recent_row_count {
             let row = &self.recent_rows[i];
             if !row.valid {
                 continue;
             }
-            let mut pct = crate::ui::stack_fmt::StackFmt::<8>::new();
-            let _ = write!(pct, "{}%", row.progress_pct);
-            BookRow::new(row_region(i), row.display_name())
-                .cover(self.recent_row_covers[i].as_ref())
-                .trailing(pct.as_str())
-                .selected(self.selected == i + 1)
-                .draw(strip, font);
+            // the bar says what a percentage beside it would say
+            // twice, so the row carries only the bar
+            let spec = RowSpec {
+                lead: RowLead::Cover(self.recent_row_covers[i].as_ref()),
+                text: row.display_name(),
+                text_font: self.book_row,
+                value: "",
+                selected: self.selected == i + 1,
+                sub: row.author.as_str(),
+                progress: row.position,
+                chip: ValueChip::None,
+            };
+            group.draw_row(strip, i, &row_fonts, &spec);
         }
     }
 }
@@ -686,4 +865,16 @@ fn draw_truncated(
     buf[n + 2] = 0xA6;
     let truncated = core::str::from_utf8(&buf[..n + 3]).unwrap_or(text);
     font.draw_aligned(strip, region, truncated, align, fg);
+}
+
+/// `9h 32m`, or minutes alone under the hour. The card's two figures
+/// and the sleep card's read the same way.
+fn write_duration(out: &mut impl core::fmt::Write, secs: u32) {
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    if hours > 0 {
+        let _ = write!(out, "{}h {}m", hours, mins);
+    } else {
+        let _ = write!(out, "{}m", mins);
+    }
 }

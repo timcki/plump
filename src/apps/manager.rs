@@ -247,8 +247,8 @@ impl AppManager {
     fn sync_nav_from_launcher(&mut self) {
         let (tab, modal) = nav_state_from_launcher(self.launcher);
         self.nav.restore(tab, modal);
-        // chrome's tab bar always reflects the current tab.
-        self.chrome.tabs.active = tab;
+        // the top bar names the current tab and its two neighbours.
+        self.chrome.top.active = tab;
     }
 
     /// Currently active tab in the new nav model. Chrome reads this
@@ -865,17 +865,16 @@ impl AppManager {
         // shared chrome is drawn on top of the app's content so the
         // bars always win the painter's-algorithm over any app pixel
         // that strays into the bar regions.
-        if show_top || show_tabs {
+        // `show_tabs` now only says whether this screen is a tab
+        // screen at all; there is one bar and it lives at the top
+        let _ = show_tabs;
+        if show_top {
             let theme = Theme::default_v1();
-            let text_font = fonts::chrome_font();
-            let icon_font = fonts::icon_font(2);
             let mut painter = Painter::new(strip, &theme);
-            if show_top {
-                self.chrome.draw_top(&mut painter, text_font);
-            }
-            if show_tabs {
-                self.chrome.draw_tabs(&mut painter, icon_font);
-            }
+            self.chrome.draw_top(&mut painter, &crate::ui::TopFonts {
+                name: fonts::ui_heading_font(0),
+                small: fonts::chrome_font(),
+            });
         }
 
         // loading indicator: after app content, before overlays.
@@ -892,6 +891,18 @@ impl AppManager {
                 )
                 .draw(strip);
             }
+        }
+
+        // the settings cache sheet is an overlay like the quick menu:
+        // drawn after the chrome so the bars do not slice its edges
+        if active == AppId::Settings && self.settings.cache_sheet_open() {
+            self.settings.draw_cache_sheet(strip);
+        }
+
+        // the settings cache sheet is an overlay like the quick menu:
+        // drawn after the chrome so the bars do not slice its edges
+        if active == AppId::Settings && self.settings.cache_sheet_open() {
+            self.settings.draw_cache_sheet(strip);
         }
 
         if self.quick_menu.open {
@@ -922,6 +933,11 @@ impl AppManager {
         self.library.set_ui_font_size(ui_idx);
         self.settings.set_ui_font_size(ui_idx);
         self.stats.set_ui_font_size(ui_idx);
+        // a book's title is set in the book's own face on every screen
+        // that names one, not just inside the reader
+        self.home.set_reader_font(reader_font);
+        self.library.set_reader_font(reader_font);
+        self.stats.set_reader_font(reader_font);
         // each setter flags the reader's layout_stale on change so
         // on_resume knows to re-index the chapter.
         self.reader.set_reader_font(reader_font);
@@ -1059,42 +1075,23 @@ impl AppLayer for AppManager {
     }
 
     fn set_chrome_state(&mut self, battery_pct: u8, today_pages: u16, today_secs: u32) {
-        let prev_pct = self.chrome.top.battery_pct;
-        let prev_pages = self.chrome.top.today_pages;
-        let prev_secs = self.chrome.top.today_secs;
+        // the bar carries the battery and the tab's name; the name only
+        // changes on navigation, which repaints everything anyway
+        let bar_changed = self.chrome.top.battery_pct != battery_pct;
         self.chrome.top.battery_pct = battery_pct;
-        self.chrome.top.today_pages = today_pages;
-        self.chrome.top.today_secs = today_secs;
-        // only invalidate when the active app actually shows the bar;
-        // in the reader (chrome hidden) the day-stat drain changes
-        // today_secs after every page turn, and an unconditional mark
-        // fired a ~400ms DU partial repainting identical book pixels
+
+        // today's reading is not chrome any more, and not Home's
+        // either: the Stats screen reads it straight off the kernel
+        // when it draws, so nothing here has to carry or invalidate it
+        let _ = (today_pages, today_secs);
+
         let active = self.launcher.active();
         let show_top = with_app_ref!(active, self, |app| app.show_top_status());
-        // compare at displayed granularity: the bar renders time as
-        // h:mm, so raw-second changes (which follow every page turn)
-        // would repaint pixel-identical content
-        if show_top
-            && (prev_pct != battery_pct
-                || prev_pages != today_pages
-                || prev_secs / 60 != today_secs / 60)
-        {
-            // chrome top bar changed; queue a coalesced redraw so the
-            // next paintable window picks it up. width spans the full
-            // bar; height is the top chrome region.
-            //
-            // discriminator for the post-turn extra refresh: if this
-            // fires right after a page turn's render, the day-stat
-            // drain missed that render and the bar repaint rides its
-            // own follow-up refresh (item 15 regression via item 8's
-            // break-to-render)
-            plump_kernel::perf_event!(
-                "chrome",
-                "bar_mark pct={} pages={} mins={}",
-                battery_pct,
-                today_pages,
-                today_secs / 60
-            );
+        // in the reader (chrome hidden) the day-stat drain changes
+        // today_secs after every page turn, and an unconditional mark
+        // fired a ~400 ms DU repainting identical book pixels
+        if show_top && bar_changed {
+            plump_kernel::perf_event!("chrome", "bar_mark pct={}", battery_pct);
             let theme = Theme::default_v1();
             self.launcher.ctx.mark_dirty_coalesced(crate::ui::Region::new(
                 0,

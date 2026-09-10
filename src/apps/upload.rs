@@ -1675,7 +1675,13 @@ impl UploadScreen<'_> {
 
             // same order the dispatch loop uses: chrome last, so the
             // bars win over any content pixel that strays into them
-            chrome.draw(&mut painter, fonts::chrome_font(), fonts::icon_font(2));
+            chrome.draw_top(
+                &mut painter,
+                &crate::ui::TopFonts {
+                    name: fonts::ui_heading_font(0),
+                    small: fonts::chrome_font(),
+                },
+            );
         };
 
         let result = if full_refresh {

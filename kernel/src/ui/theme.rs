@@ -44,8 +44,13 @@ impl Theme {
             panel_stroke: 2,
             row_h: 44,
             row_h_compact: 32,
-            top_bar_h: 28,
-            bottom_bar_h: 64,
+            // the top bar is the navigation now: a screen nameplate
+            // flanked by its two neighbours, so it needs heading room
+            top_bar_h: 40,
+            // nothing at the bottom but a margin. the tab bar was 64 px
+            // of a 800 px display drawing a control that could not be
+            // pressed; its job moved up top
+            bottom_bar_h: 8,
             tracked_caption_px: 3,
         }
     }

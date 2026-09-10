@@ -233,6 +233,14 @@ pub fn ui_heading_font(idx: u8) -> &'static BitmapFont {
     heading_font(ui_family(), idx)
 }
 
+/// Bold UI body face. The top bar's current-screen name is the only
+/// caller: bold at body size is the whole of its emphasis, where a
+/// tracked heading nameplate was too much bar for too little fact.
+#[inline]
+pub fn ui_bold_font(idx: u8) -> &'static BitmapFont {
+    bold_body_font(ui_family(), idx)
+}
+
 // chrome font (quick-menu items, loading text, status bar)
 // always Inter XSmall body for compact display
 #[inline]

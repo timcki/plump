@@ -1,11 +1,14 @@
-// Library tab: scrollable list of every book on the card, one BookRow
-// per entry (mini cover on the left, title next to it) so it matches
-// the home RECENT list exactly. successor to the paged list, which in
-// turn replaced the 2x3 cover grid (filter chips are gone for now:
+// Library tab: scrollable list of every book on the card, drawn with
+// the shared list row (widgets/row.rs) inside one outlined group, so
+// it is the same object as home's recent list, the reader's contents
+// sheet and the settings screen. successor to the paged list, which
+// in turn replaced the 2x3 cover grid (filter chips are gone for now:
 // broken rendering + confusing navigation).
 //
-// a caption above the list shows the book count on the left and, once
-// the list overflows the screen, the visible range on the right.
+// a row shows the mini cover, the title in the book's own face, the
+// author, the book's length, and a position bar once you have started
+// it. a caption above the list shows the book count on the left and,
+// once the list overflows the screen, the visible range on the right.
 //
 // navigation:
 //   Up / Down: move the selection one row; the window scrolls by one
@@ -20,7 +23,9 @@ use embedded_graphics::pixelcolor::BinaryColor;
 
 use plump_kernel::ui::{Painter, Region, StackFmt, Theme};
 
-use crate::apps::widgets::{BOOK_ROW_H, BookRow};
+use plump_kernel::util::FixedStr;
+
+use crate::apps::widgets::row::{self, RowFonts, RowLead, RowSpec, ValueChip};
 use crate::apps::{App, AppContext, AppId, BgBudget, BgOutcome, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
@@ -32,8 +37,6 @@ use crate::kernel::work_queue::DecodedImage;
 use crate::ui::{Alignment, CONTENT_TOP, FULL_CONTENT_W, LARGE_MARGIN, SectionLabel};
 
 const VISIBLE_ROWS: usize = 6;
-const ROW_GAP: u16 = 4;
-const ROW_STRIDE: u16 = BOOK_ROW_H + ROW_GAP;
 
 const CAPTION_H: u16 = 16;
 const CAPTION_GAP: u16 = 8;
@@ -41,17 +44,28 @@ const CAPTION_REGION: Region = Region::new(LARGE_MARGIN, CONTENT_TOP, FULL_CONTE
 
 const LIST_TOP: u16 = CONTENT_TOP + CAPTION_H + CAPTION_GAP;
 const LIST_BOTTOM: u16 = Theme::default_v1().content_bottom();
-const _: () = assert!(LIST_TOP + VISIBLE_ROWS as u16 * ROW_STRIDE - ROW_GAP <= LIST_BOTTOM);
+
+/// Rows divide the band they are given rather than carrying a fixed
+/// height: six of them come out at 112, which leaves the 96 px cover
+/// 8 px above and below. Two less than home's list, which is what
+/// buys the sixth book on a browse screen.
+const ROW_H: u16 = (LIST_BOTTOM - LIST_TOP - 1) / VISIBLE_ROWS as u16;
+const _: () = assert!(ROW_H >= row::COVER_H + 12, "library rows crowd their covers");
+const _: () = assert!(
+    LIST_TOP + row::RowGroup::height(VISIBLE_ROWS, ROW_H) <= LIST_BOTTOM,
+    "library list overflows the content band"
+);
 
 const CONTENT_REGION: Region = Region::new(0, CONTENT_TOP, SCREEN_W, SCREEN_H - CONTENT_TOP);
 
+/// The visible window as one outlined group, sized to the rows it
+/// actually holds so a short shelf does not leave an empty frame.
+fn list_group(rows: usize) -> row::RowGroup {
+    row::RowGroup::new(LARGE_MARGIN, LIST_TOP, FULL_CONTENT_W, rows, ROW_H)
+}
+
 fn row_region(slot: usize) -> Region {
-    Region::new(
-        LARGE_MARGIN,
-        LIST_TOP + slot as u16 * ROW_STRIDE,
-        FULL_CONTENT_W,
-        BOOK_ROW_H,
-    )
+    list_group(VISIBLE_ROWS).row_region(slot)
 }
 
 // pending SD work for the visible window, run from background_step
@@ -76,8 +90,14 @@ pub struct LibraryApp {
     // cached page count per row from the book's layout index; 0 =
     // unknown (never opened, or not indexed yet)
     pages: [u32; VISIBLE_ROWS],
+    // author and reading position, from the same bundle session that
+    // reads the row's cover
+    authors: [FixedStr<32>; VISIBLE_ROWS],
+    positions: [Option<(u32, u32)>; VISIBLE_ROWS],
     total: usize,
     ui_fonts: fonts::UiFonts,
+    /// a book's title is set in the book's own face
+    book_font: &'static fonts::bitmap::BitmapFont,
     load: Load,
 }
 
@@ -97,8 +117,11 @@ impl LibraryApp {
             entries: [const { None }; VISIBLE_ROWS],
             covers: [const { None }; VISIBLE_ROWS],
             pages: [0; VISIBLE_ROWS],
+            authors: [FixedStr::EMPTY; VISIBLE_ROWS],
+            positions: [None; VISIBLE_ROWS],
             total: 0,
             ui_fonts: fonts::UiFonts::for_size(0),
+            book_font: fonts::body_font(fonts::ReaderFont::Bookerly.family(), 1),
             load: Load::Full,
         }
     }
@@ -107,10 +130,18 @@ impl LibraryApp {
         self.ui_fonts = fonts::UiFonts::for_size(idx);
     }
 
+    /// A book's title is set in the book's own face, the way the
+    /// reader's contents sheet sets a chapter's.
+    pub fn set_reader_font(&mut self, font: fonts::ReaderFont) {
+        self.book_font = fonts::body_font(font.family(), 1);
+    }
+
     fn clear_slot(&mut self, slot: usize) {
         self.entries[slot] = None;
         self.covers[slot] = None;
         self.pages[slot] = 0;
+        self.authors[slot] = FixedStr::EMPTY;
+        self.positions[slot] = None;
     }
 
     /// Read directory entry `index` plus its mini cover and cached
@@ -128,15 +159,16 @@ impl LibraryApp {
             return false;
         }
         let entry = scratch[0];
-        self.covers[slot] = crate::apps::cover_cache::load_cover_variant_for(
+        let name_hash = plump_kernel::util::hash::fnv1a(entry.name.as_bytes());
+        let book = crate::apps::cover_cache::load_book_entry(
             k,
-            entry.name.as_bytes(),
+            name_hash,
             plump_kernel::kernel::bundle::CoverKind::Mini,
         );
-        let name_hash = plump_kernel::util::hash::fnv1a(entry.name.as_bytes());
-        let book = crate::apps::cover_cache::load_library_entry(k, name_hash);
-        self.covers[slot] = book.cover;
         self.pages[slot] = book.total_pages.unwrap_or(0);
+        self.authors[slot] = FixedStr::from_bytes(book.author.as_bytes());
+        self.positions[slot] = book.position();
+        self.covers[slot] = book.cover;
         self.entries[slot] = Some(entry);
         true
     }
@@ -340,12 +372,20 @@ impl App<AppId> for LibraryApp {
 
         self.draw_caption(strip, font);
 
+        let group = list_group(self.window_count);
+        group.draw_outline(strip);
+        let row_fonts = RowFonts {
+            text: self.book_font,
+            small: fonts::chrome_font(),
+            icon: fonts::icon_font(1),
+        };
+
         for slot in 0..self.window_count {
             let Some(entry) = self.entries[slot].as_ref() else {
                 continue;
             };
-            // page count from the cached layout index; hidden until
-            // the book has been opened and indexed at least once
+            // the page count is the book's length, which the position
+            // bar does not say: one is how long, the other how far
             let mut pages = StackFmt::<16>::new();
             match self.pages[slot] {
                 0 => {}
@@ -356,11 +396,24 @@ impl App<AppId> for LibraryApp {
                     let _ = write!(pages, "{} pages", n);
                 }
             }
-            BookRow::new(row_region(slot), entry.display_name())
-                .cover(self.covers[slot].as_ref())
-                .trailing(pages.as_str())
-                .selected(self.selected == self.window_start + slot)
-                .draw(strip, font);
+            group.draw_row(
+                strip,
+                slot,
+                &row_fonts,
+                &RowSpec {
+                    lead: RowLead::Cover(self.covers[slot].as_ref()),
+                    text: entry.display_name(),
+                    text_font: self.book_font,
+                    value: pages.as_str(),
+                    selected: self.selected == self.window_start + slot,
+                    sub: self.authors[slot].as_str(),
+                    // only a book you have started gets a bar; an
+                    // untouched one would show an empty tube on every
+                    // row and say nothing
+                    progress: self.positions[slot],
+                    chip: ValueChip::None,
+                },
+            );
         }
 
         if self.window_count == 0 {
