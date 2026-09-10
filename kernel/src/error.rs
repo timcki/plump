@@ -180,6 +180,11 @@ impl From<&'static str> for Error {
             | "invalid filename"
             | "upload incomplete"
             | "connection closed during headers" => ErrorKind::Protocol,
+            // the image decoders name the buffer that could not be
+            // reserved ("jpeg: OOM for output", "png: OOM for output
+            // bitmap", ...); match the shape rather than each string,
+            // so callers can tell a budget failure from a bad file
+            m if m.contains("OOM") => ErrorKind::OutOfMemory,
             _ => ErrorKind::Other,
         };
         Self { kind, source: msg }

@@ -8,7 +8,9 @@ use plump_kernel::util::FixedStr;
 
 use crate::apps::MSG_TAG_OPEN_CONTENTS;
 use crate::apps::PendingSetting;
-use crate::apps::widgets::sheet::{self, HintSlot, RowLead, RowSpec, SheetFonts, SheetGeom};
+use crate::apps::widgets::sheet::{
+    self, HintSlot, RowLead, RowSpec, SheetFonts, SheetGeom, ValueChip,
+};
 use crate::apps::recent::{self, RecentRecord};
 use crate::fonts::bitmap::{self, BitmapFont};
 
@@ -129,6 +131,16 @@ pub(super) const MAX_IMAGES_PER_PAGE: usize = 8;
 // dimensions are unavailable (e.g. uncached deflated images, or
 // during preindex_all_pages where no pre-scan runs)
 pub(super) const DEFAULT_IMG_H: u16 = 350;
+
+// how many times a decode may halve its target size when the heap
+// cannot hold the output plane, and the dimension below which a
+// further step is not worth the SD pass
+pub(super) const IMG_BUDGET_STEPS: u8 = 2;
+pub(super) const IMG_BUDGET_MIN: u16 = 48;
+
+// consecutive large-image decode failures before the reader stops
+// trying them for this session
+pub(super) const LARGE_IMG_FAIL_LIMIT: u8 = 2;
 
 // inline images are capped at this fraction of the text area height.
 // keeps illustrations proportional to surrounding text, similar to
@@ -438,6 +450,13 @@ pub(super) struct EpubState {
     pub(super) img_cache_offset: u32,
     pub(super) img_scan_wrapped: bool,
     pub(super) skip_large_img: bool,
+    // consecutive streaming-decode failures; raises skip_large_img
+    // once it reaches LARGE_IMG_FAIL_LIMIT
+    pub(super) large_img_fails: u8,
+    // the image whose worker decode is being retried, and how many
+    // budget steps it has already taken. bounded by IMG_BUDGET_STEPS,
+    // after which the image is marked skipped rather than redispatched
+    pub(super) img_retry: Option<(u32, u8)>,
     pub(super) img_found_count: u16,
     pub(super) img_cached_count: u16,
 
@@ -476,6 +495,8 @@ impl EpubState {
             img_cache_offset: 0,
             img_scan_wrapped: false,
             skip_large_img: false,
+            large_img_fails: 0,
+            img_retry: None,
             img_found_count: 0,
             img_cached_count: 0,
             cache_step: None,
@@ -491,6 +512,28 @@ impl EpubState {
         cache::dir_name_str(&self.cache_dir)
     }
 
+    /// The decode budget to dispatch `path_hash` at.
+    ///
+    /// Worker decodes cannot step down in place the way [`oom_retry`]
+    /// does — the worker owns no reader state and its input buffer is
+    /// gone by the time the failure comes back — so the ladder lives
+    /// here instead: each recorded retry halves the budget the next
+    /// dispatch asks for.
+    ///
+    /// [`oom_retry`]: Self::oom_retry
+    pub(super) fn img_budget(&self, path_hash: u32, base_w: u16, base_h: u16) -> (u16, u16) {
+        let steps = match self.img_retry {
+            Some((h, steps)) if h == path_hash => steps,
+            _ => 0,
+        };
+        let (w, h) = (base_w >> steps, base_h >> steps);
+        if w < IMG_BUDGET_MIN || h < IMG_BUDGET_MIN {
+            (base_w, base_h)
+        } else {
+            (w, h)
+        }
+    }
+
     #[inline]
     pub(super) fn chapter_size(&self, ch: usize) -> u32 {
         if ch < cache::MAX_CACHE_CHAPTERS {
@@ -500,35 +543,86 @@ impl EpubState {
         }
     }
 
-    /// Try `f()` once; on failure, drop `ch_cache` to free heap and retry.
+    /// Decode at `max_w` x `max_h`, giving ground to the heap on the way.
     ///
-    /// The chapter cache can hold up to 96 KB.  Large DEFLATED cover/inline
-    /// JPEGs need ~90 KB for the decoder, so both cannot coexist on the
-    /// 172 KB heap.  After a successful retry the cache stays empty — it is
-    /// lazily reloaded on the next chapter navigation via `try_cache_chapter`.
-    pub(super) fn oom_retry<E: core::fmt::Display, F>(
+    /// Two things can be released when a decode does not fit.  First the
+    /// chapter cache, which can hold up to 96 KB: a large DEFLATED
+    /// cover or inline JPEG wants most of the heap for itself, so the
+    /// two cannot coexist.  After a successful retry the cache stays
+    /// empty; the next chapter navigation reloads it via
+    /// `try_cache_chapter`.
+    ///
+    /// Then the target size itself.  The decoder's output plane is its
+    /// largest reservation and shrinks with the square of the budget
+    /// (halving the budget doubles the integer downscale), so a step
+    /// down turns a ~40 KB block into a ~10 KB one — which fits a
+    /// fragmented heap far more often.  A softer picture beats a blank
+    /// one, and the page renders a cached image at whatever size it
+    /// was decoded at.
+    ///
+    /// Only budget failures step down: a truncated or unsupported file
+    /// fails the same way at every size, and each retry is a fresh
+    /// streaming pass over the SD card.
+    pub(super) fn oom_retry<E, F>(
         &mut self,
         label: &str,
+        max_w: u16,
+        max_h: u16,
         mut f: F,
     ) -> Result<DecodedImage, E>
     where
-        F: FnMut() -> Result<DecodedImage, E>,
+        E: core::fmt::Display + IsOom,
+        F: FnMut(u16, u16) -> Result<DecodedImage, E>,
     {
-        let result = f();
-        match result {
-            Ok(_) => result,
-            Err(e) if !self.ch_cache.is_empty() => {
-                log::debug!(
-                    "{}: decode failed ({}), releasing {} KB ch_cache and retrying",
-                    label,
-                    e,
-                    self.ch_cache.len() / 1024,
-                );
-                self.ch_cache = Vec::new();
-                f()
-            }
-            Err(_) => result,
+        let mut result = f(max_w, max_h);
+
+        if matches!(&result, Err(e) if e.is_oom()) && !self.ch_cache.is_empty() {
+            log::debug!(
+                "{}: decode out of memory, releasing {} KB ch_cache and retrying",
+                label,
+                self.ch_cache.len() / 1024,
+            );
+            self.ch_cache = Vec::new();
+            result = f(max_w, max_h);
         }
+
+        let (mut w, mut h) = (max_w, max_h);
+        for _ in 0..IMG_BUDGET_STEPS {
+            if !matches!(&result, Err(e) if e.is_oom()) {
+                break;
+            }
+            w /= 2;
+            h /= 2;
+            if w < IMG_BUDGET_MIN || h < IMG_BUDGET_MIN {
+                break;
+            }
+            log::info!("{}: decode out of memory, retrying at {}x{}", label, w, h);
+            result = f(w, h);
+        }
+
+        result
+    }
+}
+
+/// Whether a decode failure was the heap giving out rather than the
+/// file being bad. The two decode call sites carry different error
+/// types: the inline path keeps smol-epub's `&'static str`, the
+/// precache path has already mapped it to [`Error`].
+pub(super) trait IsOom {
+    fn is_oom(&self) -> bool;
+}
+
+impl IsOom for &'static str {
+    #[inline]
+    fn is_oom(&self) -> bool {
+        self.contains("OOM")
+    }
+}
+
+impl IsOom for crate::error::Error {
+    #[inline]
+    fn is_oom(&self) -> bool {
+        self.kind() == crate::error::ErrorKind::OutOfMemory
     }
 }
 
@@ -1766,6 +1860,8 @@ impl ReaderApp {
         self.epub.ch_cached = [false; smol_epub::cache::MAX_CACHE_CHAPTERS];
         self.epub.img_scan_wrapped = false;
         self.epub.skip_large_img = false;
+        self.epub.large_img_fails = 0;
+        self.epub.img_retry = None;
 
         // set up reader pipeline — enter at NeedBookmark but with
         // chapter/offset already populated from RTC, so bookmark_load
@@ -3033,7 +3129,9 @@ impl ReaderApp {
                     text_font: title_font,
                     value: val.as_str(),
                     selected: idx == self.epub.toc_selected,
+                    sub: "",
                     progress,
+                    chip: ValueChip::None,
                 },
             );
         }
@@ -3074,6 +3172,8 @@ impl App<AppId> for ReaderApp {
         self.epub.ch_cached = [false; cache::MAX_CACHE_CHAPTERS];
         self.epub.img_scan_wrapped = false;
         self.epub.skip_large_img = false;
+        self.epub.large_img_fails = 0;
+        self.epub.img_retry = None;
 
         self.is_epub = epub::is_epub_filename(self.name());
         self.rebuild_quick_actions();

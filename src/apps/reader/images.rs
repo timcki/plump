@@ -21,7 +21,8 @@ use crate::kernel::KernelHandle;
 use crate::kernel::work_queue;
 
 use super::{
-    DEFAULT_IMG_H, MAX_IMAGES_PER_PAGE, NO_PREFETCH, PAGE_BUF, PRECACHE_IMG_MAX, ReaderApp,
+    DEFAULT_IMG_H, IMG_BUDGET_STEPS, IsOom, LARGE_IMG_FAIL_LIMIT, MAX_IMAGES_PER_PAGE, NO_PREFETCH,
+    PAGE_BUF, PRECACHE_IMG_MAX, ReaderApp,
 };
 
 fn from_smol_image(img: smol_epub::DecodedImage) -> DecodedImage {
@@ -223,7 +224,10 @@ impl ReaderApp {
         let img_max_h = img_budget_h;
 
         let img_max_w = self.text_w as u16;
-        let do_decode = |k_ref: &mut KernelHandle<'_>| -> Result<DecodedImage, &'static str> {
+        let do_decode = |k_ref: &mut KernelHandle<'_>,
+                         img_max_w: u16,
+                         img_max_h: u16|
+         -> Result<DecodedImage, &'static str> {
             let k_cell = RefCell::new(k_ref);
             let read_err = |e: Error| -> &'static str { e.into() };
             let raw = if is_jpeg && entry.method == zip::METHOD_STORED {
@@ -280,7 +284,9 @@ impl ReaderApp {
             raw.map(from_smol_image)
         };
 
-        let result = self.epub.oom_retry("reader", || do_decode(k));
+        let result = self
+            .epub
+            .oom_retry("reader", img_max_w, img_max_h, |w, h| do_decode(k, w, h));
 
         match result {
             Ok(img) => {
@@ -561,8 +567,8 @@ impl ReaderApp {
                     );
                     let img_w = self.text_w as u16;
                     let img_h = self.text_area_h;
-                    let result = self.epub.oom_retry("precache", || {
-                        decode_image_streaming(k, epub_name, &entry, is_jpeg, img_w, img_h)
+                    let result = self.epub.oom_retry("precache", img_w, img_h, |w, h| {
+                        decode_image_streaming(k, epub_name, &entry, is_jpeg, w, h)
                     });
 
                     match result {
@@ -574,12 +580,22 @@ impl ReaderApp {
                                 img.data.len(),
                             );
                             let _ = save_cached_image(k, dir, img_file, &img);
+                            self.epub.large_img_fails = 0;
                         }
                         Err(e) => {
                             log::warn!("precache: streaming failed: {}", e);
                             let _ = k.sd().write_in_plump_subdir(dir, img_file, &[]);
-                            // stop trying large images this session
-                            self.epub.skip_large_img = true;
+                            // a decode that failed even at the smallest
+                            // budget says the heap is gone right now, not
+                            // that this book's images are hopeless; give
+                            // up on large images only once it repeats,
+                            // so one bad moment does not blank the rest
+                            self.epub.large_img_fails =
+                                self.epub.large_img_fails.saturating_add(1);
+                            if self.epub.large_img_fails >= LARGE_IMG_FAIL_LIMIT {
+                                log::warn!("precache: skipping large images this session");
+                                self.epub.skip_large_img = true;
+                            }
                         }
                     }
                     self.epub.img_found_count = self.epub.img_found_count.saturating_add(1);
@@ -614,12 +630,15 @@ impl ReaderApp {
 
                 log::info!("precache: dispatch {} ({} bytes)", full_path, data.len(),);
 
+                let (max_w, max_h) =
+                    self.epub
+                        .img_budget(path_hash, self.text_w as u16, self.text_area_h);
                 let task = work_queue::WorkTask::DecodeImage {
                     path_hash,
                     data,
                     is_jpeg,
-                    max_w: self.text_w as u16,
-                    max_h: self.text_area_h,
+                    max_w,
+                    max_h,
                 };
                 // no generation yet means no book was ever opened here,
                 // so there is nothing for a result to belong to
@@ -729,11 +748,56 @@ impl ReaderApp {
                 if let Err(e) = save_cached_image(k, dir, img_file, &image) {
                     log::warn!("precache: save failed: {}", e);
                 }
+                if matches!(self.epub.img_retry, Some((h, _)) if h == path_hash) {
+                    self.epub.img_retry = None;
+                }
 
                 Ok(Some(true))
             }
             work_queue::WorkOutcome::ImageFailed { path_hash, error } => {
+                // the same ground oom_retry gives on the main loop, but
+                // spread across dispatches: the worker owns no reader
+                // state, so releasing ch_cache and stepping the budget
+                // down happen here and the scan redispatches
+                let steps = match self.epub.img_retry {
+                    Some((h, steps)) if h == path_hash => steps,
+                    _ => 0,
+                };
+
+                if error.is_oom() && steps < IMG_BUDGET_STEPS {
+                    // the chapter buffer is the biggest thing the reader
+                    // holds; it goes on the first try, before the picture
+                    // gets smaller
+                    if steps == 0 && !self.epub.ch_cache.is_empty() {
+                        log::warn!(
+                            "precache: image {:#010X} out of memory, releasing {} KB ch_cache",
+                            path_hash,
+                            self.epub.ch_cache.len() / 1024,
+                        );
+                        self.epub.ch_cache = Vec::new();
+                    }
+                    // the count only ever climbs: a page redraw can
+                    // reload ch_cache between attempts, and a step that
+                    // released it again without advancing would retry
+                    // the same budget forever
+                    self.epub.img_retry = Some((path_hash, steps + 1));
+                    log::warn!(
+                        "precache: image {:#010X} out of memory, retrying one budget step down",
+                        path_hash,
+                    );
+                    return Ok(Some(true));
+                }
+
+                // out of steps, or a failure no smaller budget will fix:
+                // mark the image skipped like every other failure path
+                // here, so the scan moves on instead of redispatching
+                // forever.  Settings > Book Cache > Rebuild cache clears
+                // the marker
                 log::warn!("precache: image {:#010X} failed: {}", path_hash, error);
+                let dir = self.epub.cache_dir_str();
+                let img_name = img_cache_name(path_hash);
+                let img_file = img_cache_str(&img_name);
+                let _ = k.sd().write_in_plump_subdir(dir, img_file, &[]);
                 Ok(Some(true))
             }
         }

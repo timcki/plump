@@ -902,6 +902,8 @@ impl ReaderApp {
                     self.epub.img_cache_offset = 0;
                     self.epub.img_scan_wrapped = false;
                     self.epub.skip_large_img = false;
+                    self.epub.large_img_fails = 0;
+                    self.epub.img_retry = None;
                     self.epub.img_found_count = 0;
                     self.epub.img_cached_count = 0;
                     self.epub.bg_cache = BgCacheState::CacheImage;
