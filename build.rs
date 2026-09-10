@@ -89,7 +89,7 @@ use std::path::{Path, PathBuf};
 
 // font families to rasterise. Bookerly + Atkinson supply reader fonts
 // (selectable); Inter supplies every UI surface; Phosphor supplies the
-// icon glyphs for tab bar + panel rows.
+// icon glyphs for the sheets and panel rows.
 //
 // `base_weight` is the keyword used to find the file we treat as the
 // "Regular" rasterisation. Bookerly/Atkinson/Inter pick the canonical
@@ -333,13 +333,9 @@ fn extended_codepoints() -> Vec<u32> {
     // this list in lockstep with `src/apps/tab.rs::Tab::icon` and any
     // future icon usage in chrome panels.
     let phosphor_icons: &[u32] = &[
-        0xE2C2, // house
-        0xE758, // books
-        0xE150, // chart-bar
-        0xE272, // gear-six
-        0xE1AE, // cloud-arrow-up
         0xE0EA, // bookmark-simple
         0xE0EC, // bookmarks
+        0xE2C2, // house (quick menu: go home)
         0xE2F2, // list-bullets
         0xE21E, // eraser
         0xE230, // file
@@ -349,6 +345,8 @@ fn extended_codepoints() -> Vec<u32> {
         0xE330, // moon
         0xE6EE, // text-aa
         0xE3D0, // play
+        0xE094, // arrows-clockwise
+        0xE4A6, // trash
     ];
     cps.extend_from_slice(phosphor_icons);
 

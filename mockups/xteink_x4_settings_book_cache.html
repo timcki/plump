@@ -1,0 +1,378 @@
+<title>Book Cache Cleanup</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Lora:ital,wght@0,400;0,500;0,600;1,400&display=swap');
+
+:root {
+  --ground: #141414;
+  --frame: #1c1c1c;
+  --paper: #f6f4ee;
+  --ink: #181818;
+  --ink-25: rgba(24,24,24,0.25);
+  --ink-12: rgba(24,24,24,0.12);
+  --paper-35: rgba(246,244,238,0.35);
+  --label: #d9d6cc;
+  --amber: #d9c37a;
+}
+body { background: var(--ground); color: var(--label); margin: 0; font-family: 'Atkinson Hyperlegible', system-ui, sans-serif; }
+
+h1 { font-size: 15px; font-weight: 500; text-align: center; margin: 2.4rem 1rem 0.4rem; letter-spacing: 0.01em; }
+h1 small { display: block; font-weight: 400; opacity: 0.55; font-size: 12px; margin-top: 4px; }
+.fr { padding: 1.4rem 1rem 1rem; display: flex; justify-content: center; gap: 22px; flex-wrap: wrap; }
+.un { display: flex; flex-direction: column; align-items: center; gap: 9px; }
+.lab { font-size: 13px; color: var(--label); font-weight: 500; margin: 0; text-align: center; max-width: 340px; }
+.lab small { display: block; font-weight: 400; opacity: 0.6; font-size: 11px; margin-top: 2px; line-height: 1.45; }
+.dv { background: var(--frame); padding: 7px; border-radius: 22px; }
+.sc { background: var(--paper); color: var(--ink); width: 340px; height: 567px; border-radius: 14px; display: flex; flex-direction: column; padding: 15px 18px 11px; box-sizing: border-box; position: relative; overflow: hidden; }
+.sc.sm { width: 240px; height: 400px; border-radius: 10px; padding: 11px 13px 8px; }
+.note { max-width: 62ch; margin: 0 auto 2.6rem; padding: 0 1rem; font-size: 12.5px; line-height: 1.55; opacity: 0.75; }
+.note b { font-weight: 700; }
+
+/* ── settings screen under the sheet ─────────────────────────── */
+.st { display: flex; justify-content: space-between; align-items: center; font-size: 10px; opacity: 0.6; padding: 0 2px 10px; }
+.kw { font-size: 9px; letter-spacing: 0.22em; opacity: 0.5; margin: 3px 2px 6px; text-transform: uppercase; font-weight: 700; }
+.sg { border: 1px solid var(--ink-25); border-radius: 7px; margin-bottom: 8px; overflow: hidden; }
+.sr { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 6px 10px; font-size: 11.5px; border-bottom: 1px solid var(--ink-12); }
+.sr:last-child { border-bottom: none; }
+.sr.on { background: var(--ink); color: var(--paper); }
+.sv { opacity: 0.6; font-size: 10.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sr.on .sv { opacity: 0.85; }
+.tb { margin-top: auto; display: flex; justify-content: space-around; align-items: center; padding-top: 10px; }
+.tab { padding: 6px 9px; border-radius: 6px; line-height: 0; }
+.tab svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.tab.on { background: var(--ink); color: var(--paper); }
+
+/* ── the sheet: same component as the menu / contents family ─── */
+.sh { position: absolute; left: 14px; right: 14px; bottom: 14px; background: var(--paper); border: 1px solid var(--ink); border-radius: 10px; padding: 11px 11px 9px; box-shadow: 0 1px 0 var(--ink), 0 -1px 0 var(--ink); display: flex; flex-direction: column; box-sizing: border-box; }
+.sh.m { height: 318px; }
+.sh.l { top: 14px; }
+
+.sh-hd { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 0 3px 3px; }
+.sh-hd h2 { font-family: 'Lora', Georgia, serif; font-weight: 500; font-size: 15px; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sh-hd .cap { font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; font-weight: 700; opacity: 0.55; flex: none; }
+.sh-meta { font-size: 10px; opacity: 0.6; padding: 0 3px 9px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sh-meta.warn { opacity: 0.95; font-weight: 700; white-space: normal; line-height: 1.35; }
+
+.gr { border: 1px solid var(--ink-25); border-radius: 7px; overflow: hidden; margin-bottom: 6px; flex: none; }
+.gr.fill { flex: 1; min-height: 0; }
+.rw { display: grid; grid-template-columns: 20px 1fr auto; align-items: center; column-gap: 8px; padding: 6px 10px; font-size: 11.5px; border-bottom: 1px solid var(--ink-12); min-height: 19px; }
+.rw:last-child { border-bottom: none; }
+.rw .n { font-size: 9.5px; opacity: 0.5; font-variant-numeric: tabular-nums; text-align: right; }
+.rw .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rw .t.bk { font-family: 'Lora', Georgia, serif; font-size: 12px; }
+.rw .t i { font-style: italic; opacity: 0.7; }
+.rw .t small { display: block; font-size: 8.5px; letter-spacing: 0.02em; opacity: 0.6; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rw .v { font-size: 10px; opacity: 0.6; font-variant-numeric: tabular-nums; }
+.rw .v.none { opacity: 0.3; }
+.rw.on { background: var(--ink); color: var(--paper); }
+.rw.on .n, .rw.on .v { opacity: 0.85; }
+.rw.on .t small { opacity: 0.8; }
+.rw.dim .t, .rw.dim .v { opacity: 0.35; }
+.rw .ic { display: inline-flex; justify-content: flex-end; }
+.rw .ic svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; opacity: 0.75; }
+.rw.on .ic svg { opacity: 1; }
+/* the book being read: bookmark in the lead column, position bar under the title */
+.rw.here .n { opacity: 1; }
+.rw.here .t { display: flex; flex-direction: column; gap: 4px; }
+.rw.here .t > div { height: 1.5px; width: 60%; background: var(--ink-25); border-radius: 1px; overflow: hidden; }
+.rw.here .t > div > b { display: block; height: 100%; background: var(--ink); width: 38%; }
+.rw.on.here .t > div { background: var(--paper-35); }
+.rw.on.here .t > div > b { background: var(--paper); }
+
+.sh-ft { display: flex; justify-content: space-between; align-items: center; padding-top: 4px; margin-top: auto; }
+.sh-ft .rg { font-size: 10px; opacity: 0.6; font-variant-numeric: tabular-nums; }
+.hn { display: flex; gap: 14px; font-size: 9px; letter-spacing: 0.16em; opacity: 0.55; text-transform: uppercase; font-weight: 700; }
+
+/* progress row inside the sheet, same motif as the loading stage row */
+.stage { padding: 4px 3px 9px; }
+.stage .cap { display: flex; justify-content: space-between; font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; font-weight: 700; opacity: 0.55; margin-bottom: 6px; font-variant-numeric: tabular-nums; }
+.stage .bar { height: 2px; background: var(--ink-25); border-radius: 1px; overflow: hidden; }
+.stage .bar > b { display: block; height: 100%; background: var(--ink); }
+
+/* ── inventory table (chrome, not on the panel) ──────────────── */
+.inv { max-width: 1020px; margin: 0.6rem auto 2.4rem; padding: 0 1rem; overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 12px; }
+caption { text-align: left; font-size: 11.5px; opacity: 0.6; padding: 0 0 9px; line-height: 1.5; }
+th, td { text-align: left; padding: 6px 10px 6px 0; border-bottom: 1px solid rgba(217,214,204,0.14); vertical-align: top; white-space: nowrap; }
+th { font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; font-weight: 700; opacity: 0.5; }
+td.p { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; opacity: 0.85; }
+td.w { white-space: normal; opacity: 0.7; font-size: 11.5px; }
+td em { font-style: normal; color: var(--amber); opacity: 0.95; }
+tbody tr.keep td.p { opacity: 0.6; }
+.tick { font-weight: 700; }
+.tick.no { opacity: 0.25; font-weight: 400; }
+
+/* ── flow strip ──────────────────────────────────────────────── */
+.tr { max-width: 1180px; margin: 0 auto 1.6rem; padding: 0 1rem; }
+.tr h3 { font-size: 13.5px; font-weight: 500; margin: 1.6rem 0 0.3rem; }
+.tr h3 small { font-weight: 400; opacity: 0.55; margin-left: 8px; font-size: 11.5px; }
+.strip { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 6px 0 4px; }
+.xs { width: 132px; height: 220px; background: var(--paper); color: var(--ink); border-radius: 8px; padding: 8px 9px 6px; box-sizing: border-box; display: flex; flex-direction: column; position: relative; overflow: hidden; flex: none; }
+.xs .l { height: 3px; background: var(--ink-25); border-radius: 2px; margin: 0 0 4px; }
+.xs .l.s { width: 60%; }
+.xs .l.k { background: var(--ink); }
+.xs .tag { position: absolute; top: 4px; right: 6px; font-size: 5px; letter-spacing: 0.1em; text-transform: uppercase; opacity: 0.4; font-weight: 700; }
+.xs .sheet { position: absolute; left: 6px; right: 6px; bottom: 6px; background: var(--paper); border: 1px solid var(--ink); border-radius: 5px; padding: 6px; box-sizing: border-box; }
+.xs .sheet.s { height: 96px; }
+.xs .sheet.m { height: 138px; }
+.xs .sheet.l { top: 6px; }
+.xs .sheet .l { margin-bottom: 7px; }
+.xs .sheet .l.on { background: var(--ink); height: 9px; border-radius: 2px; margin: -3px 0 5px; }
+.xs .sheet .l.warn { background: var(--ink); height: 5px; width: 80%; border-radius: 1px; }
+.ar { display: flex; flex-direction: column; align-items: center; gap: 3px; min-width: 68px; font-size: 9.5px; text-align: center; opacity: 0.75; line-height: 1.3; }
+.ar b { font-weight: 700; letter-spacing: 0.08em; font-size: 8.5px; opacity: 0.7; }
+.ar i { font-style: normal; font-size: 16px; line-height: 1; opacity: 0.5; }
+.ar.arm b { color: var(--amber); opacity: 1; }
+.tr p { font-size: 12px; line-height: 1.5; opacity: 0.75; margin: 4px 0 0; max-width: 78ch; }
+
+.rules { max-width: 78ch; margin: 0.4rem auto 3rem; padding: 0 1rem; font-size: 12.5px; line-height: 1.55; opacity: 0.8; }
+.rules li { margin-bottom: 8px; }
+.rules b { font-weight: 700; }
+.rules code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; opacity: 0.9; }
+.open-q { max-width: 78ch; margin: 0 auto 3rem; padding: 0 1rem; }
+.open-q h3 { font-size: 13px; font-weight: 500; margin: 0 0 8px; }
+.open-q p { font-size: 12.5px; line-height: 1.55; opacity: 0.78; margin: 0 0 10px; }
+.open-q p b { color: var(--amber); font-weight: 700; }
+</style>
+
+<h1>Book cache cleanup<small>What a book leaves on the SD card, and the settings path that removes it. Same sheet family as the reader menu and contents.</small></h1>
+
+<div class="inv">
+  <table>
+    <caption>Everything one book writes. <em>name_hash</em> is <code>fnv1a(filename)</code>, case-sensitive: the bundle is named from all 32 bits, the image directory from the low 28. Bookmarks hash their own key, case-folded, inside the cache; stats and titles are keyed by the filename itself. Only the first two are derived from the EPUB.</caption>
+    <thead>
+      <tr><th>Artifact</th><th>Path</th><th>Typical</th><th>Rebuild</th><th>Forget</th><th>What it costs to lose</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Bundle header</td><td class="p">_PLUMP/BOOKS/&lt;H8&gt;.BIN</td><td>256 B</td><td class="tick">drop</td><td class="tick">drop</td><td class="w">Title, author, flags, the mirrored bookmark</td></tr>
+      <tr><td>&nbsp;&nbsp;Spine</td><td class="p">&#8735; section 0</td><td>4 KB</td><td class="tick">drop</td><td class="tick">drop</td><td class="w">One OPF re-parse</td></tr>
+      <tr><td>&nbsp;&nbsp;Content</td><td class="p">&#8735; section 1</td><td>288 KB</td><td class="tick">drop</td><td class="tick">drop</td><td class="w">Full re-inflate and HTML strip of every chapter: the slow one</td></tr>
+      <tr><td>&nbsp;&nbsp;Page index</td><td class="p">&#8735; sections 2, 4</td><td>96 KB</td><td class="tick">drop</td><td class="tick">drop</td><td class="w">Re-typeset per chapter as you reach it</td></tr>
+      <tr><td>&nbsp;&nbsp;Covers</td><td class="p">&#8735; section 3</td><td>24 KB</td><td class="tick">drop</td><td class="tick">drop</td><td class="w">Card and Mini thumbs re-dithered in the background</td></tr>
+      <tr><td>Image cache</td><td class="p">_PLUMP/_HHHHHHH/&lt;h8&gt;.BIN</td><td>0&ndash;2 MB</td><td class="tick">drop</td><td class="tick">drop</td><td class="w">One worker decode per figure, on the page that shows it</td></tr>
+      <tr class="keep"><td>Bookmark slot</td><td class="p">_PLUMP/BKMK.BIN</td><td>48 B</td><td class="tick no">keep</td><td class="tick">drop</td><td class="w"><em>Not rebuildable.</em> The book reopens at page 1</td></tr>
+      <tr class="keep"><td>Reading stats</td><td class="p">_PLUMP/STATS/&lt;filename&gt;</td><td>40 B</td><td class="tick no">keep</td><td class="tick">drop</td><td class="w"><em>Not rebuildable.</em> Pages, time, sessions; the pace the sleep card needs</td></tr>
+      <tr class="keep"><td>Recent record</td><td class="p">_PLUMP/RECENT</td><td>&mdash;</td><td class="tick no">keep</td><td class="tick">drop</td><td class="w"><em>Not rebuildable.</em> Only if it names this book</td></tr>
+      <tr class="keep"><td>Title line</td><td class="p">_PLUMP/TITLES.BIN</td><td>~90 B</td><td class="tick no">keep</td><td class="tick no">keep</td><td class="w">Rewritten by the next directory scan; the line is a shared file, not a per-book one</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h1>The two scopes<small>The split the whole design turns on: the bundle and images are derived from the EPUB and rebuild themselves, the bookmark and stats do not exist anywhere else.</small></h1>
+
+<div class="fr">
+
+  <div class="un">
+    <div class="dv"><div class="sc">
+      <div class="st"><span>today &middot; 47 pages &middot; 1h 12m</span><span>87%</span></div>
+      <div class="kw">Reading</div>
+      <div class="sg">
+        <div class="sr"><span>Reader Font</span><span class="sv">Bookerly</span></div>
+        <div class="sr"><span>Book Font</span><span class="sv">Medium</span></div>
+        <div class="sr"><span>Line Spacing</span><span class="sv">1.35x</span></div>
+        <div class="sr"><span>Margins</span><span class="sv">Comfortable</span></div>
+      </div>
+      <div class="kw">Display</div>
+      <div class="sg">
+        <div class="sr"><span>UI Font</span><span class="sv">Small</span></div>
+        <div class="sr"><span>Text AA</span><span class="sv">On</span></div>
+        <div class="sr"><span>Ghost Clear</span><span class="sv">Every 6</span></div>
+      </div>
+      <div class="kw">System</div>
+      <div class="sg">
+        <div class="sr"><span>Sleep After</span><span class="sv">5 min</span></div>
+        <div class="sr"><span>Swap Buttons</span><span class="sv">No</span></div>
+        <div class="sr on"><span>Book Cache</span><span class="sv">4.5 MB &rarr;</span></div>
+      </div>
+      <div class="tb">
+        <span class="tab"><svg viewBox="0 0 16 16"><path d="M2 8l6-6 6 6M4 7v7h8V7"/></svg></span>
+        <span class="tab"><svg viewBox="0 0 16 16"><path d="M2 2h3v12H2zM6 2h3v12H6zM10 3l3-1 2 11-3 1z"/></svg></span>
+        <span class="tab"><svg viewBox="0 0 16 16"><path d="M2 14h12M4 12V8M8 12V4M12 12V6"/></svg></span>
+        <span class="tab on"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.5"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4"/></svg></span>
+        <span class="tab"><svg viewBox="0 0 16 16"><path d="M4 12a3 3 0 0 1-.5-6A4.5 4.5 0 0 1 12 6.5 2.75 2.75 0 0 1 12 12zM8 13V8M6 10l2-2 2 2"/></svg></span>
+      </div>
+    </div></div>
+    <p class="lab">1 &middot; The row<small>Last in System, below Swap Buttons. Its value is the whole cache, so the row answers &ldquo;is this worth opening&rdquo; without opening. The 150 px value cell holds the bytes and the arrow that marks it as the only settings row which opens a surface instead of stepping a value; the book count rides on the sheet&rsquo;s own header, which has the width for it.</small></p>
+  </div>
+
+  <div class="un">
+    <div class="dv"><div class="sc">
+      <div class="st"><span>today &middot; 47 pages &middot; 1h 12m</span><span>87%</span></div>
+      <div class="kw">System</div>
+      <div class="sg">
+        <div class="sr"><span>Sleep After</span><span class="sv">5 min</span></div>
+        <div class="sr"><span>Swap Buttons</span><span class="sv">No</span></div>
+        <div class="sr"><span>Book Cache</span><span class="sv">4.5 MB &rarr;</span></div>
+      </div>
+      <div class="sh l">
+        <div class="sh-hd"><h2>Book Cache</h2><span class="cap">Largest first</span></div>
+        <div class="sh-meta">9 books &middot; 4.5 MB of 14.8 GB card</div>
+        <div class="gr fill">
+          <div class="rw on"><span class="n"><svg width="9" height="11" viewBox="0 0 9 11" aria-hidden="true"><path d="M1 1h7v9L4.5 7.6 1 10z" fill="currentColor"/></svg></span><span class="t bk">Exhalation<small>41 images &middot; reading now</small></span><span class="v">2.3 MB</span></div>
+          <div class="rw"><span class="n">2</span><span class="t bk">The MANIAC<small>6 images</small></span><span class="v">608 KB</span></div>
+          <div class="rw"><span class="n">3</span><span class="t bk">Pachinko</span><span class="v">486 KB</span></div>
+          <div class="rw"><span class="n">4</span><span class="t bk">The Left Hand of Darkness</span><span class="v">302 KB</span></div>
+          <div class="rw"><span class="n">5</span><span class="t bk">Foundation</span><span class="v">254 KB</span></div>
+          <div class="rw"><span class="n">6</span><span class="t bk">Piranesi</span><span class="v">168 KB</span></div>
+          <div class="rw"><span class="n">7</span><span class="t bk">Sea of Tranquility</span><span class="v">142 KB</span></div>
+          <div class="rw"><span class="n">8</span><span class="t bk"><i>NOTES.TXT</i></span><span class="v">18 KB</span></div>
+          <div class="rw dim"><span class="n">9</span><span class="t bk">Piranesi (copy)</span><span class="v">measuring</span></div>
+        </div>
+        <div class="sh-ft"><span class="rg"></span><div class="hn"><span>&uarr;&darr; move</span><span>OK open</span><span>Back close</span></div></div>
+      </div>
+    </div></div>
+    <p class="lab">2 &middot; The picker, sheet L<small>Every book with a bundle, biggest first, so the row worth clearing is the top one. Sizes stream in from the background budget: a row shows <b>measuring</b> until its bundle and image directory have been sized, and the header total climbs as they land. The book on the reader stack carries the bookmark glyph, exactly as the current chapter does in Contents.</small></p>
+  </div>
+
+  <div class="un">
+    <div class="dv"><div class="sc">
+      <div class="st"><span>today &middot; 47 pages &middot; 1h 12m</span><span>87%</span></div>
+      <div class="kw">System</div>
+      <div class="sg">
+        <div class="sr"><span>Sleep After</span><span class="sv">5 min</span></div>
+        <div class="sr"><span>Swap Buttons</span><span class="sv">No</span></div>
+        <div class="sr"><span>Book Cache</span><span class="sv">4.5 MB &rarr;</span></div>
+      </div>
+      <div class="sh m">
+        <div class="sh-hd"><h2>The MANIAC</h2><span class="cap">Cache</span></div>
+        <div class="sh-meta">Benjam&iacute;n Labatut &middot; 608 KB &middot; 11 chapters, 6 images</div>
+        <div class="gr">
+          <div class="rw on"><span class="ic"><svg viewBox="0 0 12 12"><path d="M2 6a4 4 0 0 1 7-2.6M10 6a4 4 0 0 1-7 2.6M9 1v2.5H6.5M3 11V8.5h2.5"/></svg></span><span class="t">Rebuild cache<small>keeps page 61 and 2h 14m read</small></span><span class="v">608 KB</span></div>
+          <div class="rw"><span class="ic"><svg viewBox="0 0 12 12"><path d="M2.5 3.5h7l-.6 7h-5.8zM4.5 3.5V2h3v1.5M1.5 3.5h9"/></svg></span><span class="t">Forget book<small>cache, page and reading time</small></span><span class="v">608 KB</span></div>
+        </div>
+        <div class="gr">
+          <div class="rw"><span class="n">&#8226;</span><span class="t">Text and layout</span><span class="v">388 KB</span></div>
+          <div class="rw"><span class="n">&#8226;</span><span class="t">Images</span><span class="v">220 KB</span></div>
+          <div class="rw"><span class="n">&#8226;</span><span class="t">Page 61 of 143 &middot; 2h 14m</span><span class="v">88 B</span></div>
+        </div>
+        <div class="sh-ft"><span class="rg"></span><div class="hn"><span>&uarr;&darr; move</span><span>OK select</span><span>Back list</span></div></div>
+      </div>
+    </div></div>
+    <p class="lab">3 &middot; The book, sheet M<small>Two actions over one breakdown. The breakdown group is not selectable: it is the receipt for the numbers above it, and its last row is what only <b>Forget</b> touches, priced at 88 bytes so the trade is plain. Neither action fires yet.</small></p>
+  </div>
+
+  <div class="un">
+    <div class="dv"><div class="sc">
+      <div class="st"><span>today &middot; 47 pages &middot; 1h 12m</span><span>87%</span></div>
+      <div class="kw">System</div>
+      <div class="sg">
+        <div class="sr"><span>Sleep After</span><span class="sv">5 min</span></div>
+        <div class="sr"><span>Swap Buttons</span><span class="sv">No</span></div>
+        <div class="sr"><span>Book Cache</span><span class="sv">4.5 MB &rarr;</span></div>
+      </div>
+      <div class="sh">
+        <div class="sh-hd"><h2>The MANIAC</h2><span class="cap">Forget book</span></div>
+        <div class="sh-meta">608 KB &middot; your place &middot; 2h 14m read</div>
+        <div class="gr">
+          <div class="rw on"><span class="ic"><svg viewBox="0 0 12 12"><path d="M2.5 3.5h7l-.6 7h-5.8zM4.5 3.5V2h3v1.5M1.5 3.5h9"/></svg></span><span class="t">Delete all of it<small>the book file itself stays on the card</small></span><span class="v"></span></div>
+        </div>
+        <div class="sh-ft"><span class="rg"></span><div class="hn"><span>OK confirm</span><span>Back cancel</span></div></div>
+      </div>
+    </div></div>
+    <p class="lab">4 &middot; Armed, sheet S<small>Only the destructive scope arms. The sheet shrinks to one row, the meta line itemizes everything that goes rather than reciting a sentence the chrome font would ellipsize, and the hint footer drops to two words over the two buttons that mean them. <b>Rebuild</b> skips this state: nothing it deletes is unrecoverable, so a second press would only be ceremony.</small></p>
+  </div>
+
+</div>
+
+<h1 style="margin-top:1rem">The states that are not a clean two-step<small>The book you are reading, a rebuild in flight, and the card with nothing on it.</small></h1>
+
+<div class="fr">
+
+  <div class="un">
+    <div class="dv"><div class="sc sm">
+      <div class="kw">System</div>
+      <div class="sg">
+        <div class="sr"><span>Swap Buttons</span><span class="sv">No</span></div>
+        <div class="sr"><span>Book Cache</span><span class="sv">4.5 MB &rarr;</span></div>
+      </div>
+      <div class="sh m">
+        <div class="sh-hd"><h2>Exhalation</h2><span class="cap">Cache</span></div>
+        <div class="sh-meta">2.3 MB &middot; 41 images &middot; reading now</div>
+        <div class="gr">
+          <div class="rw on"><span class="ic"><svg viewBox="0 0 12 12"><path d="M2 6a4 4 0 0 1 7-2.6M10 6a4 4 0 0 1-7 2.6M9 1v2.5H6.5M3 11V8.5h2.5"/></svg></span><span class="t">Rebuild cache<small>keeps your place and reading time</small></span><span class="v">2.3 MB</span></div>
+          <div class="rw"><span class="ic"><svg viewBox="0 0 12 12"><path d="M2.5 3.5h7l-.6 7h-5.8zM4.5 3.5V2h3v1.5M1.5 3.5h9"/></svg></span><span class="t">Forget book<small>cache, place and reading time</small></span><span class="v">2.3 MB</span></div>
+        </div>
+        <div class="sh-ft"><span class="rg"></span><div class="hn"><span>OK select</span><span>Back list</span></div></div>
+      </div>
+    </div></div>
+    <p class="lab">The book you were reading<small>No guard needed, and no open file to close: the reader is a modal that keeps Left and Right for chapter jumps, so the tab bar is unreachable from inside a book and the reader is never on the stack while Settings is. The bookmark glyph marks the book the continue-reading card names; Forget clears that card along with the position behind it.</small></p>
+  </div>
+
+  <div class="un">
+    <div class="dv"><div class="sc sm">
+      <div class="kw">System</div>
+      <div class="sg">
+        <div class="sr"><span>Swap Buttons</span><span class="sv">No</span></div>
+        <div class="sr"><span>Book Cache</span><span class="sv">4.5 MB &rarr;</span></div>
+      </div>
+      <div class="sh m">
+        <div class="sh-hd"><h2>Exhalation</h2><span class="cap">Clearing</span></div>
+        <div class="sh-meta">2.3 MB &middot; 41 images</div>
+        <div class="stage">
+          <div class="cap"><span>Removing images &middot; 26 of 41</span><span>63%</span></div>
+          <div class="bar"><b style="width:63%"></b></div>
+        </div>
+        <div class="gr">
+          <div class="rw"><span class="n">&#10003;</span><span class="t">Text and layout</span><span class="v">412 KB freed</span></div>
+          <div class="rw"><span class="n">&#8226;</span><span class="t">Images</span><span class="v">1.2 of 1.9 MB</span></div>
+        </div>
+        <div class="sh-ft"><span class="rg"></span><div class="hn"><span>Back stop</span></div></div>
+      </div>
+    </div></div>
+    <p class="lab">Clearing<small>The image directory is one unlink per file, each a directory scan, so a 41-figure book is the one case slow enough to show. Same stage row as the loading screens, repainted on 10% steps only. Stopping leaves a half-cleared cache, which is harmless: the next open rebuilds whatever is missing.</small></p>
+  </div>
+
+  <div class="un">
+    <div class="dv"><div class="sc sm">
+      <div class="kw">System</div>
+      <div class="sg">
+        <div class="sr"><span>Swap Buttons</span><span class="sv">No</span></div>
+        <div class="sr on"><span>Book Cache</span><span class="sv">3.9 MB &rarr;</span></div>
+      </div>
+      <div class="sh">
+        <div class="sh-hd"><h2>The MANIAC</h2><span class="cap">Forgotten</span></div>
+        <div class="sh-meta">608 KB freed &middot; 3.9 MB left in 8 books</div>
+        <div class="gr">
+          <div class="rw on"><span class="ic"><svg viewBox="0 0 12 12"><path d="M2 3h8M2 6h8M2 9h5"/></svg></span><span class="t">Back to the list</span><span class="v">&rarr;</span></div>
+        </div>
+        <div class="sh-ft"><span class="rg"></span><div class="hn"><span>OK list</span><span>Back settings</span></div></div>
+      </div>
+    </div></div>
+    <p class="lab">Done<small>The result is the meta line, not a toast: e-paper has no way to fade one. The settings row behind it already carries the new total, so closing the sheet needs no further refresh. An empty card shows the same sheet with &ldquo;No cached books&rdquo; and a Back hint alone.</small></p>
+  </div>
+
+</div>
+
+<h1 style="margin-top:1.4rem">Refresh cost of the whole path<small>GC is a full clear, DU a partial. Every sheet transition is one DU over the settings screen, which never repaints.</small></h1>
+
+<div class="tr">
+  <div class="strip">
+    <div class="xs"><span class="tag">Settings</span><div class="l k s"></div><div class="l"></div><div class="l"></div><div class="l"></div><div class="l k s"></div><div class="l"></div><div class="l"></div><div class="l"></div><div class="l k s"></div><div class="l"></div><div class="l"></div><div class="l k"></div></div>
+    <div class="ar"><b>DU sheet</b><i>&rarr;</i><span>picker opens, list below unchanged</span></div>
+    <div class="xs"><span class="tag">Picker</span><div class="l k s"></div><div class="l"></div><div class="l"></div><div class="sheet l"><div class="l k" style="width:50%"></div><div class="l" style="width:34%;margin-bottom:9px"></div><div class="l on"></div><div class="l"></div><div class="l"></div><div class="l"></div><div class="l"></div><div class="l"></div><div class="l s"></div></div></div>
+    <div class="ar"><b>DU sheet</b><i>&rarr;</i><span>shrinks to sheet M</span></div>
+    <div class="xs"><span class="tag">Book</span><div class="l k s"></div><div class="l"></div><div class="l"></div><div class="l"></div><div class="l"></div><div class="l k s"></div><div class="l"></div><div class="sheet m"><div class="l k" style="width:50%"></div><div class="l" style="width:40%;margin-bottom:9px"></div><div class="l on"></div><div class="l"></div><div class="l" style="margin-top:8px"></div><div class="l"></div><div class="l s"></div></div></div>
+    <div class="ar arm"><b>DU sheet</b><i>&rarr;</i><span>arms: shrinks to one row</span></div>
+    <div class="xs"><span class="tag">Armed</span><div class="l k s"></div><div class="l"></div><div class="l"></div><div class="l"></div><div class="l"></div><div class="l k s"></div><div class="l"></div><div class="l"></div><div class="l"></div><div class="l k s"></div><div class="l"></div><div class="sheet s"><div class="l k" style="width:50%"></div><div class="l warn"></div><div class="l warn" style="width:60%;margin-bottom:9px"></div><div class="l on"></div></div></div>
+    <div class="ar"><b>DU sheet</b><i>&rarr;</i><span>one refresh, or the stage row if it is slow</span></div>
+    <div class="xs"><span class="tag">Done</span><div class="l k s"></div><div class="l"></div><div class="l"></div><div class="l"></div><div class="l"></div><div class="l k s"></div><div class="l"></div><div class="l"></div><div class="l"></div><div class="l k s"></div><div class="l"></div><div class="l k"></div><div class="sheet s"><div class="l k" style="width:50%"></div><div class="l" style="width:70%;margin-bottom:9px"></div><div class="l on"></div></div></div>
+  </div>
+  <p>Five DU partials from the row to the freed bytes, each scoped to the sheet rectangle, and one more when Back closes it. No GC anywhere on the path: the sheet is plain BW, like Home, so nothing has to be neutralized on the way in or out. The settings row&rsquo;s new total is painted in the same refresh that removes the sheet.</p>
+</div>
+
+<ol class="rules">
+  <li><b>Two scopes, never one.</b> <b>Rebuild cache</b> deletes only what the EPUB can regenerate: the bundle file and the image directory. <b>Forget book</b> adds the bookmark slot, the stats file, and the Recent record if it names this book. A single &ldquo;clear cache&rdquo; that silently took the reading position would be the wrong default; one that left 2 MB of stale images behind would not be a clear.</li>
+  <li><b>The size is the label.</b> Every row that deletes something is priced in the same place, right-aligned, and the sum is on the settings row before the sheet is ever opened. The reason to be on this screen is bytes, so bytes are what the screen is made of.</li>
+  <li><b>Only the irreversible arms.</b> Forget takes a second OK behind a sentence that names the loss; Rebuild fires on the first. Arming everything trains the second press into a reflex and buys nothing.</li>
+  <li><b>Sizes stream, the sheet does not wait.</b> Sizing a book costs one <code>file_size</code> in <code>BOOKS/</code> plus one iterate of its image directory. The picker opens immediately with rows in directory order, then reorders once measured, on the background budget the title scan already uses. A row that has not been measured reads <b>measuring</b>, never <b>0 B</b>.</li>
+  <li><b>Close before unlink.</b> FAT will not delete an open entry, and the cached subdirectory handle in <code>SdStorageInner::sub_handles</code> counts as open: the image directory&rsquo;s handle must be evicted before its own entry goes, and a directory only unlinks once empty. The reader is popped to Home before its book is touched, for the same reason the upload server closes a file before unlinking it.</li>
+  <li><b>Whole book or nothing, per artifact.</b> No partial-section surgery inside a bundle: the whole file goes and the next open rebuilds. Stopping mid-clear is safe for the same reason a power loss mid-cache is: nothing reads a bundle it cannot verify, and a missing file is just a cold open.</li>
+  <li><b>Believe the card, not the clear.</b> A finished clear zeroes its row so every total on screen is right at once, then re-measures that book to confirm it. A book that really is at zero leaves the list on that pass; one the user stopped, or one whose unlink failed, shows its real leftover instead of vanishing.</li>
+</ol>
+
+<div class="open-q">
+  <h3>What this cost, and what it left open</h3>
+  <p><b>Both scopes shipped.</b> The two differ in exactly one way that matters: the bookmark slot and the stats file are the only per-book bytes on the card that no amount of re-reading the EPUB can reconstruct, so Rebuild fires on one press and Forget takes a second.</p>
+  <p><b>It lives in <code>SettingsApp</code>.</b> No new <code>AppId</code>, no nav change: the sheet is state on the settings screen, and the manager draws it after the shared chrome the way it draws the quick menu, so the status bar and tab bar do not slice its edges. The 20-entry size table costs about 1.4 KB of <code>.bss</code>, which took the linker&rsquo;s heap floor from 157K to 154K.</p>
+  <p><b>The settings model needed one new shape.</b> <code>Row::Item(SettingId)</code> and <code>SettingId::get/set</code> are contracted onto <code>SystemSettings</code>, and a row that opens a surface has no value there. <code>Domain::Action</code> with an inert get/set keeps one cursor type for the list, at the price of a variant those two methods have nothing to say about.</p>
+  <p><b>Still open:</b> a second entry point &mdash; <b>Clear cache</b> in the Library&rsquo;s Menu sheet, acting on the highlighted book &mdash; would reuse the same book sheet and skip the picker. It is the faster path for the common case, and the settings row stays the one place that shows the total.</p>
+</div>

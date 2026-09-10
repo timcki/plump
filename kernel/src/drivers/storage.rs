@@ -169,6 +169,37 @@ fn timestamp_to_day_key(t: embedded_sdmmc::Timestamp) -> Option<DayKey> {
 
 // build "NAME.EXT" bytes from a ShortFileName
 
+/// How much a subdirectory holds, from one directory walk.
+#[derive(Clone, Copy, Debug)]
+pub struct SubdirUsage {
+    pub files: u16,
+    pub bytes: u32,
+}
+
+impl SubdirUsage {
+    pub const EMPTY: Self = Self { files: 0, bytes: 0 };
+}
+
+/// Files unlinked in one [`SdStorage::purge_plump_subdir`] call.
+#[derive(Clone, Copy, Debug)]
+pub struct PurgeStep {
+    pub deleted: u16,
+    pub bytes: u32,
+    /// entries were still there when the batch filled up
+    pub more: bool,
+}
+
+/// Files unlinked per purge call. Each unlink walks the directory, so
+/// this is the trade between clearing promptly and holding the event
+/// loop; 8 keeps a batch near the cost of one page turn.
+pub const PURGE_BATCH: usize = 8;
+
+/// Directory entries that are not files we can unlink: the volume
+/// label, subdirectories (`.` and `..` among them), long-name shards.
+fn skip_entry(entry: &embedded_sdmmc::DirEntry) -> bool {
+    entry.attributes.is_volume() || entry.attributes.is_directory() || entry.attributes.is_lfn()
+}
+
 fn sfn_to_bytes(name: &embedded_sdmmc::ShortFileName, out: &mut [u8; 13]) -> u8 {
     let base = name.base_name();
     let ext = name.extension();
@@ -404,6 +435,20 @@ impl SdStorageInner {
             return Ok((dir, true));
         }
         Ok((dir, false))
+    }
+
+    /// Close and forget one cached subdirectory handle, if it is
+    /// cached. Removing a directory goes through here first: FAT will
+    /// not unlink an entry that is still open.
+    pub(crate) fn close_sub_handle(&mut self, name: &str) {
+        for slot in self.sub_handles.iter_mut() {
+            let Some((cached, dir)) = *slot else { continue };
+            if cached.as_str() == name {
+                *slot = None;
+                let _ = self.mgr.close_dir(dir);
+                return;
+            }
+        }
     }
 
     /// Close every cached directory handle (data dir change, halt).
@@ -959,6 +1004,106 @@ impl SdStorage {
     ) -> crate::error::Result<()> {
         poll_once(self.with_scope(Scope::DataSub(dir), async |inner, sub| {
             inner.delete(sub, name).await
+        }))
+    }
+
+    // whole-subdirectory operations (per-book cache clearing)
+
+    /// Count the files in <data_dir>/<dir>/ and total their bytes.
+    ///
+    /// One directory walk, no file opens. A missing directory is an
+    /// `OpenDir` error, which callers reading a cache size treat as
+    /// zero rather than a failure.
+    pub fn measure_plump_subdir(&self, dir: &str) -> crate::error::Result<SubdirUsage> {
+        poll_once(self.with_scope(Scope::DataSub(dir), async |inner, sub| {
+            let mut usage = SubdirUsage::EMPTY;
+            inner
+                .mgr
+                .iterate_dir(sub, |entry| {
+                    if !skip_entry(entry) {
+                        usage.files = usage.files.saturating_add(1);
+                        usage.bytes = usage.bytes.saturating_add(entry.size);
+                    }
+                    ControlFlow::Continue(())
+                })
+                .await
+                .map_err(|_| Error::new(ErrorKind::ReadFailed, "measure_plump_subdir"))?;
+            Ok(usage)
+        }))
+    }
+
+    /// Delete up to [`PURGE_BATCH`] files from <data_dir>/<dir>/.
+    ///
+    /// Bounded so a directory with hundreds of cached images clears
+    /// across several background steps instead of blocking the event
+    /// loop. Call until `more` comes back false; the directory itself
+    /// survives, so finish with [`Self::remove_plump_subdir`].
+    ///
+    /// The walk and the unlinks are separate passes: deleting entries
+    /// while iterating the same directory would invalidate the walk.
+    pub fn purge_plump_subdir(&self, dir: &str) -> crate::error::Result<PurgeStep> {
+        poll_once(self.with_scope(Scope::DataSub(dir), async |inner, sub| {
+            let mut names = [([0u8; 13], 0u8, 0u32); PURGE_BATCH];
+            let mut found = 0usize;
+            let mut more = false;
+
+            inner
+                .mgr
+                .iterate_dir(sub, |entry| {
+                    if skip_entry(entry) {
+                        return ControlFlow::Continue(());
+                    }
+                    if found >= PURGE_BATCH {
+                        more = true;
+                        return ControlFlow::Break(());
+                    }
+                    let mut buf = [0u8; 13];
+                    let len = sfn_to_bytes(&entry.name, &mut buf);
+                    names[found] = (buf, len, entry.size);
+                    found += 1;
+                    ControlFlow::Continue(())
+                })
+                .await
+                .map_err(|_| Error::new(ErrorKind::ReadFailed, "purge_plump_subdir"))?;
+
+            let mut step = PurgeStep {
+                deleted: 0,
+                bytes: 0,
+                more,
+            };
+            for (buf, len, size) in names.iter().take(found) {
+                let name = match core::str::from_utf8(&buf[..*len as usize]) {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                match inner.delete(sub, name).await {
+                    Ok(()) => {
+                        step.deleted = step.deleted.saturating_add(1);
+                        step.bytes = step.bytes.saturating_add(*size);
+                    }
+                    // an entry we cannot unlink would otherwise be
+                    // walked again forever; report no progress and let
+                    // the caller stop
+                    Err(e) => {
+                        log::warn!("purge {}/{}: {}", dir, name, e);
+                        step.more = false;
+                        return Ok(step);
+                    }
+                }
+            }
+            Ok(step)
+        }))
+    }
+
+    /// Remove the (empty) directory <data_dir>/<dir>/.
+    ///
+    /// FAT refuses to unlink a directory that is still open, and this
+    /// one may well be holding one of the cached `sub_handles`, so the
+    /// handle is closed before the entry goes.
+    pub fn remove_plump_subdir(&self, dir: &str) -> crate::error::Result<()> {
+        poll_once(self.with_scope(Scope::Data, async |inner, data| {
+            inner.close_sub_handle(dir);
+            inner.delete(data, dir).await
         }))
     }
 

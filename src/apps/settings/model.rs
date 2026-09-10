@@ -55,6 +55,10 @@ pub enum NumFmt {
 /// the values a setting accepts.
 #[derive(Clone, Copy)]
 pub enum Domain {
+    /// no value on this screen: the row opens something that owns its
+    /// own surface. `get`/`set` are inert for these, and `format`
+    /// writes nothing, so the owner supplies the value cell itself
+    Action,
     /// two states, each with its own word
     Toggle {
         off: &'static str,
@@ -83,6 +87,8 @@ pub enum Activation {
     Flip,
     /// open an edit session, which captures Left/Right until it closes
     Edit,
+    /// hand the screen to the row's own surface (the cache sheet)
+    Open,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -99,12 +105,38 @@ pub enum SettingId {
     SunlightFix,
     SleepAfter,
     SwapButtons,
+    BookCache,
 }
 
-/// a visual row: a section caption or an editable setting.
+/// A read-only figure at the foot of the list. Not a setting: the
+/// cursor never lands on one, because `item_at` only answers for
+/// `Row::Item`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InfoId {
+    Version,
+    Storage,
+    Battery,
+    Uptime,
+}
+
+impl InfoId {
+    pub const ALL: [Self; 4] = [Self::Version, Self::Storage, Self::Battery, Self::Uptime];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Version => "Firmware",
+            Self::Storage => "Book cache",
+            Self::Battery => "Battery",
+            Self::Uptime => "Awake",
+        }
+    }
+}
+
+/// a visual row: a section caption, an editable setting, or a figure.
 pub enum Row {
     Section(&'static str),
     Item(SettingId),
+    Info(InfoId),
 }
 
 /// the settings screen, top to bottom.
@@ -124,7 +156,20 @@ pub const ROWS: &[Row] = &[
     Row::Section("System"),
     Row::Item(SettingId::SleepAfter),
     Row::Item(SettingId::SwapButtons),
+    Row::Item(SettingId::BookCache),
+    Row::Section("About"),
+    Row::Info(InfoId::Version),
+    Row::Info(InfoId::Storage),
+    Row::Info(InfoId::Battery),
+    Row::Info(InfoId::Uptime),
 ];
+
+/// Where a setting sits on screen, for a caller that has to repaint
+/// one row it is not the cursor on.
+pub fn row_index(id: SettingId) -> Option<usize> {
+    ROWS.iter()
+        .position(|r| matches!(r, Row::Item(item) if *item == id))
+}
 
 fn font_size_name(v: u16) -> &'static str {
     fonts::font_size_name(v as u8)
@@ -160,6 +205,7 @@ impl SettingId {
             Self::SunlightFix => "Sunlight Fix",
             Self::SleepAfter => "Sleep After",
             Self::SwapButtons => "Swap Buttons",
+            Self::BookCache => "Book Cache",
         }
     }
 
@@ -211,6 +257,24 @@ impl SettingId {
                 off: "No",
                 on: "Yes",
             },
+            Self::BookCache => Domain::Action,
+        }
+    }
+
+    /// The line under the label, for a setting whose label and value
+    /// together still do not say what it does. Empty for the ones that
+    /// speak for themselves, so the list stays scannable rather than
+    /// becoming a manual.
+    pub const fn sub(self) -> &'static str {
+        match self {
+            Self::ReaderFont => "the face the book itself is set in",
+            Self::ReaderStatus => "title, chapter bar and page count",
+            Self::TextAa => "grey glyph edges, one extra pass a page",
+            Self::GhostClear => "full clear after this many page turns",
+            Self::SunlightFix => "powers the panel down after each refresh",
+            Self::SwapButtons => "next page on the upper button",
+            Self::BookCache => "text, layout and figures kept on the card",
+            _ => "",
         }
     }
 
@@ -218,6 +282,7 @@ impl SettingId {
     pub const fn activation(self) -> Activation {
         match self.domain() {
             Domain::Toggle { .. } => Activation::Flip,
+            Domain::Action => Activation::Open,
             _ => Activation::Edit,
         }
     }
@@ -243,6 +308,7 @@ impl SettingId {
             Self::SunlightFix => s.sunlight_fix as u16,
             Self::SleepAfter => s.sleep_timeout,
             Self::SwapButtons => s.swap_buttons as u16,
+            Self::BookCache => 0,
         }
     }
 
@@ -260,6 +326,7 @@ impl SettingId {
             Self::SunlightFix => s.sunlight_fix = v != 0,
             Self::SleepAfter => s.sleep_timeout = v,
             Self::SwapButtons => s.swap_buttons = v != 0,
+            Self::BookCache => {}
         }
     }
 
@@ -268,6 +335,8 @@ impl SettingId {
     pub fn step(self, s: &mut SystemSettings, dir: Step) -> bool {
         let cur = self.get(s);
         let next = match self.domain() {
+            // nothing to step: the row opens a surface instead
+            Domain::Action => return false,
             // a toggle has no ends to hit: either direction flips it
             Domain::Toggle { .. } => u16::from(cur == 0),
             Domain::Named { count, .. } => clamped(cur, dir, 0, count.saturating_sub(1), 1),
@@ -286,6 +355,7 @@ impl SettingId {
         out.clear();
         let v = self.get(s);
         match self.domain() {
+            Domain::Action => {}
             Domain::Toggle { off, on } => {
                 let _ = out.write_str(if v != 0 { on } else { off });
             }

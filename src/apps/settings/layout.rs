@@ -32,8 +32,13 @@ pub const VALUE_W: u16 = 150;
 #[derive(Clone, Copy)]
 pub struct Metrics {
     pub row_h: u16,
+    /// extra height a row with a sub line takes
+    pub sub_h: u16,
     pub caption_h: u16,
     pub section_gap: u16,
+    /// gap under a caption, so it reads as belonging to the group
+    /// beneath it rather than floating between two
+    pub caption_pad: u16,
     pub top: u16,
     pub bottom: u16,
 }
@@ -44,8 +49,10 @@ impl Metrics {
     pub fn for_line_height(body_line_h: u16) -> Self {
         Self {
             row_h: THEME.row_h.max(body_line_h + 2 * THEME.margin_sm),
+            sub_h: crate::fonts::chrome_font().line_height,
             caption_h: body_line_h + THEME.margin_sm,
             section_gap: THEME.section_gap,
+            caption_pad: 6,
             top: THEME.content_top() + THEME.margin_sm,
             bottom: THEME.content_bottom() - THEME.margin_sm,
         }
@@ -235,10 +242,29 @@ impl SettingsList {
         match ROWS[idx] {
             // the gap belongs to the caption below it, and collapses
             // when the caption is the first row painted
-            Row::Section(_) if first_painted => self.metrics.caption_h,
-            Row::Section(_) => self.metrics.section_gap + self.metrics.caption_h,
-            Row::Item(_) => self.metrics.row_h,
+            Row::Section(_) if first_painted => self.metrics.caption_h + self.metrics.caption_pad,
+            Row::Section(_) => {
+                self.metrics.section_gap + self.metrics.caption_h + self.metrics.caption_pad
+            }
+            // a sub line makes its row taller rather than smaller type
+            Row::Item(id) if !id.sub().is_empty() => self.metrics.row_h + self.metrics.sub_h,
+            Row::Item(_) | Row::Info(_) => self.metrics.row_h,
         }
+    }
+
+    /// The run of consecutive non-caption rows `idx` belongs to, as
+    /// (first, last) indices into `ROWS`. One outline is drawn per run,
+    /// which is what makes a section read as a group.
+    pub fn group_run(idx: usize) -> (usize, usize) {
+        let mut first = idx;
+        while first > 0 && !matches!(ROWS[first - 1], Row::Section(_)) {
+            first -= 1;
+        }
+        let mut last = idx;
+        while last + 1 < ROWS.len() && !matches!(ROWS[last + 1], Row::Section(_)) {
+            last += 1;
+        }
+        (first, last)
     }
 
     fn ensure_visible(&mut self) {
@@ -253,6 +279,14 @@ impl SettingsList {
         }
         while self.scroll < self.cursor && self.row_region(self.cursor).is_none() {
             self.scroll += 1;
+        }
+        // the About group holds no selectable row, so the cursor can
+        // never pull it into view: on the last setting, scroll until
+        // the foot of the list is on screen as well
+        if self.cursor == last_item() {
+            while self.scroll < self.cursor && self.row_region(ROWS.len() - 1).is_none() {
+                self.scroll += 1;
+            }
         }
     }
 }
@@ -280,6 +314,12 @@ fn item_at(idx: usize) -> Option<SettingId> {
 fn first_item() -> usize {
     ROWS.iter()
         .position(|r| matches!(r, Row::Item(_)))
+        .unwrap_or(0)
+}
+
+fn last_item() -> usize {
+    ROWS.iter()
+        .rposition(|r| matches!(r, Row::Item(_)))
         .unwrap_or(0)
 }
 

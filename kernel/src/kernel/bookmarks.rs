@@ -175,6 +175,25 @@ impl BookmarkCache {
         self.write_slot(filename, byte_offset, chapter);
     }
 
+    /// Invalidate this book's slot. The record stays in the file as a
+    /// dead slot, which is what `find_slot` already skips, so the
+    /// layout of the other 15 is untouched. True when something was
+    /// cleared; the flush rides the usual housekeeping tick.
+    fn forget_slot(&mut self, filename: &[u8]) -> bool {
+        let key = fnv1a_icase(filename);
+        let mut cleared = false;
+        for slot in self.slots[..self.count].iter_mut() {
+            if slot.valid && slot.name_hash == key && slot.matches_name(filename) {
+                *slot = BookmarkSlot::EMPTY;
+                cleared = true;
+            }
+        }
+        if cleared {
+            self.dirty = true;
+        }
+        cleared
+    }
+
     fn write_slot(&mut self, filename: &[u8], byte_offset: u32, chapter: u16) {
         let key = fnv1a_icase(filename);
 
@@ -299,5 +318,12 @@ impl Loaded<'_> {
     #[inline]
     pub fn save(&mut self, filename: &[u8], byte_offset: u32, chapter: u16) {
         self.cache.write_slot(filename, byte_offset, chapter);
+    }
+
+    /// Drop this book's reading position. Nothing rebuilds it: the
+    /// book reopens at page 1.
+    #[inline]
+    pub fn forget(&mut self, filename: &[u8]) -> bool {
+        self.cache.forget_slot(filename)
     }
 }

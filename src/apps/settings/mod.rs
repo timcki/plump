@@ -16,8 +16,11 @@
 // measured in `layout` (where the rows land). this file owns the input
 // state machine, persistence, and drawing.
 
+pub mod cache;
 pub mod layout;
 pub mod model;
+
+use core::fmt::Write as _;
 
 use embedded_graphics::pixelcolor::BinaryColor;
 
@@ -28,10 +31,20 @@ use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::kernel::KernelHandle;
 use crate::kernel::config::{self, SystemSettings, WifiConfig};
-use crate::ui::{Alignment, CONTENT_TOP, Painter, Region, SectionLabel, SelectableRow, Theme};
+use crate::ui::{Alignment, CONTENT_TOP, Painter, Region, SectionLabel, Theme};
 
-use layout::{Damage, GUTTER_W, SettingsList, VALUE_W};
-use model::{Activation, ROWS, Row, SettingId, Step, ValueFmt};
+use crate::apps::widgets::row::{self, RowFonts, RowLead, RowSpec, ValueChip};
+
+use cache::{CacheSheet, SheetResult};
+use layout::{Damage, GUTTER_W, SettingsList};
+use model::{Activation, Domain, InfoId, ROWS, Row, SettingId, Step, ValueFmt};
+
+/// A group outline sits one pixel outside its rows, so the stroke
+/// lands where a separator would and every row is framed at the same
+/// distance above and below.
+const fn grow_1(r: Region) -> Region {
+    Region::new(r.x, r.y, r.w, r.h + 1)
+}
 
 /// which layer owns Left/Right.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,6 +64,15 @@ pub struct SettingsApp {
     save_needed: bool,
     generation: u32,
     ui_fonts: fonts::UiFonts,
+    /// the Book Cache row's own surface; owns the picker, the two
+    /// scopes and the clear in flight
+    cache: CacheSheet,
+    /// About group figures, sampled on the background budget: the
+    /// battery is an ADC read the status bar already pays for, and
+    /// the uptime is the monotonic clock
+    bat_pct: u8,
+    bat_mv: u16,
+    uptime_secs: u32,
 }
 
 impl Default for SettingsApp {
@@ -71,12 +93,17 @@ impl SettingsApp {
             save_needed: false,
             generation: 0,
             ui_fonts,
+            cache: CacheSheet::new(),
+            bat_pct: 0,
+            bat_mv: 0,
+            uptime_secs: 0,
         }
     }
 
     pub fn set_ui_font_size(&mut self, idx: u8) {
         self.ui_fonts = fonts::UiFonts::for_size(idx);
         self.list.set_line_height(self.ui_fonts.body.line_height);
+        self.cache.set_ui_font_size(idx);
     }
 
     pub fn system_settings(&self) -> &SystemSettings {
@@ -89,6 +116,19 @@ impl SettingsApp {
 
     pub fn wifi_config(&self) -> &WifiConfig {
         &self.wifi
+    }
+
+    /// True while the Book Cache sheet owns the screen. The manager
+    /// draws it after the shared chrome, the way it draws the quick
+    /// menu: the status bar and tab bar win the painter's algorithm
+    /// over app content, and would slice the sheet's edges.
+    #[inline]
+    pub fn cache_sheet_open(&self) -> bool {
+        self.cache.is_open()
+    }
+
+    pub fn draw_cache_sheet(&self, strip: &mut StripBuffer) {
+        self.cache.draw(strip);
     }
 
     pub fn mark_save_needed(&mut self) {
@@ -195,8 +235,42 @@ impl SettingsApp {
                 self.focus = Focus::Editing(id);
                 Damage::Rows([self.list.selected_row_region(), None])
             }
+            Activation::Open => {
+                self.cache.open();
+                Damage::Viewport(self.cache.max_region())
+            }
         };
         damage.mark(ctx);
+    }
+
+    /// While the Book Cache sheet is up it owns every press: Up/Down
+    /// walk its rows, Select goes forward, Back comes back one stage
+    /// (and out of the sheet from the first), Menu closes it. The tab
+    /// bar is unreachable until it does, which is what `captures_menu`
+    /// and the `on_horizontal` short-circuit are for.
+    fn dispatch_to_cache(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {
+        let result = match event {
+            ActionEvent::Press(Action::Next) | ActionEvent::Repeat(Action::Next) => {
+                self.cache.on_vertical(true, ctx)
+            }
+            ActionEvent::Press(Action::Prev) | ActionEvent::Repeat(Action::Prev) => {
+                self.cache.on_vertical(false, ctx)
+            }
+            ActionEvent::Press(Action::Select) => self.cache.on_select(ctx),
+            ActionEvent::Press(Action::Back) => self.cache.on_back(ctx),
+            ActionEvent::Press(Action::Menu) => self.cache.on_menu(ctx),
+            // a long Back leaves the tab outright, sheet and all
+            ActionEvent::LongPress(Action::Back) => {
+                self.cache.close();
+                return Transition::Home;
+            }
+            _ => SheetResult::Consumed,
+        };
+        debug_assert!(
+            !matches!(result, SheetResult::Closed) || !self.cache.is_open(),
+            "sheet reported Closed while still open"
+        );
+        Transition::None
     }
 
     // Up / Down: move the cursor, or step the open value. leaving an
@@ -212,52 +286,94 @@ impl SettingsApp {
         damage.mark(ctx);
     }
 
-    fn draw_item(&self, p: &mut Painter<'_>, id: SettingId, row: Region, selected: bool, editing: bool) {
-        let theme = *p.theme();
-        let font = self.ui_fonts.body;
-        let fg = SelectableRow::new(row, selected).draw_if_visible(p.strip_mut());
-
-        let label_w = row.w.saturating_sub(VALUE_W + 2 * theme.margin_md);
-        let label_r = Region::new(row.x + theme.margin_md, row.y, label_w, row.h);
-        font.draw_aligned(p.strip_mut(), label_r, id.label(), Alignment::CenterLeft, fg);
-
+    /// One setting. The chip on the focused row is the cue for what
+    /// Select acts on, and it fills once the edit session has Left and
+    /// Right; everything else about the row is the shared anatomy.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_item(
+        &self,
+        strip: &mut StripBuffer,
+        fonts: &RowFonts,
+        id: SettingId,
+        region: Region,
+        edges: row::RowEdges,
+        selected: bool,
+        editing: bool,
+    ) {
         let mut value = ValueFmt::new();
-        id.format(&self.settings, &mut value);
-        let value_r = Region::new(
-            row.x + row.w - VALUE_W - theme.margin_md,
-            row.y,
-            VALUE_W,
-            row.h,
-        );
-
-        if !selected {
-            font.draw_aligned(
-                p.strip_mut(),
-                value_r,
-                value.as_str(),
-                Alignment::CenterRight,
-                fg,
-            );
-            return;
+        let opens_surface = matches!(id.domain(), Domain::Action);
+        if opens_surface {
+            self.cache.row_value(&mut value);
+        } else {
+            id.format(&self.settings, &mut value);
         }
 
-        // the value on the focused row wears a chip: outlined under the
-        // cursor (this is what Select acts on), filled while the edit
-        // session is open (this is what Left/Right are changing). with
-        // no chevrons anywhere it is the only cue for the mode, so the
-        // two states have to look clearly different
-        let text_w = font.measure_str(value.as_str());
-        let chip_w = (text_w + 2 * theme.margin_md).min(value_r.w);
-        let chip_h = row.h.saturating_sub(2 * theme.margin_sm);
-        let chip = Region::new(
-            value_r.x + value_r.w - chip_w,
-            row.y + row.h.saturating_sub(chip_h) / 2,
-            chip_w,
-            chip_h,
+        // a row with no value to edit never wears the chip: the arrow
+        // in its value already says the press opens something
+        let chip = match (selected, opens_surface, editing) {
+            (false, _, _) | (_, true, _) => ValueChip::None,
+            (true, false, false) => ValueChip::Cursor,
+            (true, false, true) => ValueChip::Editing,
+        };
+
+        row::draw(
+            strip,
+            region,
+            edges,
+            fonts,
+            &RowSpec {
+                lead: RowLead::None,
+                text: id.label(),
+                text_font: fonts.text,
+                value: value.as_str(),
+                selected,
+                sub: id.sub(),
+                progress: None,
+                chip,
+            },
         );
-        p.with_fg(BinaryColor::Off).rounded_rect(chip, 4, editing);
-        let text_fg = if editing { BinaryColor::On } else { fg };
-        font.draw_aligned(p.strip_mut(), chip, value.as_str(), Alignment::Center, text_fg);
+    }
+
+    /// Read the two live figures the About group shows. Both are
+    /// already computed elsewhere every few seconds (the status bar's
+    /// battery, the stats line's uptime), so this is a lookup.
+    fn sample_device_figures(&mut self, k: &mut KernelHandle<'_>) {
+        self.bat_mv = k.battery_mv();
+        self.bat_pct = crate::drivers::battery::battery_percentage(self.bat_mv);
+        self.uptime_secs = plump_kernel::kernel::wake::uptime_secs();
+    }
+
+    /// The About group's figures: what the device knows about itself
+    /// without reading anything new off the card.
+    fn info_value(&self, id: InfoId, out: &mut ValueFmt) {
+        out.clear();
+        match id {
+            // the one thing a settings screen is always asked for,
+            // free from the manifest at compile time
+            InfoId::Version => {
+                let _ = out.write_str(env!("CARGO_PKG_VERSION"));
+            }
+            InfoId::Storage => self.cache.row_value_plain(out),
+            InfoId::Battery => {
+                let _ = write!(
+                    out,
+                    "{}% \u{00B7} {}.{:02} V",
+                    self.bat_pct,
+                    self.bat_mv / 1000,
+                    (self.bat_mv % 1000) / 10
+                );
+            }
+            InfoId::Uptime => {
+                let secs = self.uptime_secs;
+                let hours = secs / 3600;
+                let mins = (secs % 3600) / 60;
+                if hours > 0 {
+                    let _ = write!(out, "{}h {}m", hours, mins);
+                } else {
+                    let _ = write!(out, "{}m", mins);
+                }
+            }
+        }
     }
 
     // thin thumb in the reserved right gutter; only drawn when the list
@@ -309,13 +425,23 @@ impl Editor<'_> {
 }
 
 impl App<AppId> for SettingsApp {
-    fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
+    fn on_enter(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
         self.list.reset();
         self.focus = Focus::Browsing;
+        self.cache.close();
+        self.cache.request_scan();
+        // the About figures are sampled here rather than tracked: a
+        // clock that repaints itself costs a DU a minute and tells
+        // nobody anything they cannot get by leaving and coming back
+        self.sample_device_figures(k);
         ctx.mark_dirty(Region::new(0, CONTENT_TOP, SCREEN_W, SCREEN_H - CONTENT_TOP));
     }
 
     fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {
+        if self.cache.is_open() {
+            return self.dispatch_to_cache(event, ctx);
+        }
+
         match event {
             ActionEvent::LongPress(Action::Back) => Transition::Home,
 
@@ -347,6 +473,11 @@ impl App<AppId> for SettingsApp {
     }
 
     fn on_horizontal(&mut self, dir: HDir, ctx: &mut AppContext) -> HResult {
+        // the sheet navigates on Up/Down and OK alone, but it must not
+        // let a stray Left/Right cycle the tab out from under it
+        if self.cache.is_open() {
+            return HResult::Consumed;
+        }
         match self.editor() {
             Some(mut editor) => {
                 editor.step(Step::from_hdir(dir)).mark(ctx);
@@ -374,7 +505,23 @@ impl App<AppId> for SettingsApp {
 
         if self.save_needed && self.save(k) {
             self.save_needed = false;
-            return BgOutcome::Progress { more: false };
+            return BgOutcome::Progress {
+                more: self.cache.has_work(),
+            };
+        }
+
+        if self.cache.background_step(ctx, k) {
+            // the row's total lands in one repaint when the scan
+            // finishes, rather than once per book sized
+            if self.cache.take_row_dirty()
+                && let Some(idx) = model::row_index(SettingId::BookCache)
+                && let Some(r) = self.list.row_region(idx)
+            {
+                ctx.mark_dirty(r);
+            }
+            return BgOutcome::Progress {
+                more: self.cache.has_work(),
+            };
         }
 
         BgOutcome::Idle
@@ -395,6 +542,10 @@ impl App<AppId> for SettingsApp {
         BgOutcome::Idle
     }
 
+    fn captures_menu(&self) -> bool {
+        self.cache.is_open()
+    }
+
     fn draw(&self, strip: &mut StripBuffer) {
         let theme = Theme::default_v1();
         let font = self.ui_fonts.body;
@@ -406,42 +557,89 @@ impl App<AppId> for SettingsApp {
             return;
         }
 
-        let mut p = Painter::new(strip, &theme);
         let cursor = self.list.cursor();
         let editing = matches!(self.focus, Focus::Editing(_));
-        let mut prev_was_item = false;
+        let row_fonts = RowFonts {
+            text: font,
+            small: fonts::chrome_font(),
+            icon: fonts::icon_font(1),
+        };
 
+        // one outline per run of rows between captions, drawn from the
+        // union of the run's visible rows: a run scrolled off the top
+        // or bottom is framed by what is on screen, and its stroke
+        // falls outside the window rather than cutting a row in half
+        let mut run: Option<(usize, Region)> = None;
         for (idx, row, region) in self.list.rows() {
-            match row {
-                Row::Section(caption) => {
-                    // the box carries the gap above the caption, so the
-                    // text sits at its bottom
-                    let text_r = Region::new(
-                        region.x + theme.margin_md,
-                        region.y + region.h.saturating_sub(metrics.caption_h),
-                        region.w,
-                        metrics.caption_h,
-                    );
-                    SectionLabel::new(text_r, caption).draw(&mut p, font);
-                    prev_was_item = false;
-                }
-                Row::Item(id) => {
-                    let selected = idx == cursor;
-                    // hairline between neighbouring rows; an inverted
-                    // row draws its own edge
-                    if prev_was_item && !selected && idx.saturating_sub(1) != cursor {
-                        p.hairline_h(
-                            region.y,
-                            region.x + theme.margin_md,
-                            region.x + region.w - theme.margin_md,
-                        );
+            if matches!(row, Row::Section(_)) {
+                continue;
+            }
+            let (first, _) = layout::SettingsList::group_run(idx);
+            match run.as_mut() {
+                Some((run_first, acc)) if *run_first == first => *acc = acc.union(region),
+                _ => {
+                    if let Some((_, acc)) = run {
+                        row::draw_group_outline(strip, grow_1(acc));
                     }
-                    self.draw_item(&mut p, *id, region, selected, editing && selected);
-                    prev_was_item = true;
+                    run = Some((first, region));
                 }
             }
         }
+        if let Some((_, acc)) = run {
+            row::draw_group_outline(strip, grow_1(acc));
+        }
 
-        self.draw_scroll_thumb(&mut p);
+        {
+            let mut p = Painter::new(strip, &theme);
+            for (idx, row, region) in self.list.rows() {
+                let Row::Section(caption) = row else {
+                    continue;
+                };
+                // the box carries the gap above the caption and the
+                // pad below it, so the text sits between the two
+                let text_r = Region::new(
+                    region.x + theme.margin_md,
+                    region.y.saturating_add(
+                        region
+                            .h
+                            .saturating_sub(metrics.caption_h + metrics.caption_pad),
+                    ),
+                    region.w,
+                    metrics.caption_h,
+                );
+                SectionLabel::new(text_r, caption).draw(&mut p, font);
+                let _ = idx;
+            }
+            self.draw_scroll_thumb(&mut p);
+        }
+
+        for (idx, row, region) in self.list.rows() {
+            let (first, last) = match row {
+                Row::Section(_) => continue,
+                _ => layout::SettingsList::group_run(idx),
+            };
+            let edges = row::RowEdges {
+                first: idx == first,
+                last: idx == last,
+            };
+            match row {
+                Row::Section(_) => {}
+                Row::Item(id) => {
+                    let selected = idx == cursor;
+                    self.draw_item(strip, &row_fonts, *id, region, edges, selected, editing);
+                }
+                Row::Info(id) => {
+                    let mut value = ValueFmt::new();
+                    self.info_value(*id, &mut value);
+                    row::draw(
+                        strip,
+                        region,
+                        edges,
+                        &row_fonts,
+                        &RowSpec::label(id.label(), value.as_str(), font),
+                    );
+                }
+            }
+        }
     }
 }
