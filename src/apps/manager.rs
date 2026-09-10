@@ -518,17 +518,12 @@ impl AppManager {
         // propagate fonts (uses settings already loaded)
         self.propagate_fonts();
 
-        // set loading indicator for reader if it's the active app,
-        // so the first frame shows "Opening" instead of blank content
-        if self.launcher.active() == AppId::Reader {
-            self.launcher
-                .ctx
-                .set_loading(crate::apps::reader::LOADING_REGION, "Resuming", 0);
+        // the reader paints its own first frame after wake: a full
+        // clear once the page, or its loading screen, is due. every
+        // other app repaints now
+        if self.launcher.active() != AppId::Reader {
+            self.launcher.ctx.request_full_redraw();
         }
-
-        // mark full redraw needed — the next render will draw the
-        // active app's content using the restored state
-        self.launcher.ctx.request_full_redraw();
 
         log::debug!(
             "session: restore complete, active={:?}",
@@ -822,7 +817,9 @@ impl AppManager {
                 self.launcher
                     .ctx
                     .mark_dirty(Region::new(0, 0, SCREEN_W, SCREEN_H));
-            } else {
+            } else if nav.to != AppId::Reader {
+                // the reader holds its first frame until the page or
+                // its loading screen is due (a full clear either way)
                 self.launcher.ctx.request_full_redraw();
             }
         }

@@ -35,7 +35,7 @@ use crate::kernel::QuickAction;
 use crate::kernel::bookmarks;
 use crate::kernel::work_queue;
 use crate::kernel::work_queue::DecodedImage;
-use crate::ui::{Alignment, ProgressBar, Region, StackFmt};
+use crate::ui::{Alignment, Region, StackFmt};
 use smol_epub::cache;
 use smol_epub::epub::{self, EpubMeta, EpubSpine, EpubToc, MAX_SPINE, TocSource};
 use smol_epub::html_strip::{
@@ -85,6 +85,27 @@ const BAR_W: u16 = 96;
 const BAR_H: u16 = 3;
 pub(super) const FOOTER_REGION: Region =
     Region::new(MARGIN, CHROME_Y, SCREEN_W - 2 * MARGIN, CHROME_H);
+
+// loading stage row: a tracked caption with the percent on the
+// right and a hairline bar beneath, sitting above the footer. the
+// only part of a loading screen that repaints while a book opens
+const STAGE_H: u16 = 34;
+const STAGE_CAP_H: u16 = 18;
+const STAGE_BOTTOM_GAP: u16 = 20;
+pub(super) const STAGE_REGION: Region = Region::new(
+    MARGIN,
+    CHROME_Y - CHROME_PAD - STAGE_BOTTOM_GAP - STAGE_H,
+    SCREEN_W - 2 * MARGIN,
+    STAGE_H,
+);
+
+// how long a loading state may run before its screen is painted:
+// anything faster lands as one refresh, the page itself. a wake
+// starts from the sleep wallpaper, which is fine to look at, and
+// its bundle reopen routinely takes a second: hold longer there so
+// the plate does not flash for a moment before the page
+const LOADING_HOLD_MS: u64 = 400;
+const LOADING_HOLD_RESUME_MS: u64 = 1500;
 
 // contents sheet: rows in the bottom-anchored state
 const CONTENTS_ROWS: usize = 8;
@@ -525,6 +546,17 @@ enum PendingPositionChange {
     Jump,
 }
 
+/// Why the reader is loading. Entering a book (open, wake) shows
+/// the plate; moving inside it (chapter change, new font) shows the
+/// strip. See mockups/xteink_x4_reader_loading.html.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadingReason {
+    Open,
+    Resume,
+    Chapter,
+    Font,
+}
+
 pub struct ReaderApp {
     pub(super) filename: FixedStr<32>,
     pub(super) title: FixedStr<64>,
@@ -604,6 +636,15 @@ pub struct ReaderApp {
     toc_pages_stale: bool,
     // home menu "Contents": show the sheet once the book is ready
     open_contents_on_ready: bool,
+    loading_reason: LoadingReason,
+    /// the loading screen is on the panel for this episode
+    loading_painted: bool,
+    loading_since: embassy_time::Instant,
+    /// first frame after entering the book or waking: full clear
+    first_paint_full: bool,
+    /// chapter count from the bundle header, for the plate before
+    /// the OPF is parsed (wake); 0 when unknown
+    spine_hint: u16,
     pub(super) qa_buf: [QuickAction; QA_MAX],
     pub(super) qa_count: u8,
 
@@ -685,6 +726,11 @@ impl ReaderApp {
             toc_pages: [0; MAX_SPINE],
             toc_pages_stale: false,
             open_contents_on_ready: false,
+            loading_reason: LoadingReason::Open,
+            loading_painted: false,
+            loading_since: embassy_time::Instant::from_ticks(0),
+            first_paint_full: false,
+            spine_hint: 0,
 
             qa_buf: [QuickAction::trigger(0, "", ""); QA_MAX],
             qa_count: 0,
@@ -789,16 +835,6 @@ impl ReaderApp {
         !matches!(self.state, State::Ready | State::ShowToc | State::Error)
     }
 
-    fn shows_rich_loading_screen(&self) -> bool {
-        self.shows_loading_screen()
-            && matches!(
-                self.pending_position_change,
-                Some(
-                    PendingPositionChange::OpenReady | PendingPositionChange::RestoreReady
-                )
-            )
-    }
-
     fn loading_visual_region(&self) -> Region {
         Region::new(
             self.text_margin,
@@ -808,202 +844,375 @@ impl ReaderApp {
         )
     }
 
-    fn set_loading_ui(&self, ctx: &mut AppContext, msg: &str, pct: u8) {
-        ctx.set_loading(LOADING_REGION, msg, pct);
-        if self.shows_loading_screen() {
+    /// Start a loading episode. nothing is painted until the hold runs
+    /// out or a slow step is next (`loading_tick`, `paint_loading`), so
+    /// a fast open, wake or chapter change lands as one refresh
+    fn begin_loading(&mut self, reason: LoadingReason) {
+        self.loading_reason = reason;
+        self.loading_painted = false;
+        self.loading_since = embassy_time::Instant::now();
+    }
+
+    /// Put the loading screen up now: plate or strip, plus the footer
+    fn paint_loading(&mut self, ctx: &mut AppContext) {
+        if self.loading_painted {
+            return;
+        }
+        self.loading_painted = true;
+        log::info!(
+            "reader: loading screen {:?} after {} ms in {:?}",
+            self.loading_reason,
+            self.loading_since.elapsed().as_millis(),
+            self.state
+        );
+        if self.first_paint_full {
+            self.first_paint_full = false;
+            ctx.request_full_redraw();
+        } else if matches!(self.loading_reason, LoadingReason::Open | LoadingReason::Resume) {
+            ctx.mark_dirty(PAGE_REGION);
+        } else {
             ctx.mark_dirty(self.loading_visual_region());
         }
     }
 
-    fn loading_title(&self) -> Option<&str> {
-        if self.title_is_real && !self.title.is_empty() {
-            Some(self.display_name())
+    /// Hold check, run before every pipeline step
+    fn loading_tick(&mut self, ctx: &mut AppContext) {
+        if self.loading_painted || !self.shows_loading_screen() {
+            return;
+        }
+        let hold = if self.loading_reason == LoadingReason::Resume {
+            LOADING_HOLD_RESUME_MS
         } else {
-            None
+            LOADING_HOLD_MS
+        };
+        if self.loading_since.elapsed().as_millis() >= hold {
+            self.paint_loading(ctx);
         }
     }
 
-    fn loading_visual(&self) -> (&'static str, u8) {
-        match self.state {
-            State::NeedBookmark => ("Opening book", 0),
-            State::NeedInit => ("Reading file", 10),
-            State::NeedOpf => ("Reading metadata", 25),
-            State::NeedToc => ("Preparing contents", 40),
-            State::NeedCache => {
-                let cached_ch = self.cached_chapter_count();
-                let total_ch = self.epub.spine.len();
-                let img_found = self.epub.img_found_count as usize;
-                let img_cached = self.epub.img_cached_count as usize;
-                let in_chapter_phase = matches!(
-                    self.epub.bg_cache,
-                    BgCacheState::CacheChapter | BgCacheState::WaitNearbyImage
-                ) && cached_ch < total_ch;
+    /// The page, or an error, is ready: repaint, as a full clear when
+    /// this is the first frame after entering the book or waking
+    fn mark_page_ready(&mut self, ctx: &mut AppContext) {
+        if self.first_paint_full {
+            self.first_paint_full = false;
+            ctx.request_full_redraw();
+        } else {
+            ctx.mark_dirty(PAGE_REGION);
+        }
+    }
 
-                if in_chapter_phase {
-                    let pct = if total_ch > 0 {
-                        55 + ((cached_ch * 25) / total_ch).min(25) as u8
+    /// A stage changed: repaint the stage row if the screen is up
+    fn set_loading_ui(&self, ctx: &mut AppContext) {
+        if self.loading_painted && self.shows_loading_screen() {
+            ctx.mark_dirty(STAGE_REGION);
+        }
+    }
+
+    /// Caption (uppercase, tracked) and right-hand value of the stage
+    /// row; the percent for the bar, None for an error
+    fn loading_stage(&self, cap: &mut StackFmt<48>, val: &mut StackFmt<48>) -> Option<u8> {
+        if let Some(e) = self.error {
+            let _ = write!(cap, "COULD NOT OPEN");
+            let _ = write!(val, "{}", e);
+            return None;
+        }
+        let n = self.epub.spine.len();
+        let ch = self.epub.chapter as usize + 1;
+        let pct = match self.state {
+            State::NeedBookmark | State::NeedInit | State::NeedOpf | State::NeedToc => {
+                let _ = write!(
+                    cap,
+                    "{}",
+                    if self.loading_reason == LoadingReason::Resume {
+                        "RESUMING"
                     } else {
-                        55
-                    };
-                    ("Caching chapters", pct)
-                } else {
-                    let pct = if img_found > 0 {
-                        80 + ((img_cached * 20) / img_found).min(20) as u8
-                    } else {
-                        80
-                    };
-                    ("Caching images", pct)
+                        "OPENING"
+                    }
+                );
+                match self.state {
+                    State::NeedBookmark => 5,
+                    State::NeedInit => 15,
+                    State::NeedOpf => 25,
+                    _ => 40,
                 }
             }
-            State::NeedIndex => ("Building pages", 75),
-            State::NeedPage => ("Opening page", 90),
-            State::Ready | State::ShowToc => ("Ready", 100),
-            State::Error => ("Error", 0),
+            State::NeedCache => {
+                if n > 0 {
+                    let _ = write!(cap, "CACHING CHAPTER {} OF {}", ch, n);
+                } else {
+                    let _ = write!(cap, "CACHING");
+                }
+                55
+            }
+            State::NeedIndex => {
+                if self.typeset_oom_waits > 0 {
+                    let _ = write!(cap, "WAITING FOR IMAGES");
+                } else if self.loading_reason == LoadingReason::Font {
+                    let _ = write!(cap, "TYPESETTING \u{00B7} ");
+                    let name = fonts::FONT_SIZE_NAMES
+                        .get(self.book_font_size_idx as usize)
+                        .copied()
+                        .unwrap_or("");
+                    for c in name.chars() {
+                        let _ = cap.write_char(c.to_ascii_uppercase());
+                    }
+                } else if self.is_epub && n > 0 {
+                    let _ = write!(cap, "TYPESETTING CHAPTER {} OF {}", ch, n);
+                } else {
+                    let _ = write!(cap, "TYPESETTING");
+                }
+                75
+            }
+            State::NeedPage => {
+                let _ = write!(cap, "OPENING PAGE");
+                90
+            }
+            State::Ready | State::ShowToc => {
+                let _ = write!(cap, "READY");
+                100
+            }
+            State::Error => 0,
+        };
+        let _ = write!(val, "{}%", pct);
+        Some(pct)
+    }
+
+    /// Where the book will open: chapter and percent, "from the start"
+    /// for a book without a bookmark, page or size for plain text
+    fn loading_resume_line(&self, out: &mut StackFmt<48>) {
+        if self.is_epub {
+            let n = self.epub.spine.len();
+            let ch = self.epub.chapter as usize + 1;
+            let fresh = self.epub.chapter == 0 && self.restore_offset.unwrap_or(0) == 0;
+            if n == 0 {
+                // before the OPF: what the bundle header knows
+                match (ch > 1, self.spine_hint as usize) {
+                    (true, hint) if hint > 0 => {
+                        let _ = write!(out, "Chapter {} of {}", ch, hint);
+                    }
+                    (true, _) => {
+                        let _ = write!(out, "Chapter {}", ch);
+                    }
+                    (false, hint) if hint > 0 => {
+                        let _ = write!(out, "{} chapters", hint);
+                    }
+                    _ => {}
+                }
+            } else if fresh {
+                let _ = write!(out, "From the start \u{00B7} {} chapters", n);
+            } else {
+                let _ = write!(
+                    out,
+                    "Chapter {} of {} \u{00B7} {}% read",
+                    ch,
+                    n,
+                    self.progress_pct()
+                );
+            }
+        } else if self.file_size > 0 {
+            match self.restore_page_hint {
+                Some(p) if p > 0 => {
+                    let _ = write!(out, "Page {}", p + 1);
+                }
+                _ => {
+                    let _ = write!(out, "{} KB", self.file_size / 1024);
+                }
+            }
         }
     }
 
+    fn placeholder_id(&self) -> u32 {
+        if self.is_epub && self.epub.name_hash != 0 {
+            self.epub.name_hash
+        } else {
+            self.filename
+                .as_bytes()
+                .iter()
+                .fold(0x811c_9dc5u32, |h, &b| (h ^ b as u32).wrapping_mul(0x0100_0193))
+        }
+    }
+
+    /// The loading screen (mockups/xteink_x4_reader_loading.html,
+    /// option A). entering a book shows the plate: cover, title,
+    /// author, rule, resume line. moving inside it shows the strip:
+    /// the text area cleared. both end in the stage row above the
+    /// footer, and only that row repaints while the pipeline runs
     fn draw_loading_screen(&self, strip: &mut StripBuffer) {
         if strip.gray_mode() != GrayMode::Bw {
             return;
         }
+        if matches!(self.loading_reason, LoadingReason::Open | LoadingReason::Resume) {
+            self.draw_loading_plate(strip, self.loading_visual_region());
+        }
+        self.draw_stage_row(strip);
+        if self.show_chrome {
+            self.draw_footer(strip);
+        }
+    }
 
-        let title = self.loading_title();
-        // stage label is chrome — always Inter
-        let stage_font = fonts::ui_body_font(1);
-        // book title uses the reader font so it matches the body
-        let reader_family = self.reader_font.family();
-        let (stage, pct) = self.loading_visual();
+    fn draw_loading_plate(&self, strip: &mut StripBuffer, area: Region) {
+        use crate::apps::cover_cache::{CARD_THUMB_H, CARD_THUMB_W};
+        const COVER_TOP: u16 = 104;
+        const TITLE_GAP: u16 = 30;
+        const RULE_W: u16 = 34;
 
-        let content = self.loading_visual_region();
-        let bar_w = content.w.saturating_sub(48).max(160);
-
-        if let Some(img) = self.loading_cover.as_ref() {
-            let title_font = title.map(|title| {
-                if title.len() > 28 {
-                    fonts::heading_font(reader_family, 2)
-                } else {
-                    fonts::heading_font(reader_family, 3)
-                }
-            });
-            let title_h = title_font.map_or(0, |font| font.line_height);
-            let pre_stage_gap = if title_h > 0 { 24 + title_h + 14 } else { 18 };
-            let total_h = img
-                .height
-                .saturating_add(pre_stage_gap)
-                .saturating_add(stage_font.line_height)
-                .saturating_add(20)
-                .saturating_add(10);
-            let mut y = content.y + content.h.saturating_sub(total_h) / 2;
-            let img_x = content.x + content.w.saturating_sub(img.width) / 2;
-
-            strip.blit_1bpp(
-                &img.data,
-                0,
-                img.width as usize,
-                img.height as usize,
-                img.stride,
-                img_x as i32,
-                y as i32,
-                true,
-            );
-            y = y.saturating_add(img.height);
-
-            if let Some(title) = title {
-                y = y.saturating_add(24);
-                let font = title_font.unwrap();
-                let title_region = Region::new(content.x, y, content.w, font.line_height);
-                draw_truncated_text(
-                    strip,
-                    font,
-                    title_region,
-                    title,
-                    Alignment::Center,
-                    BinaryColor::On,
+        let cover = Region::new(
+            area.x + area.w.saturating_sub(CARD_THUMB_W) / 2,
+            area.y + COVER_TOP,
+            CARD_THUMB_W,
+            CARD_THUMB_H,
+        );
+        match self.loading_cover.as_ref() {
+            Some(img) => {
+                let x = cover.x + cover.w.saturating_sub(img.width) / 2;
+                let y = cover.y + cover.h.saturating_sub(img.height) / 2;
+                strip.blit_1bpp(
+                    &img.data,
+                    0,
+                    img.width as usize,
+                    img.height as usize,
+                    img.stride,
+                    x as i32,
+                    y as i32,
+                    true,
                 );
-                y = y.saturating_add(font.line_height).saturating_add(14);
-            } else {
-                y = y.saturating_add(18);
             }
-
-            let stage_region = Region::new(content.x, y, content.w, stage_font.line_height);
-            let bar_region = Region::new(
-                content.x + (content.w.saturating_sub(bar_w)) / 2,
-                stage_region.y + stage_region.h + 20,
-                bar_w,
-                10,
-            );
-
-            draw_truncated_text(
-                strip,
-                stage_font,
-                stage_region,
-                stage,
-                Alignment::Center,
-                BinaryColor::On,
-            );
-            ProgressBar::new(bar_region, pct).draw(strip);
-            return;
+            None => {
+                // the library's placeholder shape stands in until the
+                // real cover is extracted after the page is up
+                let theme = plump_kernel::ui::Theme::default_v1();
+                let mut p = plump_kernel::ui::Painter::new(strip, &theme);
+                crate::apps::cover_placeholder::draw_cover(&mut p, cover, self.placeholder_id());
+            }
         }
 
-        if let Some(title) = title {
-            let title_font = if title.len() > 28 {
-                fonts::heading_font(reader_family, 2)
-            } else {
-                fonts::heading_font(reader_family, 3)
-            };
-            let title_y = content.y + content.h / 3;
-            let title_region = Region::new(content.x, title_y, content.w, title_font.line_height);
-            let stage_region = Region::new(
-                content.x,
-                title_region.y + title_region.h + 14,
-                content.w,
-                stage_font.line_height,
-            );
-            let bar_region = Region::new(
-                content.x + (content.w.saturating_sub(bar_w)) / 2,
-                stage_region.y + stage_region.h + 20,
-                bar_w,
-                10,
-            );
-
+        let family = self.reader_font.family();
+        let title = self.display_name();
+        let title_font = if title.len() > 40 {
+            fonts::heading_font(family, 2)
+        } else {
+            fonts::heading_font(family, 3)
+        };
+        let lh = title_font.line_height;
+        let (first, rest) = split_title_line(title_font, title, area.w);
+        let mut y = cover.y + cover.h + TITLE_GAP;
+        title_font.draw_aligned(
+            strip,
+            Region::new(area.x, y, area.w, lh),
+            first,
+            Alignment::Center,
+            BinaryColor::On,
+        );
+        y += lh;
+        if !rest.is_empty() {
             draw_truncated_text(
                 strip,
                 title_font,
-                title_region,
-                title,
+                Region::new(area.x, y, area.w, lh),
+                rest,
                 Alignment::Center,
                 BinaryColor::On,
             );
-            draw_truncated_text(
-                strip,
-                stage_font,
-                stage_region,
-                stage,
-                Alignment::Center,
-                BinaryColor::On,
-            );
-            ProgressBar::new(bar_region, pct).draw(strip);
-        } else {
-            // no title — purely chrome, use Inter
-            let heading_font = fonts::ui_heading_font(2);
-            let stage_y = content.y + content.h / 3 + 6;
-            let stage_region = Region::new(content.x, stage_y, content.w, heading_font.line_height);
-            let bar_region = Region::new(
-                content.x + (content.w.saturating_sub(bar_w)) / 2,
-                stage_region.y + stage_region.h + 22,
-                bar_w,
-                10,
-            );
+            y += lh;
+        }
 
+        let author = if self.is_epub {
+            self.epub.meta.author_str()
+        } else {
+            ""
+        };
+        if !author.is_empty() {
+            let small = fonts::ui_body_font(1);
+            y += 8;
             draw_truncated_text(
                 strip,
-                heading_font,
-                stage_region,
-                stage,
+                small,
+                Region::new(area.x, y, area.w, small.line_height),
+                author,
                 Alignment::Center,
                 BinaryColor::On,
             );
-            ProgressBar::new(bar_region, pct).draw(strip);
+            y += small.line_height;
+        }
+
+        y += 22;
+        Rectangle::new(
+            Point::new((area.x + area.w.saturating_sub(RULE_W) / 2) as i32, y as i32),
+            Size::new(RULE_W as u32, 1),
+        )
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(strip)
+        .ok();
+        y += 20;
+
+        let mut line = StackFmt::<48>::new();
+        self.loading_resume_line(&mut line);
+        if !line.is_empty() {
+            let f = fonts::chrome_font();
+            draw_truncated_text(
+                strip,
+                f,
+                Region::new(area.x, y, area.w, f.line_height),
+                line.as_str(),
+                Alignment::Center,
+                BinaryColor::On,
+            );
+        }
+    }
+
+    fn draw_stage_row(&self, strip: &mut StripBuffer) {
+        let r = STAGE_REGION;
+        if !r.intersects(strip.logical_window()) {
+            return;
+        }
+        let font = fonts::chrome_font();
+        let mut cap = StackFmt::<48>::new();
+        let mut val = StackFmt::<48>::new();
+        let pct = self.loading_stage(&mut cap, &mut val);
+        let baseline = r.y as i32 + ((STAGE_CAP_H + font.ascent) / 2) as i32;
+        sheet::draw_tracked(strip, font, cap.as_str(), 1, r.x as i32, baseline, BinaryColor::On);
+        match pct {
+            Some(pct) => {
+                if !val.is_empty() {
+                    let w = sheet::tracked_width(font, val.as_str(), 1);
+                    sheet::draw_tracked(
+                        strip,
+                        font,
+                        val.as_str(),
+                        1,
+                        (r.x + r.w - w) as i32,
+                        baseline,
+                        BinaryColor::On,
+                    );
+                }
+                // track: 1 px line across the width, fill: 2 px high up
+                // to the position, like the footer bar
+                let bar_y = r.y + STAGE_CAP_H + 8;
+                Rectangle::new(
+                    Point::new(r.x as i32, (bar_y + 1) as i32),
+                    Size::new(r.w as u32, 1),
+                )
+                .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                .draw(strip)
+                .ok();
+                let filled = (r.w as u32 * pct.min(100) as u32) / 100;
+                if filled > 0 {
+                    Rectangle::new(Point::new(r.x as i32, bar_y as i32), Size::new(filled, 2))
+                        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                        .draw(strip)
+                        .ok();
+                }
+            }
+            None => {
+                // error: the message takes the bar's place
+                sheet::draw_ellipsized(
+                    strip,
+                    font,
+                    Region::new(r.x, r.y + STAGE_CAP_H, r.w, r.h - STAGE_CAP_H),
+                    val.as_str(),
+                    BinaryColor::On,
+                );
+            }
         }
     }
 
@@ -1232,7 +1441,7 @@ impl ReaderApp {
             self.commit_position_change(change);
         }
         ctx.clear_loading();
-        ctx.mark_dirty(PAGE_REGION);
+        self.mark_page_ready(ctx);
     }
 
     /// Pause the reading-time clock (call on suspend/exit).
@@ -1376,7 +1585,7 @@ impl ReaderApp {
         self.error = Some(e);
         self.state = State::Error;
         ctx.clear_loading();
-        ctx.mark_dirty(PAGE_REGION);
+        self.mark_page_ready(ctx);
     }
 
     // run one step of image work queue polling while suspended;
@@ -1580,6 +1789,7 @@ impl ReaderApp {
         self.pending_title_save = false;
         self.pending_cover_thumb = false;
         self.loading_cover = None;
+        self.spine_hint = 0;
         self.persist_next_flush_at = None;
         self.apply_font_metrics();
 
@@ -1593,6 +1803,8 @@ impl ReaderApp {
         // even if bookmark_load overwrites them with slightly different
         // values, the pipeline proceeds correctly
         self.state = State::NeedBookmark;
+        self.begin_loading(LoadingReason::Resume);
+        self.first_paint_full = true;
 
         log::debug!(
             "reader: restore_state file={} ch={} off={} font={}",
@@ -1730,6 +1942,29 @@ impl ReaderApp {
 
     pub(crate) fn prepare_restore_loading_screen(&mut self, k: &mut KernelHandle<'_>) {
         let _ = self.try_load_cached_cover_thumb(k);
+        self.prefill_title_from_bundle(k);
+    }
+
+    /// Title and chapter count from the bundle header, before the
+    /// zip is even opened: the wake plate and footer then show the
+    /// book, not its file name. the pipeline re-reads both later
+    fn prefill_title_from_bundle(&mut self, k: &mut KernelHandle<'_>) {
+        use plump_kernel::kernel::bundle;
+        if !self.is_epub || self.title_is_real {
+            return;
+        }
+        let hash = plump_kernel::util::hash::fnv1a(self.filename.as_bytes());
+        let Some(hdr) = bundle::read_header(k.sd(), hash) else {
+            return;
+        };
+        if hdr.name_hash != hash || !hdr.has_flag(bundle::FLAG_CORE_READY) {
+            return;
+        }
+        if !hdr.title.is_empty() {
+            self.title.set(hdr.title.as_bytes());
+            self.title_is_real = true;
+        }
+        self.spine_hint = hdr.spine_count;
     }
 
     fn progress_pct(&self) -> u8 {
@@ -1906,6 +2141,23 @@ fn draw_bottom_fill_bar(strip: &mut StripBuffer, region: Region, filled_w: u16) 
     .unwrap();
 }
 
+/// First line of a title that may wrap once: the longest prefix
+/// that fits, cut back to a word boundary, and the remainder
+fn split_title_line<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> (&'a str, &'a str) {
+    let cut = font.truncate_len(text, max_w);
+    if cut >= text.len() {
+        return (text, "");
+    }
+    let mut n = cut;
+    while n > 0 && !text.is_char_boundary(n) {
+        n -= 1;
+    }
+    match text[..n].rfind(' ') {
+        Some(sp) if sp > 0 => (&text[..sp], text[sp + 1..].trim_start()),
+        _ => (&text[..n], &text[n..]),
+    }
+}
+
 fn draw_truncated_text(
     strip: &mut StripBuffer,
     font: &'static BitmapFont,
@@ -1935,117 +2187,116 @@ fn draw_truncated_text(
 
 // contents sheet, footer position and the page painter
 impl ReaderApp {
+    /// One-line footer: title, chapter bar, counter. drawn under the
+    /// page and under every loading screen, in the same place
+    fn draw_footer(&self, strip: &mut StripBuffer) {
+        let cf = self.chrome_font;
+        FOOTER_REGION
+            .to_rect()
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+            .draw(strip)
+            .unwrap();
+
+        // the title takes its measured width (cut with an ellipsis
+        // past TITLE_MAX_W) so the bar sits right after it instead
+        // of at a fixed column
+        let name = self.display_name();
+        let title_w = cf
+            .map_or(TITLE_MAX_W, |font| font.measure_str(name))
+            .clamp(1, TITLE_MAX_W);
+        let title_r = Region::new(MARGIN, CHROME_Y, title_w, CHROME_H);
+        match cf {
+            Some(font) => draw_truncated_text(
+                strip,
+                font,
+                title_r,
+                name,
+                Alignment::CenterLeft,
+                BinaryColor::On,
+            ),
+            None => draw_chrome_text(strip, title_r, name, Alignment::CenterLeft, cf),
+        }
+        let after_title = MARGIN + title_w + BAR_GAP;
+        let counter_region = |x: u16| {
+            Region::new(x, CHROME_Y, (SCREEN_W - MARGIN).saturating_sub(x), CHROME_H)
+        };
+
+        if self.is_epub && !self.epub.spine.is_empty() {
+            // counter: position in the book once every chapter has a
+            // layout, else the chapter index; caching progress follows
+            let mut sbuf = StackFmt::<40>::new();
+            match self.book_position() {
+                Some((page, total)) => {
+                    let _ = write!(sbuf, "{} / {}", page, total);
+                }
+                None if self.epub.spine.len() > 1 => {
+                    let _ = write!(sbuf, "{}/{}", self.epub.chapter + 1, self.epub.spine.len());
+                }
+                None => {}
+            }
+            if self.epub.bg_cache != BgCacheState::Idle {
+                if !sbuf.as_str().is_empty() {
+                    let _ = write!(sbuf, " ");
+                }
+                let cached = self.cached_chapter_count();
+                let total = self.epub.spine.len();
+                if cached < total {
+                    let _ = write!(sbuf, "[{}/{}]", cached, total);
+                } else if self.epub.img_found_count > 0 {
+                    let _ = write!(
+                        sbuf,
+                        "[img {}/{}]",
+                        self.epub.img_cached_count, self.epub.img_found_count,
+                    );
+                } else {
+                    let _ = write!(sbuf, "[img]");
+                }
+            }
+            let bar_fill = self.chapter_page_bar_fill_width();
+            let counter_x = if bar_fill.is_some() {
+                after_title + BAR_W + BAR_GAP
+            } else {
+                after_title
+            };
+            draw_chrome_text(
+                strip,
+                counter_region(counter_x),
+                sbuf.as_str(),
+                Alignment::CenterRight,
+                cf,
+            );
+            if let Some(filled_w) = bar_fill {
+                let bar_r =
+                    Region::new(after_title, CHROME_Y + (CHROME_H - BAR_H) / 2, BAR_W, BAR_H);
+                draw_bottom_fill_bar(strip, bar_r, filled_w);
+            }
+        } else if self.file_size > 0 {
+            let mut sbuf = StackFmt::<24>::new();
+            if self.pg.fully_indexed {
+                let _ = write!(sbuf, "{}/{}", self.pg.page + 1, self.pg.total_pages);
+            } else {
+                let _ = write!(sbuf, "p{}", self.pg.page + 1);
+            }
+            draw_chrome_text(
+                strip,
+                counter_region(after_title),
+                sbuf.as_str(),
+                Alignment::CenterRight,
+                cf,
+            );
+        }
+    }
+
     fn draw_page(&self, strip: &mut StripBuffer) {
         let cf = self.chrome_font;
         let gray_pass = strip.gray_mode() != GrayMode::Bw;
 
         if self.show_chrome && !gray_pass && matches!(self.state, State::Ready | State::ShowToc) {
-            FOOTER_REGION
-                .to_rect()
-                .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
-                .draw(strip)
-                .unwrap();
-
-            // the title takes its measured width (cut with an ellipsis
-            // past TITLE_MAX_W) so the bar sits right after it instead
-            // of at a fixed column
-            let name = self.display_name();
-            let title_w = cf
-                .map_or(TITLE_MAX_W, |font| font.measure_str(name))
-                .clamp(1, TITLE_MAX_W);
-            let title_r = Region::new(MARGIN, CHROME_Y, title_w, CHROME_H);
-            match cf {
-                Some(font) => draw_truncated_text(
-                    strip,
-                    font,
-                    title_r,
-                    name,
-                    Alignment::CenterLeft,
-                    BinaryColor::On,
-                ),
-                None => draw_chrome_text(strip, title_r, name, Alignment::CenterLeft, cf),
-            }
-            let after_title = MARGIN + title_w + BAR_GAP;
-            let counter_region = |x: u16| {
-                Region::new(x, CHROME_Y, (SCREEN_W - MARGIN).saturating_sub(x), CHROME_H)
-            };
-
-            if self.is_epub && !self.epub.spine.is_empty() {
-                // counter: position in the book once every chapter has a
-                // layout, else the chapter index; caching progress follows
-                let mut sbuf = StackFmt::<40>::new();
-                match self.book_position() {
-                    Some((page, total)) => {
-                        let _ = write!(sbuf, "{} / {}", page, total);
-                    }
-                    None if self.epub.spine.len() > 1 => {
-                        let _ = write!(sbuf, "{}/{}", self.epub.chapter + 1, self.epub.spine.len());
-                    }
-                    None => {}
-                }
-                if self.epub.bg_cache != BgCacheState::Idle {
-                    if !sbuf.as_str().is_empty() {
-                        let _ = write!(sbuf, " ");
-                    }
-                    let cached = self.cached_chapter_count();
-                    let total = self.epub.spine.len();
-                    if cached < total {
-                        let _ = write!(sbuf, "[{}/{}]", cached, total);
-                    } else if self.epub.img_found_count > 0 {
-                        let _ = write!(
-                            sbuf,
-                            "[img {}/{}]",
-                            self.epub.img_cached_count, self.epub.img_found_count,
-                        );
-                    } else {
-                        let _ = write!(sbuf, "[img]");
-                    }
-                }
-                let bar_fill = self.chapter_page_bar_fill_width();
-                let counter_x = if bar_fill.is_some() {
-                    after_title + BAR_W + BAR_GAP
-                } else {
-                    after_title
-                };
-                draw_chrome_text(
-                    strip,
-                    counter_region(counter_x),
-                    sbuf.as_str(),
-                    Alignment::CenterRight,
-                    cf,
-                );
-                if let Some(filled_w) = bar_fill {
-                    let bar_r =
-                        Region::new(after_title, CHROME_Y + (CHROME_H - BAR_H) / 2, BAR_W, BAR_H);
-                    draw_bottom_fill_bar(strip, bar_r, filled_w);
-                }
-            } else if self.file_size > 0 {
-                let mut sbuf = StackFmt::<24>::new();
-                if self.pg.fully_indexed {
-                    let _ = write!(sbuf, "{}/{}", self.pg.page + 1, self.pg.total_pages);
-                } else {
-                    let _ = write!(sbuf, "p{}", self.pg.page + 1);
-                }
-                draw_chrome_text(
-                    strip,
-                    counter_region(after_title),
-                    sbuf.as_str(),
-                    Alignment::CenterRight,
-                    cf,
-                );
-            }
+            self.draw_footer(strip);
         }
 
-        if let Some(e) = self.error {
-            let mut ebuf = StackFmt::<32>::new();
-            let _ = write!(ebuf, "{}", e);
-            draw_chrome_text(
-                strip,
-                LOADING_REGION,
-                ebuf.as_str(),
-                Alignment::CenterLeft,
-                cf,
-            );
+        if self.error.is_some() {
+            self.draw_loading_screen(strip);
             return;
         }
 
@@ -2054,7 +2305,8 @@ impl ReaderApp {
         // chapter jumps stay intentionally blank so they don't flash
         // book metadata between chapters.
         if self.shows_loading_screen() {
-            if self.shows_rich_loading_screen() {
+            // the hold: nothing until the loading screen is due
+            if self.loading_painted {
                 self.draw_loading_screen(strip);
             }
             return;
@@ -2604,6 +2856,23 @@ impl ReaderApp {
         Some((before + self.pg.page as u32 + 1, total))
     }
 
+    /// Whether the chapter about to be indexed already has a layout at
+    /// this font. reads the layout directory only when the cached
+    /// counts do not know the chapter yet; the counts are taken as
+    /// stored, never overridden from the page state, which at this
+    /// point still describes the chapter being left
+    fn chapter_has_layout(&mut self, k: &mut KernelHandle<'_>) -> bool {
+        let ch = self.epub.chapter as usize;
+        let n = self.epub.spine.len().min(MAX_SPINE);
+        if ch >= n {
+            return true;
+        }
+        if self.toc_pages[ch] == 0 {
+            layout::cache::chapter_page_counts(k, self.epub.name_hash, &mut self.toc_pages[..n]);
+        }
+        self.toc_pages[ch] > 0
+    }
+
     /// Reload the per-chapter page counts; true when they changed.
     fn refresh_chapter_pages(&mut self, k: &mut KernelHandle<'_>) -> bool {
         if !self.is_epub {
@@ -2829,6 +3098,7 @@ impl App<AppId> for ReaderApp {
         self.pending_title_save = false;
         self.pending_cover_thumb = false;
         self.loading_cover = None;
+        self.spine_hint = 0;
         self.persist_next_flush_at = None;
 
         self.apply_font_metrics();
@@ -2844,8 +3114,8 @@ impl App<AppId> for ReaderApp {
 
         log::info!("reader: opening {}", self.name());
 
-        self.set_loading_ui(ctx, "Opening", 0);
-        ctx.mark_dirty(PAGE_REGION);
+        self.begin_loading(LoadingReason::Open);
+        self.first_paint_full = true;
     }
 
     fn on_exit(&mut self) {
@@ -3008,6 +3278,8 @@ impl App<AppId> for ReaderApp {
             } else {
                 self.state = State::NeedPage;
             }
+            self.begin_loading(LoadingReason::Font);
+            self.paint_loading(ctx);
         }
         ctx.mark_dirty(PAGE_REGION);
     }
@@ -3033,6 +3305,9 @@ impl App<AppId> for ReaderApp {
             }
         }
 
+        // loading hold: the screen goes up once it is overdue
+        self.loading_tick(ctx);
+
         // Phase 1: Open pipeline (NeedBookmark..NeedPage)
         // Each state does ONE step and returns Progress { more: true }
         match self.state {
@@ -3051,10 +3326,10 @@ impl App<AppId> for ReaderApp {
                     self.epub.chapters_cached = false;
                     self.goto_last_page = false;
                     self.state = State::NeedInit;
-                    self.set_loading_ui(ctx, "Loading", 10);
+                    self.set_loading_ui(ctx);
                 } else {
                     self.state = State::NeedPage;
-                    self.set_loading_ui(ctx, "Loading", 50);
+                    self.set_loading_ui(ctx);
                 }
                 plump_kernel::perf_event!(
                     "reader",
@@ -3073,7 +3348,7 @@ impl App<AppId> for ReaderApp {
                     Ok(()) => {
                         self.try_prefill_title_from_cache_header(k);
                         self.state = State::NeedOpf;
-                        self.set_loading_ui(ctx, "Loading", 25);
+                        self.set_loading_ui(ctx);
                         plump_kernel::perf_event!(
                             "reader",
                             "NeedInit ok to=NeedOpf elapsed_ms={}",
@@ -3121,7 +3396,7 @@ impl App<AppId> for ReaderApp {
                                 h.has_flag(plump_kernel::kernel::bundle::FLAG_CORE_READY)
                             });
                         self.state = State::NeedToc;
-                        self.set_loading_ui(ctx, "Loading", 40);
+                        self.set_loading_ui(ctx);
                         plump_kernel::perf_event!(
                             "reader",
                             "NeedOpf ok to=NeedToc spine_len={} elapsed_ms={}",
@@ -3157,7 +3432,7 @@ impl App<AppId> for ReaderApp {
                 // the Contents row exists only once the toc does
                 self.rebuild_quick_actions();
                 self.state = State::NeedCache;
-                self.set_loading_ui(ctx, "Caching", 55);
+                self.set_loading_ui(ctx);
                 plump_kernel::perf_event!(
                     "reader",
                     "NeedToc to=NeedCache elapsed_ms={}",
@@ -3172,7 +3447,7 @@ impl App<AppId> for ReaderApp {
                     Ok(true) => {
                         // cache hit
                         self.state = State::NeedIndex;
-                        self.set_loading_ui(ctx, "Indexing", 75);
+                        self.set_loading_ui(ctx);
                         plump_kernel::perf_event!(
                             "reader",
                             "NeedCache hit=true to=NeedIndex elapsed_ms={}",
@@ -3181,7 +3456,9 @@ impl App<AppId> for ReaderApp {
                         return BgOutcome::Progress { more: true };
                     }
                     Ok(false) => {
-                        // cache miss: start/continue caching the current chapter
+                        // cache miss: start/continue caching the current chapter.
+                        // seconds of work, so the loading screen goes up first
+                        self.paint_loading(ctx);
                         let ch = self.epub.chapter as usize;
                         let fname = self.filename;
                 let epub_name = fname.as_str();
@@ -3222,7 +3499,7 @@ impl App<AppId> for ReaderApp {
                                 }
 
                                 self.state = State::NeedIndex;
-                                self.set_loading_ui(ctx, "Indexing", 75);
+                                self.set_loading_ui(ctx);
                                 plump_kernel::perf_event!(
                                     "reader",
                                     "NeedCache hit=false ch={} to=NeedIndex elapsed_ms={}",
@@ -3274,6 +3551,9 @@ impl App<AppId> for ReaderApp {
                     let fname = self.filename;
                 let epub_name = fname.as_str();
 
+                    // the chapter still has to be cached: seconds, so the
+                    // loading screen goes up first
+                    self.paint_loading(ctx);
                     if self.epub.cache_step.is_none() {
                         if let Err(e) = self.epub.cache_chapter_begin(k, ch, &epub_name) {
                             plump_kernel::perf_event!(
@@ -3310,6 +3590,13 @@ impl App<AppId> for ReaderApp {
                             return BgOutcome::Progress { more: true };
                         }
                     }
+                }
+
+                // no layout for this chapter at this font means a full
+                // typeset, seconds on a long chapter: show the screen
+                // before it, not after
+                if !self.loading_painted && self.is_epub && !self.chapter_has_layout(k) {
+                    self.paint_loading(ctx);
                 }
 
                 let want_last = self.goto_last_page;
@@ -3377,7 +3664,7 @@ impl App<AppId> for ReaderApp {
                     }
                 } else {
                     self.state = State::NeedPage;
-                    self.set_loading_ui(ctx, "Loading page", 90);
+                    self.set_loading_ui(ctx);
                     plump_kernel::perf_event!(
                         "reader",
                         "NeedIndex to=NeedPage pages={} fully_indexed={} elapsed_ms={}",
@@ -3598,7 +3885,8 @@ impl App<AppId> for ReaderApp {
                         self.queue_position_change(PendingPositionChange::Jump);
                         self.goto_last_page = false;
                         self.state = State::NeedIndex;
-                        ctx.mark_dirty(PAGE_REGION);
+                        // the sheet stays up until the chapter is ready
+                        self.begin_loading(LoadingReason::Chapter);
                     } else {
                         log::warn!(
                             "toc: entry \"{}\" unresolved (spine_idx=0xFFFF), ignoring",
@@ -3621,7 +3909,7 @@ impl App<AppId> for ReaderApp {
                     self.show_position = true;
                 }
                 if self.page_forward() {
-                    ctx.mark_dirty(PAGE_REGION);
+                    self.begin_loading(LoadingReason::Chapter);
                 }
                 Transition::None
             }
@@ -3630,7 +3918,7 @@ impl App<AppId> for ReaderApp {
                     self.show_position = true;
                 }
                 if self.page_backward() {
-                    ctx.mark_dirty(PAGE_REGION);
+                    self.begin_loading(LoadingReason::Chapter);
                 }
                 Transition::None
             }
@@ -3645,28 +3933,28 @@ impl App<AppId> for ReaderApp {
 
             ActionEvent::Press(Action::Next) | ActionEvent::Repeat(Action::Next) => {
                 if self.page_forward() {
-                    ctx.mark_dirty(PAGE_REGION);
+                    self.begin_loading(LoadingReason::Chapter);
                 }
                 Transition::None
             }
 
             ActionEvent::Press(Action::Prev) | ActionEvent::Repeat(Action::Prev) => {
                 if self.page_backward() {
-                    ctx.mark_dirty(PAGE_REGION);
+                    self.begin_loading(LoadingReason::Chapter);
                 }
                 Transition::None
             }
 
             ActionEvent::Press(Action::NextJump) | ActionEvent::Repeat(Action::NextJump) => {
                 if self.jump_forward() {
-                    ctx.mark_dirty(PAGE_REGION);
+                    self.begin_loading(LoadingReason::Chapter);
                 }
                 Transition::None
             }
 
             ActionEvent::Press(Action::PrevJump) | ActionEvent::Repeat(Action::PrevJump) => {
                 if self.jump_backward() {
-                    ctx.mark_dirty(PAGE_REGION);
+                    self.begin_loading(LoadingReason::Chapter);
                 }
                 Transition::None
             }
@@ -3712,6 +4000,7 @@ impl App<AppId> for ReaderApp {
                     self.queue_position_change(PendingPositionChange::Jump);
                     self.goto_last_page = false;
                     self.state = State::NeedIndex;
+                    self.begin_loading(LoadingReason::Chapter);
                 }
             }
             QA_NEXT_CHAPTER => {
@@ -3721,6 +4010,7 @@ impl App<AppId> for ReaderApp {
                     self.queue_position_change(PendingPositionChange::Jump);
                     self.goto_last_page = false;
                     self.state = State::NeedIndex;
+                    self.begin_loading(LoadingReason::Chapter);
                 }
             }
             QA_TOC => self.open_contents(ctx),
@@ -3733,7 +4023,7 @@ impl App<AppId> for ReaderApp {
     // changed. the early-return guard here avoids a spurious re-index. if
     // more cycle values are added to the quick menu, the changed-value
     // check should move into sync_quick_menu() itself.
-    fn on_quick_cycle_update(&mut self, id: u8, value: u8, _ctx: &mut AppContext) {
+    fn on_quick_cycle_update(&mut self, id: u8, value: u8, ctx: &mut AppContext) {
         if id == QA_FONT_SIZE && value != self.book_font_size_idx {
             self.book_font_size_idx = value;
             self.apply_font_metrics();
@@ -3743,6 +4033,10 @@ impl App<AppId> for ReaderApp {
                 } else {
                     self.state = State::NeedPage;
                 }
+                // re-typesetting is always slow enough to show, and
+                // the menu is closing in the same refresh anyway
+                self.begin_loading(LoadingReason::Font);
+                self.paint_loading(ctx);
             }
             self.rebuild_quick_actions();
         }

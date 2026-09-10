@@ -484,7 +484,7 @@ pub fn draw_hints(
     }
 }
 
-fn tracked_width(font: &BitmapFont, text: &str, tracking: u16) -> u16 {
+pub fn tracked_width(font: &BitmapFont, text: &str, tracking: u16) -> u16 {
     let mut w = 0u16;
     let mut utf8 = [0u8; 4];
     for (i, ch) in text.chars().enumerate() {
@@ -496,7 +496,7 @@ fn tracked_width(font: &BitmapFont, text: &str, tracking: u16) -> u16 {
     w
 }
 
-fn draw_tracked(
+pub fn draw_tracked(
     strip: &mut StripBuffer,
     font: &BitmapFont,
     text: &str,

@@ -338,6 +338,8 @@ Progressive state machine: `NeedBookmark → NeedInit → NeedOpf → NeedToc �
 
 Background caching runs during the EPD waveform window and between user inputs. It's interruptible: if input arrives during `run_background`, the future is dropped. Partial chapter cache writes are safe because `ch_cached` stays false until the full write completes.
 
+**Loading screens hold.** A loading episode (`ReaderApp::begin_loading`: open, wake, chapter change, font change) paints nothing for its first 400 ms unless the next step is known to be slow (bundle miss, chapter not cached, no layout at this font). A fast open, wake or chapter crossing therefore costs one refresh, the page itself. When the screen does go up it is painted once (plate for entering a book, strip for moving inside it, footer already in its final place) and later stages mark only `STAGE_REGION`. The first frame after entering a book or waking is always a full clear (`first_paint_full`); the manager leaves that request to the reader. Design: mockups/xteink_x4_reader_loading.html.
+
 Rendering takes priority over the background chain: the scheduler's `'bg` loop breaks to render whenever a redraw is render-ready, so loading percentages paint as they change and the first page shows as soon as the reader hits `Ready` — remaining caching continues during the paint's waveform window. Once the page is visible the caching indicator repaints only on 10% progress steps (each repaint costs a DU refresh).
 
 ### Image decode
