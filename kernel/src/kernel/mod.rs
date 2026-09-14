@@ -154,6 +154,10 @@ pub struct Services {
     pub(crate) bm_cache: &'static mut BookmarkCache,
     pub(crate) sd_ok: bool,
     pub(crate) cached_battery_mv: u16,
+    /// Percentage the UI is currently showing, which is not simply
+    /// `battery_percentage(cached_battery_mv)`. See
+    /// `Services::battery_pct_for_ui`.
+    pub(crate) battery_pct_shown: u8,
 
     // deferred grayscale-AA fire; armed by the render path when the
     // active app uses `GrayscaleMode::Deferred`
@@ -348,6 +352,7 @@ impl Kernel {
                 bm_cache,
                 sd_ok,
                 cached_battery_mv: battery_mv,
+                battery_pct_shown: crate::drivers::battery::battery_percentage(battery_mv),
                 aa: DeferredAa::new(),
                 input_policy: input_policy::InputPolicyState::new(),
                 applied: AppliedSettings::new(),

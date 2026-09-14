@@ -76,22 +76,20 @@ mod ctrl2 {
     /// Power-down-after-refresh bits, added under the sunlight policy.
     pub const POWER_OFF: u8 = 0x03; // ANALOG_OFF + CLOCK_OFF
 
-    /// LUT_LOAD + mode + DISPLAY_START: the partial DU.
+    /// TEMP_LOAD + LUT_LOAD + mode + DISPLAY_START: the partial DU.
     ///
-    /// No TEMP_LOAD. This carried 0x3C (TEMP_LOAD set) and every DU
-    /// therefore made the controller re-sample the sensor and re-pick
-    /// the OTP waveform mid-session -- including straight after
-    /// `start_full_update` faked the register to 0x5A for the 90C
-    /// trick, so the DU ran a waveform the panel's current state was
-    /// not produced with. CrossPoint's FAST_REFRESH is 0x1C on this
-    /// exact panel and only its full/half paths load temperature.
+    /// This was briefly 0x1C, on the theory that TEMP_LOAD was behind
+    /// the windowed-DU inversion and that CrossPoint's FAST_REFRESH
+    /// was the reference. Both halves were wrong: the inversion is the
+    /// window itself (`screen::plan_partial`), and CrossPoint never
+    /// calls `displayWindow` at all -- it is commented out of its
+    /// GfxRenderer, so every CrossPoint refresh is full-panel and its
+    /// fast path was never a windowed reference to match.
     ///
-    /// Found while chasing the windowed-DU inversion, and it did NOT
-    /// fix it (that was the window itself; see `screen::plan_partial`).
-    /// Kept because matching the reference driver on a byte we had no
-    /// reason to differ on is worth more than the divergence, but it
-    /// is unverified: nothing observable changed when it went in.
-    pub const DU: u8 = 0x1C;
+    /// Reverted rather than kept: TEMP_LOAD re-reads the sensor before
+    /// the OTP search (datasheet 6.9), which is what corrects the
+    /// register `start_full_update` leaves faked at 90C.
+    pub const DU: u8 = 0x3C;
     /// LUT_LOAD + DISPLAY_START, no TEMP_LOAD so the faked temperature
     /// written just before survives into the OTP LUT pick.
     pub const FULL: u8 = 0x14;

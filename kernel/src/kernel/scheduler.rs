@@ -15,7 +15,7 @@
 // sd_card_sleep sends cmd0 before deep sleep to reduce sd card
 // idle current from ~150 uA to ~10 uA
 
-use embassy_futures::select::{Either3, Either4, select3, select4};
+use embassy_futures::select::{Either3, select3};
 use embassy_time::{Duration, Instant, Timer};
 use log::{debug, info};
 
@@ -49,6 +49,12 @@ enum InputResult<Id> {
 }
 
 /// Action deferred until the EPD waveform completes.
+///
+/// Nothing constructs these any more: `wave_window` stopped
+/// dispatching input mid-waveform, which was the only producer. The
+/// plumbing is left threaded through `render` for now rather than
+/// unpicked from ~15 sites in the same change that fixed the display;
+/// it wants its own pass, with the panel in front of you.
 enum DeferredAction<Id> {
     Transition(Transition<Id>),
     Semantic(SemanticInput),
@@ -466,7 +472,7 @@ impl super::Kernel {
 
             // push live chrome state into the app layer so the top
             // status bar shows up-to-date numbers.
-            let pct = crate::drivers::battery::battery_percentage(self.svc.cached_battery_mv);
+            let pct = self.svc.battery_pct_for_ui();
             let day_pages = self.svc.day_stats.pages();
             let day_secs = self.svc.day_stats.secs_today();
             app_mgr.set_chrome_state(pct, day_pages, day_secs);
@@ -700,6 +706,36 @@ impl super::Services {
             }
             InputResult::Nothing => AfterInput::Continue,
         }
+    }
+
+    /// Battery percentage for the UI: follows a falling reading point
+    /// by point, but needs `BATTERY_PCT_RISE` points of real gain
+    /// before it will go back up.
+    ///
+    /// Not the raw `battery_percentage`. The discharge curve is at its
+    /// flattest 4 mV to the percentage point (3830-3870 mV spans
+    /// 50-60%), which is inside the noise of a 100K/100K divider read
+    /// through the ESP32 ADC, so the computed value crosses a boundary
+    /// and comes back indefinitely while the device sits still. Every
+    /// crossing marked the top bar dirty, and since `plan_partial`
+    /// drives the whole panel that is a ~760 ms full-screen refresh
+    /// for one point of battery. It is also just wrong: a meter that
+    /// ticks between two numbers on an untouched device reads as a
+    /// fault.
+    ///
+    /// Falling is followed exactly because that is the direction that
+    /// matters and the one a reader expects to see; rising needs to
+    /// clear the noise band, which on USB costs a couple of points of
+    /// lag while charging and nothing at all on battery.
+    fn battery_pct_for_ui(&mut self) -> u8 {
+        /// points of gain before the shown value is allowed to rise
+        const BATTERY_PCT_RISE: u8 = 2;
+
+        let raw = crate::drivers::battery::battery_percentage(self.cached_battery_mv);
+        if raw < self.battery_pct_shown || raw >= self.battery_pct_shown + BATTERY_PCT_RISE {
+            self.battery_pct_shown = raw;
+        }
+        self.battery_pct_shown
     }
 
     // shared housekeeping body: battery, sd probe, bookmark flush,
