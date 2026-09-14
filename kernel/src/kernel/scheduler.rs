@@ -885,7 +885,37 @@ impl super::Kernel {
                                         r.w,
                                         r.h
                                     );
-                                    app_mgr.ctx_mut().mark_dirty(r);
+                                    // re-mark only when nothing else
+                                    // did. a frame is abandoned because
+                                    // the app already marked what
+                                    // changed, and re-marking the whole
+                                    // region on top of that ratchets:
+                                    // the union can only grow, so one
+                                    // move that spans the screen makes
+                                    // every later keypress re-drive the
+                                    // whole content band via inv_red,
+                                    // 400ms at a time, while repeat
+                                    // input arrives every 150ms. the
+                                    // panel took a full-area pulse per
+                                    // keystroke and turned to ink. the
+                                    // deferred-only case has no other
+                                    // mark, so it keeps this one
+                                    // which half of `interrupted` fired
+                                    // decides the fix: a redraw means
+                                    // something marked dirty inside the
+                                    // waveform (input, or a background
+                                    // step), a deferred action means a
+                                    // transition is queued
+                                    log::info!(
+                                        "render: abandon redraw={} deferred={} write_ms={} wave_ms={}",
+                                        app_mgr.has_redraw(),
+                                        deferred.is_some(),
+                                        write_ms,
+                                        wave_ms
+                                    );
+                                    if !app_mgr.has_redraw() {
+                                        app_mgr.ctx_mut().mark_dirty(r);
+                                    }
                                     settled.abandon();
                                 }
                                 ClosePlan::GrayNow => {
@@ -902,6 +932,11 @@ impl super::Kernel {
                                     }
                                 }
                                 ClosePlan::SyncRed | ClosePlan::SyncThenArm(_) => {
+                                    log::info!(
+                                        "render: sync write_ms={} wave_ms={}",
+                                        write_ms,
+                                        wave_ms
+                                    );
                                     let draw = |s: &mut StripBuffer| app_mgr.draw(s);
                                     settled.sync_red(&draw);
                                 }
@@ -1063,8 +1098,11 @@ impl super::Services {
             Duration::from_millis(crate::drivers::ssd1677::BUSY_TIMEOUT_MS);
         let guard_at = Instant::now() + WAVEFORM_GUARD;
 
-        let mut deferred: Option<DeferredAction<A::Id>> = None;
-        let mut sleep_requested = false;
+        // both stay empty now that input is not consumed here; the
+        // caller's shape is unchanged so a future mid-wave action
+        // (a worker result that needs applying, say) has a slot
+        let deferred: Option<DeferredAction<A::Id>> = None;
+        let sleep_requested = false;
 
         loop {
             if !wave.is_busy() {
@@ -1083,59 +1121,33 @@ impl super::Services {
                 app_mgr.run_background_step(&mut handle, super::app::BgBudget::quiet())
             };
 
-            let ev = if let Ok(ev) = tasks::INPUT_EVENTS.try_receive() {
-                Some(ev)
-            } else {
-                match outcome {
-                    super::app::BgOutcome::Progress { more: true } => {
-                        // more work queued; just let other tasks run
-                        embassy_futures::yield_now().await;
-                        None
-                    }
-                    _ => {
-                        match select4(
-                            wave.until_idle(),
-                            tasks::INPUT_EVENTS.receive(),
-                            worker_arm(matches!(
-                                outcome,
-                                super::app::BgOutcome::WaitingExternal
-                            )),
-                            Timer::at(guard_at),
-                        )
-                        .await
-                        {
-                            Either4::Second(ev) => Some(ev),
-                            _ => None,
-                        }
-                    }
+            // input is deliberately left in the channel. dispatching
+            // it here mutates drawable state between phase 1 and
+            // phase 3, and that divergence is the only reason phase 3
+            // ever has to be skipped -- a skipped phase 3 leaves RED
+            // != BW, which the OTP DU reads as a drive state rather
+            // than as no-change, so the band gets re-pulsed by every
+            // later windowed refresh anywhere on the panel.
+            //
+            // nothing is slower for it: the main loop takes the
+            // events the moment this session closes, which is the
+            // earliest the next frame could have started regardless.
+            // a press that lands mid-waveform used to be applied at
+            // once and then cost the frame it landed in; now the
+            // frame finishes and the press is applied at the same
+            // instant the re-render would have begun.
+            match outcome {
+                super::app::BgOutcome::Progress { more: true } => {
+                    // more work queued; just let other tasks run
+                    embassy_futures::yield_now().await;
                 }
-            };
-
-            if let Some(hw_event) = ev {
-                self.last_activity = Instant::now();
-                self.input_events = self.input_events.wrapping_add(1);
-                let suppress = app_mgr.suppress_deferred_input();
-
-                match self.resolve_input(hw_event, app_mgr, suppress) {
-                    InputResult::Sleep => {
-                        info!("wave_window: sleep requested during waveform, will sleep after");
-                        sleep_requested = true;
-                    }
-                    InputResult::Transition(t) => {
-                        if deferred.is_none() {
-                            deferred = Some(DeferredAction::Transition(t));
-                            tasks::request_hold_reset();
-                        }
-                    }
-                    InputResult::OverlayChanged => {
-                        tasks::request_hold_reset();
-                    }
-                    InputResult::Semantic(input) => {
-                        if !suppress && deferred.is_none() {
-                            deferred = Some(DeferredAction::Semantic(input));
-                        }
-                    }
-                    InputResult::Nothing => {}
+                _ => {
+                    select3(
+                        wave.until_idle(),
+                        worker_arm(matches!(outcome, super::app::BgOutcome::WaitingExternal)),
+                        Timer::at(guard_at),
+                    )
+                    .await;
                 }
             }
 

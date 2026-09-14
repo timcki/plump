@@ -329,10 +329,24 @@ impl Screen {
             return Err(PartialRejected::NeedsFull);
         }
 
-        // snap on both axes: the physical window then carries no edge
-        // slop, and the 0-7 extra rows repaint with real content
-        // instead of the old masks parking fake white in both planes
-        let r = AlignedRegion::snap(region);
+        // every partial is full-screen. measured on the panel: a
+        // 480x40 window and a 480x800 one both take 641ms of waveform,
+        // so the RAM window never scoped the waveform -- the
+        // controller scans every gate either way, and the area outside
+        // the window is driven from whatever the planes hold. on this
+        // panel it is driven to its inverse: a windowed DU flipped
+        // every pixel outside its window and a second one flipped them
+        // back, with both planes provably in sync the whole time.
+        //
+        // a full-screen window has no outside, so there is nothing to
+        // misdrive. the price is SPI write time only (~120ms against
+        // ~6-77ms for a window) because the waveform was always paying
+        // for the whole panel. the reader's page turn, the AA pass and
+        // the revert pass were full-screen already; this makes the
+        // remaining path agree with them and with the whole-panel rule
+        // this file's header describes.
+        let _ = region;
+        let r = FULL_REGION;
 
         // any codes anywhere, not just under r: a windowed DU scans
         // the whole panel, so codes outside the window would be
@@ -384,6 +398,26 @@ impl Screen {
         let driven = self.epd.partial_start_du(written);
         self.partials = self.partials.saturating_add(1);
         self.aa_pending = true;
+
+        // one line per partial while the refresh artefacts are being
+        // chased. `outside` is the part of the stale map this window
+        // does not cover: those planes hold RED != BW, which the OTP
+        // DU reads as a transition rather than as no-change, so the
+        // waveform re-drives them from whatever BW happens to hold.
+        // a non-empty `outside` on a frame that looks wrong is the
+        // whole-panel rule biting the stale map the way it used to
+        // bite the gray one
+        let rg = r.get();
+        log::info!(
+            "screen: du {},{} {}x{} redrive={} partials={} outside={:?}",
+            rg.x,
+            rg.y,
+            rg.w,
+            rg.h,
+            hard_redrive,
+            self.partials,
+            self.planes.stale_outside(r).map(|o| o.get()),
+        );
 
         Ok(Wave {
             screen: self,
@@ -542,6 +576,8 @@ impl Settled<'_, Du> {
     /// pre-waveform image while the panel shows the new one, so the
     /// region needs an inv_red re-drive before any delta DU.
     pub fn abandon(self) {
+        let r = self.region.get();
+        log::info!("screen: abandon {},{} {}x{}", r.x, r.y, r.w, r.h);
         if self
             .screen
             .planes

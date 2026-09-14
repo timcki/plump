@@ -89,6 +89,20 @@ impl PlaneMap {
         out
     }
 
+    /// Bounding box of tracked area that `r` does not cover, which is
+    /// what a windowed waveform over `r` drives without meaning to
+    /// (the whole-panel rule: outside the window the controller still
+    /// scans every gate, and RED != BW is a drive state, not a
+    /// no-change one). `None` means the rest of the panel is plain
+    /// content and the window is the only thing this frame touches.
+    pub fn stale_outside(&self, r: AlignedRegion) -> Option<AlignedRegion> {
+        self.entries
+            .iter()
+            .flatten()
+            .flat_map(|(e, _)| subtract_aligned(*e, r).into_iter().flatten())
+            .reduce(AlignedRegion::union)
+    }
+
     /// Debug view: bounding box of everything tracked.
     pub fn bbox(&self) -> Option<AlignedRegion> {
         self.entries
