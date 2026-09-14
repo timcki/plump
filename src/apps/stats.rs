@@ -383,11 +383,14 @@ impl App<AppId> for StatsApp {
         // loose numerals at three times body size
         y = self.draw_caption(strip, &theme, y, "TODAY", "");
         self.draw_today(strip, y);
-        y += FIG_H + CAPTION_LEAD;
+        y += self.fig_h() + CAPTION_LEAD;
 
-        // ── lifetime: rows, which is what a record looks like
+        // ── lifetime: rows, which is what a record looks like. two of
+        // the three carry a sub line, and a group is one height, so
+        // all three are sized for the tallest of them
         y = self.draw_caption(strip, &theme, y, "LIFETIME", "");
-        let life = RowGroup::new(LARGE_MARGIN, y, FULL_CONTENT_W, 3, row::ROW_H);
+        let life_row_h = row::row_height(body, chrome, true, false);
+        let life = RowGroup::new(LARGE_MARGIN, y, FULL_CONTENT_W, 3, life_row_h);
         life.draw_outline(strip);
 
         let mut books_v = ValueBuf::new();
@@ -434,17 +437,23 @@ impl App<AppId> for StatsApp {
             self.draw_empty(strip, y);
             return;
         }
+        // a book row here carries a title in the book's own face, a
+        // sub line and a bar; how many of them the page has left room
+        // for is whatever the two groups above it did not take, which
+        // moves with the UI font. the caption is only worth drawing
+        // if at least one row follows it
+        let top_row_h = row::row_height(self.book_font, chrome, true, true);
+        let caption_h = self.ui_fonts.body.line_height + CAPTION_PAD;
+        let below = theme.content_bottom().saturating_sub(y + caption_h);
+        let shown = self.top_count.min((below / top_row_h) as usize);
+        if shown == 0 {
+            return;
+        }
         y = self.draw_caption(strip, &theme, y, "MOST TIME SPENT", "");
         let longest = self.books[self.top_books[0]].stats.time_secs.max(1);
-        let top = RowGroup::new(
-            LARGE_MARGIN,
-            y,
-            FULL_CONTENT_W,
-            self.top_count,
-            TOP_ROW_H,
-        );
+        let top = RowGroup::new(LARGE_MARGIN, y, FULL_CONTENT_W, shown, top_row_h);
         top.draw_outline(strip);
-        for i in 0..self.top_count {
+        for i in 0..shown {
             let book = &self.books[self.top_books[i]];
             let mut value = ValueBuf::new();
             write_duration(&mut value, book.stats.time_secs);
@@ -500,12 +509,24 @@ impl StatsApp {
         y + caption_h + CAPTION_PAD
     }
 
+    /// Height of a Today cell: the figure, the caption under it, and
+    /// the pad that keeps the two off each other and off the border.
+    /// It used to be a flat 62, which at the default UI font left the
+    /// caption nine pixels inside the figure it sits under.
+    fn fig_h(&self) -> u16 {
+        2 * FIG_PAD
+            + self.ui_fonts.heading.line_height
+            + FIG_LEAD
+            + fonts::chrome_font().line_height
+    }
+
     /// Three bordered cells: the count, the time, and the pace between
     /// them. A rate with nothing behind it prints as an em dash rather
     /// than a zero, which would read as a measurement.
     fn draw_today(&self, strip: &mut StripBuffer, y: u16) {
         let heading = self.ui_fonts.heading;
         let chrome = fonts::chrome_font();
+        let fig_h = self.fig_h();
         let cell_w = (FULL_CONTENT_W - 2 * FIG_GAP) / 3;
 
         let mut pages = ValueBuf::new();
@@ -535,7 +556,7 @@ impl StatsApp {
         .enumerate()
         {
             let x = LARGE_MARGIN + i as u16 * (cell_w + FIG_GAP);
-            let cell = Region::new(x, y, cell_w, FIG_H);
+            let cell = Region::new(x, y, cell_w, fig_h);
             row::draw_group_outline(strip, cell);
             heading.draw_aligned(
                 strip,
@@ -548,7 +569,7 @@ impl StatsApp {
                 strip,
                 Region::new(
                     x + FIG_PAD,
-                    y + FIG_H - FIG_PAD - chrome.line_height,
+                    y + fig_h - FIG_PAD - chrome.line_height,
                     cell_w - 2 * FIG_PAD,
                     chrome.line_height,
                 ),
@@ -601,17 +622,15 @@ const CAPTION_LEAD: u16 = 13;
 const CAPTION_PAD: u16 = 6;
 
 // today's three cells
-const FIG_H: u16 = 62;
 const FIG_GAP: u16 = 10;
 const FIG_PAD: u16 = 10;
+/// between the figure and the caption under it
+const FIG_LEAD: u16 = 4;
 
-// a book row here carries a title, a sub line and a bar
-const TOP_ROW_H: u16 = 62;
-
-/// Books in the most-time-spent list. Six is what the band holds
-/// under the two figure groups now that the tab bar is gone; the
-/// screen used to show three and end in a third of a page of blank
-/// paper.
+/// Books the most-time-spent list will hold at most. How many
+/// actually fit is worked out from what is left of the page after
+/// the two groups above it, which moves with the UI font: the cap is
+/// only there to bound the scan.
 const TOP_N: usize = 6;
 
 /// A pace under this much of a sample is noise, so the cell says

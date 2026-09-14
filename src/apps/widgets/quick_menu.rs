@@ -100,7 +100,7 @@ impl QuickMenu {
             app_count: 0,
             selected: 0,
             dirty: false,
-            geom: SheetGeom::anchored(0, None),
+            geom: SheetGeom::anchored(0, None, sheet::ROW_H),
             title: FixedStr::EMPTY,
             meta: FixedStr::EMPTY,
             ui_font_idx: 1,
@@ -167,7 +167,8 @@ impl QuickMenu {
         self.meta.set(ctx.meta.as_bytes());
 
         let group_break = if n_app > 0 { Some(n_app - 1) } else { None };
-        self.geom = SheetGeom::anchored(self.count, group_break);
+        let fonts = SheetFonts::for_ui(self.ui_font_idx);
+        self.geom = SheetGeom::anchored(self.count, group_break, fonts.row_h(fonts.body, false, false));
     }
 
     pub fn hide(&mut self) {
@@ -305,7 +306,7 @@ impl QuickMenu {
                     let name = options.get(value as usize).copied().unwrap_or("?");
                     // the selected cycle row shows its adjust arrows
                     if selected {
-                        let _ = write!(val, "\u{25C0} {} \u{25B6}", name);
+                        let _ = write!(val, "\u{2039} {} \u{203A}", name);
                     } else {
                         let _ = write!(val, "{}", name);
                     }
@@ -341,7 +342,7 @@ impl QuickMenu {
             MenuItemKind::AppCycle { .. } => &[
                 (HintSlot::Back, "CLOSE"),
                 (HintSlot::Ok, "SELECT"),
-                (HintSlot::LeftRight, "\u{25C0} ADJUST \u{25B6}"),
+                (HintSlot::LeftRight, "\u{2039} ADJUST \u{203A}"),
             ],
             _ => &[(HintSlot::Back, "CLOSE"), (HintSlot::Ok, "SELECT")],
         };

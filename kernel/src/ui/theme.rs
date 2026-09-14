@@ -45,7 +45,9 @@ impl Theme {
             row_h: 44,
             row_h_compact: 32,
             // the top bar is the navigation now: a screen nameplate
-            // flanked by its two neighbours, so it needs heading room
+            // flanked by its two neighbours. all three are body text
+            // (the current one bold), so the height is margin around
+            // one line rather than room for a heading
             top_bar_h: 40,
             // nothing at the bottom but a margin. the tab bar was 64 px
             // of a 800 px display drawing a control that could not be

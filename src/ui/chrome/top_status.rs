@@ -40,8 +40,14 @@ const BAT_W: u16 = 56;
 /// Gap between the three names in the cluster.
 const GAP: u16 = 12;
 
-const CHEVRON_LEFT: char = '\u{25C0}';
-const CHEVRON_RIGHT: char = '\u{25B6}';
+/// The arms point with arrows, not the solid triangles they used to.
+/// An arm is one lowercase word in the body face; a filled triangle
+/// beside it carried more ink than the destination it pointed at, so
+/// the bar read as two glyphs with some text between them. An arrow
+/// is drawn in the same stroke weight as the word, which is what
+/// makes the cluster read as one line.
+const ARROW_LEFT: char = '\u{2190}';
+const ARROW_RIGHT: char = '\u{2192}';
 
 /// The two faces the bar draws with.
 #[derive(Clone, Copy)]
@@ -80,7 +86,7 @@ impl TopStatus {
         let mut x = bar.x + theme.margin_lg;
         if let Some(prev) = self.active.left() {
             let mut text = StackFmt::<24>::new();
-            let _ = write!(text, "{} ", CHEVRON_LEFT);
+            let _ = write!(text, "{} ", ARROW_LEFT);
             push_lower(&mut text, prev.label());
             x = self.draw_piece(p, fonts.small, bar, x, text.as_str()) + GAP;
         }
@@ -92,7 +98,7 @@ impl TopStatus {
         if let Some(next) = self.active.right() {
             let mut text = StackFmt::<24>::new();
             push_lower(&mut text, next.label());
-            let _ = write!(text, " {}", CHEVRON_RIGHT);
+            let _ = write!(text, " {}", ARROW_RIGHT);
             x = self.draw_piece(p, fonts.small, bar, x, text.as_str());
         }
         let _ = x;

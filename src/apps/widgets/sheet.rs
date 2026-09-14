@@ -83,16 +83,30 @@ impl SheetFonts {
             icon: fonts::icon_font(1),
         }
     }
+
+    /// Height a row of this sheet needs for a title set in `text`,
+    /// plus the sub line or bar it stacks under it.
+    pub fn row_h(&self, text: &BitmapFont, sub: bool, bar: bool) -> u16 {
+        row::row_height(text, self.small, sub, bar)
+    }
 }
 
 /// Where the sheet sits and how many rows it holds. Rows are laid out
 /// as one flat list; `group_break` names the last row of the first
 /// group, after which a gap and a second outlined group follow.
+///
+/// Row height is per group and comes from the caller, not from a
+/// constant: a sheet whose rows carry a sub line needs more room than
+/// one whose rows are a single label, and both need more as the user
+/// steps the UI font up. The two scopes of the book cache sheet sit
+/// over a breakdown set in the chrome font, which is the case the
+/// second height exists for.
 #[derive(Clone, Copy, Debug)]
 pub struct SheetGeom {
     pub region: Region,
     pub rows: usize,
     pub group_break: Option<usize>,
+    row_h: [u16; 2],
 }
 
 impl SheetGeom {
@@ -101,24 +115,57 @@ impl SheetGeom {
         2 * PAD + HEADER_H + META_H + gap + HINT_H
     }
 
+    /// rows belonging to the first group
+    const fn first_rows(rows: usize, group_break: Option<usize>) -> usize {
+        match group_break {
+            Some(b) if b + 1 < rows => b + 1,
+            _ => rows,
+        }
+    }
+
+    const fn rows_h(rows: usize, group_break: Option<usize>, row_h: [u16; 2]) -> u16 {
+        let first = Self::first_rows(rows, group_break);
+        first as u16 * row_h[0] + (rows - first) as u16 * row_h[1]
+    }
+
     /// Bottom-anchored sheet sized to `rows`.
-    pub const fn anchored(rows: usize, group_break: Option<usize>) -> Self {
-        let h = Self::fixed_h(group_break) + rows as u16 * ROW_H;
+    pub const fn anchored(rows: usize, group_break: Option<usize>, row_h: u16) -> Self {
+        Self::anchored_groups(rows, group_break, [row_h, row_h])
+    }
+
+    /// Bottom-anchored sheet whose two groups have different row
+    /// heights.
+    pub const fn anchored_groups(
+        rows: usize,
+        group_break: Option<usize>,
+        row_h: [u16; 2],
+    ) -> Self {
+        let h = Self::fixed_h(group_break) + Self::rows_h(rows, group_break, row_h);
         Self {
             region: Region::new(SHEET_X, SHEET_BOTTOM - h, SHEET_W, h),
             rows,
             group_break,
+            row_h,
         }
     }
 
     /// Sheet grown to the top margin; holds as many rows as fit.
-    pub const fn full(group_break: Option<usize>) -> Self {
+    pub const fn full(group_break: Option<usize>, row_h: u16) -> Self {
         let h = SHEET_BOTTOM - SHEET_MARGIN;
-        let rows = ((h - Self::fixed_h(group_break)) / ROW_H) as usize;
+        let rows = ((h - Self::fixed_h(group_break)) / row_h) as usize;
         Self {
             region: Region::new(SHEET_X, SHEET_MARGIN, SHEET_W, h),
             rows,
             group_break,
+            row_h: [row_h, row_h],
+        }
+    }
+
+    /// Height of row `i`.
+    pub const fn row_h(&self, i: usize) -> u16 {
+        match self.group_break {
+            Some(b) if i > b => self.row_h[1],
+            _ => self.row_h[0],
         }
     }
 
@@ -153,15 +200,22 @@ impl SheetGeom {
     }
 
     pub fn row_region(&self, i: usize) -> Region {
-        let gap = match self.group_break {
-            Some(b) if i > b => GROUP_GAP,
-            _ => 0,
+        let (gap, above) = match self.group_break {
+            Some(b) if i > b => {
+                let first = Self::first_rows(self.rows, self.group_break);
+                (
+                    GROUP_GAP,
+                    first as u16 * self.row_h[0]
+                        + i.saturating_sub(first) as u16 * self.row_h[1],
+                )
+            }
+            _ => (0, i as u16 * self.row_h[0]),
         };
         Region::new(
             self.inner_x(),
-            self.rows_y() + i as u16 * ROW_H + gap,
+            self.rows_y() + above + gap,
             self.inner_w(),
-            ROW_H,
+            self.row_h(i),
         )
     }
 
@@ -290,6 +344,13 @@ pub fn draw_row(
     row::draw(strip, geom.row_region(i), edges, &fonts.rows(), spec);
 }
 
+/// Left and right are marked with angle quotes (`\u{2039}` / `\u{203A}`)
+/// wherever the bezel steps a value in place: a hint, or the value
+/// cell of a cycle row. They used to be solid triangles, which put
+/// more ink beside a word than the word itself carried and made the
+/// eye read the marker before the value. Navigation that actually
+/// goes somewhere uses arrows instead (see `ui::chrome::top_status`).
+///
 /// Where a hint sits on the footer line: centred over the bezel
 /// button it names. the bottom edge carries Back, OK, Left and
 /// Right; Up and Down on the side need no label.
@@ -299,7 +360,7 @@ pub enum HintSlot {
     Ok,
     Left,
     Right,
-    /// one label spanning Left and Right ("◀ ADJUST ▶")
+    /// one label spanning Left and Right ("\u{2039} ADJUST \u{203A}")
     LeftRight,
 }
 

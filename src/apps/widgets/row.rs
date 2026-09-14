@@ -52,10 +52,41 @@ const COVER_PAD: u16 = 10;
 /// Row height for a list whose lead is a cover.
 pub const COVER_ROW_H: u16 = COVER_H + 2 * COVER_PAD;
 
-/// Row height everywhere else.
+/// Row height everywhere else: one line of UI body text with room
+/// around it. It is the floor `row_height` never goes under, not a
+/// figure a list should reach for directly -- a row stacking a sub
+/// line or a bar under its title needs more, and how much more moves
+/// with the user's UI font.
 pub const ROW_H: u16 = 44;
 
+/// Space above and below a row's stacked text block. Modest, because
+/// a line box already carries its face's leading inside it: at 6 the
+/// visible gap above the first glyph is nearer ten.
+pub const ROW_PAD: u16 = 6;
+
 pub const GROUP_RADIUS: u32 = 6;
+
+/// Height a row needs for a title in `text_font` plus whatever it
+/// stacks under it. Lists size their rows with this rather than
+/// reaching for `ROW_H`: the UI font is user-settable across five
+/// tiers, so a two-line row at the top of that range is nearly twice
+/// a one-line row at the bottom, and a fixed figure clips one end or
+/// wastes the other.
+pub fn row_height(
+    text_font: &BitmapFont,
+    small: &BitmapFont,
+    sub: bool,
+    bar: bool,
+) -> u16 {
+    let mut block = text_font.line_height;
+    if sub {
+        block += STACK_GAP + small.line_height;
+    }
+    if bar {
+        block += STACK_GAP + BAR_H;
+    }
+    (block + 2 * ROW_PAD).max(ROW_H)
+}
 
 // position bar under a title: the sleep card's tube, an outlined
 // capsule that fills up, rather than a hairline with a solid stub

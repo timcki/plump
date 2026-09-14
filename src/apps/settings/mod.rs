@@ -237,7 +237,12 @@ impl SettingsApp {
             }
             Activation::Open => {
                 self.cache.open();
-                Damage::Viewport(self.cache.max_region())
+                // the sheet covers all but the margins and replaces
+                // every pixel under it. a DU that wide is a delta
+                // against the whole settings screen, which the panel
+                // then holds as a ghost showing through the paper
+                ctx.request_full_redraw();
+                Damage::None
             }
         };
         damage.mark(ctx);

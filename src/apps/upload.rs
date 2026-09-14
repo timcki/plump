@@ -1678,7 +1678,7 @@ impl UploadScreen<'_> {
             chrome.draw_top(
                 &mut painter,
                 &crate::ui::TopFonts {
-                    name: fonts::ui_heading_font(0),
+                    name: fonts::ui_bold_font(0),
                     small: fonts::chrome_font(),
                 },
             );

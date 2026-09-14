@@ -47,11 +47,6 @@ const TITLE_CAP: usize = 40;
 
 const STATS_DIR: &str = crate::apps::stats::STATS_DIR;
 
-/// widest sheet the states use, and so the region a stage change has
-/// to repaint: the picker fills the screen, everything else is
-/// bottom-anchored inside it.
-const MAX_REGION: Region = SheetGeom::full(None).region;
-
 // ── what a clear takes with it ──────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -285,7 +280,7 @@ impl CacheSheet {
             scanning: false,
             pending: Pending::None,
             row_dirty: false,
-            geom: SheetGeom::full(None),
+            geom: SheetGeom::full(None, sheet::ROW_H),
             ui_font_idx: 1,
         }
     }
@@ -297,14 +292,9 @@ impl CacheSheet {
 
     pub fn set_ui_font_size(&mut self, idx: u8) {
         self.ui_font_idx = idx;
-    }
-
-    /// Region a stage change has to repaint: the settings rows show
-    /// through wherever the sheet shrank away, so every transition
-    /// marks the tallest state rather than the current one.
-    #[inline]
-    pub fn max_region(&self) -> Region {
-        MAX_REGION
+        // rows are sized from the UI face, so the sheet and the
+        // scroll window have to be re-derived with it
+        self.resync_geom();
     }
 
     // ── the settings row's own value ────────────────────────────────
@@ -431,7 +421,9 @@ impl CacheSheet {
         }
 
         self.scanning = self.count > 0;
-        self.sel = ListSelection::new(self.count, SheetGeom::full(None).rows);
+        self.sel = ListSelection::new(self.count, 0);
+        // the picker is sized to the list, so a fresh count resizes it
+        self.resync_geom();
         log::info!("cache: {} candidate books to size", self.count);
     }
 
@@ -683,7 +675,7 @@ impl CacheSheet {
             Stage::Picker => {
                 if self.count == 0 {
                     self.close();
-                    ctx.mark_dirty(MAX_REGION);
+                    ctx.request_full_redraw();
                     return SheetResult::Closed;
                 }
                 self.target = self.sel.selected;
@@ -712,7 +704,7 @@ impl CacheSheet {
         match self.stage {
             Stage::Picker => {
                 self.close();
-                ctx.mark_dirty(MAX_REGION);
+                ctx.request_full_redraw();
                 SheetResult::Closed
             }
             Stage::Book => {
@@ -740,7 +732,7 @@ impl CacheSheet {
             }
             Stage::Done => {
                 self.close();
-                ctx.mark_dirty(MAX_REGION);
+                ctx.request_full_redraw();
                 SheetResult::Closed
             }
         }
@@ -753,14 +745,19 @@ impl CacheSheet {
             return SheetResult::Consumed;
         }
         self.close();
-        ctx.mark_dirty(MAX_REGION);
+        ctx.request_full_redraw();
         SheetResult::Closed
     }
 
+    /// Move to another stage. A stage change swaps all but the sheet
+    /// frame and resizes it, so it repaints on a full clear rather
+    /// than a DU over most of the screen: the delta a DU would drive
+    /// is the whole sheet, and what it leaves behind is a ghost of
+    /// the screen it replaced showing through the paper.
     fn goto(&mut self, stage: Stage, ctx: &mut AppContext) {
         self.stage = stage;
         self.resync_geom();
-        ctx.mark_dirty(MAX_REGION);
+        ctx.request_full_redraw();
     }
 
     fn begin_clear(&mut self, scope: Scope, ctx: &mut AppContext) {
@@ -851,16 +848,35 @@ impl CacheSheet {
     // ── geometry ────────────────────────────────────────────────────
 
     fn resync_geom(&mut self) {
-        self.geom = match self.stage {
-            Stage::Picker => {
-                let g = SheetGeom::full(None);
-                self.sel.set_visible(g.rows);
-                g
+        let fonts = SheetFonts::for_ui(self.ui_font_idx);
+        // a listing row names a book over a line of context, which is
+        // two lines of text and needs the height for both; the
+        // breakdown under the scopes is one line of chrome text per
+        // figure, and a short row is the right size for it
+        let listing = fonts.row_h(fonts.body, true, false);
+        let plain = fonts.row_h(fonts.small, false, false);
+
+        // the picker hugs its list: three cached books get a
+        // three-row sheet rather than a screen-tall outline drawn
+        // around them. its window is re-derived whatever stage is on
+        // screen, because a clear that drops a book renumbers it
+        let picker = {
+            let full = SheetGeom::full(None, listing);
+            if self.count >= full.rows {
+                full
+            } else {
+                SheetGeom::anchored(self.count, None, listing)
             }
+        };
+        self.sel.set_visible(picker.rows);
+
+        self.geom = match self.stage {
+            Stage::Picker => picker,
             // two scopes, then the breakdown they act on
-            Stage::Book => SheetGeom::anchored(5, Some(1)),
-            Stage::Armed | Stage::Done => SheetGeom::anchored(1, None),
-            Stage::Clearing => SheetGeom::anchored(2, None),
+            Stage::Book => SheetGeom::anchored_groups(5, Some(1), [listing, plain]),
+            Stage::Armed => SheetGeom::anchored(1, None, listing),
+            Stage::Done => SheetGeom::anchored(1, None, fonts.row_h(fonts.body, false, false)),
+            Stage::Clearing => SheetGeom::anchored(2, None, fonts.row_h(fonts.body, false, true)),
         };
     }
 

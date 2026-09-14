@@ -2988,11 +2988,21 @@ impl ReaderApp {
     }
 
     fn contents_geom(&self) -> SheetGeom {
+        // a chapter row is a title in the book face over the reading
+        // bar the current chapter carries, so it is sized for both
+        let fonts = SheetFonts::for_ui(self.ui_font_idx);
+        let row_h = fonts.row_h(self.contents_title_font(), false, true);
         if self.toc_expanded {
-            SheetGeom::full(None)
+            SheetGeom::full(None, row_h)
         } else {
-            SheetGeom::anchored(CONTENTS_ROWS, None)
+            SheetGeom::anchored(CONTENTS_ROWS, None, row_h)
         }
+    }
+
+    /// Chapter titles are book content, so they take the reader's own
+    /// face at the small tier rather than the UI face.
+    fn contents_title_font(&self) -> &'static BitmapFont {
+        fonts::body_font(self.reader_font.family(), 1)
     }
 
     fn toc_scroll_into_view(&mut self) {
@@ -3067,8 +3077,7 @@ impl ReaderApp {
         };
         let geom = self.contents_geom();
         let fonts = SheetFonts::for_ui(self.ui_font_idx);
-        // chapter titles are book content: the reader's face, small
-        let title_font = fonts::body_font(self.reader_font.family(), 1);
+        let title_font = self.contents_title_font();
 
         sheet::draw_frame(strip, &geom);
 
@@ -3140,13 +3149,13 @@ impl ReaderApp {
             &[
                 (HintSlot::Back, "CLOSE"),
                 (HintSlot::Ok, "GO"),
-                (HintSlot::Left, "\u{25C0} SHRINK"),
+                (HintSlot::Left, "\u{2039} SHRINK"),
             ]
         } else {
             &[
                 (HintSlot::Back, "CLOSE"),
                 (HintSlot::Ok, "GO"),
-                (HintSlot::Right, "EXPAND \u{25B6}"),
+                (HintSlot::Right, "EXPAND \u{203A}"),
             ]
         };
         sheet::draw_hints(strip, &geom, &fonts, hints);

@@ -872,7 +872,7 @@ impl AppManager {
             let theme = Theme::default_v1();
             let mut painter = Painter::new(strip, &theme);
             self.chrome.draw_top(&mut painter, &crate::ui::TopFonts {
-                name: fonts::ui_heading_font(0),
+                name: fonts::ui_bold_font(0),
                 small: fonts::chrome_font(),
             });
         }
@@ -891,12 +891,6 @@ impl AppManager {
                 )
                 .draw(strip);
             }
-        }
-
-        // the settings cache sheet is an overlay like the quick menu:
-        // drawn after the chrome so the bars do not slice its edges
-        if active == AppId::Settings && self.settings.cache_sheet_open() {
-            self.settings.draw_cache_sheet(strip);
         }
 
         // the settings cache sheet is an overlay like the quick menu:
