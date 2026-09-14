@@ -1,6 +1,6 @@
 // top bar: the navigation.
 //
-//     <- settings  home  library ->                            87%
+//     <- settings  home  library ->                    [###  ] 87%
 //
 // the five screens are a line with Home in its middle
 // (`apps::tab`), and this bar is that line seen from where you are
@@ -8,6 +8,11 @@
 // button gets you either side of the one you are on, and the battery
 // in the far corner. at either end of the line one arm is simply
 // absent, so running out reads as running out.
+//
+// the battery is the glyph the sleep card draws plus its percentage,
+// not the percentage alone: the charge is read from the lock screen
+// more often than from here, and two shapes for one measurement is
+// one shape too many.
 //
 // all lowercase, and the current screen is bold rather than large:
 // the whole cluster is one line of body text, which is as much bar as
@@ -27,15 +32,10 @@ use core::fmt::Write as _;
 
 use embedded_graphics::pixelcolor::BinaryColor;
 
-use plump_kernel::ui::{Alignment, Painter, Region, StackFmt};
+use plump_kernel::ui::{Alignment, BatteryIcon, Painter, Region, StackFmt};
 
 use crate::apps::Tab;
 use crate::fonts::bitmap::BitmapFont;
-
-/// Width reserved for the battery at the right margin, and mirrored
-/// as empty space at the left so the nameplate sits on the true
-/// centre of the screen rather than the centre of what is left over.
-const BAT_W: u16 = 56;
 
 /// Gap between the three names in the cluster.
 const GAP: u16 = 12;
@@ -103,14 +103,23 @@ impl TopStatus {
         }
         let _ = x;
 
+        // the same glyph the sleep card draws, so the charge reads as
+        // one measurement across the two screens that name it. both
+        // hang off the right margin and the glyph off the text's own
+        // width, so the gap between them does not open up at 9%
+        let pct = self.battery_pct.min(100);
         let mut bat = StackFmt::<8>::new();
-        let _ = write!(bat, "{}%", self.battery_pct.min(100));
-        let bat_r = Region::new(
-            bar.x + bar.w - theme.margin_lg - BAT_W,
-            bar.y,
-            BAT_W,
-            bar.h,
-        );
+        let _ = write!(bat, "{}%", pct);
+        let bat_w = fonts.small.measure_str(bat.as_str());
+        let text_x = (bar.x + bar.w).saturating_sub(theme.margin_lg + bat_w);
+        let bat_r = Region::new(text_x, bar.y, bat_w, bar.h);
+        // the glyph sits on the percentage's own midline; centring it
+        // in the bar would put it above the text, which sits high in a
+        // line box by the height of its descent and leading
+        let icon_y = fonts
+            .small
+            .midline_in(bat_r)
+            .saturating_sub(BatteryIcon::H / 2);
         fonts.small.draw_aligned(
             p.strip_mut(),
             bat_r,
@@ -118,6 +127,12 @@ impl TopStatus {
             Alignment::CenterRight,
             BinaryColor::On,
         );
+        BatteryIcon::new(
+            text_x.saturating_sub(BatteryIcon::GAP + BatteryIcon::TOTAL_W),
+            icon_y,
+            pct,
+        )
+        .draw(p.strip_mut());
 
         // the edge neither bar has ever had
         p.hairline_h(bar.y + bar.h - 1, bar.x, bar.x + bar.w);

@@ -8,6 +8,7 @@ use plump_kernel::util::FixedStr;
 
 use crate::apps::MSG_TAG_OPEN_CONTENTS;
 use crate::apps::PendingSetting;
+use crate::apps::widgets::row;
 use crate::apps::widgets::sheet::{
     self, HintSlot, RowLead, RowSpec, SheetFonts, SheetGeom, ValueChip,
 };
@@ -54,9 +55,21 @@ pub(super) const MARGIN: u16 = 8;
 // screen edge padding (display clips pixels at very edge)
 pub(super) const SCREEN_PAD: u16 = 4;
 
-// bottom chrome, one line: book title, a short chapter-position bar
-// right after it, and the page counter on the right (mockups/
-// xteink_x4_reader_footer.html, option A)
+// the reader's one line of chrome: the book's title on the left and
+// how far through the book you are on the right, drawn as the sleep
+// card's tube bar (mockups/xteink_x4_reader_footer.html, option A).
+//
+// it sits under the page. it was tried at the top, on the line every
+// other screen puts its own chrome on, and reads worse there: over a
+// column of prose a header is a thing to look past on the way in,
+// where a footer is a thing to glance at on the way out.
+//
+// the chapter used to live here too -- a fill bar for the position
+// inside it, and the chapter number in the corner -- and neither is
+// here now. the Menu sheet names the chapter in its header and gives
+// its number as the Contents row's value, which is where you look
+// when you want it; on the page it was two figures competing with the
+// one that answers "how much is left".
 pub(super) const CHROME_H: u16 = 18;
 pub(super) const CHROME_PAD: u16 = 4;
 // clear of the bottom edge: the display clips its last rows and the
@@ -80,11 +93,10 @@ pub(super) const PAGE_BUF: usize = 8192;
 
 pub(super) const MAX_PAGES: usize = 512;
 
-// the title takes its measured width up to this, the bar follows it
-const TITLE_MAX_W: u16 = 216;
+// the position tube in the right corner, and the gap between it and
+// whatever the title leaves
 const BAR_GAP: u16 = 12;
 const BAR_W: u16 = 96;
-const BAR_H: u16 = 3;
 pub(super) const FOOTER_REGION: Region =
     Region::new(MARGIN, CHROME_Y, SCREEN_W - 2 * MARGIN, CHROME_H);
 
@@ -2098,18 +2110,6 @@ impl ReaderApp {
         ((pos * 100) / size).min(100) as u8
     }
 
-    fn chapter_page_bar_fill_width(&self) -> Option<u16> {
-        if !self.is_epub || self.pg.total_pages == 0 {
-            return None;
-        }
-
-        let page = (self.pg.page + 1).min(self.pg.total_pages);
-        let filled = ((BAR_W as usize * page) / self.pg.total_pages)
-            .max(1)
-            .min(BAR_W as usize);
-        Some(filled as u16)
-    }
-
     // write the RECENT file; layout lives in apps::recent
     // returns Err on write failure (dirty state kept for retry)
     fn write_recent(&mut self, k: &mut KernelHandle<'_>) -> crate::error::Result<()> {
@@ -2207,36 +2207,6 @@ fn draw_chrome_text(
     }
 }
 
-fn draw_bottom_fill_bar(strip: &mut StripBuffer, region: Region, filled_w: u16) {
-    region
-        .to_rect()
-        .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
-        .draw(strip)
-        .unwrap();
-
-    // 1 px track across the whole bar, full-height fill up to the
-    // position
-    Rectangle::new(
-        Point::new(region.x as i32, (region.y + region.h / 2) as i32),
-        Size::new(region.w as u32, 1),
-    )
-    .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-    .draw(strip)
-    .unwrap();
-
-    if filled_w == 0 {
-        return;
-    }
-
-    Rectangle::new(
-        Point::new(region.x as i32, region.y as i32),
-        Size::new(filled_w as u32, region.h as u32),
-    )
-    .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-    .draw(strip)
-    .unwrap();
-}
-
 /// First line of a title that may wrap once: the longest prefix
 /// that fits, cut back to a word boundary, and the remainder
 fn split_title_line<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> (&'a str, &'a str) {
@@ -2283,8 +2253,9 @@ fn draw_truncated_text(
 
 // contents sheet, footer position and the page painter
 impl ReaderApp {
-    /// One-line footer: title, chapter bar, counter. drawn under the
-    /// page and under every loading screen, in the same place
+    /// One-line footer: the title, and how far through the book you
+    /// are as the tube the sleep card draws. Under the page and under
+    /// every loading screen, in the same place.
     fn draw_footer(&self, strip: &mut StripBuffer) {
         let cf = self.chrome_font;
         FOOTER_REGION
@@ -2293,13 +2264,67 @@ impl ReaderApp {
             .draw(strip)
             .unwrap();
 
-        // the title takes its measured width (cut with an ellipsis
-        // past TITLE_MAX_W) so the bar sits right after it instead
-        // of at a fixed column
+        // a book with nothing to measure (an unreadable file) gets the
+        // title alone rather than an empty tube, which would read as
+        // no progress rather than no figure
+        let measurable = self.file_size > 0 || (self.is_epub && !self.epub.spine.is_empty());
+        let mut right_x = MARGIN + FOOTER_REGION.w;
+        if measurable {
+            right_x -= BAR_W;
+            // centred on the title's own midline, not on the middle of
+            // the strip: the line box sits high in the strip, so a bar
+            // centred on the strip reads as sitting under the title
+            let mid = cf.map_or(CHROME_Y + CHROME_H / 2, |f| f.midline_in(FOOTER_REGION));
+            let bar = Region::new(
+                right_x,
+                mid.saturating_sub(row::BAR_H / 2),
+                BAR_W,
+                row::BAR_H,
+            );
+            // the same figure the sleep card fills its tube with, so
+            // the two agree when the screen goes to sleep mid-page
+            row::draw_tube_bar(
+                strip,
+                bar,
+                self.progress_pct() as u32,
+                100,
+                BinaryColor::On,
+            );
+        }
+
+        // background caching is the one thing left that reports from
+        // down here: it is transient, and nothing else says the book
+        // is still being read off the card
+        let mut sbuf = StackFmt::<24>::new();
+        if self.is_epub && self.epub.bg_cache != BgCacheState::Idle {
+            let cached = self.cached_chapter_count();
+            let total = self.epub.spine.len();
+            if cached < total {
+                let _ = write!(sbuf, "[{}/{}]", cached, total);
+            } else if self.epub.img_found_count > 0 {
+                let _ = write!(
+                    sbuf,
+                    "[img {}/{}]",
+                    self.epub.img_cached_count, self.epub.img_found_count,
+                );
+            } else {
+                let _ = write!(sbuf, "[img]");
+            }
+        }
+        if !sbuf.as_str().is_empty() {
+            let w = cf.map_or(0, |font| font.measure_str(sbuf.as_str()));
+            right_x = right_x.saturating_sub(BAR_GAP + w);
+            draw_chrome_text(
+                strip,
+                Region::new(right_x, CHROME_Y, w, CHROME_H),
+                sbuf.as_str(),
+                Alignment::CenterRight,
+                cf,
+            );
+        }
+
         let name = self.display_name();
-        let title_w = cf
-            .map_or(TITLE_MAX_W, |font| font.measure_str(name))
-            .clamp(1, TITLE_MAX_W);
+        let title_w = right_x.saturating_sub(MARGIN + BAR_GAP);
         let title_r = Region::new(MARGIN, CHROME_Y, title_w, CHROME_H);
         match cf {
             Some(font) => draw_truncated_text(
@@ -2311,75 +2336,6 @@ impl ReaderApp {
                 BinaryColor::On,
             ),
             None => draw_chrome_text(strip, title_r, name, Alignment::CenterLeft, cf),
-        }
-        let after_title = MARGIN + title_w + BAR_GAP;
-        let counter_region = |x: u16| {
-            Region::new(x, CHROME_Y, (SCREEN_W - MARGIN).saturating_sub(x), CHROME_H)
-        };
-
-        if self.is_epub && !self.epub.spine.is_empty() {
-            // counter: position in the book once every chapter has a
-            // layout, else the chapter index; caching progress follows
-            let mut sbuf = StackFmt::<40>::new();
-            match self.book_position() {
-                Some((page, total)) => {
-                    let _ = write!(sbuf, "{} / {}", page, total);
-                }
-                None if self.epub.spine.len() > 1 => {
-                    let _ = write!(sbuf, "{}/{}", self.epub.chapter + 1, self.epub.spine.len());
-                }
-                None => {}
-            }
-            if self.epub.bg_cache != BgCacheState::Idle {
-                if !sbuf.as_str().is_empty() {
-                    let _ = write!(sbuf, " ");
-                }
-                let cached = self.cached_chapter_count();
-                let total = self.epub.spine.len();
-                if cached < total {
-                    let _ = write!(sbuf, "[{}/{}]", cached, total);
-                } else if self.epub.img_found_count > 0 {
-                    let _ = write!(
-                        sbuf,
-                        "[img {}/{}]",
-                        self.epub.img_cached_count, self.epub.img_found_count,
-                    );
-                } else {
-                    let _ = write!(sbuf, "[img]");
-                }
-            }
-            let bar_fill = self.chapter_page_bar_fill_width();
-            let counter_x = if bar_fill.is_some() {
-                after_title + BAR_W + BAR_GAP
-            } else {
-                after_title
-            };
-            draw_chrome_text(
-                strip,
-                counter_region(counter_x),
-                sbuf.as_str(),
-                Alignment::CenterRight,
-                cf,
-            );
-            if let Some(filled_w) = bar_fill {
-                let bar_r =
-                    Region::new(after_title, CHROME_Y + (CHROME_H - BAR_H) / 2, BAR_W, BAR_H);
-                draw_bottom_fill_bar(strip, bar_r, filled_w);
-            }
-        } else if self.file_size > 0 {
-            let mut sbuf = StackFmt::<24>::new();
-            if self.pg.fully_indexed {
-                let _ = write!(sbuf, "{}/{}", self.pg.page + 1, self.pg.total_pages);
-            } else {
-                let _ = write!(sbuf, "p{}", self.pg.page + 1);
-            }
-            draw_chrome_text(
-                strip,
-                counter_region(after_title),
-                sbuf.as_str(),
-                Alignment::CenterRight,
-                cf,
-            );
         }
     }
 

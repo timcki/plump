@@ -23,12 +23,13 @@ use plump_kernel::drivers::strip::GrayMode;
 use plump_kernel::util::{FixedStr, hash};
 
 use crate::apps::cover_placeholder;
+use crate::apps::widgets::row;
 use crate::apps::widgets::sheet::{SHEET_MARGIN, draw_ellipsized};
 use crate::board::SCREEN_H;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::{self, FontSet, ReaderFont, Style, bitmap::BitmapFont};
 use crate::kernel::work_queue::DecodedImage;
-use crate::ui::{Alignment, Painter, Region, StackFmt, Theme};
+use crate::ui::{Alignment, BatteryIcon, Painter, Region, StackFmt, Theme};
 
 const CARD_X: u16 = SHEET_MARGIN;
 const CARD_W: u16 = 320;
@@ -45,7 +46,7 @@ const COVER_STRIDE: usize = (COVER_W as usize).div_ceil(8);
 const COVER_BYTES: usize = COVER_STRIDE * COVER_H as usize;
 const COVER_GAP: u16 = 14;
 
-const BAR_H: u16 = 4;
+const BAR_H: u16 = row::BAR_H;
 const BAR_GAP: u16 = 6;
 const RULE_GAP: u16 = 10;
 
@@ -359,7 +360,7 @@ impl SleepCard {
         let mut bat = StackFmt::<8>::new();
         let _ = write!(bat, "{}%", self.bat_pct);
         let bat_w = f.small.measure_str(bat.as_str());
-        let bat_icon_w = BAT_W + BAT_NUB_W + BAT_GAP;
+        let bat_icon_w = BatteryIcon::TOTAL_W + BatteryIcon::GAP;
         let author_w = g.text.w.saturating_sub(bat_w + bat_icon_w + COVER_GAP);
         draw_ellipsized(
             strip,
@@ -373,8 +374,12 @@ impl SleepCard {
             .draw_aligned(strip, bat_region, bat.as_str(), Alignment::CenterRight, ink);
         if bw {
             let icon_x = g.text.x + g.text.w - bat_w - bat_icon_w;
-            let icon_y = y + (f.small.line_height - BAT_H) / 2;
-            draw_battery(strip, icon_x, icon_y, self.bat_pct);
+            // on the percentage's own midline, not the line box's
+            let icon_y = f
+                .small
+                .midline_in(bat_region)
+                .saturating_sub(BatteryIcon::H / 2);
+            BatteryIcon::new(icon_x, icon_y, self.bat_pct).draw(strip);
         }
         y += f.small.line_height;
 
@@ -392,22 +397,13 @@ impl SleepCard {
         );
         y += f.chapter.line_height + BAR_GAP;
 
-        // position bar and the counter row under it
+        // position bar and the counter row under it. the tube is
+        // `row::draw_tube_bar`, the same call the reader's footer and
+        // every list row make, so the card and the page under it
+        // cannot end up drawing the same fact two ways
         if bw {
             let bar = Region::new(g.text.x, y, g.text.w, BAR_H);
-            let radii = Size::new(2, 2);
-            RoundedRectangle::with_equal_corners(bar.to_rect(), radii)
-                .into_styled(PrimitiveStyle::with_stroke(ink, 1))
-                .draw(strip)
-                .ok();
-            let filled = (bar.w as u32 * self.percent as u32 / 100) as u16;
-            if filled > 0 {
-                let fill = Region::new(bar.x, bar.y, filled.max(BAR_H), bar.h);
-                RoundedRectangle::with_equal_corners(fill.to_rect(), radii)
-                    .into_styled(PrimitiveStyle::with_fill(ink))
-                    .draw(strip)
-                    .ok();
-            }
+            row::draw_tube_bar(strip, bar, self.percent as u32, 100, ink);
         }
         y += BAR_H + BAR_GAP;
 
@@ -581,37 +577,3 @@ fn scale_1bpp(src: &DecodedImage, dst: &mut [u8], dw: u16, dh: u16, stride: usiz
     }
 }
 
-// battery glyph: outlined body with a nub, filled to the percentage
-const BAT_W: u16 = 16;
-const BAT_H: u16 = 9;
-const BAT_NUB_W: u16 = 2;
-const BAT_GAP: u16 = 5;
-
-fn draw_battery(strip: &mut StripBuffer, x: u16, y: u16, pct: u8) {
-    let ink = BinaryColor::On;
-    Rectangle::new(
-        Point::new(x as i32, y as i32),
-        Size::new(BAT_W as u32, BAT_H as u32),
-    )
-    .into_styled(PrimitiveStyle::with_stroke(ink, 1))
-    .draw(strip)
-    .ok();
-    Rectangle::new(
-        Point::new((x + BAT_W) as i32, (y + 2) as i32),
-        Size::new(BAT_NUB_W as u32, (BAT_H - 4) as u32),
-    )
-    .into_styled(PrimitiveStyle::with_fill(ink))
-    .draw(strip)
-    .ok();
-    let inner_w = BAT_W - 4;
-    let filled = (inner_w as u32 * pct as u32 / 100) as u16;
-    if filled > 0 {
-        Rectangle::new(
-            Point::new((x + 2) as i32, (y + 2) as i32),
-            Size::new(filled as u32, (BAT_H - 4) as u32),
-        )
-        .into_styled(PrimitiveStyle::with_fill(ink))
-        .draw(strip)
-        .ok();
-    }
-}

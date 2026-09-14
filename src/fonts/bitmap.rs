@@ -230,6 +230,32 @@ impl BitmapFont {
     }
 
     // draw a &str aligned within a region
+    /// y of the optical midline of a line of text this font draws
+    /// centred in `region`, which is where anything set beside that
+    /// text should be centred: a bar, a rule, an icon.
+    ///
+    /// Not `region.y + region.h / 2`. A line box carries its descent
+    /// and its leading below the baseline and nothing above the
+    /// ascender, so centring the box puts the ink noticeably high in
+    /// it; a bar centred on the box then sits below the word it is
+    /// meant to sit beside. This measures the rasterised `x` instead
+    /// -- a glyph with neither ascender nor descender -- and takes
+    /// the middle of its ink, which is the line the eye reads as the
+    /// middle of lowercase text.
+    pub fn midline_in(&self, region: Region) -> u16 {
+        let top = region.y as i32 + (region.h as i32 - self.line_height as i32) / 2;
+        let baseline = top + self.ascent as i32;
+        let x = self.glyph('x');
+        let mid = if x.height > 0 {
+            baseline + x.offset_y as i32 + x.height as i32 / 2
+        } else {
+            // a stub face with no ink to measure: the box centre is
+            // as good a guess as any
+            region.y as i32 + region.h as i32 / 2
+        };
+        mid.max(0) as u16
+    }
+
     pub fn draw_aligned(
         &self,
         strip: &mut StripBuffer,

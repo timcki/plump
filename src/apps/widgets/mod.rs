@@ -19,6 +19,6 @@ pub use button_feedback::{BUTTON_BAR_H, ButtonFeedback};
 pub use format::{draw_position_indicator, fmt_percent, fmt_position};
 pub use list::ListSelection;
 pub use quick_menu::QuickMenu;
-pub use row::{COVER_ROW_H, RowEdges, RowFonts, RowGroup, RowLead, RowSpec, ValueChip};
+pub use row::{COVER_ROW_H, CoverBox, RowEdges, RowFonts, RowGroup, RowLead, RowSpec, ValueChip};
 pub use selectable_row::SelectableRow;
 pub use sleep_card::SleepCard;

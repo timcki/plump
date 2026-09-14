@@ -401,7 +401,7 @@ impl App<AppId> for LibraryApp {
                 slot,
                 &row_fonts,
                 &RowSpec {
-                    lead: RowLead::Cover(self.covers[slot].as_ref()),
+                    lead: RowLead::Cover(self.covers[slot].as_ref(), row::CoverBox::Mini),
                     text: entry.display_name(),
                     text_font: self.book_font,
                     value: pages.as_str(),

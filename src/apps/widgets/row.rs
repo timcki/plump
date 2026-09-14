@@ -24,6 +24,7 @@ use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{CornerRadii, PrimitiveStyle, Rectangle, RoundedRectangle};
 
+use crate::apps::cover_cache;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::bitmap::BitmapFont;
 use crate::kernel::work_queue::DecodedImage;
@@ -38,19 +39,51 @@ pub const CELL_PAD: u16 = 12;
 pub const LEAD_W: u16 = 28;
 pub const CELL_GAP: u16 = 10;
 
-/// Cover thumb in the lead column, matching the cached Mini variant
-/// (`cover_cache::MINI_THUMB_*`) so nothing is rescaled: a 1-bit
-/// dithered image cannot be resampled without destroying its dither.
-pub const COVER_W: u16 = 64;
-pub const COVER_H: u16 = 96;
+/// Which cached cover variant a row's lead column is cut for. A
+/// 1-bit dithered image cannot be resampled without destroying its
+/// dither, so the column is sized to the variant rather than the
+/// variant scaled to the column, and the two sizes the bundle stores
+/// are the two a row can ask for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CoverBox {
+    /// the library's rows: a thumb beside a line of text
+    Mini,
+    /// home's recent books, where three of them have the whole band
+    /// under the card and a thumb would float in it
+    Card,
+}
+
+impl CoverBox {
+    pub const fn w(self) -> u16 {
+        match self {
+            Self::Mini => cover_cache::MINI_THUMB_W,
+            Self::Card => cover_cache::CARD_THUMB_W,
+        }
+    }
+
+    pub const fn h(self) -> u16 {
+        match self {
+            Self::Mini => cover_cache::MINI_THUMB_H,
+            Self::Card => cover_cache::CARD_THUMB_H,
+        }
+    }
+
+    /// Row height this variant wants: the cover plus its air.
+    pub const fn row_h(self) -> u16 {
+        self.h() + 2 * COVER_PAD
+    }
+}
 
 /// Space above and below a cover inside its row. At 4 px the cover
 /// sat all but on the separator above it, which read as cramped
 /// however few rows the list held.
 const COVER_PAD: u16 = 10;
 
-/// Row height for a list whose lead is a cover.
-pub const COVER_ROW_H: u16 = COVER_H + 2 * COVER_PAD;
+pub const COVER_W: u16 = CoverBox::Mini.w();
+pub const COVER_H: u16 = CoverBox::Mini.h();
+
+/// Row height for a list whose lead is a Mini cover.
+pub const COVER_ROW_H: u16 = CoverBox::Mini.row_h();
 
 /// Row height everywhere else: one line of UI body text with room
 /// around it. It is the floor `row_height` never goes under, not a
@@ -119,16 +152,16 @@ pub enum RowLead<'a> {
     Icon(char),
     Number(u16),
     Bookmark,
-    /// cached Mini cover; `None` strokes the box so a missing cover
-    /// reads as intentional rather than broken
-    Cover(Option<&'a DecodedImage>),
+    /// cached cover in the named box; `None` strokes the box so a
+    /// missing cover reads as intentional rather than broken
+    Cover(Option<&'a DecodedImage>, CoverBox),
 }
 
 impl RowLead<'_> {
     /// Width the lead reserves before the title.
     pub const fn width(&self) -> u16 {
         match self {
-            Self::Cover(_) => COVER_W,
+            Self::Cover(_, size) => size.w(),
             _ => LEAD_W,
         }
     }
@@ -466,27 +499,31 @@ fn draw_lead(
                 .small
                 .draw_aligned(strip, lead_r, s.as_str(), Alignment::CenterRight, fg);
         }
-        RowLead::Cover(cover) => {
+        RowLead::Cover(cover, size) => {
+            let (bw, bh) = (size.w(), size.h());
             let x = lead_r.x;
-            let y = row.y + row.h.saturating_sub(COVER_H) / 2;
+            let y = row.y + row.h.saturating_sub(bh) / 2;
             match cover {
                 // covers are 1-bit packed; invert the bit on a
                 // selected row so a dark cover still reads against
-                // the inverted background
+                // the inverted background. the loader hands back
+                // whichever variant the bundle actually has, so an
+                // image smaller than the box is centred in it rather
+                // than pinned to a corner
                 Some(img) => strip.blit_1bpp(
                     &img.data,
                     0,
                     img.width as usize,
                     img.height as usize,
                     img.stride,
-                    x as i32,
-                    y as i32,
+                    (x + bw.saturating_sub(img.width) / 2) as i32,
+                    (y + bh.saturating_sub(img.height) / 2) as i32,
                     !spec.selected,
                 ),
                 None => {
                     Rectangle::new(
                         Point::new(x as i32, y as i32),
-                        Size::new(COVER_W as u32, COVER_H as u32),
+                        Size::new(bw as u32, bh as u32),
                     )
                     .into_styled(PrimitiveStyle::with_stroke(fg, 1))
                     .draw(strip)

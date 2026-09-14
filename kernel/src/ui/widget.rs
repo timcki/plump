@@ -223,6 +223,65 @@ pub fn wrap_prev(current: usize, count: usize) -> usize {
     if current == 0 { count - 1 } else { current - 1 }
 }
 
+/// Battery glyph: an outlined body with a nub on its right, filled
+/// from the left to the charge level. `BatteryIcon::W` is the body
+/// alone; `BatteryIcon::TOTAL_W` includes the nub, which is what a
+/// caller reserving space wants.
+///
+/// It lives here rather than beside the sleep card that first drew it
+/// because the top bar names the same fact and should not draw a
+/// second battery: the two are read minutes apart, and a battery that
+/// changes shape between the lock screen and the menu reads as two
+/// different measurements.
+pub struct BatteryIcon {
+    pub x: u16,
+    pub y: u16,
+    pub pct: u8,
+}
+
+impl BatteryIcon {
+    pub const W: u16 = 16;
+    pub const H: u16 = 9;
+    pub const NUB_W: u16 = 2;
+    pub const TOTAL_W: u16 = Self::W + Self::NUB_W;
+    /// gap between the glyph and the percentage beside it
+    pub const GAP: u16 = 5;
+
+    pub const fn new(x: u16, y: u16, pct: u8) -> Self {
+        Self { x, y, pct }
+    }
+
+    pub fn draw(&self, strip: &mut StripBuffer) {
+        let ink = BinaryColor::On;
+        let (x, y) = (self.x, self.y);
+        Rectangle::new(
+            Point::new(x as i32, y as i32),
+            Size::new(Self::W as u32, Self::H as u32),
+        )
+        .into_styled(PrimitiveStyle::with_stroke(ink, 1))
+        .draw(strip)
+        .ok();
+        Rectangle::new(
+            Point::new((x + Self::W) as i32, (y + 2) as i32),
+            Size::new(Self::NUB_W as u32, (Self::H - 4) as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(ink))
+        .draw(strip)
+        .ok();
+        let inner_w = Self::W - 4;
+        let filled = (inner_w as u32 * self.pct.min(100) as u32 / 100) as u16;
+        if filled > 0 {
+            Rectangle::new(
+                Point::new((x + 2) as i32, (y + 2) as i32),
+                Size::new(filled as u32, (Self::H - 4) as u32),
+            )
+            .into_styled(PrimitiveStyle::with_fill(ink))
+            .draw(strip)
+            .ok();
+        }
+    }
+}
+
 /// Horizontal progress bar for 1-bit e-paper.
 ///
 /// Draws a 1px black border around the full track and fills

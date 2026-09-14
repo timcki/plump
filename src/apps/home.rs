@@ -2,9 +2,13 @@
 //
 // the v1 mockup collapses the old launcher menu (5 buttons) into a
 // single content surface: one big card for the most recently opened
-// book, then a short list of the next 3 by bookmark generation. all
-// app navigation now happens through the bottom tab bar; only Reader
-// is reachable from here (by selecting the card or a recent row).
+// book, then the next 3 by bookmark generation. app navigation lives
+// in the top bar (`ui::chrome::top_status`); only Reader is reachable
+// from here, by selecting the card or one of the rows.
+//
+// all four draw a Card cover on the same left edge into the same text
+// column, so the screen reads as four books with the top one opened
+// rather than as one book and a list about some others.
 
 use core::fmt::Write as _;
 
@@ -46,7 +50,19 @@ const CARD_PROGRESS_H: u16 = row::BAR_H;
 
 // recent list: one outlined group of cover rows, the same component
 // the library and the reader's contents sheet draw.
-const MAX_RECENT_ROWS: usize = 4;
+//
+// three, not four. the band under the card is 533 px, and four rows
+// of it put a 64x96 thumb in the middle of 133 px with an empty
+// right-hand column beside it -- a list that was mostly the paper
+// between its contents. three rows take the Card cover the screen
+// already loads for the card above them, which fills the row it is
+// in, and the column that was empty carries the position.
+const MAX_RECENT_ROWS: usize = 3;
+
+/// Cover variant the recent rows draw. Same one the card uses, so a
+/// row and the card show a book at the same size and the screen reads
+/// as four books rather than one book and a list about three others.
+const ROW_COVER: row::CoverBox = row::CoverBox::Card;
 
 // 1 card + N rows.
 const MAX_ITEMS: usize = 1 + MAX_RECENT_ROWS;
@@ -80,9 +96,10 @@ const FIRST_ROW_Y: u16 = RULE_Y + 1 + RULE_GAP;
 const CONTENT_REGION: Region = Region::new(0, CONTENT_TOP, SCREEN_W, SCREEN_H - CONTENT_TOP);
 
 /// Row height: the band left under the card, divided by the rows that
-/// go in it. With the tab bar gone this comes out at 136, which is
-/// 20 px of air above and below every cover; it was 4 px when this
-/// screen first felt cramped.
+/// go in it. At three Card covers this comes out at 177, which is
+/// 8 px of air above and below each one -- the same air the library
+/// gives its own rows, and the cover reaches the full height of the
+/// row instead of floating in it.
 const ROW_H: u16 = (LIST_BOTTOM - FIRST_ROW_Y - 1) / MAX_RECENT_ROWS as u16;
 const LIST_BOTTOM: u16 = plump_kernel::ui::Theme::default_v1().content_bottom();
 
@@ -110,7 +127,7 @@ const _: () = assert!(
     "card plus recent list overflows the content band"
 );
 const _: () = assert!(
-    ROW_H >= row::COVER_H + 12,
+    ROW_H >= ROW_COVER.h() + 12,
     "recent rows crowd their covers"
 );
 
@@ -366,7 +383,7 @@ impl HomeApp {
             let book = crate::apps::cover_cache::load_book_entry(
                 k,
                 plump_kernel::util::hash::fnv1a(entry.filename.as_bytes()),
-                plump_kernel::kernel::bundle::CoverKind::Mini,
+                plump_kernel::kernel::bundle::CoverKind::Card,
             );
             row.author = book.author;
             row.progress_pct = book.progress_pct().unwrap_or(0);
@@ -677,23 +694,28 @@ impl App<AppId> for HomeApp {
         let heading_h = heading.line_height;
 
         if self.has_recent() {
-            const COVER_GAP: u16 = 16;
+            // the card reserves the cover box rather than measuring
+            // the image in it, and the box and the gap after it are
+            // the row's own: the card's cover and the three below it
+            // then share one left edge and one text column, which is
+            // the whole reason the card is the same width as the
+            // group under it. a book whose bundle only cached the
+            // small variant used to shift this entire block left
+            let (box_w, box_h) = (ROW_COVER.w(), ROW_COVER.h());
             let (text_x, text_w, text_align) = if let Some(ref img) = self.recent_cover {
-                let img_x = inner_x as i32;
-                let img_y = CARD_Y as i32
-                    + CARD_PAD as i32
-                    + ((CARD_H - 2 * CARD_PAD) as i32 - img.height as i32) / 2;
+                let img_x = inner_x + box_w.saturating_sub(img.width) / 2;
+                let img_y = CARD_Y + CARD_PAD + box_h.saturating_sub(img.height) / 2;
                 strip.blit_1bpp(
                     &img.data,
                     0,
                     img.width as usize,
                     img.height as usize,
                     img.stride,
-                    img_x,
-                    img_y.max(CARD_Y as i32 + CARD_PAD as i32),
+                    img_x as i32,
+                    img_y as i32,
                     !card_selected,
                 );
-                let tx = inner_x + img.width + COVER_GAP;
+                let tx = inner_x + box_w + row::CELL_GAP;
                 let tw = (CARD_X + CARD_W - CARD_PAD).saturating_sub(tx);
                 (tx, tw, Alignment::TopLeft)
             } else {
@@ -821,18 +843,25 @@ impl App<AppId> for HomeApp {
             small: fonts::chrome_font(),
             icon: fonts::icon_font(1),
         };
+        let mut pos = StackFmt::<20>::new();
         for i in 0..self.recent_row_count {
             let row = &self.recent_rows[i];
             if !row.valid {
                 continue;
             }
-            // the bar says what a percentage beside it would say
-            // twice, so the row carries only the bar
+            // where you are, in the value cell every other list on the
+            // device fills. the bar beside it is the same fact read at
+            // a glance rather than counted, which is the pairing the
+            // reader's contents sheet already draws
+            pos.clear();
+            if let Some((done, total)) = row.position {
+                let _ = write!(pos, "{} / {}", done, total);
+            }
             let spec = RowSpec {
-                lead: RowLead::Cover(self.recent_row_covers[i].as_ref()),
+                lead: RowLead::Cover(self.recent_row_covers[i].as_ref(), ROW_COVER),
                 text: row.display_name(),
                 text_font: self.book_row,
-                value: "",
+                value: pos.as_str(),
                 selected: self.selected == i + 1,
                 sub: row.author.as_str(),
                 progress: row.position,

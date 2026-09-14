@@ -268,7 +268,7 @@ impl SettingId {
     pub const fn sub(self) -> &'static str {
         match self {
             Self::ReaderFont => "the face the book itself is set in",
-            Self::ReaderStatus => "title, chapter bar and page count",
+            Self::ReaderStatus => "the title and how far in, under the page",
             Self::TextAa => "grey glyph edges, one extra pass a page",
             Self::GhostClear => "full clear after this many page turns",
             Self::SunlightFix => "powers the panel down after each refresh",
