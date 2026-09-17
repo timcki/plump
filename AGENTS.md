@@ -336,7 +336,7 @@ The kernel ships a built-in `FONT_9X18` mono font (embedded-graphics) for the bo
 /                       root — user files (.txt, .epub)
 /_PULP/                 app data directory
   SETTINGS.TXT          key=value config (sleep, fonts, theme, wifi)
-  BKMK.BIN              bookmark cache (16 × 48 bytes, binary)
+  BKMK.BIN              recently-read LRU (16 × 48 bytes, binary)
   SESSION.BIN           sleep session copy (battery wakes lose RTC memory)
   PWR.LOG               append-only boot / sleep power log
   TITLES.BIN            filename→title mapping (tab-separated text)
@@ -345,11 +345,15 @@ The kernel ships a built-in `FONT_9X18` mono font (embedded-graphics) for the bo
 
 ### Per-book cache, and clearing it
 
-A book's derived bytes are the bundle (`_PLUMP/BOOKS/<H8>.BIN`) and its image directory (`_PLUMP/_HHHHHHH/`, one dithered figure per file), both keyed by the case-sensitive `fnv1a` of the filename. Its irreplaceable bytes are the bookmark slot, `_PLUMP/STATS/<filename>` and the RECENT record, keyed by the filename itself. Settings > Book Cache is where that splits into two actions: **Rebuild cache** drops the derived bytes on one press, **Forget book** adds the rest behind a second. Sizes come from `SdStorage::measure_plump_subdir`; clearing is `purge_plump_subdir` in `PURGE_BATCH`-sized passes then `remove_plump_subdir`, which closes the cached `sub_handles` entry first because FAT will not unlink an open directory. Design: mockups/xteink_x4_settings_book_cache.html.
+A book's derived bytes are the bundle (`_PLUMP/BOOKS/<H8>.BIN`) and its image directory (`_PLUMP/_HHHHHHH/`, one dithered figure per file), both keyed by the case-sensitive `fnv1a` of the filename. Its irreplaceable bytes are `_PLUMP/STATS/<filename>` (position and stats, the book record), its BKMK.BIN slot and the RECENT record, keyed by the filename itself. Settings > Book Cache is where that splits into two actions: **Rebuild cache** drops the derived bytes on one press, **Forget book** adds the rest behind a second. Sizes come from `SdStorage::measure_plump_subdir`; clearing is `purge_plump_subdir` in `PURGE_BATCH`-sized passes then `remove_plump_subdir`, which closes the cached `sub_handles` entry first because FAT will not unlink an open directory. Design: mockups/xteink_x4_settings_book_cache.html.
 
-### Bookmark system
+### Reading position
 
-16-slot LRU in RAM, binary format on SD. Flushed every 30s if dirty, plus on sleep. Lookup by FNV-1a hash of the filename + case-insensitive name comparison. Each slot stores: filename, byte offset, chapter number, generation counter.
+One record per book, `_PLUMP/STATS/<filename>` (`apps::book_record`), holds the position and the reading stats: key=value text closed by an `fnv1a` checksum line, so a torn write drops the position rather than inventing one. The reader is its only writer, from `flush_deferred_persistence` (page turns mark it dirty; flushed on transition, sleep and the 30 s debounce). The position carries the spine index and byte offset with the content format they were counted in, a format-independent anchor (paragraph and word ordinal, `smol_epub::markup::anchor_at` / `offset_of`) so a rebuilt or re-stripped bundle lands on the same sentence, a page hint valid only under the layout key it was counted under, and the display numbers (chapter number and count in TOC units, progress percent) so Home, the recent rows, the library, the quick menu and the sleep card all read the same figures without opening the bundle. The record is keyed by filename: Rebuild cache keeps it, Forget book deletes it, a changed archive size starts the book over.
+
+Restore: `record_load` at NeedBookmark, `apply_pending_position` once the spine is known, `resolve_restore` at NeedPage (anchor to offset when the bundle's content format differs, hint dropped when the layout differs). A book without a record imports the old bundle-header bookmark or BKMK.BIN slot once. The RTC / SD session names the open book only; its place comes from the record the pre-sleep flush wrote.
+
+BKMK.BIN (16-slot LRU, `kernel/bookmarks.rs`) now only orders the recently-read list on Home; its position fields are legacy.
 
 ### EPUB reader pipeline
 

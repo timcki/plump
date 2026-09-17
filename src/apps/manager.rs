@@ -498,12 +498,11 @@ impl AppManager {
         // restore reader state if active or in stack
         if self.launcher.active() == AppId::Reader || self.launcher.contains(AppId::Reader) {
             let filename = &session.reader_filename[..session.reader_filename_len as usize];
+            // the place itself comes from the book record, flushed
+            // before sleep; the session only says which book was open
             self.reader.restore_state(
                 filename,
                 session.reader_is_epub != 0,
-                session.reader_chapter,
-                session.reader_page as usize,
-                session.reader_byte_offset,
                 session.reader_font_size,
             );
 

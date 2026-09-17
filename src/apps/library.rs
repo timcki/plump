@@ -167,7 +167,10 @@ impl LibraryApp {
         );
         self.pages[slot] = book.total_pages.unwrap_or(0);
         self.authors[slot] = FixedStr::from_bytes(book.author.as_bytes());
-        self.positions[slot] = book.position();
+        self.positions[slot] = crate::apps::book_record::BookRecord::load(k, entry.name.as_str())
+            .and_then(|r| r.pos)
+            .filter(|p| p.chapter_count > 0)
+            .map(|p| (p.chapter_no as u32, p.chapter_count as u32));
         self.covers[slot] = book.cover;
         self.entries[slot] = Some(entry);
         true

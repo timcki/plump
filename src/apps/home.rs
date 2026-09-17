@@ -140,8 +140,7 @@ struct RecentRow {
     title: FixedStr<64>,
     author: FixedStr<40>,
     progress_pct: u8,
-    /// (done, total) in pages when the book has been indexed, in
-    /// chapters when it has not
+    /// (chapter number, chapter count) from the book record
     position: Option<(u32, u32)>,
     valid: bool,
 }
@@ -180,7 +179,7 @@ pub struct HomeApp {
     recent_author: FixedStr<64>,
     recent_progress: u8,
     recent_stats_time: u32,
-    /// bookmark chapter (1-based for display) and the book's count,
+    /// chapter number as the device names it (1-based) and the count,
     /// from the bundle header the cover read already opens
     recent_chapter: u16,
     recent_chapter_count: u16,
@@ -308,13 +307,19 @@ impl HomeApp {
         }
 
         if !self.recent_book.is_empty() {
-            if let Some(s) = crate::apps::stats::ReadingStats::load(k, self.recent_book.as_str()) {
-                self.recent_stats_time = s.time_secs;
-            } else {
-                self.recent_stats_time = 0;
+            // the book record says where the reader is, in the same
+            // numbers the reader's own screens use
+            let rec = crate::apps::book_record::BookRecord::load(k, self.recent_book.as_str())
+                .unwrap_or(crate::apps::book_record::BookRecord::EMPTY);
+            self.recent_stats_time = rec.stats.time_secs;
+            self.recent_chapter = rec.pos.map(|p| p.chapter_no).unwrap_or(0);
+            self.recent_chapter_count = rec.pos.map(|p| p.chapter_count).unwrap_or(0);
+            // RECENT's own percentage is written by the reader on every
+            // turn, so it beats the record's; fall back to the record
+            // for a book whose RECENT predates it
+            if self.recent_progress == 0 {
+                self.recent_progress = rec.pos.map(|p| p.progress_pct).unwrap_or(0);
             }
-            // one session: the cover, and the position the card's meta
-            // line reads from the same header
             let entry = crate::apps::cover_cache::load_book_entry(
                 k,
                 plump_kernel::util::hash::fnv1a(self.recent_book.as_bytes()),
@@ -325,14 +330,6 @@ impl HomeApp {
             // size on next open. without this guard the old image would
             // overflow the card by ~88 px vertical.
             const CARD_INNER_H: u16 = CARD_H - 2 * CARD_PAD;
-            self.recent_chapter = entry.chapter;
-            self.recent_chapter_count = entry.chapter_count;
-            // RECENT's own percentage is written by the reader on every
-            // turn, so it beats the header's page hint; fall back to
-            // the header for a book whose record predates it
-            if self.recent_progress == 0 {
-                self.recent_progress = entry.progress_pct().unwrap_or(0);
-            }
             self.recent_cover = entry.cover.filter(|img| img.height <= CARD_INNER_H);
         } else {
             self.recent_stats_time = 0;
@@ -379,15 +376,20 @@ impl HomeApp {
             if let Some(title) = k.dir_cache_mut().find_title(entry.filename.as_bytes()) {
                 row.title.set(title);
             }
-            // one bundle session per row: cover, author and position
+            // one bundle session per row for the cover and author; the
+            // position is the book record's
             let book = crate::apps::cover_cache::load_book_entry(
                 k,
                 plump_kernel::util::hash::fnv1a(entry.filename.as_bytes()),
                 plump_kernel::kernel::bundle::CoverKind::Card,
             );
             row.author = book.author;
-            row.progress_pct = book.progress_pct().unwrap_or(0);
-            row.position = book.position();
+            let pos = crate::apps::book_record::BookRecord::load(k, entry.filename.as_str())
+                .and_then(|r| r.pos);
+            row.progress_pct = pos.map(|p| p.progress_pct).unwrap_or(0);
+            row.position = pos
+                .filter(|p| p.chapter_count > 0)
+                .map(|p| (p.chapter_no as u32, p.chapter_count as u32));
             row.valid = true;
             self.recent_rows[out] = row;
             self.recent_row_covers[out] = book.cover;
@@ -467,6 +469,9 @@ impl HomeApp {
             self.recent_book.as_bytes(),
         );
         card.set_progress(self.recent_progress);
+        if self.recent_chapter_count > 0 && self.recent_chapter > 0 {
+            card.set_chapter_number(self.recent_chapter, self.recent_chapter_count);
+        }
         true
     }
 
@@ -765,7 +770,7 @@ impl App<AppId> for HomeApp {
                 let _ = write!(
                     left,
                     "chapter {} of {}",
-                    self.recent_chapter.saturating_add(1),
+                    self.recent_chapter,
                     self.recent_chapter_count
                 );
                 if self.recent_progress > 0 {

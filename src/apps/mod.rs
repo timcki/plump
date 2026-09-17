@@ -12,6 +12,7 @@ pub mod manager;
 pub mod reader;
 pub mod recent;
 pub mod stats;
+pub mod book_record;
 pub mod tab;
 pub mod widgets;
 

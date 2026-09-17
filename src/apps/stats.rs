@@ -1,6 +1,7 @@
 // per-book reading statistics screen
 //
-// stats are stored as individual key=value files in _PLUMP/STATS/<filename>
+// stats live in the per-book record, key=value files in
+// _PLUMP/STATS/<filename> (see apps::book_record); only the reader writes them
 // the screen shows global totals and a scrollable per-book list
 
 use core::fmt::Write as _;
@@ -32,7 +33,7 @@ pub const STATS_DIR: &str = "STATS";
 /// Per-book reading statistics (pages turned, time spent, sessions).
 ///
 /// Stored as key=value text files in `_PLUMP/STATS/<filename>`.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ReadingStats {
     pub pages: u32,
     pub time_secs: u32,
@@ -61,27 +62,6 @@ impl ReadingStats {
             return None;
         }
         Some(stats)
-    }
-
-    /// Save stats for a book to SD.
-    pub fn save(
-        &self,
-        k: &mut KernelHandle<'_>,
-        filename: &str,
-    ) -> crate::error::Result<()> {
-        let mut buf = [0u8; 64];
-        let mut fmt = StackFmt::<64>::new();
-        let _ = write!(
-            fmt,
-            "pages={}\ntime={}\nsessions={}\n",
-            self.pages, self.time_secs, self.sessions
-        );
-        let s = fmt.as_str().as_bytes();
-        let len = s.len().min(buf.len());
-        buf[..len].copy_from_slice(&s[..len]);
-        k.sd().ensure_plump_subdir(STATS_DIR)?;
-        k.sd()
-            .write_in_plump_subdir(STATS_DIR, filename, &buf[..len])
     }
 
     /// Returns true if all fields are zero.

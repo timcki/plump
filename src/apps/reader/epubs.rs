@@ -107,6 +107,10 @@ impl EpubState {
         scratch: &mut [u8],
     ) -> crate::error::Result<bool> {
         let spine_len = self.spine.len();
+        // whatever is rebuilt below is written at the current format;
+        // only a bundle adopted as-is could differ, and that case now
+        // rebuilds too, so this is the stream format either way
+        self.bundle_content_fmt = bundle::CONTENT_FMT_LATEST;
 
         // happy-path validation: header must exist, magic/version must match,
         // source_size + name_hash + spine_count must all match the open file,
@@ -129,11 +133,11 @@ impl EpubState {
             return Ok(false);
         };
 
-        // unknown content stream format -> a future plump wrote this bundle;
-        // we don't understand the markers, rebuild from source.
-        if hdr.content_fmt > bundle::CONTENT_FMT_LATEST {
+        // another content stream format, older or newer: the markers
+        // are not the ones this firmware strips and reads, rebuild
+        if hdr.content_fmt != bundle::CONTENT_FMT_LATEST {
             log::info!(
-                "epub: bundle content_fmt {} unknown (we support {}), rebuilding",
+                "epub: bundle content_fmt {} (we write {}), rebuilding",
                 hdr.content_fmt,
                 bundle::CONTENT_FMT_LATEST,
             );

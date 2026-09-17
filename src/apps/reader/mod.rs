@@ -559,6 +559,8 @@ pub(super) struct EpubState {
     pub(super) name_hash: u32,
     // source file size; header mismatch triggers bundle rebuild
     pub(super) archive_size: u32,
+    // content format of the bundle's chapter streams, set by check_cache
+    pub(super) bundle_content_fmt: u8,
 }
 
 impl EpubState {
@@ -571,6 +573,7 @@ impl EpubState {
             cache_dir: [0u8; 8],
             name_hash: 0,
             archive_size: 0,
+            bundle_content_fmt: plump_kernel::kernel::bundle::CONTENT_FMT_LATEST,
             chapter_table: [(0u32, 0u32); cache::MAX_CACHE_CHAPTERS],
             chapters_cached: false,
             cache_chapter: 0,
@@ -764,6 +767,19 @@ pub struct ReaderApp {
     typeset_retry_ch: u16,
     pub(super) restore_offset: Option<u32>,
     pub(super) restore_page_hint: Option<usize>,
+    // the book record's position, held from NeedBookmark until the
+    // spine is known and it can be checked against the file
+    pending_position: Option<crate::apps::book_record::Position>,
+    // format-independent locator, resolved to a byte offset at NeedPage
+    // when the bundle's content format is not the one `restore_offset`
+    // was counted in
+    restore_anchor: Option<smol_epub::markup::Anchor>,
+    restore_fmt: u8,
+    restore_layout_key: u32,
+    // the position last written to the record, kept so a stats-only
+    // flush outside Ready never erases the place
+    last_saved_pos: Option<crate::apps::book_record::Position>,
+    record_seq: u32,
     pub(super) recent_dirty: bool,
     pending_position_change: Option<PendingPositionChange>,
     pub(super) defer_open_work_once: bool,
@@ -870,6 +886,12 @@ impl ReaderApp {
             typeset_retry_ch: 0,
             restore_offset: None,
             restore_page_hint: None,
+            pending_position: None,
+            restore_anchor: None,
+            restore_fmt: 0,
+            restore_layout_key: 0,
+            last_saved_pos: None,
+            record_seq: 0,
             recent_dirty: false,
             pending_position_change: None,
             defer_open_work_once: false,
@@ -1598,6 +1620,7 @@ impl ReaderApp {
     /// Commit a visible position change and schedule deferred persistence.
     fn commit_position_change(&mut self, change: PendingPositionChange) {
         self.recent_dirty = true;
+        self.stats_dirty = true;
         match change {
             PendingPositionChange::PageTurn => self.stats_record_page_turn(),
             PendingPositionChange::OpenReady | PendingPositionChange::RestoreReady => {
@@ -1672,17 +1695,157 @@ impl ReaderApp {
         self.stats_dirty = true;
     }
 
-    // load stats from SD for the current book
-    fn stats_load(&mut self, k: &mut KernelHandle<'_>) {
-        self.stats = crate::apps::stats::ReadingStats::load(k, self.name())
-            .unwrap_or(crate::apps::stats::ReadingStats::EMPTY);
+    // load the book record: stats, and the position to restore
+    fn record_load(&mut self, k: &mut KernelHandle<'_>) {
+        let rec = crate::apps::book_record::BookRecord::load(k, self.name())
+            .unwrap_or(crate::apps::book_record::BookRecord::EMPTY);
+        self.stats = rec.stats;
+        self.record_seq = rec.seq;
+        self.last_saved_pos = rec.pos;
+        self.pending_position = rec.pos;
+        match rec.pos {
+            Some(p) => log::info!(
+                "record: {} ch{} off={} anchor={}/{} page={} seq={}",
+                self.name(),
+                p.chapter,
+                p.byte_offset,
+                p.para,
+                p.word,
+                p.page,
+                rec.seq
+            ),
+            None => log::info!("record: {} has no position (seq={})", self.name(), rec.seq),
+        }
         // new session
         self.stats.sessions = self.stats.sessions.saturating_add(1);
         self.stats_dirty = true;
     }
 
-    // flush stats to SD; returns Err on write failure (dirty state kept)
-    fn stats_flush(&mut self, k: &mut KernelHandle<'_>) -> crate::error::Result<()> {
+    /// The reader's place in every unit the record stores; None until
+    /// a page is on screen. The anchor is counted from the chapter's
+    /// start, from RAM when the chapter is cached there and from the
+    /// bundle otherwise.
+    fn current_position(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+    ) -> Option<crate::apps::book_record::Position> {
+        use crate::apps::book_record::{NO_ANCHOR, Position};
+        if !matches!(self.state, State::Ready | State::ShowToc)
+            || self.pg.total_pages == 0
+            || self.pg.page >= self.pg.total_pages
+        {
+            return None;
+        }
+        let byte_offset = self.pg.offsets[self.pg.page];
+        let mut p = Position {
+            archive_size: if self.is_epub {
+                self.epub.archive_size
+            } else {
+                self.file_size
+            },
+            chapter: if self.is_epub { self.epub.chapter } else { 0 },
+            byte_offset,
+            content_fmt: if self.is_epub {
+                self.epub.bundle_content_fmt
+            } else {
+                0
+            },
+            para: NO_ANCHOR,
+            word: NO_ANCHOR,
+            layout_key: self.current_layout_key().hash(),
+            page: self.pg.page.min(u16::MAX as usize) as u16,
+            chapter_no: 0,
+            chapter_count: 0,
+            progress_pct: self.progress_pct(),
+            font_idx: self.book_font_size_idx,
+        };
+        if self.is_epub {
+            let (no, count) = self.chapter_numbering();
+            p.chapter_no = no;
+            p.chapter_count = count;
+            if let Some(a) = self.chapter_anchor_at(k, byte_offset as usize) {
+                p.para = a.para;
+                p.word = a.word;
+            }
+        }
+        Some(p)
+    }
+
+    // the anchor of `offset` in the current chapter's stream
+    fn chapter_anchor_at(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+        offset: usize,
+    ) -> Option<smol_epub::markup::Anchor> {
+        use smol_epub::markup::{SliceSource, anchor_at};
+        if !self.epub.ch_cache.is_empty() {
+            return Some(anchor_at(&mut SliceSource(&self.epub.ch_cache), offset));
+        }
+        let ch = self.epub.chapter as usize;
+        if !self.epub.chapters_cached || ch >= smol_epub::cache::MAX_CACHE_CHAPTERS {
+            return None;
+        }
+        let (base, size) = self.epub.chapter_table[ch];
+        if size == 0 {
+            return None;
+        }
+        let mut src = paging::BundleByteSource::new(k.sd(), self.epub.name_hash, base, size);
+        Some(anchor_at(&mut src, offset))
+    }
+
+    // the byte offset of `anchor` in the current chapter's stream
+    fn chapter_offset_of(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+        anchor: smol_epub::markup::Anchor,
+    ) -> Option<u32> {
+        use smol_epub::markup::{SliceSource, offset_of};
+        if !self.epub.ch_cache.is_empty() {
+            return Some(offset_of(&mut SliceSource(&self.epub.ch_cache), anchor));
+        }
+        let ch = self.epub.chapter as usize;
+        if !self.epub.chapters_cached || ch >= smol_epub::cache::MAX_CACHE_CHAPTERS {
+            return None;
+        }
+        let (base, size) = self.epub.chapter_table[ch];
+        if size == 0 {
+            return None;
+        }
+        let mut src = paging::BundleByteSource::new(k.sd(), self.epub.name_hash, base, size);
+        Some(offset_of(&mut src, anchor))
+    }
+
+    fn current_layout_key(&self) -> layout::LayoutKey {
+        layout::LayoutKey::current(
+            self.book_font_size_idx,
+            self.reader_font.to_idx(),
+            plump_kernel::kernel::bundle::CONTENT_FMT_LATEST,
+            self.text_w as u16,
+            self.font_line_h,
+            self.max_lines,
+        )
+    }
+
+    /// (number, count) of the current chapter as the device names it:
+    /// TOC entries when there is a TOC, spine items otherwise. the
+    /// contents sheet, the sleep card and the home card all say this
+    fn chapter_numbering(&self) -> (u16, u16) {
+        let ch = self.epub.chapter;
+        match self.epub.toc.as_ref().filter(|t| !t.is_empty()) {
+            Some(toc) => {
+                let entries = &toc.entries[..toc.len()];
+                match entries.iter().position(|e| e.spine_idx == ch) {
+                    Some(i) => (i as u16 + 1, toc.len() as u16),
+                    None => (0, toc.len() as u16),
+                }
+            }
+            None => (ch + 1, self.epub.spine.len() as u16),
+        }
+    }
+
+    // flush the book record (stats and position) to SD; returns Err on
+    // write failure with the dirty state kept for a retry
+    fn record_flush(&mut self, k: &mut KernelHandle<'_>) -> crate::error::Result<()> {
         if !self.stats_dirty || self.filename.is_empty() {
             return Ok(());
         }
@@ -1697,11 +1860,33 @@ impl ReaderApp {
             self.stats_last_uptime = now;
         }
 
-        self.stats.save(k, self.name())?;
+        let pos = self.current_position(k).or(self.last_saved_pos);
+        let rec = crate::apps::book_record::BookRecord {
+            stats: self.stats,
+            pos,
+            seq: self.record_seq.wrapping_add(1),
+        };
+        rec.save(k, self.name())?;
+        self.record_seq = rec.seq;
+        self.last_saved_pos = pos;
         self.stats_dirty = false;
+        if let Some(p) = pos {
+            log::info!(
+                "record: saved ch{} off={} anchor={}/{} page={} chapter {}/{} {}% seq={}",
+                p.chapter,
+                p.byte_offset,
+                p.para,
+                p.word,
+                p.page,
+                p.chapter_no,
+                p.chapter_count,
+                p.progress_pct,
+                rec.seq
+            );
+        }
         plump_kernel::perf_event!(
             "reader",
-            "stats_flush pages={} time_s={} elapsed_ms={}",
+            "record_flush pages={} time_s={} elapsed_ms={}",
             self.stats.pages,
             self.stats.time_secs,
             _sf_t0.elapsed().as_millis()
@@ -1745,18 +1930,16 @@ impl ReaderApp {
         if let Some((page, total)) = self.book_position() {
             card.set_book_pages(page, total);
         }
-        // chapter numbering follows the contents sheet: TOC entries
-        // when there is a TOC, spine items otherwise
         let ch = self.epub.chapter;
-        match self.epub.toc.as_ref().filter(|t| !t.is_empty()) {
-            Some(toc) => {
-                let entries = &toc.entries[..toc.len()];
-                if let Some(i) = entries.iter().position(|e| e.spine_idx == ch) {
-                    card.set_chapter_title(entries[i].title_str());
-                    card.set_chapter_number(i as u16 + 1, toc.len() as u16);
-                }
+        if let Some(toc) = self.epub.toc.as_ref().filter(|t| !t.is_empty()) {
+            let entries = &toc.entries[..toc.len()];
+            if let Some(i) = entries.iter().position(|e| e.spine_idx == ch) {
+                card.set_chapter_title(entries[i].title_str());
             }
-            None => card.set_chapter_number(ch + 1, self.epub.spine.len() as u16),
+        }
+        let (no, count) = self.chapter_numbering();
+        if no > 0 {
+            card.set_chapter_number(no, count);
         }
     }
 
@@ -1923,15 +2106,7 @@ impl ReaderApp {
     // instead, we set up the state machine to enter at NeedBookmark
     // with chapter/offset pre-populated, so the reader pipeline will
     // skip the bookmark lookup and go straight to initializing the book.
-    pub fn restore_state(
-        &mut self,
-        filename: &[u8],
-        is_epub: bool,
-        chapter: u16,
-        page: usize,
-        byte_offset: u32,
-        font_size: u8,
-    ) {
+    pub fn restore_state(&mut self, filename: &[u8], is_epub: bool, font_size: u8) {
         self.filename.set(filename);
 
         // set title from filename initially (will be replaced by
@@ -1940,9 +2115,14 @@ impl ReaderApp {
         self.title_is_real = false;
 
         self.is_epub = is_epub;
-        self.epub.chapter = chapter;
-        self.restore_offset = Some(byte_offset);
-        self.restore_page_hint = Some(page);
+        // the place comes from the book record at NeedBookmark, which
+        // the pre-sleep flush wrote after the last page turn
+        self.epub.chapter = 0;
+        self.restore_offset = None;
+        self.restore_page_hint = None;
+        self.pending_position = None;
+        self.restore_anchor = None;
+        self.last_saved_pos = None;
         self.book_font_size_idx = font_size;
 
         // reset work queue for clean start
@@ -1954,9 +2134,7 @@ impl ReaderApp {
         self.epub.large_img_fails = 0;
         self.epub.img_retry = None;
 
-        // set up reader pipeline — enter at NeedBookmark but with
-        // chapter/offset already populated from RTC, so bookmark_load
-        // will find our pre-set values and the pipeline proceeds
+        // set up reader pipeline: enter at NeedBookmark like a fresh open
         self.rebuild_quick_actions();
         self.apply_theme_layout();
         self.reset_paging();
@@ -1985,21 +2163,12 @@ impl ReaderApp {
         self.stats_dirty = false;
         self.stats_clock_running = false;
 
-        // enter state machine — NeedBookmark will check the bookmark
-        // cache, but our chapter/offset from RTC are already set, so
-        // even if bookmark_load overwrites them with slightly different
-        // values, the pipeline proceeds correctly
+        // enter the state machine; NeedBookmark reads the book record
         self.state = State::NeedBookmark;
         self.begin_loading(LoadingReason::Resume);
         self.first_paint_full = true;
 
-        log::debug!(
-            "reader: restore_state file={} ch={} off={} font={}",
-            self.name(),
-            chapter,
-            byte_offset,
-            font_size
-        );
+        log::info!("reader: restore_state file={} font={}", self.name(), font_size);
     }
 
     pub fn save_position(&self, bm: &mut bookmarks::BookmarkCache) {
@@ -2012,57 +2181,30 @@ impl ReaderApp {
         }
     }
 
-    /// Write the current bookmark state into the bundle header. This
-    /// runs in addition to save_position (dual write) until the in-RAM
-    /// BookmarkCache is retired. No-op when the bundle file doesn't
-    /// exist yet (pre-first-chapter-cache).
-    pub(super) fn save_bookmark_to_bundle(&self, k: &mut KernelHandle<'_>) {
-        if self.state != State::Ready || !self.is_epub {
-            return;
-        }
-        let name_hash = self.epub.name_hash;
-        let Some(mut hdr) = plump_kernel::kernel::bundle::read_header(k.sd(), name_hash)
-        else {
-            return;
-        };
-        hdr.bm_chapter = self.epub.chapter;
-        hdr.bm_page_hint = (self.pg.page as u16).min(u16::MAX);
-        hdr.bm_byte_offset = self.pg.offsets[self.pg.page];
-        hdr.bm_font_idx = self.book_font_size_idx;
-        hdr.bm_flags = plump_kernel::kernel::bundle::BM_FLAG_VALID;
-        hdr.set_flag(plump_kernel::kernel::bundle::FLAG_HAS_BOOKMARK, true);
-        if let Err(e) = plump_kernel::kernel::bundle::write_header(k.sd(), name_hash, &hdr) {
-            log::warn!("reader: bundle bookmark write failed: {}", e);
-        }
-    }
-
+    /// Where to open the book. The book record is the source; the
+    /// bundle header's bookmark and the BKMK.BIN slot are read only
+    /// for a book that has no record yet (written by older firmware),
+    /// and the next flush writes the record so they are never read
+    /// again.
     fn bookmark_load(&mut self, k: &mut KernelHandle<'_>) -> bool {
-        // if restore_offset is already set (from RTC/SD session restore),
-        // keep it — the session has the most recent position, while the
-        // bookmark cache may be stale (only flushed periodically or on
-        // navigation, not on every page turn)
-        if self.restore_offset.is_some() {
-            log::debug!(
-                "bookmark: skipping load, session restore_offset={} ch={} for {}",
-                self.restore_offset.unwrap_or(0),
-                self.epub.chapter,
-                self.name(),
-            );
+        if let Some(p) = self.pending_position {
+            if self.is_epub {
+                // checked against the file once the spine is known
+                return true;
+            }
+            self.pending_position = None;
+            self.restore_offset = Some(p.byte_offset);
+            self.restore_page_hint = None;
             return true;
         }
 
-        // prefer the bundle header if it has a valid bookmark: written
-        // on every save_position, it's at least as current as BKMK.BIN
-        // (which is flushed periodically). falls back to the RAM cache
-        // when the bundle doesn't yet exist (first-ever open) or has
-        // no bookmark recorded.
         if self.is_epub {
             if let Some(hdr) =
                 plump_kernel::kernel::bundle::read_header(k.sd(), self.epub.name_hash)
             {
-                if hdr.has_valid_bookmark() && hdr.source_size == self.epub.archive_size {
-                    log::debug!(
-                        "bookmark: restoring from bundle off={} ch={} for {}",
+                if hdr.has_valid_bookmark() {
+                    log::info!(
+                        "bookmark: importing bundle bookmark off={} ch={} for {}",
                         hdr.bm_byte_offset,
                         hdr.bm_chapter,
                         self.name(),
@@ -2080,8 +2222,8 @@ impl ReaderApp {
         }
 
         if let Some(slot) = k.bookmarks().find(self.filename.as_bytes()) {
-            log::debug!(
-                "bookmark: restoring from BKMK.BIN off={} ch={} for {}",
+            log::info!(
+                "bookmark: importing BKMK.BIN slot off={} ch={} for {}",
                 slot.byte_offset,
                 slot.chapter,
                 slot.filename_str(),
@@ -2093,6 +2235,66 @@ impl ReaderApp {
         } else {
             false
         }
+    }
+
+    /// Take the record's position once the spine and the file size
+    /// are known: a replaced file starts over, everything else restores
+    /// by byte offset, with the anchor resolved at NeedPage should the
+    /// bundle's content format differ from the one the offset was
+    /// counted in.
+    fn apply_pending_position(&mut self, spine_len: usize) {
+        let Some(p) = self.pending_position.take() else {
+            return;
+        };
+        if p.archive_size != self.epub.archive_size {
+            log::info!(
+                "record: file size {} != recorded {}, starting over",
+                self.epub.archive_size,
+                p.archive_size
+            );
+            return;
+        }
+        if spine_len > 0 && p.chapter as usize >= spine_len {
+            log::info!("record: chapter {} beyond spine {}, starting over", p.chapter, spine_len);
+            return;
+        }
+        self.epub.chapter = p.chapter;
+        self.restore_offset = Some(p.byte_offset);
+        self.restore_anchor = p.anchor();
+        self.restore_fmt = p.content_fmt;
+        self.restore_layout_key = p.layout_key;
+        self.restore_page_hint = Some(p.page as usize);
+    }
+
+    /// At NeedPage: the byte offset to seek, re-derived from the anchor
+    /// when the chapter stream is not the one it was counted in, and
+    /// the page hint only under the layout it was counted under.
+    fn resolve_restore(&mut self, k: &mut KernelHandle<'_>) {
+        if self.is_epub && self.epub.bundle_content_fmt != self.restore_fmt {
+            if let Some(anchor) = self.restore_anchor.take() {
+                match self.chapter_offset_of(k, anchor) {
+                    Some(off) => {
+                        log::info!(
+                            "record: content fmt {} -> {}, anchor {}/{} resolves to off={}",
+                            self.restore_fmt,
+                            self.epub.bundle_content_fmt,
+                            anchor.para,
+                            anchor.word,
+                            off
+                        );
+                        self.restore_offset = Some(off);
+                    }
+                    None => log::info!("record: anchor unresolvable, keeping byte offset"),
+                }
+            }
+            self.restore_page_hint = None;
+        }
+        if self.restore_page_hint.is_some()
+            && self.restore_layout_key != self.current_layout_key().hash()
+        {
+            self.restore_page_hint = None;
+        }
+        self.restore_anchor = None;
     }
 
     fn display_name(&self) -> &str {
@@ -3036,6 +3238,12 @@ impl App<AppId> for ReaderApp {
         self.goto_last_page = false;
         self.restore_offset = None;
         self.restore_page_hint = None;
+        self.pending_position = None;
+        self.restore_anchor = None;
+        self.restore_fmt = 0;
+        self.restore_layout_key = 0;
+        self.last_saved_pos = None;
+        self.record_seq = 0;
         self.recent_dirty = false;
         self.pending_position_change = Some(PendingPositionChange::OpenReady);
         self.defer_open_work_once = false;
@@ -3258,8 +3466,8 @@ impl App<AppId> for ReaderApp {
         match self.state {
             State::NeedBookmark => {
                 plump_kernel::perf_begin!(_t0);
+                self.record_load(k);
                 self.bookmark_load(k);
-                self.stats_load(k);
                 if self.try_load_cached_cover_thumb(k) {
                     ctx.mark_dirty(self.loading_visual_region());
                 }
@@ -3321,6 +3529,7 @@ impl App<AppId> for ReaderApp {
                 match self.epub_init_opf(k) {
                     Ok(()) => {
                         let spine_len = self.epub.spine.len();
+                        self.apply_pending_position(spine_len);
                         if spine_len > 0 && self.epub.chapter as usize >= spine_len {
                             self.epub.chapter = (spine_len - 1) as u16;
                         }
@@ -3623,6 +3832,7 @@ impl App<AppId> for ReaderApp {
 
             State::NeedPage => {
                 plump_kernel::perf_begin!(_t0);
+                self.resolve_restore(k);
                 let page_hint = self.restore_page_hint.take();
                 if let Some(target_off) = self.restore_offset.take() {
                     if self.pg.fully_indexed && self.pg.total_pages > 0 {
@@ -4088,15 +4298,11 @@ impl App<AppId> for ReaderApp {
                 log::warn!("reader: deferred write_recent failed: {}", e);
                 first_error.get_or_insert(e);
             }
-            // dual-write the bookmark into the bundle header so bundle
-            // data stays current; the BookmarkCache still flushes on
-            // its own cadence via kernel housekeeping
-            self.save_bookmark_to_bundle(k);
         }
 
         if self.stats_dirty {
-            if let Err(e) = self.stats_flush(k) {
-                log::warn!("reader: deferred stats_flush failed: {}", e);
+            if let Err(e) = self.record_flush(k) {
+                log::warn!("reader: deferred record_flush failed: {}", e);
                 first_error.get_or_insert(e);
             }
         }

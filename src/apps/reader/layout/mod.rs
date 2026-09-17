@@ -109,6 +109,23 @@ impl LayoutKey {
         }
     }
 
+    /// one number for the whole key, stored with a page hint so the
+    /// hint is trusted only under the layout it was counted under
+    pub fn hash(&self) -> u32 {
+        plump_kernel::util::hash::fnv1a(&[
+            self.format_version,
+            self.algo_version,
+            self.font_idx,
+            self.font_family,
+            self.content_fmt,
+            (self.text_w & 0xff) as u8,
+            (self.text_w >> 8) as u8,
+            (self.line_h & 0xff) as u8,
+            (self.line_h >> 8) as u8,
+            self.max_lines,
+        ])
+    }
+
     /// true when the on-disk LINE table is reusable: every typeset
     /// input matches. spacing fields are deliberately excluded.
     pub fn lines_match(&self, h: &bundle::LayoutIdxHeader) -> bool {
