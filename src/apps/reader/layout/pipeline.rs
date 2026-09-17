@@ -375,6 +375,13 @@ fn check_cap(out_lines: &Vec<LineLayout>) -> Result<(), TypesetError> {
     }
 }
 
+// lines the output tables grow by at a time. Vec's doubling rule made
+// the step past 2048 lines hold a 24 KB table and its 48 KB successor
+// at once, which is what sank Exhalation's 120 KB novella when the
+// reader already held 38 KB; a fixed exact chunk keeps the transient
+// at one chunk, and TLSF extends the topmost block in place anyway
+const OUT_GROW_LINES: usize = 512;
+
 // reserve room for one paragraph's worth of output in both parallel
 // vectors before appending, so the append loops never take Vec's
 // infallible growth path
@@ -383,9 +390,27 @@ fn try_reserve_out(
     out_image_blocks: &mut Vec<u8>,
     additional: usize,
 ) -> Result<(), TypesetError> {
-    if out_lines.try_reserve(additional).is_err()
-        || out_image_blocks.try_reserve(additional).is_err()
+    let need = |len: usize, cap: usize| -> usize {
+        if cap - len >= additional {
+            0
+        } else {
+            additional.max(OUT_GROW_LINES)
+        }
+    };
+    let grow_lines = need(out_lines.len(), out_lines.capacity());
+    let grow_blocks = need(out_image_blocks.len(), out_image_blocks.capacity());
+    if out_lines.try_reserve_exact(grow_lines).is_err()
+        || out_image_blocks.try_reserve_exact(grow_blocks).is_err()
     {
+        let heap = esp_alloc::HEAP.stats();
+        log::warn!(
+            "typeset: no room for {} more lines at {} (heap {}/{}K peak {}K)",
+            grow_lines,
+            out_lines.len(),
+            heap.current_usage / 1024,
+            heap.size / 1024,
+            heap.max_usage / 1024,
+        );
         return Err(TypesetError::OutOfMemory);
     }
     Ok(())
