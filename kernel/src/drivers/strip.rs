@@ -133,12 +133,14 @@ impl StripBuffer {
         self.win = Region::new(x, y, w, h);
         self.row_bytes = rb as u16;
 
-        // white content in every plane in use. GrayDual keeps both
-        // planes equal to the content except at AA edge pixels, where
-        // `buf` (BW RAM) is cleared to mark the edge; see blit_2bpp
-        self.buf[..total].fill(0xFF);
+        let fill = if self.gray_mode == GrayMode::Bw {
+            0xFF
+        } else {
+            0x00
+        };
+        self.buf[..total].fill(fill);
         if self.gray_mode == GrayMode::GrayDual {
-            self.gray_buf[..total].fill(0xFF);
+            self.gray_buf[..total].fill(0x00);
         }
     }
 
@@ -152,7 +154,7 @@ impl StripBuffer {
         &mut self.buf[..total]
     }
 
-    /// The content plane in GrayDual mode (goes to RED RAM).
+    /// Secondary buffer data (MSB plane) for GrayDual mode.
     pub fn gray_data(&self) -> &[u8] {
         let total = self.row_bytes as usize * self.win.h as usize;
         &self.gray_buf[..total]
@@ -193,16 +195,6 @@ impl StripBuffer {
         } else {
             self.buf[idx] |= 1 << bit;
         }
-        // a gray pass keeps the content in both planes: every 1-bit
-        // primitive writes RED too, so after the revert RED holds
-        // exactly what the panel shows and the next refresh is a delta
-        if self.gray_mode == GrayMode::GrayDual {
-            if black {
-                self.gray_buf[idx] &= !(1 << bit);
-            } else {
-                self.gray_buf[idx] |= 1 << bit;
-            }
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -218,6 +210,13 @@ impl StripBuffer {
         black: bool,
     ) {
         if w == 0 || h == 0 || offset + stride * h > bitmaps.len() {
+            return;
+        }
+        // gray passes refresh only AA glyph pixels (blit_2bpp). 1bpp
+        // content writes BW polarity, which the gray LUT would read as
+        // a drive-gray state; skipping leaves both planes at {0,0} =
+        // no change, so the panel keeps the BW-refresh image.
+        if self.gray_mode != GrayMode::Bw {
             return;
         }
         self.blit_1bpp_270(bitmaps, offset, w, h, stride, gx, gy, black)
@@ -240,7 +239,6 @@ impl StripBuffer {
             Some(c) => c,
             None => return,
         };
-        let dual = self.gray_mode == GrayMode::GrayDual;
 
         // hottest loop in the firmware. per destination byte we
         // accumulate up to 8 source pixels into one mask and apply it
@@ -253,7 +251,6 @@ impl StripBuffer {
             let mut src_idx = offset + c.y0 * stride + x / 8;
             let dst_row_base = (c.base_buf_y - x) * c.rb;
             let row = &mut self.buf[dst_row_base..dst_row_base + c.rb];
-            let gray_row = &mut self.gray_buf[dst_row_base..dst_row_base + c.rb];
 
             let mut buf_x = (gy + c.y0 as i32 - c.wx) as usize;
             let mut y = c.y0;
@@ -273,14 +270,8 @@ impl StripBuffer {
                 if acc != 0 {
                     if black {
                         row[byte_col] &= !acc;
-                        if dual {
-                            gray_row[byte_col] &= !acc;
-                        }
                     } else {
                         row[byte_col] |= acc;
-                        if dual {
-                            gray_row[byte_col] |= acc;
-                        }
                     }
                 }
                 buf_x += group;
@@ -292,16 +283,20 @@ impl StripBuffer {
     /// Blit a 2bpp glyph bitmap to the strip buffer.
     ///
     /// Pixel values: 0=white, 1=light gray, 2=dark gray, 3=black.
-    /// `black` controls polarity (true=black text, false=white text).
+    /// `black` controls polarity in Bw mode (true=black text, false=white text).
+    /// In gray modes, white text (`black == false`) is skipped entirely:
+    /// the gray LUT states drive pixels darkward, which would erase
+    /// white-on-dark glyphs. Skipping leaves them at {0,0} = no change.
     ///
-    /// Bw: any non-zero value is ink, set/cleared per `black`.
+    /// Behaviour depends on `self.gray_mode`:
+    ///   Bw:       any non-zero → set/clear bit per `black` (buffer starts 0xFF)
+    ///   GrayDual: val == 2     → set bit in buf (LSB plane)
+    ///             val 1 or 2   → set bit in gray_buf (MSB plane)
     ///
-    /// GrayDual: RED takes the pixel as the panel will hold it after
-    /// the revert and BW the same bit, except at the one AA state (see
-    /// the driver's `LUT_GRAYSCALE`): val 1 is the lifted edge, white
-    /// in RED and 0 in BW; val 2 and 3 are black in both. White-on-
-    /// dark text gets no gray waveform (the gray state only lifts from
-    /// black) and is written as white in both.
+    /// Only partial coverage takes a plane bit. val 3 (solid) and val 0
+    /// (empty) both land on {0,0}, the LUT's no-change state, so the
+    /// pass lightens glyph edges and leaves the body and the page at
+    /// whatever the BW frame drove them to.
     #[allow(clippy::too_many_arguments)]
     pub fn blit_2bpp(
         &mut self,
@@ -315,6 +310,9 @@ impl StripBuffer {
         black: bool,
     ) {
         if w == 0 || h == 0 || offset + stride * h > bitmaps.len() {
+            return;
+        }
+        if self.gray_mode != GrayMode::Bw && !black {
             return;
         }
         self.blit_2bpp_270(bitmaps, offset, w, h, stride, gx, gy, black)
@@ -380,35 +378,27 @@ impl StripBuffer {
                 }
             }
             GrayMode::GrayDual => {
-                if black {
-                    walk!(|val, idx, mask| {
-                        // val 1 is the lifted edge: white in RED, 0 in
-                        // BW. val 2 and 3 are ink in both planes and
-                        // take no waveform (one would lighten the body
-                        // of the glyph on every pass)
-                        if val == 1 {
-                            self.gray_buf[idx] |= mask;
-                            self.buf[idx] &= !mask;
-                        } else {
-                            self.gray_buf[idx] &= !mask;
-                            self.buf[idx] &= !mask;
-                        }
-                    });
-                } else {
-                    walk!(|_val, idx, mask| {
-                        self.gray_buf[idx] |= mask;
+                walk!(|val, idx, mask| {
+                    // val 3 is solid ink: the BW frame already drove it
+                    // black, so it must land on {0,0} = no change. giving
+                    // it a plane bit hands it a gray waveform and every
+                    // pass lightens the body of the glyph
+                    if val == 2 {
                         self.buf[idx] |= mask;
-                    });
-                }
+                    }
+                    if val <= 2 {
+                        self.gray_buf[idx] |= mask;
+                    }
+                });
             }
         }
     }
 
     /// Flatten a logical region in whatever mode the strip is in: a
-    /// plain fill, written to both planes in GrayDual, so nothing
-    /// blitted underneath earlier in the same pass keeps a gray
-    /// waveform. overlays painted over gray content (the sleep card
-    /// over the wallpaper) call this before drawing.
+    /// plain fill in Bw, both planes cleared to {0,0} (no change) in
+    /// GrayDual, so nothing blitted underneath earlier in the same
+    /// pass keeps a gray waveform. overlays painted over gray content
+    /// (the sleep card over the wallpaper) call this before drawing.
     pub fn fill_flat(&mut self, r: Region, black: bool) {
         let size = self.size();
         let sw = size.width as u16;
@@ -421,7 +411,10 @@ impl StripBuffer {
             return;
         }
         let (px0, py0, px1, py1) = (ly0, HEIGHT - lx1, ly1, HEIGHT - lx0);
-        self.fill_physical_rect(px0, py0, px1, py1, black);
+        match self.gray_mode {
+            GrayMode::Bw => self.fill_physical_rect(px0, py0, px1, py1, black),
+            GrayMode::GrayDual => self.clear_planes_physical(px0, py0, px1, py1),
+        }
     }
 
     // local (window-relative) pixel bounds of a physical rect, None
@@ -451,9 +444,15 @@ impl StripBuffer {
         };
         let rb = self.row_bytes as usize;
         fill_bits(&mut self.buf, rb, lx0, lx1, ly0, ly1, !black);
-        if self.gray_mode == GrayMode::GrayDual {
-            fill_bits(&mut self.gray_buf, rb, lx0, lx1, ly0, ly1, !black);
-        }
+    }
+
+    fn clear_planes_physical(&mut self, px0: u16, py0: u16, px1: u16, py1: u16) {
+        let Some((lx0, lx1, ly0, ly1)) = self.clip_physical(px0, py0, px1, py1) else {
+            return;
+        };
+        let rb = self.row_bytes as usize;
+        fill_bits(&mut self.buf, rb, lx0, lx1, ly0, ly1, false);
+        fill_bits(&mut self.gray_buf, rb, lx0, lx1, ly0, ly1, false);
     }
 }
 
@@ -512,6 +511,10 @@ impl DrawTarget for StripBuffer {
     where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
+        // BW-polarity path; a no-op during gray passes (see blit_1bpp)
+        if self.gray_mode != GrayMode::Bw {
+            return Ok(());
+        }
         let size = self.size();
         let log_w = size.width as i32;
         let log_h = size.height as i32;
@@ -528,6 +531,10 @@ impl DrawTarget for StripBuffer {
     }
 
     fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
+        // BW-polarity path; a no-op during gray passes (see blit_1bpp)
+        if self.gray_mode != GrayMode::Bw {
+            return Ok(());
+        }
         let size = self.size();
         let sw = size.width as u16;
         let sh = size.height as u16;
@@ -550,6 +557,10 @@ impl DrawTarget for StripBuffer {
     where
         I: IntoIterator<Item = Self::Color>,
     {
+        // BW-polarity path; a no-op during gray passes (see blit_1bpp)
+        if self.gray_mode != GrayMode::Bw {
+            return Ok(());
+        }
         let w = area.size.width as i32;
         if w == 0 {
             return Ok(());

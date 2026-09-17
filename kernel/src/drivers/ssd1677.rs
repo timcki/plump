@@ -107,35 +107,21 @@ mod ctrl2 {
 
 /// Custom waveform LUT for 4-level grayscale rendering.
 ///
-/// The SSD1677 combines the two RAM planes into a 2-bit index per
-/// pixel. Which plane is the high bit of that index is not what the
-/// datasheet reading suggested: measured on the panel, the state
-/// RED=1 / BW=0 selects row 1 below, not row 2 (a revert with a
-/// waveform in row 1 greyed every white pixel written that way). So
-/// the encoding here never relies on the order: plain pixels put the
-/// same bit in both planes (white = 1,1 = row 3; black = 0,0 = row 0,
-/// both no-change), and the single AA state RED=1 / BW=0 gets the
-/// same lift waveform in rows 1 and 2, whichever the controller reads.
+/// The SSD1677 combines BW RAM (LSB) and RED RAM (MSB) into a 2-bit index
+/// per pixel. This LUT defines a waveform for each of the 4 states:
+///   {0,0} = no change (white/black pixels stay as-is from BW refresh)
+///   {0,1} = light gray
+///   {1,0} = medium gray
+///   {1,1} = dark gray
 ///
-/// RED carries the pixel's content (1 = white, as the panel will hold
-/// it once the grays are reverted), which is what lets a page turn
-/// after an AA pass be a delta: the revert leaves RED describing the
-/// panel exactly, phase 1 writes the new page into BW, and the OTP DU
-/// drives only the pixels that changed. The earlier encoding ({0,0}
-/// for every plain pixel) lost the content, so every post-AA turn had
-/// to re-drive the whole panel through inv_red, a same-direction pulse
-/// over the entire background per turn that built up as a grey haze.
-///
-/// The lift waveform (VSH1 pulses, from CrossPoint Reader) is the one
-/// the old encoding used for its visible gray level, so the AA looks
-/// as before; its revert is CrossPoint's revert for that same state.
+/// Waveform data from CrossPoint Reader (open-source, tuned for X4 display).
 #[rustfmt::skip]
 static LUT_GRAYSCALE: [u8; 112] = [
     // VS[0..4] waveform entries (5 × 10 bytes = 50 bytes)
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 0: black, no change
-    0x54, 0x54, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 1: edge, lifted from black
-    0x54, 0x54, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 2: edge (other bit order)
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 3: white, no change
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 00 no change
+    0x54, 0x54, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 01 light gray
+    0xAA, 0xA0, 0xA8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 10 medium gray
+    0xA2, 0x22, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 11 dark gray
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // VCOM
     // TP/RP timing groups (10 × 5 bytes = 50 bytes)
     0x01, 0x01, 0x01, 0x01, 0x00,  // G0
@@ -156,23 +142,24 @@ static LUT_GRAYSCALE: [u8; 112] = [
 
 /// Revert LUT: snaps each AA gray state back to its nearest rail.
 ///
-/// Indexed like [`LUT_GRAYSCALE`] and driven with the gray planes
-/// still resident in controller RAM, so the pass needs no RAM writes.
-/// After it the panel is bimodal (pure black / white) and equal to the
-/// content bit in RED, which is the starting state the following
-/// delta DU assumes; re-driving straight over intermediate grays is
-/// what produced the mottled, non-uniform AA on page turns.
+/// Indexed by the same {RED, BW} pair as [`LUT_GRAYSCALE`], and driven
+/// with the gray planes still resident in controller RAM, so the pass
+/// needs no RAM writes. After it the panel is bimodal (pure black /
+/// white), which is the starting state the OTP DU transitions assume;
+/// re-driving straight over intermediate grays is what produced the
+/// mottled, non-uniform AA on page turns.
 ///
-/// The lifted edge continues white-ward to its rail (CrossPoint's
-/// revert for that lift state, VSH1 for sixteen phases); plain pixels
-/// are no-ops in both bit orders.
+/// Waveform bytes from CrossPoint Reader's lut_grayscale_revert (X4):
+/// medium gray ({1,0}, the strong-lift state) snaps white-ward, dark
+/// gray ({1,1}) snaps black-ward. {0,1} is unused by our glyph
+/// encoding and stays a no-op.
 #[rustfmt::skip]
 static LUT_GRAYSCALE_REVERT: [u8; 112] = [
     // VS[0..4] waveform entries (5 x 10 bytes = 50 bytes)
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 0: black, no change
-    0x54, 0x54, 0x54, 0x54, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 1: edge -> white
-    0x54, 0x54, 0x54, 0x54, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 2: edge -> white (other bit order)
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 3: white, no change
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 00 no change
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 01 unused
+    0xA8, 0xA8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 10 medium -> white
+    0xFC, 0xFC, 0xFC, 0xFC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 11 dark -> black
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // VCOM
     // TP/RP timing groups (10 x 5 bytes = 50 bytes)
     0x01, 0x01, 0x01, 0x01, 0x01,  // G0
@@ -273,8 +260,7 @@ enum PlaneWrite {
     DualSame,
     /// BW takes the content, RED its inverse (delta-free re-drive).
     BwInvRed,
-    /// Gray pass planes: `buf` -> BW RAM, `gray_buf` (the content) ->
-    /// RED RAM (see [`LUT_GRAYSCALE`]).
+    /// Gray dual-plane: LSB -> BW RAM, MSB -> RED RAM.
     GrayDual,
 }
 
@@ -440,12 +426,12 @@ where
                     self.send_data(strip.data());
                 }
                 PlaneWrite::GrayDual => {
-                    // content with the edge bits cleared -> BW RAM
+                    // LSB plane → BW RAM
                     self.set_partial_ram_area(px, y, pw, rows);
                     self.send_command(cmd::WRITE_RAM_BW);
                     self.send_data(strip.data());
 
-                    // content -> RED RAM
+                    // MSB plane → RED RAM
                     self.set_partial_ram_area(px, y, pw, rows);
                     self.send_command(cmd::WRITE_RAM_RED);
                     self.send_data(strip.gray_data());
