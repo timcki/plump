@@ -15,7 +15,7 @@ embedded-hal-bus   = "0.3.0"
 embedded-graphics-core = "0.4.1"
 embedded-graphics      = "0.8.2"
 embedded-sdmmc = { path = "vendor/embedded-sdmmc-rs", features = ["async"] }
-smol-epub      = { path = "../smol-epub", features = ["async"] }
+smol-epub      = { path = "../smol-epub", features = ["async", "hyphenation"] }
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
 nb  = "1.1.0"

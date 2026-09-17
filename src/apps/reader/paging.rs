@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use smol_epub::markup::{BlockProps, ByteSource, Event, Events, SliceSource, Style};
+use smol_epub::markup::{self, BlockProps, ByteSource, Event, Events, SliceSource, Style};
 
 use crate::fonts;
 use crate::fonts::bitmap;
@@ -805,7 +805,10 @@ impl ReaderApp {
             fs.advance('\u{2019}', crate::fonts::Style::Regular),
         );
 
-        let mut pipeline = LayoutPipeline::new();
+        // the book's language picks the hyphenation patterns; none means
+        // only soft hyphens and explicit hyphens can break a word
+        let lang = smol_epub::hyphen::lang_from_tag(self.epub.meta.lang());
+        let mut pipeline = LayoutPipeline::new(lang);
         let mut out_lines: Vec<LineLayout> = Vec::new();
         let mut out_image_blocks: Vec<u8> = Vec::new();
 
@@ -915,10 +918,11 @@ impl ReaderApp {
 
         plump_kernel::perf_event!(
             "reader",
-            "preindex.kp paragraphs={} pages={} lines={} fallbacks={} elapsed_ms={}",
+            "preindex.kp paragraphs={} pages={} lines={} hyphenated={} fallbacks={} elapsed_ms={}",
             pipeline.paragraphs,
             pages.len(),
             out_lines.len(),
+            pipeline.hyphenated_lines,
             pipeline.fallback_count,
             _kp_t0.elapsed().as_millis()
         );
@@ -1397,8 +1401,28 @@ impl ReaderApp {
             }
             pg.run_len[i] = (pg.run_count - first_run).min(u8::MAX as usize) as u8;
 
+            // a line that ends inside a word took a discretionary break
+            // (soft hyphen or dictionary): it gets the hyphen glyph K-P
+            // measured into it. an explicit hyphen already sits there
+            let hyphenated = end < buf_len
+                && is_word_byte(pg.buf[end])
+                && is_word_byte(pg.buf[end - 1])
+                && pg.buf[end - 1] != b'-';
+            pg.line_hyphen[i] = hyphenated;
+            let hyphen_w = if hyphenated {
+                let last_style = if pg.run_count > first_run {
+                    let r = pg.runs[pg.run_count - 1];
+                    fonts::Style::from_markup(markup::Style::unpack(r.style))
+                } else {
+                    span.style()
+                };
+                fs.advance('-', last_style) as u32
+            } else {
+                0
+            };
+
             let m = LineMeasure {
-                width: width.saturating_sub(trailing),
+                width: width.saturating_sub(trailing) + hyphen_w,
                 gaps,
             };
 
@@ -1446,6 +1470,13 @@ impl ReaderApp {
             pg.line_x_end[i] = cx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         }
     }
+}
+
+/// a byte that belongs to a word in the markup stream: printable, not a
+/// space, not a marker (UTF-8 lead and continuation bytes included)
+#[inline]
+fn is_word_byte(b: u8) -> bool {
+    b > b' ' && b != smol_epub::markup::MARKER
 }
 
 /// drop trailing carriage returns from a line range

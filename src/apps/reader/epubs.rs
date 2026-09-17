@@ -707,6 +707,14 @@ impl ReaderApp {
             self.epub.meta.author_str(),
             self.epub.spine.len()
         );
+        log::info!(
+            "epub: language {:?} -> hyphenation {}",
+            core::str::from_utf8(self.epub.meta.lang()).unwrap_or("?"),
+            match smol_epub::hyphen::lang_from_tag(self.epub.meta.lang()) {
+                Some(_) => "on",
+                None => "off",
+            }
+        );
 
         let tlen = self.epub.meta.title_len as usize;
         if tlen > 0 {

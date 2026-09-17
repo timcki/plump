@@ -20,6 +20,7 @@
 
 use alloc::vec::Vec;
 
+use smol_epub::hyphen::{self, Lang};
 use smol_epub::markup::{BlockProps, Event, Events, ImageRef, Style, decode_utf8};
 
 // ── Item ───────────────────────────────────────────────────────────
@@ -33,10 +34,11 @@ use smol_epub::markup::{BlockProps, Event, Events, ImageRef, Style, decode_utf8}
 ///
 /// `style` is the packed `markup::Style` the item was measured in.
 ///
-/// For `Penalty` items, `width` carries the penalty cost as `i16`
+/// For `Penalty` items, `stretch` carries the penalty cost as `i16`
 /// (bit-reinterpret); `i16::MAX` means "forbidden break", `i16::MIN`
-/// means "forced break". For `Box` and `Glue`, `width` is plain
-/// unsigned px.
+/// means "forced break", and `width` is what the line gains when it
+/// breaks there (a discretionary's hyphen). For `Box` and `Glue`,
+/// `width` is plain unsigned px.
 #[derive(Clone, Copy, Debug)]
 pub struct Item {
     pub width: u16,
@@ -98,13 +100,22 @@ impl Item {
             flags |= Self::FLAG_FORCED;
         }
         Self {
-            width: p as u16, // bit-reinterpret i16 → u16
-            stretch: 0,
+            width: 0,
+            stretch: p as u16, // bit-reinterpret i16 → u16
             shrink: 0,
             flags,
             style: 0,
             byte_offset,
         }
+    }
+
+    /// A discretionary break inside a word: a flagged penalty that,
+    /// when the line breaks here, adds `pre_break_width` (the hyphen
+    /// glyph) to the line. Unbroken it is zero-width.
+    pub fn discretionary(p: i16, pre_break_width: u16, byte_offset: u32) -> Self {
+        let mut it = Self::penalty(p, true, false, byte_offset);
+        it.width = pre_break_width;
+        it
     }
 
     #[inline]
@@ -126,11 +137,12 @@ impl Item {
         self.flags & Self::FLAG_FORCED != 0
     }
 
-    /// Penalty cost, reinterpreting `width` as `i16`. Only meaningful
-    /// when `kind() == ItemKind::Penalty`.
+    /// Penalty cost, reinterpreting `stretch` as `i16`. Only meaningful
+    /// when `kind() == ItemKind::Penalty`; `width` is then the width the
+    /// line gains by breaking here (a visible hyphen).
     #[inline]
     pub fn penalty_value(&self) -> i16 {
-        self.width as i16
+        self.stretch as i16
     }
 
     /// Stamp the inline style the item was measured in, so the convert
@@ -179,10 +191,14 @@ pub struct ParagraphMeta {
 
 // ── tunables ──────────────────────────────────────────────────────
 
-/// Penalty for accepting a soft-hyphen break. Small positive cost so
-/// the breaker prefers no-hyphen lines unless they meaningfully reduce
-/// badness.
+/// Penalty for accepting a hyphenated break (soft hyphen or dictionary).
+/// Small positive cost so the breaker prefers no-hyphen lines unless
+/// they meaningfully reduce badness.
 pub const HYPHEN_PENALTY: i16 = 50;
+
+/// Penalty for breaking after an explicit hyphen inside a word (TeX's
+/// `\exhyphenpenalty`): cheaper than a hyphenation, nothing is added.
+pub const EXHYPHEN_PENALTY: i16 = 20;
 
 /// Maximum word size measured by `build_paragraph`. Bytes beyond this
 /// are silently dropped from the width calculation; the breaker still
@@ -203,10 +219,19 @@ const WORD_MEASURE_BUF: usize = 256;
 /// at a word start). The closure form keeps this module free of
 /// font/HAL imports for host testability. `em_px` sizes the first-line
 /// indent box.
+///
+/// With `lang`, words are hyphenated: each break point becomes a
+/// flagged penalty whose pre-break width is the hyphen glyph, and the
+/// word's boxes carry the pair kerning across the break so an unbroken
+/// word measures exactly as the renderer draws it. (A continuation
+/// line then measures the kern into its first box, at most a pixel or
+/// two, which the renderer does not draw.) An explicit hyphen inside a
+/// word is a zero-width, unflagged break opportunity in any language.
 pub fn build_paragraph(
     events: &mut Events<'_>,
     mut advance: impl FnMut(Option<char>, char, Style) -> i16,
     em_px: u16,
+    lang: Option<Lang>,
     out: &mut Vec<Item>,
 ) -> ParagraphMeta {
     let style_at_start = events.style();
@@ -242,8 +267,46 @@ pub fn build_paragraph(
                 lead_in!(start, style);
                 let len = (end - start) as usize;
                 let n = events.read_into(start, &mut word_buf[..len.min(WORD_MEASURE_BUF)]);
-                let width = measure_word(&word_buf[..n], style, &mut advance);
-                out.push(Item::boxed(width, start).with_style(style));
+                let word = &word_buf[..n];
+
+                // break opportunities inside the word, as byte offsets:
+                // explicit hyphens (free, no glyph added) or the
+                // dictionary's (a hyphen is drawn when taken)
+                let mut cuts = [0u16; hyphen::MAX_BREAKS];
+                let mut n_cuts = 0usize;
+                let mut explicit = false;
+                if n > 2 && word[1..n - 1].contains(&b'-') {
+                    explicit = true;
+                    for (i, &b) in word.iter().enumerate().take(n - 1).skip(1) {
+                        if b == b'-' && n_cuts < hyphen::MAX_BREAKS {
+                            cuts[n_cuts] = i as u16 + 1;
+                            n_cuts += 1;
+                        }
+                    }
+                } else if let Some(lang) = lang {
+                    n_cuts = hyphen::breaks(word, lang, &mut cuts);
+                }
+
+                let mut from = 0usize;
+                let mut prev: Option<char> = None;
+                for &cut in &cuts[..n_cuts] {
+                    let cut = cut as usize;
+                    if cut <= from || cut >= n {
+                        continue;
+                    }
+                    let (w, last) = measure_word(&word[from..cut], style, prev, &mut advance);
+                    out.push(Item::boxed(w, start + from as u32).with_style(style));
+                    prev = last;
+                    if explicit {
+                        out.push(Item::penalty(EXHYPHEN_PENALTY, false, false, start + cut as u32));
+                    } else {
+                        let hyphen_w = advance(None, '-', style).max(0) as u16;
+                        out.push(Item::discretionary(HYPHEN_PENALTY, hyphen_w, start + cut as u32));
+                    }
+                    from = cut;
+                }
+                let (w, _) = measure_word(&word[from..], style, prev, &mut advance);
+                out.push(Item::boxed(w, start + from as u32).with_style(style));
                 last_end = end;
             }
 
@@ -277,10 +340,11 @@ pub fn build_paragraph(
                 last_end = end;
             }
 
-            Event::SoftHyphen { start, end, .. } => {
-                // discretionary break: zero-width penalty (visible
-                // hyphen rendering is deferred — see plan §5).
-                out.push(Item::penalty(HYPHEN_PENALTY, true, false, start));
+            Event::SoftHyphen { start, end, style } => {
+                // discretionary break: a hyphen is drawn when the line
+                // breaks here, so the penalty carries its width
+                let hyphen_w = advance(None, '-', style).max(0) as u16;
+                out.push(Item::discretionary(HYPHEN_PENALTY, hyphen_w, start));
                 last_end = end;
             }
 
@@ -369,14 +433,17 @@ fn push_forced_break_triple(out: &mut Vec<Item>, byte_offset: u32) {
     out.push(Item::penalty(Item::PENALTY_FORCE, false, true, byte_offset));
 }
 
+/// natural width of `bytes` drawn after `prev` (kerning applies between
+/// consecutive glyphs of a word, so a word split at a break point is
+/// measured in pieces that hand the last glyph on); returns the width
+/// and the last glyph
 #[inline]
 fn measure_word(
     bytes: &[u8],
     style: Style,
+    mut prev: Option<char>,
     advance: &mut impl FnMut(Option<char>, char, Style) -> i16,
-) -> u16 {
-    // kerning applies between consecutive glyphs of the word
-    let mut prev: Option<char> = None;
+) -> (u16, Option<char>) {
     let mut width: i32 = 0;
     let mut i = 0;
     while i < bytes.len() {
@@ -389,7 +456,7 @@ fn measure_word(
         prev = Some(ch);
         i += len.max(1);
     }
-    width.clamp(0, u16::MAX as i32) as u16
+    (width.clamp(0, u16::MAX as i32) as u16, prev)
 }
 
 // ── tests ─────────────────────────────────────────────────────────
@@ -414,7 +481,7 @@ mod tests {
         let mut src = SliceSource(bytes);
         let mut events = Events::new(&mut src);
         let mut out: Vec<Item> = Vec::new();
-        let meta = build_paragraph(&mut events, unit_advance, em_px, &mut out);
+        let meta = build_paragraph(&mut events, unit_advance, em_px, None, &mut out);
         (out, meta)
     }
 
@@ -534,15 +601,52 @@ mod tests {
         let mut src = SliceSource(&bytes);
         let mut events = Events::new(&mut src);
         let mut out = Vec::new();
-        let first = build_paragraph(&mut events, unit_advance, 16, &mut out);
+        let first = build_paragraph(&mut events, unit_advance, 16, None, &mut out);
         assert_eq!(first.end_kind, ParagraphEnd::ParagraphBreak);
         out.clear();
-        let second = build_paragraph(&mut events, unit_advance, 16, &mut out);
+        let second = build_paragraph(&mut events, unit_advance, 16, None, &mut out);
         assert!(out.is_empty());
         assert_eq!(second.end_kind, ParagraphEnd::ImageBlock);
         let img = second.image.unwrap();
         assert_eq!(img.start, 3);
         assert_eq!(img.path_len, 3);
+    }
+
+    #[test]
+    fn dictionary_breaks_become_discretionaries_with_hyphen_width() {
+        // as|sump|tions: two flagged penalties carrying the hyphen width
+        // (1 px under unit_advance), three boxes whose widths sum to the
+        // unbroken word
+        let mut src = SliceSource(b"assumptions");
+        let mut events = Events::new(&mut src);
+        let mut out = Vec::new();
+        build_paragraph(&mut events, unit_advance, 16, Some(Lang::English), &mut out);
+        let kinds: Vec<ItemKind> = out.iter().map(|i| i.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![ItemKind::Box, ItemKind::Penalty, ItemKind::Box, ItemKind::Penalty, ItemKind::Box]
+        );
+        assert!(out[1].is_flagged());
+        assert_eq!(out[1].width, 1);
+        assert_eq!(out[1].penalty_value(), HYPHEN_PENALTY);
+        assert_eq!(out[1].byte_offset, 2);
+        assert_eq!(out[3].byte_offset, 6);
+        let boxes: u16 = out.iter().filter(|i| i.kind() == ItemKind::Box).map(|i| i.width).sum();
+        assert_eq!(boxes, 11);
+    }
+
+    #[test]
+    fn explicit_hyphen_is_a_free_break() {
+        let mut src = SliceSource(b"well-known");
+        let mut events = Events::new(&mut src);
+        let mut out = Vec::new();
+        build_paragraph(&mut events, unit_advance, 16, Some(Lang::English), &mut out);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1].kind(), ItemKind::Penalty);
+        assert!(!out[1].is_flagged());
+        assert_eq!(out[1].width, 0);
+        assert_eq!(out[1].byte_offset, 5);
+        assert_eq!(out[0].width, 5);
     }
 
     #[test]

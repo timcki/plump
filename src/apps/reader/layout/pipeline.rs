@@ -16,9 +16,10 @@ use alloc::vec::Vec;
 
 use crate::fonts::{FontSet, Style};
 
-use super::breaker::{break_paragraph_with_fallback, BreakChoice, BreakConfig, BreakScratch};
+use super::breaker::{break_paragraph_with_fallback, BreakChoice, BreakConfig, BreakScratch, ChoiceFlags};
 use super::items::{self, Item, ParagraphEnd, ParagraphMeta};
 use super::paginate::convert;
+use smol_epub::hyphen::Lang;
 use smol_epub::markup::{Events, ImageRef, Style as MarkupStyle};
 use super::{LineLayout, MAX_LINES_PER_CHAPTER};
 
@@ -107,12 +108,16 @@ pub struct LayoutPipeline {
     pub paragraphs: u32,
     /// number of image blocks emitted this run
     pub images: u32,
+    /// number of lines that end in a hyphenated break this run
+    pub hyphenated_lines: u32,
     /// pending page-break flag, threaded across paragraphs
     pub page_break_pending: bool,
+    /// dictionary hyphenation for the book's language, if any
+    pub lang: Option<Lang>,
 }
 
 impl LayoutPipeline {
-    pub fn new() -> Self {
+    pub fn new(lang: Option<Lang>) -> Self {
         Self {
             items: Vec::new(),
             choices: Vec::new(),
@@ -120,7 +125,9 @@ impl LayoutPipeline {
             fallback_count: 0,
             paragraphs: 0,
             images: 0,
+            hyphenated_lines: 0,
             page_break_pending: false,
+            lang,
         }
     }
 
@@ -153,6 +160,7 @@ impl LayoutPipeline {
             scanner,
             |p, c, s| advance_for(fonts, p, c, s),
             fonts.em_px(),
+            self.lang,
             &mut self.items,
         );
 
@@ -207,6 +215,12 @@ impl LayoutPipeline {
             Ok(()) => {
                 kp_choice_count = self.choices.len();
                 used_fallback = false;
+                let hyphenated = self
+                    .choices
+                    .iter()
+                    .filter(|c| c.flags.contains(ChoiceFlags::FROM_HYPHEN))
+                    .count() as u32;
+                self.hyphenated_lines = self.hyphenated_lines.saturating_add(hyphenated);
                 try_reserve_out(out_lines, out_image_blocks, self.choices.len())?;
                 convert::append_lines(
                     &self.items,
@@ -251,12 +265,6 @@ impl LayoutPipeline {
             self.page_break_pending = true;
         }
         Ok(StepOutcome::More)
-    }
-}
-
-impl Default for LayoutPipeline {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

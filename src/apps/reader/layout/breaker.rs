@@ -540,13 +540,17 @@ fn consider_break(
     let mut line_y = pfx_y[hi] - pfx_y[lo];
     let mut line_z = pfx_z[hi] - pfx_z[lo];
 
-    // Trailing Glue at the breakpoint is collapsed (zero-width).
-    // Trailing Penalty's width was already 0 in our model (visible
-    // hyphen rendering deferred); leave it as-is.
-    if matches!(items[i].kind(), ItemKind::Glue) {
-        line_w -= items[i].width as u32;
-        line_y -= items[i].stretch as u32;
-        line_z -= items[i].shrink as u32;
+    // Trailing Glue at the breakpoint is collapsed (zero-width). A
+    // Penalty broken at adds its pre-break width: the hyphen glyph of a
+    // discretionary, nothing for a plain penalty.
+    match items[i].kind() {
+        ItemKind::Glue => {
+            line_w -= items[i].width as u32;
+            line_y -= items[i].stretch as u32;
+            line_z -= items[i].shrink as u32;
+        }
+        ItemKind::Penalty => line_w += items[i].width as u32,
+        ItemKind::Box => {}
     }
 
     let line_w_i = line_w as i32;

@@ -432,6 +432,7 @@ pub(super) struct PageState {
     /// px, remainder), and the run table slice
     pub(super) line_y: [u16; LINES_PER_PAGE],
     pub(super) line_x_end: [i16; LINES_PER_PAGE],
+    pub(super) line_hyphen: [bool; LINES_PER_PAGE],
     pub(super) line_just: [(i16, i16); LINES_PER_PAGE],
     pub(super) run_first: [u16; LINES_PER_PAGE],
     pub(super) run_len: [u8; LINES_PER_PAGE],
@@ -464,6 +465,7 @@ impl PageState {
             line_count: 0,
             line_y: [0u16; LINES_PER_PAGE],
             line_x_end: [0i16; LINES_PER_PAGE],
+            line_hyphen: [false; LINES_PER_PAGE],
             line_just: [(0i16, 0i16); LINES_PER_PAGE],
             run_first: [0u16; LINES_PER_PAGE],
             run_len: [0u8; LINES_PER_PAGE],
@@ -2671,6 +2673,18 @@ impl ReaderApp {
                                 .draw(strip)
                                 .ok();
                             }
+                        }
+                    }
+
+                    // the hyphen of a line broken inside a word, in the
+                    // face of the line's last run, right where it ended
+                    if self.pg.line_hyphen[i] && rn > 0 {
+                        let hx = self.pg.line_x_end[i] as i32;
+                        let last = self.pg.runs[rf + rn - 1];
+                        let sty = fonts::Style::from_markup(markup::Style::unpack(last.style));
+                        let hw = fs.advance('-', sty) as i32;
+                        if hx < win_r + 8 && hx + hw > win_l - 8 {
+                            fs.draw_char(strip, '-', sty, hx, baseline);
                         }
                     }
                 }
