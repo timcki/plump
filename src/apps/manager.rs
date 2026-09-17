@@ -695,7 +695,7 @@ impl AppManager {
 
             QuickMenuResult::RefreshScreen => {
                 self.close_quick_menu();
-                self.launcher.ctx.request_full_redraw();
+                self.launcher.ctx.request_clean_refresh();
                 Transition::None
             }
 

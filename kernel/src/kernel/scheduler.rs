@@ -798,6 +798,11 @@ impl super::Services {
     }
 }
 
+// partials since the last full clear, for the render log
+fn screen_partials(screen: &super::screen::Screen) -> u32 {
+    screen.partials_since_clear()
+}
+
 impl super::Kernel {
     // partial refreshes use DU waveform (~400 ms); after ghost_clear_every
     // partials, a full GC refresh (~600 ms at faked temp) clears ghosting
@@ -997,10 +1002,23 @@ impl super::Kernel {
             if matches!(redraw, Redraw::Full | Redraw::Partial(_)) {
                 svc.log_stats();
 
+                // a clear that is meant to clean (the periodic
+                // promotion, the manual clear-ghosting action) runs
+                // the real-temperature waveform; a full paint that is
+                // only a paint (entering a book, waking) keeps the
+                // quick faked-90C one
+                let clean = screen.ghost_clear_due(app_mgr.ghost_clear_every())
+                    || app_mgr.ctx_mut().take_clean_refresh();
+                let kind = if clean {
+                    crate::drivers::ssd1677::FullKind::Clean
+                } else {
+                    crate::drivers::ssd1677::FullKind::Fast
+                };
+                info!("render: full kind={:?} partials={}", kind, screen_partials(screen));
                 let t_write = Instant::now();
                 let mut wave = {
                     let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                    screen.begin_full(&draw)
+                    screen.begin_full(&draw, kind)
                 };
                 #[cfg(feature = "perf")]
                 {
@@ -1026,8 +1044,7 @@ impl super::Kernel {
                 // after a full GC refresh the panel is left in plain BW.
                 // re-apply grayscale AA per the current `GrayscaleMode`
                 // (or arm the deferred timer). the pass marks the screen
-                // stale, so later partials re-drive the area they touch
-                // via inv_red.
+                // gray-coded; the next partial reverts and runs a delta.
                 //
                 // finish() already closed the session, so the plan's
                 // sync arms carry no work here: only GrayNow has a

@@ -297,6 +297,8 @@ struct Loading {
 }
 
 pub struct AppContext {
+    // the pending full redraw wants the real-temperature clear
+    clean_refresh: bool,
     msg_buf: [u8; MSG_BUF_SIZE],
     msg_len: usize,
     msg_tag: u8,
@@ -322,6 +324,7 @@ impl AppContext {
             msg_len: 0,
             msg_tag: 0,
             redraw: PendingRedraw::None,
+            clean_refresh: false,
             loading: None,
         }
     }
@@ -354,6 +357,20 @@ impl AppContext {
 
     pub fn request_full_redraw(&mut self) {
         self.redraw = PendingRedraw::Now(Redraw::Full);
+    }
+
+    /// A full redraw with the real-temperature clear waveform: the
+    /// user asked for ghosting to go, so the quick fake-90C waveform
+    /// (which does not reset the pigment) is the wrong tool.
+    pub fn request_clean_refresh(&mut self) {
+        self.redraw = PendingRedraw::Now(Redraw::Full);
+        self.clean_refresh = true;
+    }
+
+    /// Whether the pending full redraw asked for the clean waveform;
+    /// consumed by the render.
+    pub fn take_clean_refresh(&mut self) -> bool {
+        core::mem::take(&mut self.clean_refresh)
     }
 
     // union `region` into whatever is pending, preserving its urgency:

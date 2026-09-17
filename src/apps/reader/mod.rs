@@ -1245,9 +1245,6 @@ impl ReaderApp {
     /// the text area cleared. both end in the stage row above the
     /// footer, and only that row repaints while the pipeline runs
     fn draw_loading_screen(&self, strip: &mut StripBuffer) {
-        if strip.gray_mode() != GrayMode::Bw {
-            return;
-        }
         if matches!(self.loading_reason, LoadingReason::Open | LoadingReason::Resume) {
             self.draw_loading_plate(strip, self.loading_visual_region());
         }
@@ -2622,9 +2619,11 @@ impl ReaderApp {
 
     fn draw_page(&self, strip: &mut StripBuffer) {
         let cf = self.chrome_font;
-        let gray_pass = strip.gray_mode() != GrayMode::Bw;
 
-        if self.show_chrome && !gray_pass && matches!(self.state, State::Ready | State::ShowToc) {
+        // a gray pass draws the whole frame too: its content plane must
+        // hold everything the panel shows, or the delta after the
+        // revert misses what changed there
+        if self.show_chrome && matches!(self.state, State::Ready | State::ShowToc) {
             self.draw_footer(strip);
         }
 
@@ -2910,7 +2909,6 @@ impl ReaderApp {
 
         if self.show_position
             && self.state == State::Ready
-            && !gray_pass
             && POSITION_OVERLAY.intersects(strip.logical_window())
         {
             let mut pbuf = StackFmt::<48>::new();

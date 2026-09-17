@@ -91,29 +91,48 @@ mod ctrl2 {
     /// register `start_full_update` leaves faked at 90C.
     pub const DU: u8 = 0x3C;
     /// LUT_LOAD + DISPLAY_START, no TEMP_LOAD so the faked temperature
-    /// written just before survives into the OTP LUT pick.
+    /// written just before survives into the OTP LUT pick: the fast
+    /// clear (CrossPoint's HALF refresh).
     pub const FULL: u8 = 0x14;
+    /// TEMP_LOAD + LUT_LOAD + DISPLAY_START: the OTP full-clear
+    /// waveform at the panel's real temperature (CrossPoint's FULL
+    /// refresh). Slower, and the only one that actually resets the
+    /// pigment; the faked-90C waveform is under-driven at room
+    /// temperature and leaves a haze the ghost clear was meant to
+    /// remove.
+    pub const FULL_CLEAN: u8 = 0x34;
     /// DISPLAY_START only: run the custom LUT already loaded.
     pub const CUSTOM_LUT: u8 = 0x0C;
 }
 
 /// Custom waveform LUT for 4-level grayscale rendering.
 ///
-/// The SSD1677 combines BW RAM (LSB) and RED RAM (MSB) into a 2-bit index
-/// per pixel. This LUT defines a waveform for each of the 4 states:
-///   {0,0} = no change (white/black pixels stay as-is from BW refresh)
-///   {0,1} = light gray
-///   {1,0} = medium gray
-///   {1,1} = dark gray
+/// The SSD1677 combines RED RAM (MSB) and BW RAM (LSB) into a 2-bit
+/// index per pixel. During a gray pass RED carries the pixel's content
+/// bit (1 = white, as the panel will hold it once the grays are
+/// reverted) and BW carries an edge bit, so the four states are:
+///   {1,0} = white, no change
+///   {0,0} = black, no change
+///   {1,1} = medium gray: lifted from black, reverts to white
+///   {0,1} = dark gray: lifted from black, reverts to black
 ///
-/// Waveform data from CrossPoint Reader (open-source, tuned for X4 display).
+/// Keeping the content bit in RED is what lets a page turn after an
+/// AA pass be a delta: the revert pass leaves RED describing the panel
+/// exactly, phase 1 writes the new page into BW, and the OTP DU drives
+/// only the pixels that changed. The earlier encoding ({0,0} for all
+/// plain pixels) lost the content, so every post-AA turn had to
+/// re-drive the whole panel through inv_red, a same-direction pulse
+/// over the entire background per turn that built up as a grey haze.
+///
+/// Waveform bytes from CrossPoint Reader (tuned for the X4 panel), the
+/// rows re-homed to the states above.
 #[rustfmt::skip]
 static LUT_GRAYSCALE: [u8; 112] = [
     // VS[0..4] waveform entries (5 × 10 bytes = 50 bytes)
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 00 no change
-    0x54, 0x54, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 01 light gray
-    0xAA, 0xA0, 0xA8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 10 medium gray
-    0xA2, 0x22, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 11 dark gray
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 00 black, no change
+    0xA2, 0x22, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 01 dark gray
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 10 white, no change
+    0xAA, 0xA0, 0xA8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 11 medium gray
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // VCOM
     // TP/RP timing groups (10 × 5 bytes = 50 bytes)
     0x01, 0x01, 0x01, 0x01, 0x00,  // G0
@@ -137,21 +156,21 @@ static LUT_GRAYSCALE: [u8; 112] = [
 /// Indexed by the same {RED, BW} pair as [`LUT_GRAYSCALE`], and driven
 /// with the gray planes still resident in controller RAM, so the pass
 /// needs no RAM writes. After it the panel is bimodal (pure black /
-/// white), which is the starting state the OTP DU transitions assume;
-/// re-driving straight over intermediate grays is what produced the
-/// mottled, non-uniform AA on page turns.
+/// white) and equal to the content bit in RED, which is the starting
+/// state the following delta DU assumes; re-driving straight over
+/// intermediate grays is what produced the mottled, non-uniform AA on
+/// page turns.
 ///
 /// Waveform bytes from CrossPoint Reader's lut_grayscale_revert (X4):
-/// medium gray ({1,0}, the strong-lift state) snaps white-ward, dark
-/// gray ({1,1}) snaps black-ward. {0,1} is unused by our glyph
-/// encoding and stays a no-op.
+/// medium gray ({1,1}, the strong-lift state) snaps white-ward, dark
+/// gray ({0,1}) snaps black-ward; plain pixels are no-ops.
 #[rustfmt::skip]
 static LUT_GRAYSCALE_REVERT: [u8; 112] = [
     // VS[0..4] waveform entries (5 x 10 bytes = 50 bytes)
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 00 no change
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 01 unused
-    0xA8, 0xA8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 10 medium -> white
-    0xFC, 0xFC, 0xFC, 0xFC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 11 dark -> black
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 00 black, no change
+    0xFC, 0xFC, 0xFC, 0xFC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 01 dark -> black
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 10 white, no change
+    0xA8, 0xA8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 11 medium -> white
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // VCOM
     // TP/RP timing groups (10 x 5 bytes = 50 bytes)
     0x01, 0x01, 0x01, 0x01, 0x01,  // G0
@@ -232,6 +251,16 @@ pub(crate) enum Phase1 {
     NeedsFullFirst,
 }
 
+/// Which full-clear waveform a GC runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FullKind {
+    /// The faked-90C waveform: quick, for entering a book and waking.
+    Fast,
+    /// The real-temperature waveform: the one that resets the pigment,
+    /// for the periodic and the manual ghost clear.
+    Clean,
+}
+
 /// Which controller planes a strip feeds.
 #[derive(Clone, Copy)]
 enum PlaneWrite {
@@ -242,7 +271,8 @@ enum PlaneWrite {
     DualSame,
     /// BW takes the content, RED its inverse (delta-free re-drive).
     BwInvRed,
-    /// Gray dual-plane: LSB -> BW RAM, MSB -> RED RAM.
+    /// Gray pass planes: the edge bit -> BW RAM, the content bit ->
+    /// RED RAM (see [`LUT_GRAYSCALE`]).
     GrayDual,
 }
 
@@ -408,12 +438,12 @@ where
                     self.send_data(strip.data());
                 }
                 PlaneWrite::GrayDual => {
-                    // LSB plane → BW RAM
+                    // edge plane (LSB) -> BW RAM
                     self.set_partial_ram_area(px, y, pw, rows);
                     self.send_command(cmd::WRITE_RAM_BW);
                     self.send_data(strip.data());
 
-                    // MSB plane → RED RAM
+                    // content plane (MSB) -> RED RAM
                     self.set_partial_ram_area(px, y, pw, rows);
                     self.send_command(cmd::WRITE_RAM_RED);
                     self.send_data(strip.gray_data());
@@ -736,22 +766,28 @@ where
     }
 
     /// Start a full GC refresh over the frame just written.
-    pub(crate) fn start_full_update(&mut self, written: FrameWritten) -> Driven {
+    pub(crate) fn start_full_update(&mut self, written: FrameWritten, kind: FullKind) -> Driven {
         let FrameWritten(win) = written;
-
-        // fake a 90C panel temperature so LUT_LOAD picks the shortest
-        // OTP full-clear waveform (~1.7s measured, matching CrossPoint's
-        // 1720ms figure; the unfaked room-temp waveform runs ~2.3s).
-        // TEMP_LOAD stays cleared in the base byte so the controller
-        // keeps this value instead of re-reading the internal sensor.
-        // trick from CrossPoint Reader, proven on this exact panel
-        self.send_command(cmd::WRITE_TEMP_REGISTER);
-        self.send_data(&[0x5A]);
 
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
         self.send_data(&[0x40, 0x00]);
 
-        self.kick(ctrl2::FULL);
+        match kind {
+            FullKind::Fast => {
+                // fake a 90C panel temperature so LUT_LOAD picks the
+                // shortest OTP full-clear waveform (~1.7s measured,
+                // matching CrossPoint's 1720ms HALF refresh; the
+                // room-temperature waveform runs ~2.3s). TEMP_LOAD
+                // stays cleared in the base byte so the controller
+                // keeps this value instead of re-reading the sensor.
+                // the next DU re-reads it. trick from CrossPoint
+                // Reader, proven on this exact panel
+                self.send_command(cmd::WRITE_TEMP_REGISTER);
+                self.send_data(&[0x5A]);
+                self.kick(ctrl2::FULL);
+            }
+            FullKind::Clean => self.kick(ctrl2::FULL_CLEAN),
+        }
         Driven(win)
     }
 

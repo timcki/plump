@@ -23,14 +23,23 @@
 // waveform "over a window" is really a waveform over the whole panel
 // in which the area outside the window is expected to sit in a
 // no-change LUT state. the OTP DU has two of those ({0,0} and {1,1},
-// plain content), the gray and revert LUTs only one ({0,0}). AA codes
-// therefore never coexist with a windowed waveform: gray passes are
-// always full-screen, and a windowed partial over a gray-coded panel
-// first neutralizes the codes (full revert, planes rewritten with
-// content). crosspoint enforces the same rule (grayscaleRevert before
+// plain content); the gray and revert LUTs read a different pair of
+// bits (content in RED, edge in BW, see the driver's LUT_GRAYSCALE),
+// so plain content under them is a drive state. AA codes therefore
+// never coexist with a windowed waveform: gray passes are always
+// full-screen, and a windowed partial over a gray-coded panel first
+// neutralizes the codes (full revert, planes rewritten with content).
+// crosspoint enforces the same rule (grayscaleRevert before
 // displayWindow); the windowed gray/revert passes this file used to
 // run re-pulsed every AA edge on the panel per session, which is the
 // progressive darkening of home and the quick menu surroundings
+//
+// page turns over AA are deltas: the gray pass leaves the content bit
+// in RED, the revert brings the panel to that content, and the DU
+// that follows writes only BW. the earlier scheme re-drove the whole
+// panel through inv_red after every AA pass, one same-direction pulse
+// over the entire background per turn, which built up as a grey haze
+// that the faked-90C clear could not remove
 
 use core::marker::PhantomData;
 
@@ -38,7 +47,7 @@ use embassy_time::{Instant, TimeoutError};
 use esp_hal::delay::Delay;
 
 use crate::board::{Epd, SCREEN_H, SCREEN_W};
-use crate::drivers::ssd1677::{Driven, Phase1, Window};
+use crate::drivers::ssd1677::{Driven, FullKind, Phase1, Window};
 use crate::drivers::strip::StripBuffer;
 use crate::kernel::plane_map::{PlaneMap, SessionOutcome};
 use crate::ui::{AlignedRegion, Region};
@@ -137,7 +146,7 @@ impl<'s> PendingRevert<'s> {
         F: Fn(&mut StripBuffer),
     {
         let PendingRevert { screen, region } = self;
-        crate::perf_begin!(_t0);
+        let t0 = Instant::now();
         let res = if region == FULL_REGION {
             screen.revert_windows(region).await
         } else {
@@ -145,7 +154,14 @@ impl<'s> PendingRevert<'s> {
         };
         match res {
             Ok(true) => {
-                crate::perf_event!("render", "revert wave_ms={}", _t0.elapsed().as_millis());
+                // the panel is at its rails and RED holds that content
+                // (the gray pass wrote the content bit there), so the
+                // planes describe the panel: the DU that follows is a
+                // delta over a single BW write, not a re-drive
+                if region == FULL_REGION {
+                    let _ = screen.planes.apply(region, SessionOutcome::Synced);
+                }
+                log::info!("screen: revert wave_ms={}", t0.elapsed().as_millis());
             }
             Ok(false) => {}
             Err(_) => {
@@ -205,6 +221,12 @@ impl Screen {
     #[inline]
     pub fn ghost_clear_due(&self, every: u32) -> bool {
         self.force_gc || self.partials >= every
+    }
+
+    /// Partial refreshes since the last full clear.
+    #[inline]
+    pub fn partials_since_clear(&self) -> u32 {
+        self.partials
     }
 
     /// Bounding box of everything a delta DU may not touch; debug view.
@@ -429,12 +451,12 @@ impl Screen {
     }
 
     /// Write the full frame to both RAMs and kick the GC waveform.
-    pub fn begin_full<F>(&mut self, draw: &F) -> Wave<'_, Gc>
+    pub fn begin_full<F>(&mut self, draw: &F, kind: FullKind) -> Wave<'_, Gc>
     where
         F: Fn(&mut StripBuffer),
     {
         let written = self.epd.write_full_frame(self.strip, &mut self.delay, draw);
-        let driven = self.epd.start_full_update(written);
+        let driven = self.epd.start_full_update(written, kind);
         // both planes hold content the panel does not show yet; if the
         // GC completes, finish() clears the map, and if it times out
         // the whole screen correctly stays marked for re-drive. gray
@@ -457,7 +479,7 @@ impl Screen {
         F: Fn(&mut StripBuffer),
     {
         crate::perf_begin!(_t0);
-        let wave = self.begin_full(draw);
+        let wave = self.begin_full(draw, FullKind::Fast);
         crate::perf_event!(
             "render",
             "full_inline_write write_ms={}",
@@ -482,10 +504,12 @@ impl Screen {
     where
         F: Fn(&mut StripBuffer),
     {
+        let t0 = Instant::now();
         let res = self
             .epd
             .grayscale_pass(self.strip, &Window::FULL, draw)
             .await;
+        log::info!("screen: gray pass total_ms={}", t0.elapsed().as_millis());
         if self.planes.apply(FULL_REGION, SessionOutcome::Grayed) {
             self.force_ghost_clear();
         }
@@ -590,13 +614,12 @@ impl Settled<'_, Du> {
     /// Grayscale AA pass over this refresh instead of phase 3.
     ///
     /// The gray LUT states are short relative pulses that lighten
-    /// pixels the BW frame just drove black, and `{0,0}` is literally
-    /// "no change", so the pass leaves the panel holding intermediate
-    /// levels only the codes now in RAM describe. The screen is
-    /// tracked as gray-coded: the next partial reverts the grays to
-    /// their rails and re-drives via inv_red, the starting state the
-    /// DU transitions assume. On timeout the pass is additionally
-    /// promoted to a full GC.
+    /// pixels the BW frame just drove black; plain pixels are in one
+    /// of two no-change states that also carry their content in RED.
+    /// The screen is tracked as gray-coded: the next partial reverts
+    /// the grays to their rails, after which RED describes the panel
+    /// and the DU is a plain delta. On timeout the pass is
+    /// additionally promoted to a full GC.
     ///
     /// Only a full-screen session takes the pass (whole-panel rule);
     /// a windowed one closes with a plain phase 3 and stays BW.
@@ -613,10 +636,12 @@ impl Settled<'_, Du> {
             return Ok(());
         }
         let s = self.screen;
+        let t0 = Instant::now();
         let res = s
             .epd
             .grayscale_pass(s.strip, &self.driven.window(), draw)
             .await;
+        log::info!("screen: gray pass total_ms={}", t0.elapsed().as_millis());
         if s.planes.apply(self.region, SessionOutcome::Grayed) {
             s.force_ghost_clear();
         }
