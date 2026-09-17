@@ -413,6 +413,15 @@ impl FontSet {
         self.font(style).advance(bitmap::byte_to_char(b))
     }
 
+    /// Pair kerning between two glyphs of one word drawn in `style`.
+    /// The rule every measure and draw path shares: kerning applies
+    /// between consecutive glyphs of a word, never across a space,
+    /// a marker or a style change.
+    #[inline]
+    pub fn kern(&self, left: char, right: char, style: Style) -> i8 {
+        self.font(style).kern(left, right)
+    }
+
     #[inline]
     pub fn draw_char(
         &self,

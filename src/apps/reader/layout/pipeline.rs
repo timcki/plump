@@ -151,7 +151,7 @@ impl LayoutPipeline {
         // Build one paragraph's items.
         let meta = items::build_paragraph(
             scanner,
-            |c, s| advance_for(fonts, c, s) as u16,
+            |p, c, s| advance_for(fonts, p, c, s),
             fonts.em_px(),
             &mut self.items,
         );
@@ -273,11 +273,16 @@ impl Drop for LayoutPipeline {
 // ── helpers ───────────────────────────────────────────────────────
 
 #[inline]
-fn advance_for(fonts: &FontSet, ch: char, style: MarkupStyle) -> u8 {
+fn advance_for(fonts: &FontSet, prev: Option<char>, ch: char, style: MarkupStyle) -> i16 {
     // single source of truth: `fonts::Style::from_markup`. K-P and the
     // renderer must agree on this resolution or measured line widths
     // diverge from drawn line widths on nested markup
-    fonts.advance(ch, Style::from_markup(style))
+    let face = Style::from_markup(style);
+    let adv = fonts.advance(ch, face) as i16;
+    match prev {
+        Some(p) => adv + fonts.kern(p, ch, face) as i16,
+        None => adv,
+    }
 }
 
 /// Number of LineLayouts to reserve for an image block, plus the

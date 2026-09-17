@@ -680,7 +680,8 @@ pub const PAGEIDX_FORMAT_VERSION: u8 = 2;
 // (2-3) and the gap above in quarter-em (high nibble); the first-line
 // indent is a K-P box so breaks moved; image-origin lines now start at
 // the IMG_REF marker so a page beginning on an image holds its header.
-pub const LAYOUT_ALGO_VERSION: u8 = 18;
+// v19: pair kerning inside words moves every measured width.
+pub const LAYOUT_ALGO_VERSION: u8 = 19;
 
 pub const PAGEIDX_HDR_V2_SIZE: usize = 20;
 pub const CHAPTER_LAYOUT_DIR_SIZE: usize = 24;

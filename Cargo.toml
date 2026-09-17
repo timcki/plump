@@ -78,6 +78,8 @@ esp-println = { version = "0.16.1", features = ["esp32c3", "log-04"] }
 
 [build-dependencies]
 fontdue = "0.9"
+# GPOS pair kerning at build time; fontdue only reads the legacy `kern` table
+ttf-parser = "0.21"
 
 [profile.dev]
 opt-level = "s"

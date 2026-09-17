@@ -1289,6 +1289,7 @@ dependencies = [
  "plump-kernel",
  "smol-epub",
  "static_cell",
+ "ttf-parser",
 ]
 
 [[package]]

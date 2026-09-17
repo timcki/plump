@@ -55,6 +55,15 @@ pub struct BitmapFont {
     pub ext_glyphs: &'static [BitmapGlyph], // parallel to ext_codepoints
     pub ext_bitmaps: &'static [u8],     // packed 2-bit data for extended
 
+    // pair kerning at this size, from the face's GPOS table, as class
+    // maps over the glyph tables (ascii, then extended; 0 = kerns with
+    // nothing on that side) and a dense left x right class matrix of
+    // pixel adjustments. empty when the face does not kern
+    pub kern_left: &'static [u8],
+    pub kern_right: &'static [u8],
+    pub kern_matrix: &'static [i8],
+    pub kern_cols: u8,
+
     pub line_height: u16, // ascent + descent + leading
     pub ascent: u16,      // baseline to top of tallest glyph
     pub em_px: u16,       // rasterisation size (the size tier's px)
@@ -118,6 +127,37 @@ impl BitmapFont {
     #[inline]
     pub fn advance(&self, ch: char) -> u8 {
         self.glyph(ch).advance
+    }
+
+    // position of `ch` in the glyph tables (ascii, then extended), the
+    // index space the kerning keys use; None for characters this font
+    // renders as '?'
+    #[inline]
+    fn table_index(&self, ch: char) -> Option<u32> {
+        let code = ch as u32;
+        if code >= FIRST_CHAR as u32 && code <= LAST_CHAR as u32 {
+            return Some(code - FIRST_CHAR as u32);
+        }
+        self.ext_codepoints
+            .binary_search(&code)
+            .ok()
+            .map(|i| GLYPH_COUNT as u32 + i as u32)
+    }
+
+    /// Horizontal adjustment, in pixels, applied to the pen before
+    /// `right` when it follows `left`. Zero for unkerned pairs.
+    pub fn kern(&self, left: char, right: char) -> i8 {
+        if self.kern_cols == 0 {
+            return 0;
+        }
+        let (Some(l), Some(r)) = (self.table_index(left), self.table_index(right)) else {
+            return 0;
+        };
+        let (lc, rc) = (self.kern_left[l as usize], self.kern_right[r as usize]);
+        if lc == 0 || rc == 0 {
+            return 0;
+        }
+        self.kern_matrix[(lc as usize - 1) * self.kern_cols as usize + (rc as usize - 1)]
     }
 
     // total width in pixels of a &str

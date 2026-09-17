@@ -1249,28 +1249,41 @@ fn justify_params(
     }
 }
 
-/// natural width of one text event's bytes in `style`; soft hyphens
-/// are zero-width (the fonts ship SHY as a visible glyph, so the
-/// decoder-side policy is to skip it; build.rs excludes it too)
+/// natural width of one word's bytes in `style`, pair kerning between
+/// its consecutive glyphs included (the same rule as the K-P measure
+/// and the draw loop). soft hyphens are zero-width and end the pair
+/// (the fonts ship SHY as a visible glyph, so the decoder-side policy
+/// is to skip it; build.rs excludes it too)
 fn measure_bytes(bytes: &[u8], fs: &fonts::FontSet, style: fonts::Style) -> u32 {
-    let mut w: u32 = 0;
+    let mut w: i32 = 0;
+    let mut prev: Option<char> = None;
     let mut j = 0usize;
     while j < bytes.len() {
         let b = bytes[j];
-        if b >= 0xC0 {
-            let (ch, len) = decode_utf8_char(bytes, j);
-            if ch != '\u{00AD}' {
-                w += fs.advance(ch, style) as u32;
-            }
-            j += len.max(1);
-        } else if b >= 0x80 || b < bitmap::FIRST_CHAR {
+        let (ch, len) = if b >= 0xC0 {
+            decode_utf8_char(bytes, j)
+        } else if !(bitmap::FIRST_CHAR..0x80).contains(&b) {
+            prev = None;
             j += 1;
+            continue;
         } else {
-            w += fs.advance_byte(b, style) as u32;
-            j += 1;
+            (b as char, 1)
+        };
+        j += len.max(1);
+        if ch == '\u{00AD}' || ch == ' ' {
+            if ch == ' ' {
+                w += fs.advance(' ', style) as i32;
+            }
+            prev = None;
+            continue;
         }
+        if let Some(p) = prev {
+            w += fs.kern(p, ch, style) as i32;
+        }
+        w += fs.advance(ch, style) as i32;
+        prev = Some(ch);
     }
-    w
+    w.max(0) as u32
 }
 
 impl ReaderApp {

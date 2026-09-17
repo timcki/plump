@@ -2603,6 +2603,9 @@ impl ReaderApp {
                         let bytes = &self.pg.buf[run.start as usize..run_end];
                         let mut cx = x0;
                         let mut gap_idx = run.gap0 as i32;
+                        // kerning pairs consecutive glyphs of a word; a
+                        // space, soft hyphen or control byte ends the pair
+                        let mut prev: Option<char> = None;
                         let mut j = 0usize;
                         while j < bytes.len() {
                             // pen passed the strip's right edge; nothing
@@ -2611,26 +2614,32 @@ impl ReaderApp {
                                 break;
                             }
                             let b = bytes[j];
-                            if b >= 0xC0 {
-                                let (ch, seq_len) = decode_utf8_char(bytes, j);
-                                // SHY (U+00AD) is a zero-width break
-                                // opportunity: the fonts ship it as a
-                                // visible hyphen, so never draw it
-                                if ch != '\u{00AD}' {
-                                    cx += fs.draw_char(strip, ch, sty, cx, baseline) as i32;
-                                }
-                                j += seq_len.max(1);
-                                continue;
-                            }
-                            if b >= 0x80 || b < bitmap::FIRST_CHAR {
+                            let (ch, seq_len) = if b >= 0xC0 {
+                                decode_utf8_char(bytes, j)
+                            } else if !(bitmap::FIRST_CHAR..0x80).contains(&b) {
+                                prev = None;
                                 j += 1;
                                 continue;
+                            } else {
+                                (b as char, 1)
+                            };
+                            j += seq_len.max(1);
+                            // SHY (U+00AD) is a zero-width break opportunity:
+                            // the fonts ship it as a visible hyphen, so never
+                            // draw it
+                            if ch == '\u{00AD}' {
+                                prev = None;
+                                continue;
                             }
-                            cx += fs.draw_char(strip, b as char, sty, cx, baseline) as i32;
+                            if let Some(p) = prev {
+                                cx += fs.kern(p, ch, sty) as i32;
+                            }
+                            cx += fs.draw_char(strip, ch, sty, cx, baseline) as i32;
+                            prev = if ch == ' ' { None } else { Some(ch) };
                             // justify: distribute the spare (signed) at ASCII
                             // space gaps; the leading `rem` gaps take one
                             // more pixel each
-                            if b == b' ' && (per != 0 || rem != 0) {
+                            if ch == ' ' && (per != 0 || rem != 0) {
                                 cx += per;
                                 if rem > 0 && gap_idx < rem {
                                     cx += 1;
@@ -2639,7 +2648,6 @@ impl ReaderApp {
                                 }
                                 gap_idx += 1;
                             }
-                            j += 1;
                         }
 
                         // decorations are 1-px strokes over the run's placed

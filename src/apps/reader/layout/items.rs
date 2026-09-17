@@ -198,13 +198,14 @@ const WORD_MEASURE_BUF: usize = 256;
 /// The caller is expected to clear `out` before each call.
 ///
 /// `advance` is called per character of every Word token to derive
-/// natural width. Implementations should call `FontSet::advance(ch,
-/// style)`; the closure form keeps this module free of font/HAL
-/// imports for host testability. `em_px` sizes the first-line indent
-/// box.
+/// natural width: it returns the pen movement for `ch` when it follows
+/// `prev` (the glyph advance plus the pair kerning, or the bare advance
+/// at a word start). The closure form keeps this module free of
+/// font/HAL imports for host testability. `em_px` sizes the first-line
+/// indent box.
 pub fn build_paragraph(
     events: &mut Events<'_>,
-    mut advance: impl FnMut(char, Style) -> u16,
+    mut advance: impl FnMut(Option<char>, char, Style) -> i16,
     em_px: u16,
     out: &mut Vec<Item>,
 ) -> ParagraphMeta {
@@ -248,7 +249,7 @@ pub fn build_paragraph(
 
             Event::Space { start, end, style } => {
                 lead_in!(start, style);
-                let space = advance(' ', style) as u32;
+                let space = advance(None, ' ', style).max(0) as u32;
                 // TeX cmr10's classical ratios. The breaker's pass-2
                 // fallback (`break_paragraph_with_fallback`) adds
                 // emergencystretch per line so narrow-column paragraphs
@@ -271,7 +272,7 @@ pub fn build_paragraph(
             Event::Nbsp { start, end, style } => {
                 lead_in!(start, style);
                 // fixed glue: render at space width but never break here
-                let space = advance(' ', style) as u32;
+                let space = advance(None, ' ', style).max(0) as u32;
                 out.push(Item::boxed(space.min(u16::MAX as u32) as u16, start).with_style(style));
                 last_end = end;
             }
@@ -372,22 +373,23 @@ fn push_forced_break_triple(out: &mut Vec<Item>, byte_offset: u32) {
 fn measure_word(
     bytes: &[u8],
     style: Style,
-    advance: &mut impl FnMut(char, Style) -> u16,
+    advance: &mut impl FnMut(Option<char>, char, Style) -> i16,
 ) -> u16 {
-    let mut width: u32 = 0;
+    // kerning applies between consecutive glyphs of the word
+    let mut prev: Option<char> = None;
+    let mut width: i32 = 0;
     let mut i = 0;
     while i < bytes.len() {
-        let b = bytes[i];
-        if b < 0x80 {
-            width = width.saturating_add(advance(b as char, style) as u32);
-            i += 1;
+        let (ch, len) = if bytes[i] < 0x80 {
+            (bytes[i] as char, 1)
         } else {
-            let (ch, len) = decode_utf8(&bytes[i..]);
-            width = width.saturating_add(advance(ch, style) as u32);
-            i += len.max(1);
-        }
+            decode_utf8(&bytes[i..])
+        };
+        width = width.saturating_add(advance(prev, ch, style) as i32);
+        prev = Some(ch);
+        i += len.max(1);
     }
-    width.min(u16::MAX as u32) as u16
+    width.clamp(0, u16::MAX as i32) as u16
 }
 
 // ── tests ─────────────────────────────────────────────────────────
@@ -400,7 +402,7 @@ mod tests {
     };
 
     /// minimal mock advance: every char is 1 px regardless of style.
-    fn unit_advance(_c: char, _s: Style) -> u16 {
+    fn unit_advance(_p: Option<char>, _c: char, _s: Style) -> i16 {
         1
     }
 

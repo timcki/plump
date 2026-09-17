@@ -102,6 +102,9 @@ struct FamilySpec {
     base_weight: &'static str,
     body: [f32; 5],
     heading: [f32; 5],
+    // emit GPOS pair kerning tables; the reader faces kern, the UI face
+    // is drawn unkerned so its tables would only cost flash
+    kern: bool,
 }
 
 // size tiers: 0=XSmall 1=Small 2=Medium 3=Large 4=XLarge
@@ -132,6 +135,7 @@ const FAMILIES: &[FamilySpec] = &[
         base_weight: "Regular",
         body: [16.0, 19.0, 22.0, 28.0, 35.0],
         heading: [22.0, 27.0, 32.0, 38.0, 46.0],
+        kern: true,
     },
     FamilySpec {
         prefix: "ATKINSON",
@@ -139,6 +143,7 @@ const FAMILIES: &[FamilySpec] = &[
         base_weight: "Regular",
         body: [16.0, 19.0, 23.0, 28.0, 35.0],
         heading: [23.0, 27.0, 32.0, 38.0, 46.0],
+        kern: true,
     },
     FamilySpec {
         prefix: "INTER",
@@ -146,6 +151,7 @@ const FAMILIES: &[FamilySpec] = &[
         base_weight: "Regular",
         body: [17.0, 18.0, 24.0, 28.0, 36.0],
         heading: [24.0, 27.0, 33.0, 39.0, 46.0],
+        kern: false,
     },
     FamilySpec {
         prefix: "PHOSPHOR",
@@ -153,6 +159,7 @@ const FAMILIES: &[FamilySpec] = &[
         base_weight: "Bold",
         body: [17.0, 18.0, 24.0, 28.0, 36.0],
         heading: [24.0, 27.0, 33.0, 39.0, 46.0],
+        kern: false,
     },
 ];
 
@@ -510,14 +517,30 @@ fn emit_or_stub_set(
         let data = fs::read(p).unwrap();
         let font = fontdue::Font::from_bytes(data.as_slice(), fontdue::FontSettings::default())
             .unwrap_or_else(|_| panic!("failed to parse {}", p.display()));
+        // the glyph set in table order: ascii, then the extended set
+        let charset: Vec<Option<char>> = (FIRST_CHAR..=LAST_CHAR)
+            .map(|b| Some(b as char))
+            .chain(ext_codepoints.iter().map(|&cp| char::from_u32(cp)))
+            .collect();
+        // the UI family draws unkerned, so its tables would only cost flash
+        let kern = if fam.kern {
+            collect_kern_units(&data, &charset)
+        } else {
+            KernUnits {
+                units_per_em: 1000,
+                pairs: Vec::new(),
+            }
+        };
         eprintln!(
-            "cargo:warning=font: rasterising {} as {family_prefix}_{style_prefix}",
+            "cargo:warning=font: rasterising {} as {family_prefix}_{style_prefix} ({} kern pairs in font units)",
             p.file_name().unwrap().to_string_lossy(),
+            kern.pairs.len(),
         );
         for (px, suffix) in fam.body.iter().zip(TIERS) {
             emit_font(
                 out,
                 &font,
+                &kern,
                 &format!("{family_prefix}_{style_prefix}_BODY_{suffix}"),
                 *px,
                 ext_codepoints,
@@ -528,6 +551,7 @@ fn emit_or_stub_set(
                 emit_font(
                     out,
                     &font,
+                    &kern,
                     &format!("{family_prefix}_{style_prefix}_HEADING_{suffix}"),
                     *px,
                     ext_codepoints,
@@ -556,6 +580,212 @@ struct RasterGlyph {
     width: u8,
     height: u8,
     bits: Vec<u8>,
+}
+
+// pair kerning in font units for the glyph set, indexed by position in
+// the emitted tables (ascii first, then the extended set). all three text
+// families keep their kerning in GPOS, which fontdue does not read
+struct KernUnits {
+    units_per_em: u16,
+    // (left index, right index, x-advance adjustment in font units)
+    pairs: Vec<(u16, u16, i16)>,
+}
+
+fn collect_kern_units(data: &[u8], charset: &[Option<char>]) -> KernUnits {
+    use ttf_parser::gpos::{PairAdjustment, PositioningSubtable};
+    use ttf_parser::{Face, GlyphId, Tag};
+
+    let mut out = KernUnits {
+        units_per_em: 1000,
+        pairs: Vec::new(),
+    };
+    let Ok(face) = Face::parse(data, 0) else {
+        return out;
+    };
+    out.units_per_em = face.units_per_em();
+    let Some(gpos) = face.tables().gpos else {
+        return out;
+    };
+
+    // the lookups the `kern` feature names, in order; a font without a
+    // kern feature gets every lookup scanned for pair subtables
+    let mut lookup_ids: Vec<u16> = Vec::new();
+    for feature in gpos.features {
+        if feature.tag == Tag::from_bytes(b"kern") {
+            lookup_ids.extend(feature.lookup_indices);
+        }
+    }
+    if lookup_ids.is_empty() {
+        lookup_ids = (0..gpos.lookups.len()).collect();
+    }
+    lookup_ids.sort_unstable();
+    lookup_ids.dedup();
+
+    let mut subtables: Vec<PairAdjustment> = Vec::new();
+    for id in lookup_ids {
+        let Some(lookup) = gpos.lookups.get(id) else {
+            continue;
+        };
+        for st in lookup.subtables.into_iter::<PositioningSubtable>() {
+            if let PositioningSubtable::Pair(pair) = st {
+                subtables.push(pair);
+            }
+        }
+    }
+    if subtables.is_empty() {
+        return out;
+    }
+
+    let gids: Vec<Option<GlyphId>> = charset
+        .iter()
+        .map(|c| c.and_then(|c| face.glyph_index(c)))
+        .collect();
+
+    // the first subtable whose coverage holds the left glyph and that has
+    // a record for the right glyph decides the pair, as a shaper would
+    for (li, left) in gids.iter().enumerate() {
+        let Some(left) = left else { continue };
+        for (ri, right) in gids.iter().enumerate() {
+            let Some(right) = right else { continue };
+            let mut value: Option<i16> = None;
+            for st in &subtables {
+                let Some(cov) = st.coverage().get(*left) else {
+                    continue;
+                };
+                match st {
+                    PairAdjustment::Format1 { sets, .. } => {
+                        if let Some(set) = sets.get(cov)
+                            && let Some((v1, _)) = set.get(*right)
+                        {
+                            value = Some(v1.x_advance);
+                            break;
+                        }
+                    }
+                    PairAdjustment::Format2 {
+                        classes, matrix, ..
+                    } => {
+                        let c1 = classes.0.get(*left);
+                        let c2 = classes.1.get(*right);
+                        if let Some((v1, _)) = matrix.get((c1, c2)) {
+                            value = Some(v1.x_advance);
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(v) = value
+                && v != 0
+            {
+                out.pairs.push((li as u16, ri as u16, v));
+            }
+        }
+    }
+    out
+}
+
+// the pair table at one tier as a class-compressed matrix. the fonts
+// kern by class, so a glyph's row (as left) and column (as right) repeat
+// across dozens of glyphs; giving identical rows one left class and
+// identical columns one right class turns ~8 000 pairs into ~50 x 50
+// entries. class 0 means the glyph kerns with nothing on that side
+struct KernPx {
+    left: Vec<u8>,
+    right: Vec<u8>,
+    matrix: Vec<i8>,
+    cols: usize,
+}
+
+fn kern_classes_px(kern: &KernUnits, px: f32, n: usize) -> KernPx {
+    let mut dense = vec![0i8; n * n];
+    let mut any = false;
+    for &(l, r, units) in &kern.pairs {
+        let scaled = (units as f32 * px / kern.units_per_em as f32).round() as i32;
+        if scaled == 0 {
+            continue;
+        }
+        dense[l as usize * n + r as usize] = scaled.clamp(-127, 127) as i8;
+        any = true;
+    }
+    if !any {
+        return KernPx {
+            left: Vec::new(),
+            right: Vec::new(),
+            matrix: Vec::new(),
+            cols: 0,
+        };
+    }
+
+    // left classes: identical rows; right classes: identical columns
+    let mut row_ids: std::collections::HashMap<Vec<i8>, u8> = std::collections::HashMap::new();
+    let mut row_reps: Vec<usize> = Vec::new();
+    let mut left = vec![0u8; n];
+    for li in 0..n {
+        let row = dense[li * n..(li + 1) * n].to_vec();
+        if row.iter().all(|&v| v == 0) {
+            continue;
+        }
+        let next = row_ids.len() as u8 + 1;
+        let id = *row_ids.entry(row).or_insert_with(|| {
+            row_reps.push(li);
+            next
+        });
+        left[li] = id;
+    }
+    let mut col_ids: std::collections::HashMap<Vec<i8>, u8> = std::collections::HashMap::new();
+    let mut col_reps: Vec<usize> = Vec::new();
+    let mut right = vec![0u8; n];
+    for ri in 0..n {
+        let col: Vec<i8> = (0..n).map(|li| dense[li * n + ri]).collect();
+        if col.iter().all(|&v| v == 0) {
+            continue;
+        }
+        let next = col_ids.len() as u8 + 1;
+        let id = *col_ids.entry(col).or_insert_with(|| {
+            col_reps.push(ri);
+            next
+        });
+        right[ri] = id;
+    }
+    assert!(row_reps.len() < 255 && col_reps.len() < 255, "kern classes overflow u8");
+
+    let cols = col_reps.len();
+    let mut matrix = vec![0i8; row_reps.len() * cols];
+    for (lc, &li) in row_reps.iter().enumerate() {
+        for (rc, &ri) in col_reps.iter().enumerate() {
+            matrix[lc * cols + rc] = dense[li * n + ri];
+        }
+    }
+    let kp = KernPx {
+        left,
+        right,
+        matrix,
+        cols,
+    };
+    // the compression must be exact: every pair reads back as extracted
+    for li in 0..n {
+        for ri in 0..n {
+            assert_eq!(
+                kp.lookup(li, ri),
+                dense[li * n + ri],
+                "kern class table mismatch at ({li}, {ri})"
+            );
+        }
+    }
+    kp
+}
+
+impl KernPx {
+    // the runtime lookup, mirrored here for the self-check and the log
+    fn lookup(&self, li: usize, ri: usize) -> i8 {
+        if self.cols == 0 {
+            return 0;
+        }
+        let (lc, rc) = (self.left[li], self.right[ri]);
+        if lc == 0 || rc == 0 {
+            return 0;
+        }
+        self.matrix[(lc as usize - 1) * self.cols + (rc as usize - 1)]
+    }
 }
 
 fn rasterize_char(font: &fontdue::Font, ch: char, px: f32) -> RasterGlyph {
@@ -610,6 +840,7 @@ fn rasterize_char(font: &fontdue::Font, ch: char, px: f32) -> RasterGlyph {
 fn emit_font(
     out: &mut fs::File,
     font: &fontdue::Font,
+    kern: &KernUnits,
     name: &str,
     px: f32,
     ext_codepoints: &[u32],
@@ -729,6 +960,49 @@ fn emit_font(
     writeln!(out, "];").unwrap();
     writeln!(out).unwrap();
 
+    // kerning at this size: per-glyph left / right class maps and the
+    // class matrix (see `kern_classes_px`)
+
+    let kp = kern_classes_px(kern, px, GLYPH_COUNT + ext_codepoints.len());
+    for (suffix, table) in [("KERN_L", &kp.left), ("KERN_R", &kp.right)] {
+        writeln!(out, "static {name}_{suffix}: [u8; {}] = [", table.len()).unwrap();
+        emit_u8_rows(out, table);
+        writeln!(out, "];").unwrap();
+    }
+    writeln!(out, "static {name}_KERN_M: [i8; {}] = [", kp.matrix.len()).unwrap();
+    let mut col = 0;
+    for val in &kp.matrix {
+        if col == 0 {
+            write!(out, "    ").unwrap();
+        }
+        write!(out, "{val},").unwrap();
+        col += 1;
+        if col >= 16 {
+            writeln!(out).unwrap();
+            col = 0;
+        }
+    }
+    if col > 0 {
+        writeln!(out).unwrap();
+    }
+    writeln!(out, "];").unwrap();
+    writeln!(out).unwrap();
+    if let Some(rows) = kp.matrix.len().checked_div(kp.cols) {
+        // a few pairs every kerned face adjusts, so the numbers can be
+        // eyeballed in the build log
+        let idx = |c: char| (c as usize) - FIRST_CHAR as usize;
+        let sample: Vec<String> = [('A', 'V'), ('T', 'o'), ('W', 'a'), ('r', '.'), ('L', 'T')]
+            .iter()
+            .map(|&(l, r)| format!("{l}{r}={}", kp.lookup(idx(l), idx(r))))
+            .collect();
+        eprintln!(
+            "cargo:warning=font: {name}: kern {rows}x{} classes ({} bytes) {}",
+            kp.cols,
+            kp.matrix.len() + kp.left.len() + kp.right.len(),
+            sample.join(" ")
+        );
+    }
+
     // BitmapFont struct
 
     writeln!(out, "pub static {name}: BitmapFont = BitmapFont {{").unwrap();
@@ -737,6 +1011,10 @@ fn emit_font(
     writeln!(out, "    ext_codepoints: &{name}_EXT_CP,").unwrap();
     writeln!(out, "    ext_glyphs: &{name}_EXT_GLYPHS,").unwrap();
     writeln!(out, "    ext_bitmaps: &{name}_EXT_BITMAPS,").unwrap();
+    writeln!(out, "    kern_left: &{name}_KERN_L,").unwrap();
+    writeln!(out, "    kern_right: &{name}_KERN_R,").unwrap();
+    writeln!(out, "    kern_matrix: &{name}_KERN_M,").unwrap();
+    writeln!(out, "    kern_cols: {},", kp.cols).unwrap();
     writeln!(out, "    line_height: {line_height},").unwrap();
     writeln!(out, "    ascent: {ascent},").unwrap();
     writeln!(out, "    em_px: {em_px},").unwrap();
@@ -753,6 +1031,10 @@ fn emit_stub(out: &mut fs::File, name: &str) {
          ext_codepoints: &[], \
          ext_glyphs: &[], \
          ext_bitmaps: &[], \
+         kern_left: &[], \
+         kern_right: &[], \
+         kern_matrix: &[], \
+         kern_cols: 0, \
          line_height: 13, \
          ascent: 13, \
          em_px: 13 \
@@ -760,6 +1042,24 @@ fn emit_stub(out: &mut fs::File, name: &str) {
     )
     .unwrap();
     writeln!(out).unwrap();
+}
+
+fn emit_u8_rows(out: &mut fs::File, bytes: &[u8]) {
+    let mut col = 0;
+    for b in bytes {
+        if col == 0 {
+            write!(out, "    ").unwrap();
+        }
+        write!(out, "{b},").unwrap();
+        col += 1;
+        if col >= 24 {
+            writeln!(out).unwrap();
+            col = 0;
+        }
+    }
+    if col > 0 {
+        writeln!(out).unwrap();
+    }
 }
 
 fn emit_bitmap_bytes(out: &mut fs::File, glyphs: &[RasterGlyph]) {
