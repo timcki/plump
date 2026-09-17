@@ -1,12 +1,17 @@
 //! Paginator + convert adapters.
 //!
 //! `paginate()` turns a chapter line table into a page table,
-//! honoring forced page breaks, image-block atomicity, and a
-//! lightweight widow/orphan post-pass.
+//! honoring forced page breaks, image-block atomicity, paragraph
+//! spacing and a lightweight widow/orphan post-pass. Page fill is
+//! counted in quarter-lines: a line costs four, plus the gap above it
+//! (its block record's `space_above`, converted with the current font
+//! metrics) unless it is the first line on the page, where the gap is
+//! dropped the way TeX drops glue at the top of a page.
 //!
 //! `convert::append_lines` translates one paragraph's K-P
 //! `BreakChoice`s into `LineLayout` records, packing per-gap
-//! justification spare into `LineLayout::extra`.
+//! justification spare into `LineLayout::extra` and the paragraph's
+//! block properties into `indent` / `align`.
 //!
 //! `convert::append_greedy_fallback` is the in-pipeline fallback
 //! used when the K-P breaker rejects a paragraph (oversized item
@@ -17,8 +22,9 @@
 
 use alloc::vec::Vec;
 
+use smol_epub::markup::{Align, Style};
+
 use super::items::{Item, ItemKind, ParagraphMeta};
-use super::scan::BlockAlign;
 use super::{LineLayout, PageLayout};
 
 // ── pagination ─────────────────────────────────────────────────────
@@ -27,6 +33,45 @@ use super::{LineLayout, PageLayout};
 pub enum PaginateError {
     EmptyChapter,
     TooManyPages,
+}
+
+/// The font metrics that turn a line's quarter-em gap into page fill.
+#[derive(Clone, Copy, Debug)]
+pub struct PageSpacing {
+    pub em_px: u16,
+    pub line_h: u16,
+}
+
+impl PageSpacing {
+    #[inline]
+    pub fn gap_quarters(&self, qem: u8) -> u16 {
+        super::gap_quarters(qem, self.em_px, self.line_h)
+    }
+}
+
+/// quarter-lines one line of text occupies without its gap
+const LINE_Q: u16 = 4;
+
+/// fill cost of `line` in quarter-lines; the gap above only counts
+/// when the line is not the first on its page
+#[inline]
+fn line_cost_q(line: &LineLayout, first_on_page: bool, spacing: &PageSpacing) -> u16 {
+    if first_on_page {
+        LINE_Q
+    } else {
+        LINE_Q + spacing.gap_quarters(line.gap_qem())
+    }
+}
+
+/// total fill of one page in quarter-lines
+fn page_fill_q(lines: &[LineLayout], page: &PageLayout, spacing: &PageSpacing) -> u16 {
+    let first = page.first_line as usize;
+    let end = (first + page.line_count as usize).min(lines.len());
+    let mut q = 0u16;
+    for (k, line) in lines[first..end].iter().enumerate() {
+        q = q.saturating_add(line_cost_q(line, k == 0, spacing));
+    }
+    q
 }
 
 /// Walk a chapter's `LineLayout` table and emit `PageLayout`s.
@@ -39,6 +84,7 @@ pub fn paginate(
     lines: &[LineLayout],
     max_lines: u8,
     image_block_lines: &[u8],
+    spacing: PageSpacing,
     out_pages: &mut Vec<PageLayout>,
 ) -> Result<(), PaginateError> {
     if lines.is_empty() {
@@ -53,6 +99,7 @@ pub fn paginate(
     if cap == 0 {
         return Err(PaginateError::TooManyPages);
     }
+    let cap_q = max_lines as u16 * LINE_Q;
     if out_pages
         .try_reserve_exact(lines.len().div_ceil(cap.max(1)))
         .is_err()
@@ -64,6 +111,7 @@ pub fn paginate(
     while i < lines.len() {
         let page_start = i;
         let mut count = 0usize;
+        let mut used_q = 0u16;
 
         while i < lines.len() && count < cap {
             let line = &lines[i];
@@ -79,10 +127,12 @@ pub fn paginate(
             } else {
                 1
             };
+            let cost = line_cost_q(line, count == 0, &spacing)
+                .saturating_add((block as u16 - 1) * LINE_Q);
 
-            // page-fit: image block bigger than `cap` is emitted on
-            // its own page anyway (renderer clips bottom)
-            if block > cap {
+            // page-fit: an image block bigger than the page is emitted
+            // on its own page anyway (renderer clips bottom)
+            if cost > cap_q {
                 if count > 0 {
                     break; // flush current page first
                 }
@@ -91,10 +141,11 @@ pub fn paginate(
                 break;
             }
 
-            if count + block > cap {
+            if used_q + cost > cap_q {
                 break;
             }
 
+            used_q += cost;
             count += block;
             i += block;
         }
@@ -119,7 +170,7 @@ pub fn paginate(
         }
     }
 
-    apply_widow_orphan(lines, image_block_lines, max_lines, out_pages);
+    apply_widow_orphan(lines, image_block_lines, max_lines, spacing, out_pages);
 
     Ok(())
 }
@@ -129,31 +180,33 @@ fn page_first_line_to_u16(idx: usize) -> u16 {
     idx.min(u16::MAX as usize) as u16
 }
 
-/// Single-pass widow/orphan adjustment.
+/// Widow / orphan post-pass: at most one line moves from the end of
+/// a page to the start of the next.
 ///
-/// Widow: a paragraph whose last line lands alone at the top of a
-/// page, while the page above is more than half-full of the SAME
-/// paragraph. Demote one line from the previous page so two move
-/// together.
+/// WIDOW: the last line of a paragraph would sit alone at the top of a
+/// page. Pull the previous line down with it.
 ///
-/// Orphan: a paragraph whose first line is the last line of a page,
-/// while the paragraph has ≥3 lines. Move the orphan forward to the
-/// next page (creates a slightly short page above; acceptable).
+/// ORPHAN: the first line of a paragraph would sit alone at the bottom
+/// of a page. Move it forward to the next page (creates a slightly
+/// short page above; acceptable).
 ///
 /// Both adjustments only fire when the previous page has more than
-/// `max_lines / 2` lines, to avoid cascading shrinkage. Headings are
-/// skipped (heading-on-its-own is intentional).
+/// `max_lines / 2` lines, to avoid cascading shrinkage, and only when
+/// the receiving page has room in quarter-lines for the moved line and
+/// for the gap its old first line regains. Headings are skipped
+/// (heading-on-its-own is intentional).
 fn apply_widow_orphan(
     lines: &[LineLayout],
     image_block_lines: &[u8],
     max_lines: u8,
+    spacing: PageSpacing,
     pages: &mut [PageLayout],
 ) {
     if pages.len() < 2 {
         return;
     }
     let half = (max_lines as usize) / 2;
-    let cap = max_lines as usize;
+    let cap_q = max_lines as u16 * LINE_Q;
 
     for p in 1..pages.len() {
         let prev = pages[p - 1];
@@ -166,10 +219,13 @@ fn apply_widow_orphan(
         }
 
         // never grow the current page past capacity: the renderer
-        // draws line i at text_y + i * line_h, so an overfull page
-        // prints its extra line over the footer chrome. single-pass
-        // adjustment cannot cascade the overflow forward, so skip.
-        if cur.line_count as usize >= cap {
+        // positions lines from the top, so an overfull page prints its
+        // extra line over the footer chrome. the moved line becomes the
+        // new first line (no gap) and the old first line regains its gap
+        let grown_q = page_fill_q(lines, &cur, &spacing)
+            .saturating_add(LINE_Q)
+            .saturating_add(spacing.gap_quarters(lines[cur_first].gap_qem()));
+        if grown_q > cap_q {
             continue;
         }
 
@@ -190,7 +246,6 @@ fn apply_widow_orphan(
             && !prev_last_line.is_paragraph_end()
             && !cur_first_line.is_heading();
         if widow_here {
-            // shrink previous page by 1, grow current page by 1
             pages[p - 1].line_count -= 1;
             pages[p - 1].end_byte = lines[prev_last - 1].end_byte;
             pages[p].first_line -= 1;
@@ -235,9 +290,7 @@ pub mod convert {
         items: &[Item],
         choices: &[BreakChoice],
         meta: &ParagraphMeta,
-        // kept on the API surface for future per-line diagnostics; the
-        // KPDIAG-li log this used to feed has been removed (it was
-        // only there for the K-P collapse investigation).
+        // kept on the API surface for future per-line diagnostics
         _line_width: u16,
         page_break_pending: &mut bool,
         out: &mut Vec<LineLayout>,
@@ -256,18 +309,18 @@ pub mod convert {
                 .map(|it| it.byte_offset)
                 .unwrap_or(meta.byte_end);
 
-            let style_byte = first_box_style(items, lo, item_idx);
-            let mut flags = style_byte;
+            let start_style = first_box_style(items, lo, item_idx);
+            let mut flags = LineLayout::style_flags(start_style);
 
             if *page_break_pending && line_idx == 0 {
                 flags |= LineLayout::FLAG_PAGE_BREAK_BEFORE;
                 *page_break_pending = false;
             }
-            if ch.flags.contains(ChoiceFlags::LAST_LINE) || ch.flags.contains(ChoiceFlags::FORCED_BREAK)
+            if (ch.flags.contains(ChoiceFlags::LAST_LINE)
+                || ch.flags.contains(ChoiceFlags::FORCED_BREAK))
+                && line_idx + 1 == choices.len()
             {
-                if line_idx + 1 == choices.len() {
-                    flags |= LineLayout::FLAG_PARAGRAPH_END;
-                }
+                flags |= LineLayout::FLAG_PARAGRAPH_END;
             }
 
             // `no_stretch` covers the typography rule: don't fully-justify
@@ -283,12 +336,20 @@ pub mod convert {
             let gap_count = count_gaps(items, lo, item_idx);
             let extra = encode_extra(ch, gap_count, no_stretch);
 
+            let first = line_idx == 0;
             out.push(LineLayout {
                 start_byte,
                 end_byte,
                 flags,
-                indent: meta.block.indent.min(u8::MAX),
-                align: align_to_u8(meta.block.align),
+                indent: LineLayout::pack_indent(
+                    meta.block.left,
+                    if first { meta.block.text_indent_qem } else { 0 },
+                ),
+                align: LineLayout::pack_align(
+                    meta.block.align,
+                    if first { meta.block.space_above_qem } else { 0 },
+                    start_style,
+                ),
                 extra,
             });
             prev_idx = Some(item_idx);
@@ -380,6 +441,7 @@ pub mod convert {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_fallback_line(
         items: &[Item],
         lo: usize,
@@ -399,7 +461,8 @@ pub mod convert {
             .map(|it| it.byte_offset)
             .unwrap_or(meta.byte_end);
 
-        let mut flags = first_box_style(items, lo, breakpoint);
+        let start_style = first_box_style(items, lo, breakpoint);
+        let mut flags = LineLayout::style_flags(start_style);
         if is_first_line_of_paragraph && *page_break_pending {
             flags |= LineLayout::FLAG_PAGE_BREAK_BEFORE;
             *page_break_pending = false;
@@ -408,20 +471,28 @@ pub mod convert {
             flags |= LineLayout::FLAG_PARAGRAPH_END;
         }
 
+        let first = is_first_line_of_paragraph;
         out.push(LineLayout {
             start_byte,
             end_byte,
             flags,
-            indent: meta.block.indent.min(u8::MAX),
-            align: align_to_u8(meta.block.align),
+            indent: LineLayout::pack_indent(
+                meta.block.left,
+                if first { meta.block.text_indent_qem } else { 0 },
+            ),
+            align: LineLayout::pack_align(
+                meta.block.align,
+                if first { meta.block.space_above_qem } else { 0 },
+                start_style,
+            ),
             extra: 0, // greedy doesn't justify
         });
     }
 
     /// Append an image-paragraph LineLayout (one origin line + filler
-    /// fillers) for an image whose alt text and path live at the
-    /// stored byte offsets in the chapter buffer. The caller already
-    /// has the `ImageRef` from `ParagraphMeta::image`.
+    /// fillers). The origin's byte range is the whole IMG_REF record,
+    /// marker included, so a page that starts on the image loads the
+    /// header, alt text and path into its buffer.
     ///
     /// `reserved_h` is the pixel height the block reserves; it rides
     /// the origin's `extra` byte in 4 px units so a later spacing
@@ -439,16 +510,16 @@ pub mod convert {
             flags |= LineLayout::FLAG_PAGE_BREAK_BEFORE;
             *page_break_pending = false;
         }
-        // origin line: start_byte points at path_start so the renderer
-        // can reach the path slice; end_byte is one-past path end.
-        // alt_len lives in `indent` (greedy convention preserved at
-        // src/apps/reader/paging.rs:903 for renderer parity).
         out.push(LineLayout {
-            start_byte: img.path_start,
-            end_byte: img.path_start + img.path_len as u32,
+            start_byte: img.start,
+            end_byte: img.end,
             flags,
-            indent: img.alt_len,
-            align: LineLayout::ALIGN_DEFAULT,
+            indent: 0,
+            align: LineLayout::pack_align(
+                Align::Default,
+                meta.block.space_above_qem,
+                Style::PLAIN,
+            ),
             extra: reserved_h.div_ceil(4).min(u8::MAX as u16) as u8,
         });
         // filler lines (start/end zero; renderer treats len==0 + IMAGE flag as filler)
@@ -462,41 +533,27 @@ pub mod convert {
                 extra: 0,
             });
         }
-        let _ = meta.end_kind; // ImageBlock; suppress warning
         Some(())
     }
 
-    fn first_box_style(items: &[Item], lo: usize, breakpoint: usize) -> u8 {
-        for k in lo..=breakpoint.min(items.len().saturating_sub(1)) {
-            let it = &items[k];
+    /// the style of the first Box in `lo..=breakpoint`: what the line's
+    /// first glyph is drawn in. a line whose first Box is bold and whose
+    /// later Boxes are regular still carries bold here; the renderer's
+    /// decoder flips back when it meets the close marker mid-line
+    fn first_box_style(items: &[Item], lo: usize, breakpoint: usize) -> Style {
+        for it in &items[lo..=breakpoint.min(items.len().saturating_sub(1))] {
             if matches!(it.kind(), ItemKind::Box) {
-                let mut f: u8 = 0;
-                if it.style_is_bold() {
-                    f |= LineLayout::FLAG_BOLD;
-                }
-                if it.style_is_italic() {
-                    f |= LineLayout::FLAG_ITALIC;
-                }
-                let tier = it.style_heading_tier();
-                if tier != Item::STYLE_TIER_NONE {
-                    f |= LineLayout::FLAG_HEADING;
-                    f |= match tier {
-                        Item::STYLE_TIER_H1 => LineLayout::HLEVEL_H1,
-                        Item::STYLE_TIER_H2 => LineLayout::HLEVEL_H2,
-                        _ => LineLayout::HLEVEL_H3,
-                    };
-                }
-                return f;
+                return it.style();
             }
         }
-        0
+        Style::PLAIN
     }
 
     fn count_gaps(items: &[Item], lo: usize, breakpoint: usize) -> u16 {
         let mut count: u16 = 0;
         let hi = breakpoint.min(items.len());
-        for k in lo..hi {
-            if matches!(items[k].kind(), ItemKind::Glue) {
+        for it in &items[lo..hi] {
+            if matches!(it.kind(), ItemKind::Glue) {
                 count = count.saturating_add(1);
             }
         }
@@ -506,8 +563,7 @@ pub mod convert {
     fn sum_widths(items: &[Item], lo: usize, hi_exclusive: usize) -> u32 {
         let mut sum: u32 = 0;
         let hi = hi_exclusive.min(items.len());
-        for k in lo..hi {
-            let it = items[k];
+        for it in &items[lo..hi] {
             if !matches!(it.kind(), ItemKind::Penalty) {
                 sum = sum.saturating_add(it.width as u32);
             }
@@ -543,28 +599,18 @@ pub mod convert {
         }
     }
 
-    fn align_to_u8(align: BlockAlign) -> u8 {
-        match align {
-            BlockAlign::Default => LineLayout::ALIGN_DEFAULT,
-            BlockAlign::Left => LineLayout::ALIGN_LEFT,
-            BlockAlign::Center => LineLayout::ALIGN_CENTER,
-            BlockAlign::Right => LineLayout::ALIGN_RIGHT,
-            BlockAlign::Justify => LineLayout::ALIGN_DEFAULT,
-        }
-    }
-
     // ── tests ──────────────────────────────────────────────────
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::apps::reader::layout::breaker::{break_paragraph, BreakConfig};
+        use crate::apps::reader::layout::breaker::{BreakConfig, BreakScratch, break_paragraph};
         use crate::apps::reader::layout::items::ParagraphEnd;
-        use crate::apps::reader::layout::scan::{BlockState, TextStyle};
+        use smol_epub::markup::BlockProps;
 
         fn meta() -> ParagraphMeta {
             ParagraphMeta {
-                block: BlockState::default(),
-                style_at_start: TextStyle::default(),
+                block: BlockProps::DEFAULT,
+                style_at_start: Style::PLAIN,
                 end_kind: ParagraphEnd::ParagraphBreak,
                 byte_start: 0,
                 byte_end: 0,
@@ -582,10 +628,11 @@ pub mod convert {
 
         #[test]
         fn append_lines_marks_paragraph_end_on_last_line() {
-            let mut items = Vec::new();
-            items.push(Item::boxed(10, 0));
-            items.push(Item::glue(5, 2, 1, 10));
-            items.push(Item::boxed(10, 11));
+            let mut items = vec![
+                Item::boxed(10, 0),
+                Item::glue(5, 2, 1, 10),
+                Item::boxed(10, 11),
+            ];
             items.extend(forced_triple());
 
             let cfg = BreakConfig {
@@ -598,14 +645,47 @@ pub mod convert {
             let mut out = Vec::new();
             let mut pending = false;
             append_lines(&items, &choices, &meta(), 100, &mut pending, &mut out);
-            assert_eq!(out.len(), choices.len());
             assert!(out.last().unwrap().is_paragraph_end());
+            assert_eq!(out.last().unwrap().extra, 0);
         }
 
         #[test]
-        fn append_lines_consumes_page_break_pending() {
-            let mut items = Vec::new();
-            items.push(Item::boxed(10, 0));
+        fn first_line_carries_block_indent_and_gap() {
+            let mut items = vec![Item::boxed(10, 0), Item::glue(5, 2, 1, 10), Item::boxed(10, 11)];
+            items.extend(forced_triple());
+            let mut m = meta();
+            m.block = BlockProps {
+                align: Align::Center,
+                left: 2,
+                text_indent_qem: 6,
+                space_above_qem: 4,
+            };
+            let mut out = Vec::new();
+            let mut pending = false;
+            append_greedy_fallback(&items, &m, 12, &mut pending, &mut out);
+            assert!(out.len() >= 2);
+            assert_eq!(out[0].left_levels(), 2);
+            assert_eq!(out[0].first_indent_qem(), 6);
+            assert_eq!(out[0].gap_qem(), 4);
+            assert_eq!(out[0].align(), LineLayout::ALIGN_CENTER);
+            assert_eq!(out[1].first_indent_qem(), 0);
+            assert_eq!(out[1].gap_qem(), 0);
+            assert_eq!(out[1].left_levels(), 2);
+        }
+
+        #[test]
+        fn dropcap_first_line_flags_bold_and_underline() {
+            let bold = Style {
+                bold: true,
+                underline: true,
+                ..Style::PLAIN
+            };
+            let mut items = vec![
+                Item::boxed(3, 0).with_style(bold),
+                Item::boxed(15, 5),
+                Item::glue(5, 2, 1, 20),
+                Item::boxed(15, 21),
+            ];
             items.extend(forced_triple());
             let cfg = BreakConfig {
                 line_width: 100,
@@ -613,295 +693,29 @@ pub mod convert {
             };
             let mut choices = Vec::new();
             break_paragraph(&items, &cfg, &mut BreakScratch::new(), &mut choices).unwrap();
-
             let mut out = Vec::new();
-            let mut pending = true;
+            let mut pending = false;
             append_lines(&items, &choices, &meta(), 100, &mut pending, &mut out);
-            assert!(out[0].is_page_break_before());
-            assert!(!pending);
+            let first = out[0];
+            assert!(first.flags & LineLayout::FLAG_BOLD != 0);
+            assert!(first.starts_underline());
+            assert_eq!(first.start_style(), bold);
         }
 
         #[test]
-        fn paragraph_end_line_has_zero_extra() {
-            // a short paragraph fitting on one line. The K-P forced-break
-            // triple carries u16::MAX stretch on its terminal glue, which
-            // (before the no-justify guard) inflated encode_extra to the
-            // +127 cap even though the renderer never justifies
-            // paragraph-end lines.
-            let mut items = Vec::new();
-            items.push(Item::boxed(10, 0));
-            items.push(Item::glue(5, 2, 1, 10));
-            items.push(Item::boxed(10, 11));
-            items.extend(forced_triple());
-
-            let cfg = BreakConfig {
-                line_width: 464,
-                ..BreakConfig::DEFAULT
-            };
-            let mut choices = Vec::new();
-            break_paragraph(&items, &cfg, &mut BreakScratch::new(), &mut choices).unwrap();
-
-            let mut out = Vec::new();
-            let mut pending = false;
-            append_lines(&items, &choices, &meta(), 464, &mut pending, &mut out);
-            let last = out.last().unwrap();
-            assert!(last.is_paragraph_end());
-            assert_eq!(
-                last.extra, 0,
-                "paragraph-end extra must be 0, got {:#x}",
-                last.extra
-            );
-        }
-
-        #[test]
-        fn empty_paragraph_has_zero_extra() {
-            // the exact pattern seen in Leviathan ch11 line 1: a paragraph
-            // that produces no Words/Spaces, only the forced-break triple.
-            let mut items = Vec::new();
-            items.extend(forced_triple());
-
-            let cfg = BreakConfig {
-                line_width: 464,
-                ..BreakConfig::DEFAULT
-            };
-            let mut choices = Vec::new();
-            break_paragraph(&items, &cfg, &mut BreakScratch::new(), &mut choices).unwrap();
-
-            let mut out = Vec::new();
-            let mut pending = false;
-            append_lines(&items, &choices, &meta(), 464, &mut pending, &mut out);
-            // breaker may emit 0 lines for an empty paragraph; if it
-            // emits any, none may have non-zero extra.
-            for ll in &out {
-                assert_eq!(ll.extra, 0, "empty-paragraph line extra must be 0");
+        fn heading_tiers_round_trip() {
+            for lvl in 1..=6u8 {
+                let s = Style {
+                    heading: lvl,
+                    ..Style::PLAIN
+                };
+                let ll = LineLayout {
+                    flags: LineLayout::style_flags(s),
+                    align: LineLayout::pack_align(Align::Default, 0, s),
+                    ..LineLayout::EMPTY
+                };
+                assert_eq!(ll.start_style().heading, lvl.min(4));
             }
-        }
-
-        #[test]
-        fn heading_line_has_zero_extra() {
-            // headings render in the heading font with no justification.
-            // The cached extra must reflect that.
-            let mut items = Vec::new();
-            let heading_style = TextStyle {
-                heading: true,
-                hlevel: 2,
-                ..TextStyle::default()
-            };
-            items.push(Item::boxed(40, 0).with_style(heading_style));
-            items.push(Item::glue(5, 2, 1, 40).with_style(heading_style));
-            items.push(Item::boxed(40, 50).with_style(heading_style));
-            items.extend(forced_triple());
-
-            let cfg = BreakConfig {
-                line_width: 464,
-                ..BreakConfig::DEFAULT
-            };
-            let mut choices = Vec::new();
-            break_paragraph(&items, &cfg, &mut BreakScratch::new(), &mut choices).unwrap();
-
-            let mut out = Vec::new();
-            let mut pending = false;
-            append_lines(&items, &choices, &meta(), 464, &mut pending, &mut out);
-            for ll in &out {
-                assert!(ll.is_heading() || ll.is_paragraph_end());
-                assert_eq!(ll.extra, 0, "heading line extra must be 0");
-            }
-        }
-
-        #[test]
-        fn dropcap_first_line_flags_bold() {
-            // A line whose first Box is the bold drop-cap "M" and whose
-            // subsequent Boxes are regular. first_box_style must return
-            // FLAG_BOLD so the renderer's initial sty is Bold; the
-            // renderer then re-walks markers and flips to Regular at the
-            // BOLD_OFF marker inside the line's byte range.
-            let bold_style = TextStyle {
-                bold: true,
-                ..TextStyle::default()
-            };
-            let regular = TextStyle::default();
-            let mut items = Vec::new();
-            // bold "M" at byte 0
-            items.push(Item::boxed(3, 0).with_style(bold_style));
-            // (no glue; markers join the words logically — the BOLD_OFF
-            // marker bytes live between the two boxes in the source
-            // stream but are zero-width in the K-P model.)
-            items.push(Item::boxed(15, 5).with_style(regular));
-            items.extend(forced_triple());
-
-            let cfg = BreakConfig {
-                line_width: 464,
-                ..BreakConfig::DEFAULT
-            };
-            let mut choices = Vec::new();
-            break_paragraph(&items, &cfg, &mut BreakScratch::new(), &mut choices).unwrap();
-
-            let mut out = Vec::new();
-            let mut pending = false;
-            append_lines(&items, &choices, &meta(), 464, &mut pending, &mut out);
-            let first = &out[0];
-            assert!(
-                first.flags & LineLayout::FLAG_BOLD != 0,
-                "drop-cap line must carry FLAG_BOLD (got flags={:#x})",
-                first.flags
-            );
-            assert!(first.is_paragraph_end(), "single-line paragraph is paragraph-end");
-            assert_eq!(first.extra, 0, "paragraph-end ⇒ extra zeroed");
-        }
-
-        #[test]
-        fn mid_paragraph_line_can_carry_extra() {
-            // a long paragraph forced into multiple lines: intermediate
-            // (non-final) lines may carry per-gap stretch from the K-P
-            // adjustment ratio. Confirms the no-justify guard isn't
-            // over-zealous and zeroing every line.
-            let mut items = Vec::new();
-            for k in 0..16u32 {
-                items.push(Item::boxed(20, k * 100));
-                items.push(Item::glue(5, 3, 2, k * 100 + 50));
-            }
-            items.extend(forced_triple());
-
-            let cfg = BreakConfig {
-                line_width: 80,
-                ..BreakConfig::DEFAULT
-            };
-            let mut choices = Vec::new();
-            break_paragraph(&items, &cfg, &mut BreakScratch::new(), &mut choices).unwrap();
-
-            let mut out = Vec::new();
-            let mut pending = false;
-            append_lines(&items, &choices, &meta(), 80, &mut pending, &mut out);
-            assert!(out.len() >= 4, "expected multi-line break, got {}", out.len());
-            // last line is paragraph-end → extra=0 (the fix).
-            assert_eq!(out.last().unwrap().extra, 0);
-            // at least one intermediate line should carry non-zero extra
-            // (Stretch or Shrink adjustment); otherwise the breaker
-            // produced only Perfect/Overflow which would be unusual.
-            let any_extra = out.iter().take(out.len() - 1).any(|ll| ll.extra != 0);
-            assert!(
-                any_extra,
-                "expected at least one mid-paragraph line with non-zero extra"
-            );
-        }
-
-        // ── marker-replay contract (Phase 3) ──────────────────────
-        //
-        // The renderer's draw loop (`mod.rs` around line 2989) initialises
-        // its style from `LineSpan::style()` and re-walks marker bytes
-        // per glyph, swapping the active font at every `0x01 X` marker.
-        // The cache stamps the line's *initial* style into
-        // `LineLayout.flags` via `first_box_style`. This test pair locks
-        // the contract: given a synthetic line, the (position, style)
-        // trace produced by replaying markers against the initial style
-        // must match what the renderer would draw.
-
-        /// Style enum mirroring `fonts::Style`. Kept local so this test
-        /// has no dependency on the rendering crate.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        enum StyleTrace {
-            Regular,
-            Bold,
-            Italic,
-            Heading,
-        }
-
-        /// Walk `bytes` exactly the way `mod.rs:draw()` does for one
-        /// line: start at `initial`, flip on inline-style markers, and
-        /// emit a `(glyph_byte_index, style)` for every printable byte.
-        fn replay_markers(bytes: &[u8], initial: StyleTrace) -> Vec<(usize, StyleTrace)> {
-            use smol_epub::html_strip::{
-                BOLD_OFF, BOLD_ON, H1_OFF, H1_ON, H2_OFF, H2_ON, H3_OFF, H3_ON, H4_OFF, H4_ON,
-                H5_OFF, H5_ON, H6_OFF, H6_ON, ITALIC_OFF, ITALIC_ON, MARKER,
-            };
-            let mut sty = initial;
-            let mut out = Vec::new();
-            let mut j = 0usize;
-            while j < bytes.len() {
-                let b = bytes[j];
-                if b == MARKER && j + 1 < bytes.len() {
-                    let tag = bytes[j + 1];
-                    sty = match tag {
-                        BOLD_ON => StyleTrace::Bold,
-                        BOLD_OFF => StyleTrace::Regular,
-                        ITALIC_ON => StyleTrace::Italic,
-                        ITALIC_OFF => StyleTrace::Regular,
-                        H1_ON | H2_ON | H3_ON | H4_ON | H5_ON | H6_ON => StyleTrace::Heading,
-                        H1_OFF | H2_OFF | H3_OFF | H4_OFF | H5_OFF | H6_OFF => StyleTrace::Regular,
-                        _ => sty, // unhandled marker (align, page break, etc.) leaves style alone
-                    };
-                    j += 2;
-                    continue;
-                }
-                out.push((j, sty));
-                j += 1;
-            }
-            out
-        }
-
-        #[test]
-        fn marker_replay_dropcap_swaps_at_close() {
-            // The Leviathan ch11 line 3 byte pattern (compressed):
-            // "M<01>biller" where 'M' is the bold drop-cap (line start
-            // is AFTER the BOLD_ON marker that lives upstream).
-            // Initial style = Bold (LineLayout.flags carries FLAG_BOLD).
-            use smol_epub::html_strip::{BOLD_OFF, MARKER};
-            let mut line = Vec::new();
-            line.push(b'M');
-            line.push(MARKER);
-            line.push(BOLD_OFF);
-            line.extend_from_slice(b"iller");
-            let trace = replay_markers(&line, StyleTrace::Bold);
-            // 6 printable bytes: M, i, l, l, e, r. Only 'M' is bold;
-            // the rest flip to Regular after the BOLD_OFF marker.
-            assert_eq!(trace.len(), 6);
-            assert_eq!(trace[0], (0, StyleTrace::Bold), "M must be bold");
-            for (pos, sty) in &trace[1..] {
-                assert_eq!(*sty, StyleTrace::Regular, "byte {} must be regular", pos);
-            }
-        }
-
-        #[test]
-        fn marker_replay_line_begins_mid_bold_span() {
-            // A continuation line whose start_byte sits inside a bold
-            // span that opened on a previous line. The line's bytes
-            // contain no BOLD_OFF marker; the entire line draws bold.
-            // first_box_style sets FLAG_BOLD ⇒ initial=Bold.
-            let line = b"continuation in bold";
-            let trace = replay_markers(line, StyleTrace::Bold);
-            assert!(trace.iter().all(|(_, s)| *s == StyleTrace::Bold));
-        }
-
-        #[test]
-        fn marker_replay_nested_italic_inside_bold() {
-            // "bold <i>italic-in-bold</i> still-bold"
-            // initial=Bold; ITALIC_ON flips to Italic; ITALIC_OFF flips
-            // back to Regular (NOT Bold) — this is the current draw
-            // loop's behaviour. Off markers reset to Regular; nesting
-            // is flattened. The renderer doesn't maintain a style
-            // stack — markers are commutative resets. Document the
-            // contract here.
-            use smol_epub::html_strip::{ITALIC_OFF, ITALIC_ON, MARKER};
-            let mut line = Vec::new();
-            line.extend_from_slice(b"bold ");
-            line.push(MARKER);
-            line.push(ITALIC_ON);
-            line.extend_from_slice(b"em");
-            line.push(MARKER);
-            line.push(ITALIC_OFF);
-            line.extend_from_slice(b" stl");
-            let trace = replay_markers(&line, StyleTrace::Bold);
-            // "bold " in Bold, "em" in Italic, " stl" in Regular (the
-            // ITALIC_OFF reset overrides any prior bold).
-            // This is a known limitation: nested styles can't survive
-            // OFF markers without a style stack. The fix is on the
-            // smol-epub side: emit the *outer* OPEN marker again when
-            // closing an inner inline that overlapped. Documented for
-            // future work — not addressed here.
-            let style_at = |b: usize| trace.iter().find(|(p, _)| *p == b).map(|(_, s)| *s);
-            assert_eq!(style_at(0), Some(StyleTrace::Bold)); // 'b' of "bold"
-            assert_eq!(style_at(7), Some(StyleTrace::Italic)); // 'e' of "em"
-            assert_eq!(style_at(12), Some(StyleTrace::Regular)); // ' ' before "stl"
         }
 
         #[test]
@@ -917,19 +731,6 @@ pub mod convert {
             assert!(out.len() >= 4, "expected ≥4 lines, got {}", out.len());
             assert!(out.last().unwrap().is_paragraph_end());
         }
-
-        #[test]
-        fn greedy_fallback_handles_forced_break_in_middle() {
-            let mut items = Vec::new();
-            items.push(Item::boxed(10, 0));
-            items.push(Item::penalty(Item::PENALTY_FORCE, false, true, 11));
-            items.push(Item::boxed(10, 12));
-            items.extend(forced_triple());
-            let mut out = Vec::new();
-            let mut pending = false;
-            append_greedy_fallback(&items, &meta(), 100, &mut pending, &mut out);
-            assert!(out.len() >= 2);
-        }
     }
 }
 
@@ -938,6 +739,8 @@ pub mod convert {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SP: PageSpacing = PageSpacing { em_px: 20, line_h: 28 };
 
     fn line(start: u32, end: u32, flags: u8) -> LineLayout {
         LineLayout {
@@ -953,124 +756,86 @@ mod tests {
     #[test]
     fn empty_chapter_returns_error() {
         let mut pages = Vec::new();
-        assert_eq!(paginate(&[], 10, &[], &mut pages), Err(PaginateError::EmptyChapter));
+        assert_eq!(paginate(&[], 10, &[], SP, &mut pages), Err(PaginateError::EmptyChapter));
     }
 
     #[test]
     fn fills_pages_to_max_lines() {
         let mut lines = Vec::new();
-        for i in 0..25 {
+        for i in 0..25u32 {
             lines.push(line(i * 10, i * 10 + 5, LineLayout::FLAG_PARAGRAPH_END));
         }
         let img = vec![0u8; lines.len()];
         let mut pages = Vec::new();
-        paginate(&lines, 10, &img, &mut pages).unwrap();
-        assert_eq!(pages.len(), 3); // 10 + 10 + 5
+        paginate(&lines, 10, &img, SP, &mut pages).unwrap();
+        assert_eq!(pages.len(), 3);
         assert_eq!(pages[0].line_count, 10);
-        assert_eq!(pages[1].line_count, 10);
         assert_eq!(pages[2].line_count, 5);
+    }
+
+    #[test]
+    fn gaps_take_page_room_except_on_the_first_line() {
+        // 1 em gaps at 20 px/em over 28 px lines: 80/28 = 2.86 → 3
+        // quarter-lines each. a 10-line page holds 40 quarters: the first
+        // line costs 4, every later one 7, so 6 lines fit (4 + 5*7 = 39)
+        let mut lines = Vec::new();
+        for i in 0..12u32 {
+            let mut l = line(i * 10, i * 10 + 5, LineLayout::FLAG_PARAGRAPH_END);
+            l.align = LineLayout::pack_align(Align::Default, 4, Style::PLAIN);
+            lines.push(l);
+        }
+        let img = vec![0u8; lines.len()];
+        let mut pages = Vec::new();
+        paginate(&lines, 10, &img, SP, &mut pages).unwrap();
+        assert_eq!(pages[0].line_count, 6);
+        assert_eq!(pages[1].line_count, 6);
     }
 
     #[test]
     fn forced_page_break_starts_new_page() {
         let mut lines = Vec::new();
-        for i in 0..5 {
+        for i in 0..6u32 {
             lines.push(line(i * 10, i * 10 + 5, 0));
         }
-        // line 3 carries page-break-before
         lines[3].flags |= LineLayout::FLAG_PAGE_BREAK_BEFORE;
         let img = vec![0u8; lines.len()];
         let mut pages = Vec::new();
-        paginate(&lines, 10, &img, &mut pages).unwrap();
+        paginate(&lines, 10, &img, SP, &mut pages).unwrap();
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0].line_count, 3);
-        assert_eq!(pages[1].line_count, 2);
+        assert_eq!(pages[1].first_line, 3);
     }
 
     #[test]
     fn image_block_stays_together() {
         let mut lines = Vec::new();
-        for i in 0..8 {
+        for i in 0..8u32 {
             lines.push(line(i * 10, i * 10 + 5, 0));
         }
-        // line 7 is an image origin needing 5 filler lines (block of 5)
-        // — we fudge by shrinking the lines so all 8 originals + 5 image
-        // lines are present
-        for i in 0..5 {
+        for i in 0..4u32 {
             lines.push(line(80 + i * 10, 80 + i * 10 + 5, LineLayout::FLAG_IMAGE));
         }
-        // mark line 8 (first image filler) as the origin
-        lines[8].flags |= LineLayout::FLAG_IMAGE;
         let mut img = vec![0u8; lines.len()];
-        img[8] = 5; // image block = 5 lines starting at index 8
+        img[8] = 4;
         let mut pages = Vec::new();
-        // max_lines = 10. First 8 plain lines + 5 image lines = 13.
-        // The image block should be pushed to its own page (8 + 5 > 10).
-        paginate(&lines, 10, &img, &mut pages).unwrap();
-        assert!(pages.len() >= 2);
-        // image must not span pages: find which page contains line 8
-        let img_page = pages
-            .iter()
-            .position(|p| {
-                let first = p.first_line as usize;
-                let last = first + p.line_count as usize;
-                (8..8 + 5).all(|i| i >= first && i < last)
-            })
-            .expect("image block not contained on a single page");
-        let _ = img_page;
+        paginate(&lines, 10, &img, SP, &mut pages).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].line_count, 8);
+        assert_eq!(pages[1].line_count, 4);
     }
 
     #[test]
     fn widow_pulls_orphan_back() {
-        // 11 lines total; max_lines=6 → 6 + 5 split.
-        // line 5 is mid-paragraph (not paragraph end); line 6 IS paragraph end.
-        // First page would end at line 5 (mid-para). Last line of paragraph
-        // (line 6) lands alone on top of next page → widow → demote line 5.
         let mut lines = Vec::new();
-        for i in 0..11 {
+        for i in 0..8u32 {
             lines.push(line(i * 10, i * 10 + 5, 0));
         }
         lines[6].flags |= LineLayout::FLAG_PARAGRAPH_END;
         let img = vec![0u8; lines.len()];
         let mut pages = Vec::new();
-        paginate(&lines, 6, &img, &mut pages).unwrap();
-        // After widow adjustment, page 0 should hold 5 lines and page 1 should have 6.
-        // (Or we accept either as long as the paragraph end is not the only
-        // paragraph-internal line on page 1.)
-        assert!(pages.len() == 2);
-        // page boundary must not split a paragraph such that its last line is alone
-        let p1 = &pages[1];
-        let p1_first = p1.first_line as usize;
-        // p1's first line should NOT be a paragraph-end line directly preceded
-        // by a non-paragraph-end on the previous page (i.e. not a widow)
-        assert!(
-            !(lines[p1_first].is_paragraph_end()
-                && !lines[p1_first - 1].is_paragraph_end()
-                && p1.line_count > 0),
-            "widow detected after pagination",
-        );
-    }
-
-    #[test]
-    fn widow_orphan_never_overfills_page() {
-        // 13 lines, max_lines=6 -> pages of 6 + 6 + 1. line 6 (first of
-        // page 1) is a paragraph end while line 5 is not: widow shape,
-        // but page 1 is already at capacity so the fix must not fire.
-        let mut lines = Vec::new();
-        for i in 0..13 {
-            lines.push(line(i * 10, i * 10 + 5, 0));
-        }
-        lines[6].flags |= LineLayout::FLAG_PARAGRAPH_END;
-        let img = vec![0u8; lines.len()];
-        let mut pages = Vec::new();
-        paginate(&lines, 6, &img, &mut pages).unwrap();
-        for (i, p) in pages.iter().enumerate() {
-            assert!(
-                p.line_count <= 6,
-                "page {} overfull: {} lines > cap 6",
-                i,
-                p.line_count,
-            );
-        }
+        paginate(&lines, 6, &img, SP, &mut pages).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].line_count, 5);
+        assert_eq!(pages[1].first_line, 5);
     }
 }

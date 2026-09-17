@@ -183,7 +183,10 @@ Then every 5 seconds: heap usage, stack watermark, battery percentage, uptime, S
 │       │   ├── mod.rs              reader state machine, draw, footer
 │       │   ├── paging.rs           text wrapping, page navigation
 │       │   ├── epubs.rs            EPUB ZIP/OPF pipeline, chapter cache
-│       │   └── images.rs           inline image decode + dithering
+│       │   ├── images.rs           inline image decode + dithering
+│       │   └── layout/             K-P typesetting: items, breaker,
+│       │                           paginate (quarter-line fill), pipeline,
+│       │                           PIDX cache (scan lives in smol-epub)
 │       └── widgets/
 │           ├── mod.rs              widget re-exports
 │           ├── row.rs              THE list row (lead / title + sub or
@@ -355,7 +358,7 @@ Progressive state machine: `NeedBookmark → NeedInit → NeedOpf → NeedToc �
 1. **ZIP init** — parse central directory from end of file
 2. **OPF parse** — extract spine (chapter order), title, TOC file
 3. **TOC build** — parse NCX or inline TOC
-4. **Chapter cache** — decompress + HTML-strip each chapter into `_PULP/<hash>.DAT`
+4. **Chapter cache** — decompress + HTML-strip each chapter (CSS resolved, see Text formatting) into the bundle
 5. **Page index** — wrap text at current font size to build page boundaries
 6. **Ready** — pages rendered on demand
 
@@ -364,6 +367,20 @@ Background caching runs during the EPD waveform window and between user inputs. 
 **Loading screens hold.** A loading episode (`ReaderApp::begin_loading`: open, wake, chapter change, font change) paints nothing for its first 400 ms unless the next step is known to be slow (bundle miss, chapter not cached, no layout at this font). A fast open, wake or chapter crossing therefore costs one refresh, the page itself. When the screen does go up it is painted once (plate for entering a book, strip for moving inside it, footer already in its final place) and later stages mark only `STAGE_REGION`. The first frame after entering a book or waking is always a full clear (`first_paint_full`); the manager leaves that request to the reader. Design: mockups/xteink_x4_reader_loading.html.
 
 Rendering takes priority over the background chain: the scheduler's `'bg` loop breaks to render whenever a redraw is render-ready, so loading percentages paint as they change and the first page shows as soon as the reader hits `Ready` — remaining caching continues during the paint's waveform window. Once the page is visible the caching indicator repaints only on 10% progress steps (each repaint costs a DU refresh).
+
+### Text formatting
+
+Styling is resolved **once, at strip time**, and rendered from a stream that every consumer decodes through one iterator.
+
+**The stripper resolves the CSS cascade.** `HtmlStripStream` (smol-epub) walks each open tag through `user-agent defaults < book stylesheet < inline style` (`css::StyleProps::overlay`). The book's stylesheets come from the OPF manifest (`epub::for_each_stylesheet`), parsed at `NeedOpf` into one `CssRules` table (up to 256 rules, on the heap only while chapters are still being cached; `EpubState::css`). An element stack records what each open tag changed so its close restores exactly that: `<b><span class="bold">` does not emit a premature bold-off, `font-style: normal` inside `<em>` turns italic off and back on, an inline tag left open is unwound by the block that closes over it, `display: none` subtrees vanish. Margins collapse the CSS way; `margin-left` maps to left-indent levels; `page-break-before: always` and `<h1>` force a page.
+
+**The stream** (`smol_epub::markup`): UTF-8 text, `\n` for `<br>`, `\n\n` between blocks, two-byte toggles for bold / italic / underline / strike / heading level, `BREAK` and `PAGE_BREAK`, the `IMG_REF` record, and one **absolute block record** `0x01 '{' <align|left> <text_indent_qem> <space_above_qem>` ahead of a paragraph that differs from the defaults. Lengths are quarter-em so the cached bytes are font-independent. `markup::Events` is the only decoder; the K-P item builder, the greedy wrapper, the image prescan and the renderer all use it.
+
+**Layout.** The paragraph's first-line indent becomes a fixed Box at the head of its K-P items (`items::build_paragraph`), so the breaker needs no per-line widths and the justification maths is untouched. `LineRecord` packs left levels and first-line indent into `indent`, alignment, underline / strike line-start bits and the gap above into `align` (`LineLayout::pack_indent` / `pack_align`). `paginate` counts page fill in quarter-lines: a line costs four plus its gap (`gap_quarters`, from `em_px` and `line_h` at page time), the gap is dropped on a page's first line. Image-origin lines cover the whole `IMG_REF` record so a page that starts on an image holds its header.
+
+**Rendering.** `build_page_runs` decodes a page once when it loads: per line the top y, the natural width and gap count, the justification (`extra px per gap`, remainder) and a table of placed style runs (`PageState::runs`, six per line, about 2 KB static). The twelve strip passes only cull runs by x and blit glyphs; no marker is decoded at draw time.
+
+To add an inline style: a marker pair in `markup.rs`, an arm in `Events::next_event`, a field in `markup::Style`, the stripper emitting it (`open_elem`), and a face or decoration in `fonts::Style::from_markup` / the draw loop. To add a block property: a field in `BlockProps` and its record, the stripper's `flush_prefix`, and wherever `LineLayout` needs to carry it. Bump `CONTENT_FMT_LATEST` for stream changes and `LAYOUT_ALGO_VERSION` for `LineRecord` bit changes. `cargo run --example strip_dump -- chapter.xhtml style.css` in `../smol-epub` shows what a real chapter strips to.
 
 ### Image decode
 

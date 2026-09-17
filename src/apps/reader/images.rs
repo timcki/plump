@@ -13,7 +13,7 @@ use crate::kernel::work_queue::DecodedImage;
 use plump_kernel::util::hash;
 use smol_epub::cache;
 use smol_epub::epub;
-use smol_epub::html_strip::{IMG_HEADER_LEN, IMG_REF, MARKER};
+use smol_epub::markup::{IMG_HEADER_LEN, ImageRef, MARKER};
 use smol_epub::zip::{self, ZipIndex};
 
 use crate::error::{Error, ErrorKind};
@@ -347,18 +347,13 @@ impl ReaderApp {
         while i + IMG_HEADER_LEN <= buf_len
             && (self.img_height_count as usize) < MAX_IMAGES_PER_PAGE
         {
-            if self.pg.buf[i] != MARKER || self.pg.buf[i + 1] != IMG_REF {
+            let Some(img) = ImageRef::parse(&self.pg.buf[..buf_len], i) else {
                 i += 1;
                 continue;
-            }
-            let alt_len = self.pg.buf[i + 7] as usize;
-            let path_len = self.pg.buf[i + 8] as usize;
-            let path_start = i + IMG_HEADER_LEN + alt_len;
-            let payload_end = path_start + path_len;
-            if path_len == 0 || payload_end > buf_len {
-                i += 1;
-                continue;
-            }
+            };
+            let path_start = img.path_start as usize;
+            let path_len = img.path_len as usize;
+            let payload_end = img.end as usize;
 
             // resolve image path
             let mut src_buf = [0u8; 128];
@@ -465,19 +460,13 @@ impl ReaderApp {
 
             let mut i = 0;
             while i + IMG_HEADER_LEN <= n {
-                if self.pg.prefetch[i] != MARKER || self.pg.prefetch[i + 1] != IMG_REF {
+                let Some(img) = ImageRef::parse(&self.pg.prefetch[..n], i) else {
                     i += 1;
                     continue;
-                }
-
-                let alt_len = self.pg.prefetch[i + 7] as usize;
-                let path_len = self.pg.prefetch[i + 8] as usize;
-                let path_start = i + IMG_HEADER_LEN + alt_len;
-                let payload_end = path_start + path_len;
-                if path_len == 0 || payload_end > n {
-                    i += 1;
-                    continue;
-                }
+                };
+                let path_start = img.path_start as usize;
+                let path_len = img.path_len as usize;
+                let payload_end = img.end as usize;
 
                 let mut src_buf = [0u8; 128];
                 let src_n = path_len.min(src_buf.len());

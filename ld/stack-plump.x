@@ -40,6 +40,7 @@ ASSERT(_stack_start <= ORIGIN(dram2_seg), "pinned stack overlaps dram2_seg")
 /* 154K: the reader's per-chapter page counts and the sheet menu's
    text buffers (2026-09) took ~1 KB of .bss from the original 160K,
    the sleep card's strings and mini cover (2026-09) another ~1.1 KB,
-   and the book cache sheet's 20-entry size table (2026-09) ~1.4 KB */
-ASSERT(_heap_end - _heap_start >= 154K, "merged heap smaller than expected; check .bss growth")
+   and the book cache sheet's 20-entry size table (2026-09) ~1.4 KB;
+   152K: the reader's per-page style-run table (2026-09) ~2 KB */
+ASSERT(_heap_end - _heap_start >= 152K, "merged heap smaller than expected; check .bss growth")
 ASSERT(SIZEOF(.dram2_uninit) == 0, "dram2 statics exist; they would sit inside the merged heap")

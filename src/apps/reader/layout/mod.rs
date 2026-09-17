@@ -5,16 +5,16 @@
 //!   - byte-layout records live in `plump_kernel::kernel::bundle`
 //!     (`LayoutIdxHeader`, `ChapterLayoutDir`, `PageRecord`,
 //!     `LineRecord`); this module owns the in-RAM mirrors.
-//!   - `scan`     — markup tokenizer over the html-stripped chapter
-//!                  byte stream
-//!   - `items`    — converts a `Token` stream into K-P items
-//!                  (paragraph-scoped)
-//!   - `breaker`  — bounded-DP K-P paragraph breaker
-//!   - `paginate` — page builder + `convert::*` adapters that pack
-//!                  break choices into `LineLayout`
-//!   - `pipeline` — `LayoutPipeline` RAII: drives scanner -> items
-//!                  -> breaker -> paginate per paragraph
-//!   - `cache`    — PIDX v2 load / save / invalidate
+//!   - `smol_epub::markup::Events` is the tokenizer over the stripped
+//!     chapter byte stream (shared with the renderer)
+//!   - `items`: converts the event stream into K-P items
+//!     (paragraph-scoped)
+//!   - `breaker`: bounded-DP K-P paragraph breaker
+//!   - `paginate`: page builder + `convert::*` adapters that pack
+//!     break choices into `LineLayout`
+//!   - `pipeline`: `LayoutPipeline` RAII: drives events -> items
+//!     -> breaker -> paginate per paragraph
+//!   - `cache`: PIDX v2 load / save / invalidate
 //!
 //! `paging.rs::preindex_all_pages` is the reader-side entry point;
 //! it tries the PIDX cache first, runs the K-P pipeline on miss,
@@ -28,17 +28,32 @@
 #![allow(dead_code)]
 
 pub mod cache;
-pub mod scan;
 
 pub mod items;
 pub mod breaker;
 pub mod paginate;
 pub mod pipeline;
 
-// scanner types are re-exported through their submodules; callers
-// import via `super::scan::*` to make the data-flow chain visible.
-
 use plump_kernel::kernel::bundle;
+use smol_epub::markup::{Align, Style};
+
+/// Pixels of first-line indent for `qem` quarter-em at the given em
+/// size. Shared by the K-P item builder and the renderer so the box the
+/// breaker measured is exactly what the page shows.
+#[inline]
+pub fn indent_px(qem: u8, em_px: u16) -> u16 {
+    ((qem as u32 * em_px as u32) / 4) as u16
+}
+
+/// Vertical space in quarter-lines for a gap of `qem` quarter-em: the
+/// paginator counts page fill in these and the renderer positions lines
+/// from them, so both round the same way. Capped at two lines.
+#[inline]
+pub fn gap_quarters(qem: u8, em_px: u16, line_h: u16) -> u16 {
+    let lh = line_h.max(1) as u32;
+    let px4 = qem as u32 * em_px as u32; // gap in px, times four
+    (((px4 + lh / 2) / lh) as u16).min(8)
+}
 
 /// hard cap on the number of `LineRecord`s stored per chapter.
 /// chapters that would exceed this fall back to greedy wrapping.
@@ -175,6 +190,15 @@ impl PageLayout {
 ///   bit 5    FLAG_PARAGRAPH_END      (was LineSpan END_SOFT slot)
 ///   bits 6-7 HLEVEL_MASK             (only meaningful when FLAG_HEADING set)
 ///
+/// `indent` byte (algo_version >= 18): low nibble left indent levels
+/// (`INDENT_PX` each), high nibble first-line indent in quarter-em on a
+/// paragraph's first line, else 0.
+///
+/// `align` byte (algo_version >= 18): bits 0-1 alignment, bit 2 the
+/// line starts underlined, bit 3 struck through, high nibble the space
+/// above in quarter-em on a paragraph's first line, else 0. Image
+/// lines keep `indent` 0 and use only the gap.
+///
 /// `extra` byte layout (algo_version >= 2): per-gap justification spare in px.
 ///   bit 7    sign (1 = shrink, 0 = stretch)
 ///   bits 0-6 magnitude in px-per-gap (cap 127)
@@ -219,6 +243,8 @@ impl LineLayout {
     pub const HLEVEL_H3: u8 = 0 << Self::HLEVEL_SHIFT;
     pub const HLEVEL_H2: u8 = 1 << Self::HLEVEL_SHIFT;
     pub const HLEVEL_H1: u8 = 2 << Self::HLEVEL_SHIFT;
+    /// h4-h6: rendered in the bold body face, not the heading face
+    pub const HLEVEL_H4: u8 = 3 << Self::HLEVEL_SHIFT;
 
     // align mirrors LineSpan; kept independent so this module compiles
     // without depending on the renderer-side type.
@@ -226,6 +252,14 @@ impl LineLayout {
     pub const ALIGN_LEFT: u8 = 1;
     pub const ALIGN_CENTER: u8 = 2;
     pub const ALIGN_RIGHT: u8 = 3;
+    pub const ALIGN_MASK: u8 = 0x03;
+    pub const START_UNDERLINE: u8 = 1 << 2;
+    pub const START_STRIKE: u8 = 1 << 3;
+    pub const GAP_SHIFT: u8 = 4;
+    pub const LEFT_MASK: u8 = 0x0F;
+    pub const FIRST_INDENT_SHIFT: u8 = 4;
+    /// largest quarter-em value a nibble holds (3.75 em)
+    pub const NIBBLE_MAX: u8 = 15;
 
     // extra byte sign bit; magnitude is bits 0..6.
     pub const EXTRA_SIGN_SHRINK: u8 = 1 << 7;
@@ -238,6 +272,91 @@ impl LineLayout {
     #[inline]
     pub fn is_page_break_before(&self) -> bool {
         self.flags & Self::FLAG_PAGE_BREAK_BEFORE != 0
+    }
+    #[inline]
+    pub fn left_levels(&self) -> u8 {
+        self.indent & Self::LEFT_MASK
+    }
+    #[inline]
+    pub fn first_indent_qem(&self) -> u8 {
+        self.indent >> Self::FIRST_INDENT_SHIFT
+    }
+    #[inline]
+    pub fn align(&self) -> u8 {
+        self.align & Self::ALIGN_MASK
+    }
+    #[inline]
+    pub fn gap_qem(&self) -> u8 {
+        self.align >> Self::GAP_SHIFT
+    }
+    #[inline]
+    pub fn starts_underline(&self) -> bool {
+        self.align & Self::START_UNDERLINE != 0
+    }
+    #[inline]
+    pub fn starts_strike(&self) -> bool {
+        self.align & Self::START_STRIKE != 0
+    }
+
+    /// pack the `indent` byte: left levels and, on a paragraph's first
+    /// line, the first-line indent in quarter-em
+    #[inline]
+    pub fn pack_indent(left: u8, first_qem: u8) -> u8 {
+        left.min(Self::LEFT_MASK) | (first_qem.min(Self::NIBBLE_MAX) << Self::FIRST_INDENT_SHIFT)
+    }
+
+    /// pack the `align` byte from the alignment, the gap above (first
+    /// line only) and the decorations in force at the line's first byte
+    #[inline]
+    pub fn pack_align(align: Align, gap_qem: u8, style: Style) -> u8 {
+        (align as u8 & Self::ALIGN_MASK)
+            | if style.underline { Self::START_UNDERLINE } else { 0 }
+            | if style.strike { Self::START_STRIKE } else { 0 }
+            | (gap_qem.min(Self::NIBBLE_MAX) << Self::GAP_SHIFT)
+    }
+
+    /// the style flag bits for a line whose first byte is drawn in
+    /// `style`: bold, italic and the heading tier
+    pub fn style_flags(style: Style) -> u8 {
+        let mut f = 0u8;
+        if style.bold {
+            f |= Self::FLAG_BOLD;
+        }
+        if style.italic {
+            f |= Self::FLAG_ITALIC;
+        }
+        if style.heading != 0 {
+            f |= Self::FLAG_HEADING;
+            f |= match style.heading {
+                1 => Self::HLEVEL_H1,
+                2 => Self::HLEVEL_H2,
+                3 => Self::HLEVEL_H3,
+                _ => Self::HLEVEL_H4,
+            };
+        }
+        f
+    }
+
+    /// the inline style in force at the line's first byte, as recorded
+    /// by the typesetter; the renderer seeds its decoder with it
+    pub fn start_style(&self) -> Style {
+        let heading = if self.is_heading() {
+            match self.hlevel() {
+                Self::HLEVEL_H1 => 1,
+                Self::HLEVEL_H2 => 2,
+                Self::HLEVEL_H3 => 3,
+                _ => 4,
+            }
+        } else {
+            0
+        };
+        Style {
+            bold: self.flags & Self::FLAG_BOLD != 0,
+            italic: self.flags & Self::FLAG_ITALIC != 0,
+            underline: self.starts_underline(),
+            strike: self.starts_strike(),
+            heading,
+        }
     }
     #[inline]
     pub fn is_heading(&self) -> bool { self.flags & Self::FLAG_HEADING != 0 }

@@ -22,6 +22,13 @@ use super::{BgCacheState, CHAPTER_CACHE_MAX, EOCD_TAIL, EpubState, PAGE_BUF, Rea
 
 // ── bundle layout helpers ──────────────────────────────────────────
 //
+// largest stylesheet the OPF stage will extract into RAM; it is read
+// while the OPF itself is resident, so the pair must fit the heap
+const CSS_SHEET_MAX: u32 = 48 * 1024;
+
+// what a chapter strips against when the book has no stylesheet table
+static EMPTY_CSS: smol_epub::css::CssRules = smol_epub::css::CssRules::new();
+
 // v1 layout places sections in this fixed order for simplicity:
 //   header  [0 .. 256)
 //   spine   [256 .. 256 + spine_count * 16)
@@ -448,8 +455,9 @@ impl EpubState {
                 .map_err(|e: Error| -> &'static str { e.into() })
         };
 
+        let css = self.css.first().unwrap_or(&EMPTY_CSS);
         match step
-            .step(&mut read_fn, &mut write_fn)
+            .step(&mut read_fn, &mut write_fn, css)
             .map_err(|msg| Error::from(msg).with_source("cache_chapter_step: step"))?
         {
             cache::StripStepResult::Continue => Ok(false),
@@ -481,6 +489,12 @@ impl EpubState {
                     text_size,
                     ch_offset,
                 );
+                // the stylesheet table has done its work once every
+                // chapter is in the bundle
+                let spine_len = self.spine.len();
+                if self.ch_cached[..spine_len].iter().all(|&c| c) {
+                    self.css = Vec::new();
+                }
                 Ok(true)
             }
         }
@@ -643,6 +657,48 @@ impl ReaderApp {
 
         // defer TOC to NeedToc to avoid stack overflow while OPF is live
         self.epub.toc_source = epub::find_toc_source(&opf_data, opf_dir, &self.epub.zip);
+
+        // the book's stylesheets, for the stripper's cascade. every
+        // sheet in the manifest goes into one table; a sheet too big to
+        // hold next to the OPF is skipped rather than risk the heap
+        self.epub.css = Vec::new();
+        // a complete bundle at the current format needs no re-strip, so
+        // the table is only built when chapters are still to be cached
+        let bundle_complete = bundle::read_header(k.sd(), self.epub.name_hash).is_some_and(|h| {
+            h.has_flag(bundle::FLAG_CORE_READY)
+                && h.source_size == self.epub.archive_size
+                && h.content_fmt == bundle::CONTENT_FMT_LATEST
+        });
+        if !bundle_complete && self.epub.css.try_reserve_exact(1).is_ok() {
+            self.epub.css.push(smol_epub::css::CssRules::new());
+        }
+        let mut sheets = 0u8;
+        if let Some(css) = self.epub.css.first_mut() {
+        epub::for_each_stylesheet(&opf_data, opf_dir, &self.epub.zip, |idx| {
+            let entry = self.epub.zip.entry(idx);
+            if entry.uncomp_size > CSS_SHEET_MAX {
+                log::warn!(
+                    "epub: stylesheet #{} is {} bytes, skipping",
+                    idx,
+                    entry.uncomp_size
+                );
+                return;
+            }
+            match super::extract_zip_entry(k, name, &self.epub.zip, idx) {
+                Ok(sheet) => {
+                    css.parse(&sheet);
+                    sheets += 1;
+                }
+                Err(e) => log::warn!("epub: stylesheet #{} unreadable: {}", idx, e),
+            }
+        });
+        log::info!(
+            "epub: {} stylesheets, {} rules{}",
+            sheets,
+            css.len(),
+            if css.is_full() { " (table full)" } else { "" }
+        );
+        }
         drop(opf_data);
 
         log::info!(

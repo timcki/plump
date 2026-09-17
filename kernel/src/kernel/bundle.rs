@@ -66,7 +66,11 @@ pub const HEADER_VERSION: u16 = 3;
 //   0 = legacy (Phase 1 marker set: BOLD/ITALIC/H1-H6/U/S/QUOTE/IMG_REF)
 //   1 = Phase 2 (adds ALIGN_*/PAGE_BREAK/FIGCAPTION; tag-keyed defaults)
 //   2 = Phase 3 (extended IMG_REF payload: flags + width + height + alt)
-pub const CONTENT_FMT_LATEST: u8 = 2;
+//   3 = Phase 4 (CSS cascade resolved in the stripper; block properties
+//       travel as one absolute BLOCK record per paragraph with alignment,
+//       left indent, first-line indent and space above; the QUOTE_*,
+//       ALIGN_* and FIGCAPTION_* toggles are gone)
+pub const CONTENT_FMT_LATEST: u8 = 3;
 
 pub const TITLE_CAP: usize = 80;
 pub const AUTHOR_CAP: usize = 40;
@@ -670,7 +674,13 @@ pub const PAGEIDX_FORMAT_VERSION: u8 = 2;
 // filler counts and re-paginate the cached line table instead of
 // re-typesetting. v16 records carry extra=0 there, which v17 reads
 // as "height unknown"; bumping so filler data is always present.
-pub const LAYOUT_ALGO_VERSION: u8 = 17;
+// v18 goes with content_fmt 3: LineRecord `indent` splits into left
+// levels (low nibble) and first-line indent in quarter-em (high nibble),
+// `align` into alignment (bits 0-1), underline / strike line-start bits
+// (2-3) and the gap above in quarter-em (high nibble); the first-line
+// indent is a K-P box so breaks moved; image-origin lines now start at
+// the IMG_REF marker so a page beginning on an image holds its header.
+pub const LAYOUT_ALGO_VERSION: u8 = 18;
 
 pub const PAGEIDX_HDR_V2_SIZE: usize = 20;
 pub const CHAPTER_LAYOUT_DIR_SIZE: usize = 24;
@@ -778,8 +788,12 @@ crate::record! {
         end_byte:   u32 @ 4,
         /// see LineLayout::FLAG_* in src/apps/reader/layout/mod.rs
         flags:  u8 @ 8,
-        /// or alt_len for image-origin lines
+        /// low nibble: left indent levels; high nibble: first-line indent
+        /// in quarter-em (paragraph-first lines only)
         indent: u8 @ 9,
+        /// bits 0-1: alignment; bit 2 / 3: line starts underlined /
+        /// struck; high nibble: space above in quarter-em (paragraph-
+        /// first lines only)
         align:  u8 @ 10,
         /// algo_version >= 2: per-gap stretch/shrink in px; bit 7 = sign
         /// (1 = shrink, 0 = stretch), bits 0-6 = magnitude per gap, cap

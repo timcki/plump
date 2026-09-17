@@ -276,6 +276,14 @@ pub enum Style {
 }
 
 impl Style {
+    /// Resolve the face for a `smol_epub::markup::Style`, the inline
+    /// state the shared decoder carries; underline and strike are
+    /// draw-side decorations the caller handles separately.
+    #[inline]
+    pub const fn from_markup(s: smol_epub::markup::Style) -> Self {
+        Self::from_flags(s.bold, s.italic, s.heading != 0, s.heading)
+    }
+
     /// Resolve a font style from accumulated markup-state flags.
     ///
     /// Both the K-P typesetting pipeline (`layout::pipeline`) and the

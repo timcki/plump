@@ -2,24 +2,20 @@
 
 use alloc::vec::Vec;
 
-use smol_epub::html_strip::{
-    ALIGN_CENTER, ALIGN_JUSTIFY, ALIGN_LEFT, ALIGN_RESET, ALIGN_RIGHT, BOLD_OFF, BOLD_ON, H1_OFF,
-    H1_ON, H2_OFF, H2_ON, H3_OFF, H3_ON, H4_OFF, H4_ON, H5_OFF, H5_ON, H6_OFF, H6_ON, HEADING_OFF,
-    HEADING_ON, IMG_HEADER_LEN, IMG_REF, ITALIC_OFF, ITALIC_ON, MARKER, PAGE_BREAK, QUOTE_OFF,
-    QUOTE_ON,
-};
+use smol_epub::markup::{BlockProps, ByteSource, Event, Events, SliceSource, Style};
 
 use crate::fonts;
-use crate::fonts::bitmap::{self, FIRST_CHAR};
+use crate::fonts::bitmap;
 use crate::kernel::KernelHandle;
 
 use super::layout::pipeline::{ImageBudget, LayoutPipeline, StepOutcome, TypesetError};
-use super::layout::scan::{ByteSource, MarkupScanner, SliceByteSource};
+use super::layout::paginate::PageSpacing;
 use super::layout::{paginate, LineLayout, PageLayout};
 
 use super::{
-    DEFAULT_IMG_H, INDENT_PX, LINES_PER_PAGE, LineSpan, MAX_PAGES, NO_PREFETCH, PAGE_BUF,
-    PendingPositionChange, ReaderApp, State, decode_utf8_char, inline_img_max_h,
+    DEFAULT_IMG_H, INDENT_PX, LINES_PER_PAGE, LineSpan, MAX_PAGES, MAX_PAGE_RUNS,
+    MAX_RUNS_PER_LINE, NO_PREFETCH, PAGE_BUF, PendingPositionChange, ReaderApp, Run, State,
+    decode_utf8_char, inline_img_max_h,
 };
 use crate::kernel::work_queue;
 
@@ -51,60 +47,13 @@ impl ReaderApp {
                 self.max_lines as usize,
                 self.text_w,
                 heights,
+                self.font_line_h,
+                fs.em_px(),
             );
             self.pg.line_count = count;
             c
         } else {
             self.wrap_monospace(n)
-        }
-    }
-
-    /// Precompute justification metrics for every line on the current page.
-    /// Called once after wrapping so that `draw()` can reuse cached values
-    /// across all strip passes instead of re-running `measure_line()` per strip.
-    pub(super) fn precompute_line_metrics(&mut self) {
-        if let Some(ref fs) = self.fonts {
-            // KPDIAG-C: chapter-line index for this page (so logs pair
-            // with KPDIAG-B by ch_li).
-            let page_first_line = self
-                .pg
-                .kp_pages
-                .get(self.pg.page)
-                .map(|p| p.first_line as usize)
-                .unwrap_or(0);
-            let text_w = self.text_w;
-            for i in 0..self.pg.line_count {
-                let span = self.pg.lines[i];
-                // Images and empty spans don't need measurement.
-                if span.is_image() || span.len == 0 {
-                    self.pg.line_measures[i] = LineMeasure::default();
-                    continue;
-                }
-                let measured = measure_line(&self.pg.buf, &span, fs);
-                self.pg.line_measures[i] = measured;
-                // KPDIAG-C: log lines that overflow the column visibly
-                // (heuristic: width > 1.3x avail). gives byte dump so
-                // we can see what content K-P collapsed.
-                let avail = text_w.saturating_sub(INDENT_PX * span.indent as u32);
-                if avail > 0 && measured.width > avail.saturating_mul(13) / 10 {
-                    let s = span.start as usize;
-                    let dump_max = (s + (span.len as usize).min(40)).min(self.pg.buf_len);
-                    let dump = &self.pg.buf[s..dump_max];
-                    log::debug!(
-                        "KPDIAG rd ch_li={} pg={} pg_li={} len={} m_w={} avail={} gaps={} flags=0x{:02x} extra=0x{:02x} bytes={:?}",
-                        page_first_line + i,
-                        self.pg.page,
-                        i,
-                        span.len,
-                        measured.width,
-                        avail,
-                        measured.gaps,
-                        span.flags,
-                        span.extra,
-                        dump,
-                    );
-                }
-            }
         }
     }
 
@@ -260,7 +209,7 @@ impl ReaderApp {
 
             plump_kernel::perf_begin!(_t_wrap);
             self.wrap_lines_counted(n);
-            self.precompute_line_metrics();
+            self.build_page_runs();
             plump_kernel::perf_event!(
                 "reader",
                 "load_prefetch.wrap+metrics lines={} elapsed_ms={}",
@@ -347,7 +296,7 @@ impl ReaderApp {
 
         plump_kernel::perf_begin!(_t_wrap);
         let consumed = self.wrap_lines_counted(self.pg.buf_len);
-        self.precompute_line_metrics();
+        self.build_page_runs();
         plump_kernel::perf_event!(
             "reader",
             "load_prefetch.wrap+metrics lines={} consumed={} elapsed_ms={}",
@@ -683,8 +632,12 @@ impl ReaderApp {
             }
         }
 
+        let spacing = PageSpacing {
+            em_px: self.fonts.map(|f| f.em_px()).unwrap_or(self.font_line_h),
+            line_h: self.font_line_h,
+        };
         let mut pages: Vec<PageLayout> = Vec::new();
-        if super::layout::paginate::paginate(&lines, self.max_lines, &blocks, &mut pages)
+        if super::layout::paginate::paginate(&lines, self.max_lines, &blocks, spacing, &mut pages)
             .is_err()
         {
             return false;
@@ -902,7 +855,7 @@ impl ReaderApp {
         // loop, then the loop body is identical, so we run it inline.
         if use_bundle_source {
             let mut src = BundleByteSource::new(sd_ref, name_hash, ch_base, ch_size_in_bundle);
-            let mut scanner = MarkupScanner::new(&mut src);
+            let mut scanner = Events::new(&mut src);
             loop {
                 let outcome = pipeline.step(
                     &mut scanner,
@@ -917,8 +870,8 @@ impl ReaderApp {
                 }
             }
         } else {
-            let mut src = SliceByteSource::new(&self.epub.ch_cache);
-            let mut scanner = MarkupScanner::new(&mut src);
+            let mut src = SliceSource(&self.epub.ch_cache);
+            let mut scanner = Events::new(&mut src);
             loop {
                 let outcome = pipeline.step(
                     &mut scanner,
@@ -945,10 +898,15 @@ impl ReaderApp {
 
         let mut pages: Vec<PageLayout> = Vec::new();
         let _ = pages.try_reserve(8);
+        let spacing = PageSpacing {
+            em_px: fs.em_px(),
+            line_h: self.font_line_h,
+        };
         if let Err(e) = paginate::paginate(
             &out_lines,
             self.max_lines,
             &out_image_blocks,
+            spacing,
             &mut pages,
         ) {
             log::warn!("reader: paginate failed: {:?}", e);
@@ -1064,7 +1022,7 @@ impl ReaderApp {
         // line slots, but the byte-stream image marker still needs
         // its inline header re-read for actual decode metadata).
         self.prescan_image_heights(k, n);
-        self.precompute_line_metrics();
+        self.build_page_runs();
         self.decode_page_images(k);
 
         // disable greedy prefetch when K-P is driving navigation.
@@ -1213,7 +1171,12 @@ impl ReaderApp {
     }
 }
 
-// ── Phase 3: line analysis helpers for justification ─────────────────
+// ── page runs: one decode per page ──────────────────────────────────
+//
+// a page is decoded once, when it is loaded: every line's vertical
+// position, its natural width and gap count, its justification, and
+// the style runs the strip passes draw from. the twelve strip passes
+// then only blit glyphs; no marker is decoded at draw time.
 
 /// Result of measuring a single line span for justification.
 #[derive(Clone, Copy, Default)]
@@ -1224,224 +1187,275 @@ pub(in crate::apps) struct LineMeasure {
     pub gaps: u16,
 }
 
-impl LineMeasure {
-    pub const ZERO: Self = Self { width: 0, gaps: 0 };
+/// Per-gap justification for one line: pixels added to every inter-word
+/// gap (negative to shrink) and how many leading gaps take one pixel
+/// more (or fewer) to spread the remainder.
+///
+/// stretch and shrink are decided independently:
+///
+/// - stretch is aesthetic (justify-vs-left preference): only fires when
+///   the user picked justified text AND this is a mid-paragraph soft-wrap.
+/// - shrink is layout-driven: fires whenever K-P signalled it via
+///   `extra`, regardless of user alignment preference and regardless of
+///   paragraph-end status. without this, single-line shrink-fit
+///   paragraphs overflow the column (Stories of Your Life's dense prose,
+///   Leviathan ch5's "Using the Knight..." paragraph).
+///
+/// headings and explicit-align lines skip both directions.
+fn justify_params(
+    text_alignment: u8,
+    span: &LineSpan,
+    m: LineMeasure,
+    avail: i32,
+    space_w: i32,
+) -> (i32, i32) {
+    let is_heading = span.flags & LineSpan::FLAG_HEADING != 0;
+    let explicit = span.is_explicit_align();
+    let can_stretch = text_alignment == 1 && span.is_soft_wrap() && !is_heading && !explicit;
+    let can_shrink = span.extra_is_shrink() && !is_heading && !explicit;
+    if !(can_stretch || can_shrink) {
+        return (0, 0);
+    }
+    let spare = avail - m.width as i32;
+    let gaps = m.gaps as i32;
+    if gaps < 2 {
+        return (0, 0);
+    }
+    if can_stretch && spare >= 3 && spare * 5 < avail * 2 {
+        // stretch: distribute positive spare across gaps, capped at 3x
+        // natural space width per gap so a sparse line doesn't open rivers
+        let per = spare / gaps;
+        if per <= space_w.saturating_mul(3) {
+            (per, spare - per * gaps)
+        } else {
+            (0, 0)
+        }
+    } else if can_shrink && spare <= -1 {
+        // shrink: K-P decided this paragraph fits by squeezing inter-word
+        // spaces. honor it up to K-P's own per-glue shrink budget
+        // (space/2, matching `Item::glue`'s shrink in items.rs and
+        // `RATIO_SHRINK_MAX` in breaker.rs)
+        let per = spare / gaps; // signed; rounds toward 0
+        let floor = -(space_w / 2).max(1);
+        if per >= floor {
+            (per, spare - per * gaps)
+        } else {
+            // K-P / renderer disagree on widths beyond the shrink budget:
+            // draw at natural width rather than crush letters together
+            (0, 0)
+        }
+    } else {
+        (0, 0)
+    }
 }
 
-/// Measure one text line's natural rendered width and count stretchable gaps.
-///
-/// Stretchable gaps are ASCII spaces (0x20) only — NBSP (U+00A0) is rendered
-/// but not stretched, and style markers are zero-width. Trailing spaces at
-/// the end of a soft-wrapped line are excluded from width measurement.
-pub(super) fn measure_line(
-    buf: &[u8],
-    span: &super::LineSpan,
-    fonts: &fonts::FontSet,
-) -> LineMeasure {
-    let start = span.start as usize;
-    let end = start + span.len as usize;
-    let line = &buf[start..end];
-
-    // Track style as accumulated flags rather than last-marker-wins,
-    // so nested markup (e.g. `<b><i>x</i></b>`) measures the same way
-    // K-P measured it. `fonts::Style::from_flags` is the shared
-    // resolver — see plan.
-    let mut in_bold = span.flags & super::LineSpan::FLAG_BOLD != 0;
-    let mut in_italic = span.flags & super::LineSpan::FLAG_ITALIC != 0;
-    let mut in_heading = span.flags & super::LineSpan::FLAG_HEADING != 0;
-    let mut hlevel: u8 = if in_heading { span.start_hlevel() } else { 0 };
-    let mut sty = fonts::Style::from_flags(in_bold, in_italic, in_heading, hlevel);
-    let sty_initial = sty;
-
-    let mut width: u32 = 0;
-    let mut gaps: u16 = 0;
-    let mut last_space_width: u32 = 0; // width contribution of the last trailing space run
-    let mut in_trailing_space = false;
-
+/// natural width of one text event's bytes in `style`; soft hyphens
+/// are zero-width (the fonts ship SHY as a visible glyph, so the
+/// decoder-side policy is to skip it; build.rs excludes it too)
+fn measure_bytes(bytes: &[u8], fs: &fonts::FontSet, style: fonts::Style) -> u32 {
+    let mut w: u32 = 0;
     let mut j = 0usize;
-    while j < line.len() {
-        let b = line[j];
+    while j < bytes.len() {
+        let b = bytes[j];
+        if b >= 0xC0 {
+            let (ch, len) = decode_utf8_char(bytes, j);
+            if ch != '\u{00AD}' {
+                w += fs.advance(ch, style) as u32;
+            }
+            j += len.max(1);
+        } else if b >= 0x80 || b < bitmap::FIRST_CHAR {
+            j += 1;
+        } else {
+            w += fs.advance_byte(b, style) as u32;
+            j += 1;
+        }
+    }
+    w
+}
 
-        // style markers: zero width, update accumulated flag state
-        if b == MARKER && j + 1 < line.len() {
-            match line[j + 1] {
-                BOLD_ON => in_bold = true,
-                BOLD_OFF => in_bold = false,
-                ITALIC_ON => in_italic = true,
-                ITALIC_OFF => in_italic = false,
-                HEADING_ON => {
-                    in_heading = true;
-                    if hlevel == 0 {
-                        hlevel = 3;
+impl ReaderApp {
+    /// Decode the loaded page once: per-line vertical positions, natural
+    /// widths and gap counts, justification, and the style runs the
+    /// strip passes draw from.
+    pub(super) fn build_page_runs(&mut self) {
+        self.pg.run_count = 0;
+        let Some(fs) = self.fonts else {
+            for i in 0..self.pg.line_count {
+                self.pg.line_y[i] = (i as u32 * self.font_line_h as u32) as u16;
+                self.pg.run_len[i] = 0;
+            }
+            return;
+        };
+        let em = fs.em_px();
+        let line_h = self.font_line_h;
+        let text_w = self.text_w as i32;
+        let margin = self.text_margin as i32;
+        let alignment = self.text_alignment;
+        let buf_len = self.pg.buf_len;
+        let pg = &mut self.pg;
+
+        let mut y_q: u32 = 0;
+        for i in 0..pg.line_count {
+            let span = pg.lines[i];
+            if i > 0 {
+                y_q += super::layout::gap_quarters(span.gap_qem(), em, line_h) as u32;
+            }
+            pg.line_y[i] = ((y_q * line_h as u32) / 4) as u16;
+            y_q += 4;
+            pg.run_first[i] = pg.run_count as u16;
+            pg.run_len[i] = 0;
+            pg.line_just[i] = (0, 0);
+            pg.line_x_end[i] = 0;
+            if span.is_image() || span.len == 0 {
+                continue;
+            }
+            let start = span.start as usize;
+            let end = (start + span.len as usize).min(buf_len);
+            if start >= end {
+                continue;
+            }
+
+            // pass 1: runs at natural width. a run is a byte-contiguous
+            // stretch of text events under one style; `x` holds its
+            // natural width until pass 2 places it
+            let first_run = pg.run_count;
+            let mut width: u32 = 0;
+            let mut gaps: u16 = 0;
+            let mut trailing: u32 = 0;
+            {
+                let buf = &pg.buf;
+                let runs = &mut pg.runs;
+                let mut src = SliceSource(&buf[..end]);
+                let mut ev = Events::resume(&mut src, start, span.start_style(), BlockProps::DEFAULT);
+                let mut n_runs = 0usize;
+                while let Some(e) = ev.next_event() {
+                    let (s, e_end, style, adv, is_gap) = match e {
+                        Event::Word { start, end, style } => {
+                            let fsty = fonts::Style::from_markup(style);
+                            let w = measure_bytes(&buf[start as usize..end as usize], &fs, fsty);
+                            (start, end, style, w, false)
+                        }
+                        Event::Space { start, end, style } => {
+                            let w = fs.advance(' ', fonts::Style::from_markup(style)) as u32;
+                            (start, end, style, w, true)
+                        }
+                        Event::Nbsp { start, end, style } => {
+                            let w = fs.advance(' ', fonts::Style::from_markup(style)) as u32;
+                            (start, end, style, w, false)
+                        }
+                        Event::SoftHyphen { start, end, style } => (start, end, style, 0, false),
+                        // block records and unknown markers sit between
+                        // words; breaks never occur inside a line
+                        Event::Block { .. } | Event::Unknown { .. } => continue,
+                        _ => break,
+                    };
+                    width += adv;
+                    if is_gap {
+                        trailing += adv;
+                    } else {
+                        trailing = 0;
+                    }
+                    let packed = style.pack();
+                    let extend = n_runs > 0 && {
+                        let last = &runs[pg.run_count - 1];
+                        (last.style == packed && last.start as u32 + last.len as u32 == s)
+                            || n_runs >= MAX_RUNS_PER_LINE
+                            || pg.run_count >= MAX_PAGE_RUNS
+                    };
+                    if extend {
+                        let last = &mut runs[pg.run_count - 1];
+                        last.len = (e_end - last.start as u32) as u16;
+                        last.x = last.x.saturating_add(adv as i16);
+                    } else {
+                        runs[pg.run_count] = Run {
+                            start: s as u16,
+                            len: (e_end - s) as u16,
+                            x: adv as i16,
+                            style: packed,
+                            gap0: gaps.min(u8::MAX as u16) as u8,
+                        };
+                        pg.run_count += 1;
+                        n_runs += 1;
+                    }
+                    if is_gap {
+                        gaps = gaps.saturating_add(1);
                     }
                 }
-                HEADING_OFF => {
-                    in_heading = false;
-                    hlevel = 0;
-                }
-                H1_ON => {
-                    in_heading = true;
-                    hlevel = 1;
-                }
-                H2_ON => {
-                    in_heading = true;
-                    hlevel = 2;
-                }
-                H3_ON => {
-                    in_heading = true;
-                    hlevel = 3;
-                }
-                H4_ON => {
-                    in_heading = true;
-                    hlevel = 4;
-                }
-                H5_ON => {
-                    in_heading = true;
-                    hlevel = 5;
-                }
-                H6_ON => {
-                    in_heading = true;
-                    hlevel = 6;
-                }
-                H1_OFF | H2_OFF | H3_OFF | H4_OFF | H5_OFF | H6_OFF => {
-                    in_heading = false;
-                    hlevel = 0;
-                }
-                // underline/strike are draw-side decorations; don't
-                // change glyph metrics, so they don't update `sty`.
-                _ => {}
             }
-            sty = fonts::Style::from_flags(in_bold, in_italic, in_heading, hlevel);
-            j += 2;
-            continue;
-        }
+            pg.run_len[i] = (pg.run_count - first_run).min(u8::MAX as usize) as u8;
 
-        // UTF-8 multi-byte
-        if b >= 0xC0 {
-            let (ch, seq_len) = decode_utf8_char(line, j);
+            let m = LineMeasure {
+                width: width.saturating_sub(trailing),
+                gaps,
+            };
 
-            // soft hyphen: zero-width
-            if ch == '\u{00AD}' {
-                j += seq_len;
-                continue;
-            }
-
-            // NBSP: rendered as space width but NOT a stretchable gap
-            if ch == '\u{00A0}' {
-                let adv = fonts.advance(' ', sty) as u32;
-                width += adv;
-                in_trailing_space = false; // NBSP is not a trailing space
-                j += seq_len;
-                continue;
-            }
-
-            // regular space (multi-byte won't normally be space, but be safe)
-            if ch == ' ' {
-                let adv = fonts.advance(' ', sty) as u32;
-                width += adv;
-                gaps += 1;
-                if !in_trailing_space {
-                    in_trailing_space = true;
-                    last_space_width = adv;
+            // pass 2: place the runs. the left and first-line indents
+            // narrow the column; centred and right-aligned lines shift by
+            // the spare; justified lines spread it over the gaps
+            let left_px = INDENT_PX as i32 * span.left_levels() as i32;
+            let first_px = super::layout::indent_px(span.first_indent_qem(), em) as i32;
+            let avail = (text_w - left_px - first_px).max(0);
+            let space_w = fs.advance(' ', span.style()) as i32;
+            let (per, rem) = justify_params(alignment, &span, m, avail, space_w);
+            pg.line_just[i] = (per as i16, rem as i16);
+            let align_offset = if span.is_explicit_align() {
+                let spare = (avail - m.width as i32).max(0);
+                if span.is_centered() {
+                    spare / 2
+                } else if span.is_right_aligned() {
+                    spare
                 } else {
-                    last_space_width += adv;
+                    0
                 }
-                j += seq_len;
-                continue;
-            }
-
-            let adv = fonts.advance(ch, sty) as u32;
-            width += adv;
-            in_trailing_space = false;
-            j += seq_len;
-            continue;
-        }
-
-        // stray continuation byte
-        if b >= 0x80 {
-            j += 1;
-            continue;
-        }
-
-        // control chars (except space)
-        if b < bitmap::FIRST_CHAR && b != b' ' {
-            j += 1;
-            continue;
-        }
-
-        // ASCII space
-        if b == b' ' {
-            let adv = fonts.advance(' ', sty) as u32;
-            width += adv;
-            gaps += 1;
-            if !in_trailing_space {
-                in_trailing_space = true;
-                last_space_width = adv;
             } else {
-                last_space_width += adv;
+                0
+            };
+            let mut cx = margin + left_px + first_px + align_offset;
+            let last_run = pg.run_count;
+            for r in first_run..last_run {
+                let g0 = pg.runs[r].gap0 as i32;
+                let g_end = if r + 1 < last_run {
+                    pg.runs[r + 1].gap0 as i32
+                } else {
+                    gaps as i32
+                };
+                let run = &mut pg.runs[r];
+                let mut w = run.x as i32 + per * (g_end - g0);
+                // the remainder goes one pixel at a time to the leading gaps
+                if rem > 0 {
+                    w += (rem.min(g_end) - g0).max(0);
+                } else if rem < 0 {
+                    w -= ((-rem).min(g_end) - g0).max(0);
+                }
+                run.x = cx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                cx += w;
             }
-            j += 1;
-            continue;
-        }
-
-        // printable ASCII
-        let adv = fonts.advance(b as char, sty) as u32;
-        width += adv;
-        in_trailing_space = false;
-        j += 1;
-    }
-
-    // strip trailing spaces from width measurement (soft-wrapped lines
-    // often include the trailing space before the break point)
-    if in_trailing_space {
-        width = width.saturating_sub(last_space_width);
-        // trailing spaces don't count as stretchable gaps
-        // (they're invisible at the end of the line)
-        // Count how many trailing spaces we had and subtract from gaps
-        // Simple approach: we tracked last_space_width which is the sum
-        // of the trailing run. Divide by single space advance to get count.
-        let space_adv = fonts.advance(' ', sty_initial) as u32;
-        if space_adv > 0 {
-            let trailing_count = (last_space_width / space_adv) as u16;
-            gaps = gaps.saturating_sub(trailing_count);
+            pg.line_x_end[i] = cx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         }
     }
-
-    LineMeasure { width, gaps }
 }
 
-// UTF-8 decoding is provided by plump_kernel::util::decode_utf8_char
-// (re-exported via super::decode_utf8_char)
+/// drop trailing carriage returns from a line range
+pub(super) fn trim_trailing_cr(buf: &[u8], start: usize, end: usize) -> usize {
+    let mut e = end;
+    while e > start && buf[e - 1] == b'\r' {
+        e -= 1;
+    }
+    e
+}
 
-/// Translate a chapter-relative `LineLayout` (K-P output) into a
-/// page-buffer-relative `LineSpan` (greedy renderer's input). Maps
-/// flag bits across the two encodings and clamps offsets so the
-/// renderer never reads past `pg.buf_len`.
+// ── LineLayout → LineSpan ──────────────────────────────────────────
+
 fn linelayout_to_span(ll: &LineLayout, page_start_byte: u32, buf_len: u32) -> LineSpan {
     // image lines: filler entries carry start=0/len=0; origin entries
-    // carry path_start/path_len. Both encodings use chapter-relative
+    // cover the IMG_REF record. both encodings use chapter-relative
     // bytes; translate to page-buffer-relative the same way.
     let raw_start = ll.start_byte.saturating_sub(page_start_byte);
     let raw_len = ll.end_byte.saturating_sub(ll.start_byte);
-    let (start, len) = if ll.is_image() {
-        // image origin: clamp into buf so `&buf[start..start+len]`
-        // stays valid even if the path bytes brush the buf edge.
-        let s = raw_start.min(buf_len) as u16;
-        let l = raw_len.min(buf_len.saturating_sub(s as u32)) as u16;
-        (s, l)
-    } else {
-        let s = raw_start.min(buf_len) as u16;
-        let l = raw_len.min(buf_len.saturating_sub(s as u32)) as u16;
-        (s, l)
-    };
+    let start = raw_start.min(buf_len) as u16;
+    let len = raw_len.min(buf_len.saturating_sub(start as u32)) as u16;
 
-    let mut flags: u8 = 0;
-    if ll.flags & LineLayout::FLAG_BOLD != 0 {
-        flags |= LineSpan::FLAG_BOLD;
-    }
-    if ll.flags & LineLayout::FLAG_ITALIC != 0 {
-        flags |= LineSpan::FLAG_ITALIC;
-    }
+    let mut flags: u8 = ll.flags & (LineLayout::FLAG_BOLD | LineLayout::FLAG_ITALIC);
     if ll.flags & LineLayout::FLAG_HEADING != 0 {
         flags |= LineSpan::FLAG_HEADING;
         // heading-tier translation: LineLayout uses the same bit pattern
@@ -1460,33 +1474,27 @@ fn linelayout_to_span(ll: &LineLayout, page_start_byte: u32, buf_len: u32) -> Li
         flags |= LineSpan::END_SOFT;
     }
 
-    // align values are identical between the two types.
-    let align = ll.align;
-
+    // indent and align bytes share their encoding between the two types
     LineSpan {
         start,
         len,
         flags,
         indent: ll.indent,
-        align,
+        align: ll.align,
         extra: ll.extra,
     }
 }
 
-pub(super) fn trim_trailing_cr(buf: &[u8], start: usize, end: usize) -> usize {
-    if end > start && buf[end - 1] == b'\r' {
-        end - 1
-    } else {
-        end
-    }
-}
+// ── greedy wrapper (.txt files and the K-P fallback) ────────────────
 
-// true if ch is a word-separator for line-wrapping (space, NBSP, etc)
-#[inline]
-fn is_wrap_space(ch: char) -> bool {
-    matches!(ch, ' ' | '\u{00A0}')
-}
-
+/// Greedy first-fit line wrapper over the markup stream in `buf[..n]`.
+///
+/// Returns `(consumed, line_count)`: the byte where the next page
+/// starts and how many lines were filled. Paragraph gaps from block
+/// records are ignored here; a paragraph break produces one empty
+/// line the way plain text does, so `.txt` files keep their look and
+/// the K-P fallback stays readable.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn wrap_proportional(
     buf: &[u8],
     n: usize,
@@ -1495,408 +1503,251 @@ pub(super) fn wrap_proportional(
     max_lines: usize,
     max_width_px: u32,
     img_heights: &[u16],
+    line_h: u16,
+    em_px: u16,
 ) -> (usize, usize) {
     let max_l = max_lines.min(lines.len());
-    let base_max_w = max_width_px;
-    let mut line_count: usize = 0;
-    let mut line_start: usize = 0;
-    let mut cursor_x: u32 = 0;
-    let mut last_space: usize = 0;
-    let mut cursor_at_space: u32 = 0;
+    let mut src = SliceSource(&buf[..n]);
+    let mut ev = Events::new(&mut src);
 
-    let mut bold = false;
-    let mut italic = false;
-    let mut heading = false;
-    // shifted (already in HLEVEL_MASK position); valid when `heading` is set
-    let mut hlevel: u8 = LineSpan::HLEVEL_H3;
-    // current paragraph alignment, set by ALIGN_* markers (Phase 2)
-    let mut align: u8 = LineSpan::ALIGN_DEFAULT;
-    let mut indent: u8 = 0;
-    let mut max_w = base_max_w;
-    let mut img_idx: usize = 0;
-    let mut skipped_leading_blank = false;
+    let mut count = 0usize;
+    let mut line_start = 0usize;
+    let mut line_style = ev.style();
+    let mut cursor: u32 = 0;
+    // last break opportunity: (line end, next line start, cursor at the
+    // opportunity, style at the next line start)
+    let mut brk: Option<(usize, usize, u32, Style)> = None;
+    let mut block = BlockProps::DEFAULT;
+    let mut first_line = true;
+    let mut img_idx = 0usize;
+    let mut last_end = 0usize;
 
-    #[inline]
-    fn current_style(bold: bool, italic: bool, heading: bool) -> fonts::Style {
-        if heading {
-            fonts::Style::Heading
-        } else if bold {
-            fonts::Style::Bold
-        } else if italic {
-            fonts::Style::Italic
+    let width_for = |block: &BlockProps, first: bool| -> u32 {
+        let left = INDENT_PX * block.left as u32;
+        let first_px = if first {
+            super::layout::indent_px(block.text_indent_qem, em_px) as u32
         } else {
-            fonts::Style::Regular
-        }
-    }
-
-    macro_rules! emit {
-        ($start:expr, $end:expr, $end_kind:expr) => {
-            if line_count < max_l {
-                let e = trim_trailing_cr(buf, $start, $end);
-                lines[line_count] = LineSpan {
-                    start: ($start) as u16,
-                    len: (e - ($start)) as u16,
-                    flags: LineSpan::pack_flags(bold, italic, heading, hlevel, $end_kind),
-                    indent,
-                    align,
-                    extra: 0,
-                };
-                line_count += 1;
-            }
+            0
         };
-    }
+        max_width_px.saturating_sub(left + first_px)
+    };
 
-    let mut i = 0;
-    while i < n {
-        let b = buf[i];
-
-        if b == MARKER && i + 1 < n {
-            if buf[i + 1] == IMG_REF && i + IMG_HEADER_LEN <= n {
-                // [MARKER, IMG_REF, flags, w_lo, w_hi, h_lo, h_hi, alt_len, path_len, alt..., path...]
-                let alt_len = buf[i + 7] as usize;
-                let path_len = buf[i + 8] as usize;
-                let alt_start = i + IMG_HEADER_LEN;
-                let path_start = alt_start + alt_len;
-                let payload_end = path_start + path_len;
-                if payload_end <= n && path_len > 0 {
-                    if line_start < i {
-                        emit!(line_start, i, LineSpan::END_HARD);
-                        if line_count >= max_l {
-                            return (i, line_count);
-                        }
-                    }
-
-                    let line_h = fonts.line_height(fonts::Style::Regular);
-                    // prefer pre-scanned height (peeked from PNG/JPEG header
-                    // by images.rs); fall back to DEFAULT_IMG_H. attribute
-                    // hints from <img width/height> are checked in images.rs
-                    // when prescan is run, so the height we land on already
-                    // accounts for them.
-                    let img_h = if img_idx < img_heights.len() && img_heights[img_idx] > 0 {
-                        img_heights[img_idx]
-                    } else {
-                        DEFAULT_IMG_H
-                    };
-                    img_idx += 1;
-                    let img_lines = img_h.div_ceil(line_h).max(1) as usize;
-
-                    // page-fit: if the image needs more lines than the page
-                    // has left AND we've already emitted text on this page,
-                    // push the entire image to the next page by returning at
-                    // the marker offset. wrap_proportional is re-entered on
-                    // the next page with i pointing at the IMG_REF marker, so
-                    // the image (and its still-active alt + dims metadata)
-                    // is consumed there. an image that's bigger than the
-                    // whole page is emitted anyway and clipped at the bottom
-                    // (better than infinite-looping).
-                    if line_count > 0 && line_count + img_lines > max_l {
-                        return (i, line_count);
-                    }
-
-                    if line_count < max_l {
-                        lines[line_count] = LineSpan {
-                            start: path_start as u16,
-                            len: path_len as u16,
-                            flags: LineSpan::FLAG_IMAGE,
-                            // store alt_len in the indent slot for image
-                            // origins (indent isn't used by image renders);
-                            // draw can recover the alt span back from
-                            // `path_start - alt_len`.
-                            indent: alt_len as u8,
-                            align: LineSpan::ALIGN_DEFAULT,
-                            extra: 0,
-                        };
-                        line_count += 1;
-                    }
-
-                    for _ in 1..img_lines {
-                        if line_count >= max_l {
-                            break;
-                        }
-                        lines[line_count] = LineSpan {
-                            start: 0,
-                            len: 0,
-                            flags: LineSpan::FLAG_IMAGE,
-                            indent: 0,
-                            align: LineSpan::ALIGN_DEFAULT,
-                            extra: 0,
-                        };
-                        line_count += 1;
-                    }
-
-                    i = payload_end;
-                    line_start = i;
-                    cursor_x = 0;
-                    last_space = line_start;
-                    cursor_at_space = 0;
-                    if line_count >= max_l {
-                        return (line_start, line_count);
-                    }
-                    continue;
-                }
-            }
-
-            // explicit page break: end the current page at the marker offset
-            // unless the chapter just started (no content yet). next page
-            // resumes at the marker so it's consumed cleanly on re-entry.
-            if buf[i + 1] == PAGE_BREAK {
-                let has_content = line_start < i || line_count > 0;
-                if has_content {
-                    if line_start < i {
-                        emit!(line_start, i, LineSpan::END_HARD);
-                    }
-                    // skip past the marker so we don't loop on the next pass
-                    return (i + 2, line_count);
-                }
-                // chapter-start PAGE_BREAK is a no-op; consume and continue
-                i += 2;
-                continue;
-            }
-
-            match buf[i + 1] {
-                BOLD_ON => bold = true,
-                BOLD_OFF => bold = false,
-                ITALIC_ON => italic = true,
-                ITALIC_OFF => italic = false,
-                // legacy v1 bundles: heading marker without level. fall back to
-                // h3-tier (left, no centering) so old bundles don't shift.
-                HEADING_ON => {
-                    heading = true;
-                    hlevel = LineSpan::HLEVEL_H3;
-                }
-                HEADING_OFF => {
-                    heading = false;
-                    hlevel = LineSpan::HLEVEL_H3;
-                }
-                H1_ON => {
-                    heading = true;
-                    hlevel = LineSpan::HLEVEL_H1;
-                }
-                H2_ON => {
-                    heading = true;
-                    hlevel = LineSpan::HLEVEL_H2;
-                }
-                H3_ON => {
-                    heading = true;
-                    hlevel = LineSpan::HLEVEL_H3;
-                }
-                // h4-h6 render as bold body text rather than a heading font
-                H4_ON | H5_ON | H6_ON => bold = true,
-                H1_OFF | H2_OFF | H3_OFF => {
-                    heading = false;
-                    hlevel = LineSpan::HLEVEL_H3;
-                }
-                H4_OFF | H5_OFF | H6_OFF => bold = false,
-                ALIGN_LEFT => align = LineSpan::ALIGN_LEFT,
-                ALIGN_CENTER => align = LineSpan::ALIGN_CENTER,
-                ALIGN_RIGHT => align = LineSpan::ALIGN_RIGHT,
-                ALIGN_JUSTIFY | ALIGN_RESET => align = LineSpan::ALIGN_DEFAULT,
-                QUOTE_ON => {
-                    indent = indent.saturating_add(1);
-                    max_w = base_max_w.saturating_sub(INDENT_PX * indent as u32);
-                }
-                QUOTE_OFF => {
-                    indent = indent.saturating_sub(1);
-                    max_w = base_max_w.saturating_sub(INDENT_PX * indent as u32);
-                }
-                _ => {}
-            }
-            i += 2;
-            continue;
-        }
-
-        if b == b'\r' {
-            i += 1;
-            continue;
-        }
-
-        if b == b'\n' {
-            let end = trim_trailing_cr(buf, line_start, i);
-            if line_count == 0 && end == line_start && !skipped_leading_blank {
-                skipped_leading_blank = true;
-                line_start = i + 1;
-                cursor_x = 0;
-                last_space = line_start;
-                cursor_at_space = 0;
-                i += 1;
-                continue;
-            }
-
-            emit!(line_start, i, LineSpan::END_HARD);
-            line_start = i + 1;
-            cursor_x = 0;
-            last_space = line_start;
-            cursor_at_space = 0;
-            if line_count >= max_l {
-                return (line_start, line_count);
-            }
-            i += 1;
-            continue;
-        }
-
-        // UTF-8 multi-byte: decode the full character and measure it
-        // using the font's extended glyph tables
-        if b >= 0xC0 {
-            let (ch, seq_len) = decode_utf8_char(buf, i);
-
-            // soft hyphen (U+00AD): zero-width break opportunity
-            if ch == '\u{00AD}' {
-                last_space = i + seq_len;
-                cursor_at_space = cursor_x;
-                i += seq_len;
-                continue;
-            }
-
-            // NBSP and regular spaces: word-break opportunity
-            if is_wrap_space(ch) {
-                let sty = current_style(bold, italic, heading);
-                cursor_x += fonts.advance(' ', sty) as u32;
-                last_space = i + seq_len;
-                cursor_at_space = cursor_x;
-                if cursor_x > max_w {
-                    emit!(line_start, i, LineSpan::END_SOFT);
-                    line_start = i + seq_len;
-                    cursor_x = 0;
-                    last_space = line_start;
-                    cursor_at_space = 0;
-                    if line_count >= max_l {
-                        return (line_start, line_count);
-                    }
-                }
-                i += seq_len;
-                continue;
-            }
-
-            let sty = current_style(bold, italic, heading);
-            let adv = fonts.advance(ch, sty) as u32;
-            cursor_x += adv;
-            if cursor_x > max_w {
-                if last_space > line_start {
-                    emit!(line_start, last_space, LineSpan::END_SOFT);
-                    cursor_x -= cursor_at_space;
-                    line_start = last_space;
-                } else {
-                    emit!(line_start, i, LineSpan::END_SOFT);
-                    line_start = i;
-                    cursor_x = adv;
-                }
-                last_space = line_start;
-                cursor_at_space = 0;
-                if line_count >= max_l {
-                    return (line_start, line_count);
-                }
-            }
-            i += seq_len;
-            continue;
-        }
-        if b >= 0x80 {
-            // stray continuation byte
-            i += 1;
-            continue;
-        }
-
-        // --- ASCII fast path: batch space and word runs ---
-        let sty = current_style(bold, italic, heading);
-        let font = fonts.font(sty);
-        let glyphs = font.glyphs;
-
-        if b == b' ' {
-            let adv = glyphs[(b' ' - FIRST_CHAR) as usize].advance as u32;
-            cursor_x += adv;
-            last_space = i + 1;
-            cursor_at_space = cursor_x;
-            if cursor_x > max_w {
-                emit!(line_start, i, LineSpan::END_SOFT);
-                line_start = i + 1;
-                cursor_x = 0;
-                last_space = line_start;
-                cursor_at_space = 0;
-                if line_count >= max_l {
-                    return (line_start, line_count);
-                }
-            }
-            i += 1;
-            continue;
-        }
-
-        // Printable non-space ASCII (0x21..=0x7E): batch-scan the word run.
-        // Find end of contiguous printable non-space ASCII bytes, sum advances.
-        let word_start = i;
-        let remaining = max_w.saturating_sub(cursor_x);
-        let mut run_adv: u32 = 0;
-        let mut j = i;
-        while j < n {
-            let c = buf[j];
-            // stop at space, control chars, MARKER, high-bit bytes
-            if c <= b' ' || c > 0x7E {
-                break;
-            }
-            let a = glyphs[(c - FIRST_CHAR) as usize].advance as u32;
-            if run_adv + a > remaining && j > word_start {
-                // would overflow; stop batch here so we handle break properly
-                break;
-            }
-            run_adv += a;
-            j += 1;
-        }
-
-        if j > i {
-            // consumed j - i bytes as a batch
-            cursor_x += run_adv;
-            i = j;
-            if cursor_x > max_w {
-                // overflow: break at last space or at word start
-                if last_space > line_start {
-                    emit!(line_start, last_space, LineSpan::END_SOFT);
-                    cursor_x -= cursor_at_space;
-                    line_start = last_space;
-                } else {
-                    emit!(line_start, word_start, LineSpan::END_SOFT);
-                    line_start = word_start;
-                    // recompute cursor_x from line_start..i
-                    cursor_x = 0;
-                    for k in line_start..i {
-                        let c = buf[k];
-                        if c >= FIRST_CHAR && c <= 0x7E {
-                            cursor_x += glyphs[(c - FIRST_CHAR) as usize].advance as u32;
-                        }
-                    }
-                }
-                last_space = line_start;
-                cursor_at_space = 0;
-                if line_count >= max_l {
-                    return (line_start, line_count);
-                }
-            }
-            continue;
-        }
-
-        // single non-printable byte that wasn't caught above; skip
-        i += 1;
-    }
-
-    if line_start < n && line_count < max_l {
-        let e = trim_trailing_cr(buf, line_start, n);
-        if e > line_start {
-            lines[line_count] = LineSpan {
-                start: line_start as u16,
-                len: (e - line_start) as u16,
-                flags: LineSpan::pack_flags(bold, italic, heading, hlevel, LineSpan::END_BUFFER),
-                indent,
-                align,
+    // push one line; returns false when the page is full
+    macro_rules! emit {
+        ($start:expr, $end:expr, $end_kind:expr, $first:expr) => {{
+            let s = $start;
+            let e = ($end).max(s);
+            lines[count] = LineSpan {
+                start: s as u16,
+                len: (e - s) as u16,
+                flags: LineSpan::flags_for(line_style, $end_kind),
+                indent: LineLayout::pack_indent(
+                    block.left,
+                    if $first { block.text_indent_qem } else { 0 },
+                ),
+                align: LineLayout::pack_align(block.align, 0, line_style),
                 extra: 0,
             };
-            line_count += 1;
+            count += 1;
+            count < max_l
+        }};
+    }
+
+    loop {
+        let Some(e) = ev.next_event() else { break };
+        match e {
+            Event::Word { start, end, style }
+            | Event::Nbsp { start, end, style } => {
+                let w = if matches!(e, Event::Nbsp { .. }) {
+                    fonts.advance(' ', fonts::Style::from_markup(style)) as u32
+                } else {
+                    measure_bytes(&buf[start as usize..end as usize], fonts, fonts::Style::from_markup(style))
+                };
+                let max_w = width_for(&block, first_line);
+                if cursor + w > max_w && cursor > 0 {
+                    // overflow: break at the last opportunity, else ahead
+                    // of this word (an overlong word overflows its line)
+                    let (line_end, next_start, cursor_at, next_style) = match brk {
+                        Some(b) => b,
+                        None => (start as usize, start as usize, cursor, style),
+                    };
+                    let more = emit!(line_start, line_end, LineSpan::END_SOFT, first_line);
+                    first_line = false;
+                    line_start = next_start;
+                    if !more {
+                        return (line_start, count);
+                    }
+                    cursor -= cursor_at;
+                    line_style = next_style;
+                    brk = None;
+                }
+                cursor += w;
+                last_end = end as usize;
+            }
+
+            Event::Space { start, end, style } => {
+                let adv = fonts.advance(' ', fonts::Style::from_markup(style)) as u32;
+                cursor += adv;
+                last_end = end as usize;
+                brk = Some((start as usize, end as usize, cursor, style));
+                if cursor > width_for(&block, first_line) {
+                    let more = emit!(line_start, start as usize, LineSpan::END_SOFT, first_line);
+                    first_line = false;
+                    line_start = end as usize;
+                    if !more {
+                        return (line_start, count);
+                    }
+                    cursor = 0;
+                    line_style = style;
+                    brk = None;
+                }
+            }
+
+            Event::SoftHyphen { end, style, .. } => {
+                // zero-width break opportunity after the hyphen point
+                brk = Some((end as usize, end as usize, cursor, style));
+                last_end = end as usize;
+            }
+
+            Event::HardBreak { start, end } => {
+                let more = emit!(line_start, start as usize, LineSpan::END_HARD, first_line);
+                first_line = false;
+                line_start = end as usize;
+                if !more {
+                    return (line_start, count);
+                }
+                cursor = 0;
+                brk = None;
+                block = ev.block();
+                line_style = ev.style();
+            }
+
+            Event::ParagraphBreak { start, end } => {
+                let had_text = (start as usize) > line_start;
+                if had_text || count > 0 {
+                    let more = emit!(line_start, start as usize, LineSpan::END_HARD, first_line);
+                    if !more {
+                        return (end as usize, count);
+                    }
+                }
+                // the blank line between paragraphs, skipped at page top
+                if count > 0 {
+                    line_start = end as usize;
+                    block = BlockProps::DEFAULT;
+                    let more = emit!(line_start, line_start, LineSpan::END_HARD, false);
+                    if !more {
+                        return (line_start, count);
+                    }
+                }
+                line_start = end as usize;
+                cursor = 0;
+                brk = None;
+                block = BlockProps::DEFAULT;
+                first_line = true;
+                line_style = ev.style();
+            }
+
+            Event::PageBreak { start, end } => {
+                // explicit page break: end the current page at the marker
+                // unless the chapter just started (no content yet)
+                let has_content = (start as usize) > line_start || count > 0;
+                if has_content {
+                    if (start as usize) > line_start {
+                        let _ = emit!(line_start, start as usize, LineSpan::END_HARD, first_line);
+                    }
+                    return (end as usize, count);
+                }
+                line_start = end as usize;
+                line_style = ev.style();
+            }
+
+            Event::ThematicBreak { end, .. } => {
+                // the stripper already put a paragraph break around it
+                if (end as usize) > line_start && cursor == 0 {
+                    line_start = end as usize;
+                    line_style = ev.style();
+                }
+            }
+
+            Event::Image(img) => {
+                if (img.start as usize) > line_start && cursor > 0 {
+                    let more = emit!(line_start, img.start as usize, LineSpan::END_HARD, first_line);
+                    if !more {
+                        return (img.start as usize, count);
+                    }
+                }
+                // prefer the pre-scanned height (peeked from the image
+                // header by images.rs); fall back to DEFAULT_IMG_H
+                let img_h = if img_idx < img_heights.len() && img_heights[img_idx] > 0 {
+                    img_heights[img_idx]
+                } else {
+                    DEFAULT_IMG_H
+                };
+                img_idx += 1;
+                let img_lines = img_h.div_ceil(line_h.max(1)).max(1) as usize;
+
+                // page-fit: if the image needs more lines than the page has
+                // left AND text is already on this page, push the whole
+                // image to the next page. an image bigger than the page is
+                // emitted anyway and clipped at the bottom
+                if count > 0 && count + img_lines > max_l {
+                    return (img.start as usize, count);
+                }
+
+                if count < max_l {
+                    lines[count] = LineSpan {
+                        start: img.start as u16,
+                        len: (img.end - img.start) as u16,
+                        flags: LineSpan::FLAG_IMAGE,
+                        indent: 0,
+                        align: LineSpan::ALIGN_DEFAULT,
+                        extra: 0,
+                    };
+                    count += 1;
+                }
+                for _ in 1..img_lines {
+                    if count >= max_l {
+                        break;
+                    }
+                    lines[count] = LineSpan {
+                        start: 0,
+                        len: 0,
+                        flags: LineSpan::FLAG_IMAGE,
+                        indent: 0,
+                        align: LineSpan::ALIGN_DEFAULT,
+                        extra: 0,
+                    };
+                    count += 1;
+                }
+
+                line_start = img.end as usize;
+                last_end = line_start;
+                cursor = 0;
+                brk = None;
+                block = BlockProps::DEFAULT;
+                first_line = true;
+                line_style = ev.style();
+                if count >= max_l {
+                    return (line_start, count);
+                }
+            }
+
+            Event::Block { block: b, .. } => {
+                block = b;
+                first_line = true;
+            }
+
+            Event::Unknown { .. } => {}
         }
     }
 
-    (n, line_count)
+    if last_end > line_start && count < max_l {
+        let _ = emit!(line_start, last_end, LineSpan::END_BUFFER, first_line);
+    }
+
+    (n, count)
 }
 
-// ── BundleByteSource ────────────────────────────────────────────────
-//
-// Streaming `ByteSource` impl that pulls chapter bytes from the bundle
-// file on SD via `bundle::read_at` through a sliding 4 KB window. Used
 // by `run_kp_typeset` when the chapter is too big to fit in `ch_cache`
 // (largest contiguous heap region on ESP32-C3 is ~108 KB; chapters
 // past that — e.g. Stories of Your Life "Seventy-Two Letters" at
@@ -1977,7 +1828,7 @@ impl<'a> BundleByteSource<'a> {
     }
 }
 
-impl<'a> ByteSource for BundleByteSource<'a> {
+impl ByteSource for BundleByteSource<'_> {
     #[inline]
     fn len(&self) -> usize {
         self.total_len as usize

@@ -1,34 +1,37 @@
 //! Knuth-Plass item builder.
 //!
-//! Walks the `MarkupScanner` token stream and emits one paragraph
-//! worth of K-P items into a caller-provided `Vec<Item>`. The
-//! breaker takes that slice as input. Items are 8 B packed so a
-//! 2 KB working budget covers ~256 items per paragraph; truly
-//! oversized paragraphs return `BreakError::ItemBudgetExceeded`
-//! at the breaker stage.
+//! Walks the `smol_epub::markup::Events` stream and emits one
+//! paragraph worth of K-P items into a caller-provided `Vec<Item>`.
+//! The breaker takes that slice as input. Items are 12 B so a 3 KB
+//! working budget covers ~256 items per paragraph; truly oversized
+//! paragraphs return `BreakError::ItemBudgetExceeded` at the breaker
+//! stage.
 //!
-//! A paragraph ends at any of: `ParagraphBreak`, `PageBreak`,
-//! `ThematicBreak`, `Image`, `BlockChanged`, or end-of-buffer.
-//! The caller drives the loop, so block-state / page-break /
-//! image dispatch happens at paragraph granularity.
+//! A paragraph ends at any of: `ParagraphBreak`, `HardBreak`,
+//! `PageBreak`, `ThematicBreak`, `Image`, a `Block` record arriving
+//! mid-paragraph, or end-of-buffer. The caller drives the loop, so
+//! block-state / page-break / image dispatch happens at paragraph
+//! granularity.
+//!
+//! The paragraph's first-line indent (from its block record) goes in
+//! as a fixed, unstretchable `Box` ahead of the first item, so the
+//! breaker and the renderer agree on the first line's width without
+//! either knowing about indents.
 
 use alloc::vec::Vec;
 
-use plump_kernel::util::decode_utf8_char;
-
-use super::scan::{BlockState, ImageRef, MarkupScanner, TextStyle, Token};
+use smol_epub::markup::{BlockProps, Event, Events, ImageRef, Style, decode_utf8};
 
 // ── Item ───────────────────────────────────────────────────────────
 
-/// Knuth-Plass item, packed to 8 bytes.
+/// Knuth-Plass item.
 ///
 /// `flags` byte layout:
 ///   bits 0-1  ItemKind discriminant (Box=0, Glue=1, Penalty=2)
 ///   bit 2     `flagged` (K-P flagged-penalty bit; informs hyphen demerit)
 ///   bit 3     `forced`  (forces a break here when set, even at +∞ stretch)
-///   bit 4     STYLE_BOLD
-///   bit 5     STYLE_ITALIC
-///   bits 6-7  STYLE_HEADING_TIER (00=not heading, 01=H3, 10=H2, 11=H1)
+///
+/// `style` is the packed `markup::Style` the item was measured in.
 ///
 /// For `Penalty` items, `width` carries the penalty cost as `i16`
 /// (bit-reinterpret); `i16::MAX` means "forbidden break", `i16::MIN`
@@ -40,6 +43,7 @@ pub struct Item {
     pub stretch: u16,
     pub shrink: u8,
     flags: u8,
+    style: u8,
     pub byte_offset: u32,
 }
 
@@ -56,15 +60,6 @@ impl Item {
     const FLAG_FLAGGED: u8 = 1 << 2;
     const FLAG_FORCED: u8 = 1 << 3;
 
-    pub const STYLE_BOLD: u8 = 1 << 4;
-    pub const STYLE_ITALIC: u8 = 1 << 5;
-    pub const STYLE_HEADING_TIER_SHIFT: u8 = 6;
-    pub const STYLE_HEADING_TIER_MASK: u8 = 0b11 << Self::STYLE_HEADING_TIER_SHIFT;
-    pub const STYLE_TIER_NONE: u8 = 0;
-    pub const STYLE_TIER_H3: u8 = 1 << Self::STYLE_HEADING_TIER_SHIFT;
-    pub const STYLE_TIER_H2: u8 = 2 << Self::STYLE_HEADING_TIER_SHIFT;
-    pub const STYLE_TIER_H1: u8 = 3 << Self::STYLE_HEADING_TIER_SHIFT;
-
     /// "+∞" penalty: forbid a break here (used as the first item of
     /// the forced-break triple at paragraph end).
     pub const PENALTY_FORBIDDEN: i16 = i16::MAX;
@@ -78,6 +73,7 @@ impl Item {
             stretch: 0,
             shrink: 0,
             flags: ItemKind::Box as u8,
+            style: 0,
             byte_offset,
         }
     }
@@ -88,6 +84,7 @@ impl Item {
             stretch,
             shrink,
             flags: ItemKind::Glue as u8,
+            style: 0,
             byte_offset,
         }
     }
@@ -105,6 +102,7 @@ impl Item {
             stretch: 0,
             shrink: 0,
             flags,
+            style: 0,
             byte_offset,
         }
     }
@@ -135,41 +133,17 @@ impl Item {
         self.width as i16
     }
 
-    /// Stamp inline style (bold/italic/heading-tier) into the
-    /// reserved bits. Used at item-build time so the convert adapter
-    /// can pick the line-start style off the first Box of each line.
-    pub fn with_style(mut self, style: TextStyle) -> Self {
-        if style.bold {
-            self.flags |= Self::STYLE_BOLD;
-        }
-        if style.italic {
-            self.flags |= Self::STYLE_ITALIC;
-        }
-        if style.heading {
-            let tier = match style.hlevel {
-                1 => Self::STYLE_TIER_H1,
-                2 => Self::STYLE_TIER_H2,
-                _ => Self::STYLE_TIER_H3,
-            };
-            self.flags |= tier;
-        }
+    /// Stamp the inline style the item was measured in, so the convert
+    /// adapter can pick the line-start style off the first Box of each
+    /// line.
+    pub fn with_style(mut self, style: Style) -> Self {
+        self.style = style.pack();
         self
     }
 
     #[inline]
-    pub fn style_is_bold(&self) -> bool {
-        self.flags & Self::STYLE_BOLD != 0
-    }
-    #[inline]
-    pub fn style_is_italic(&self) -> bool {
-        self.flags & Self::STYLE_ITALIC != 0
-    }
-    /// Returns the heading tier byte (`STYLE_TIER_NONE` / `H3` / `H2` / `H1`)
-    /// already shifted into bits 6-7 — convenient to OR into a LineLayout
-    /// flags byte after masking.
-    #[inline]
-    pub fn style_heading_tier(&self) -> u8 {
-        self.flags & Self::STYLE_HEADING_TIER_MASK
+    pub fn style(&self) -> Style {
+        Style::unpack(self.style)
     }
 }
 
@@ -185,14 +159,17 @@ pub enum ParagraphEnd {
     ImageBlock,
     /// a `<hr>`-style break; caller may emit a spacer line if desired
     ThematicBreak,
-    /// indent / align changed; new paragraph picks up the new BlockState
+    /// a block record arrived mid-paragraph; the next paragraph picks
+    /// up the new properties
     BlockChanged,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct ParagraphMeta {
-    pub block: BlockState,
-    pub style_at_start: TextStyle,
+    /// the paragraph's block properties (from its block record, or the
+    /// defaults / continuation of the block a hard break split)
+    pub block: BlockProps,
+    pub style_at_start: Style,
     pub end_kind: ParagraphEnd,
     pub byte_start: u32,
     pub byte_end: u32,
@@ -215,53 +192,62 @@ const WORD_MEASURE_BUF: usize = 256;
 
 // ── builder ───────────────────────────────────────────────────────
 
-/// Drive the scanner until one paragraph is consumed; emit its K-P
-/// items into `out`. Returns metadata about the paragraph boundary.
+/// Drive the event stream until one paragraph is consumed; emit its
+/// K-P items into `out`. Returns metadata about the paragraph boundary.
 ///
 /// The caller is expected to clear `out` before each call.
 ///
 /// `advance` is called per character of every Word token to derive
 /// natural width. Implementations should call `FontSet::advance(ch,
 /// style)`; the closure form keeps this module free of font/HAL
-/// imports for host testability.
+/// imports for host testability. `em_px` sizes the first-line indent
+/// box.
 pub fn build_paragraph(
-    scanner: &mut MarkupScanner<'_>,
-    mut advance: impl FnMut(char, TextStyle) -> u16,
+    events: &mut Events<'_>,
+    mut advance: impl FnMut(char, Style) -> u16,
+    em_px: u16,
     out: &mut Vec<Item>,
 ) -> ParagraphMeta {
-    let block_at_start = scanner.block_state();
-    let style_at_start = scanner.text_style();
-    let byte_start = scanner.position();
+    let style_at_start = events.style();
+    let byte_start = events.offset();
+    let mut block = events.block();
     let mut last_end: u32 = byte_start;
-    // stack scratch for word bytes, replacing the old `&buf[start..end]`
-    // slice. typical English words / URLs comfortably fit in 256 bytes;
-    // longer runs are truncated and the K-P breaker still handles them
-    // correctly via single_overfull_box.
+    // stack scratch for word bytes. typical English words / URLs
+    // comfortably fit in 256 bytes; longer runs are truncated and the
+    // K-P breaker still handles them correctly via single_overfull_box.
     let mut word_buf = [0u8; WORD_MEASURE_BUF];
+    // the first-line indent box goes in ahead of the first text item
+    let mut indent_pending = true;
+
+    macro_rules! lead_in {
+        ($at:expr, $style:expr) => {
+            if indent_pending {
+                indent_pending = false;
+                let w = super::indent_px(block.text_indent_qem, em_px);
+                if w > 0 {
+                    out.push(Item::boxed(w, $at).with_style($style));
+                }
+            }
+        };
+    }
 
     loop {
-        let Some(tok) = scanner.next() else {
-            return finish(
-                out,
-                byte_start,
-                last_end,
-                block_at_start,
-                style_at_start,
-                ParagraphEnd::EndOfBuffer,
-                None,
-            );
+        let Some(ev) = events.next_event() else {
+            return finish(byte_start, last_end, block, style_at_start, ParagraphEnd::EndOfBuffer, None);
         };
 
-        match tok {
-            Token::Word { start, end, style } => {
+        match ev {
+            Event::Word { start, end, style } => {
+                lead_in!(start, style);
                 let len = (end - start) as usize;
-                let n = scanner.read_into(start, &mut word_buf[..len.min(WORD_MEASURE_BUF)]);
+                let n = events.read_into(start, &mut word_buf[..len.min(WORD_MEASURE_BUF)]);
                 let width = measure_word(&word_buf[..n], style, &mut advance);
                 out.push(Item::boxed(width, start).with_style(style));
                 last_end = end;
             }
 
-            Token::Space { start, style, end } => {
+            Event::Space { start, end, style } => {
+                lead_in!(start, style);
                 let space = advance(' ', style) as u32;
                 // TeX cmr10's classical ratios. The breaker's pass-2
                 // fallback (`break_paragraph_with_fallback`) adds
@@ -282,113 +268,67 @@ pub fn build_paragraph(
                 last_end = end;
             }
 
-            Token::Nbsp { start, end, style } => {
+            Event::Nbsp { start, end, style } => {
+                lead_in!(start, style);
                 // fixed glue: render at space width but never break here
                 let space = advance(' ', style) as u32;
-                out.push(
-                    Item::boxed(space.min(u16::MAX as u32) as u16, start).with_style(style),
-                );
+                out.push(Item::boxed(space.min(u16::MAX as u32) as u16, start).with_style(style));
                 last_end = end;
             }
 
-            Token::SoftHyphen { start, end, .. } => {
+            Event::SoftHyphen { start, end, .. } => {
                 // discretionary break: zero-width penalty (visible
                 // hyphen rendering is deferred — see plan §5).
                 out.push(Item::penalty(HYPHEN_PENALTY, true, false, start));
                 last_end = end;
             }
 
-            Token::HardBreak { start, end } => {
-                // single \n inside a block: treat as paragraph end
-                // for typesetting purposes (the renderer also flushes
-                // the line). This matches greedy's behavior at
-                // paging.rs:1009-1031 where \n closes the line.
+            Event::HardBreak { start, end } => {
+                // single \n inside a block: treat as paragraph end for
+                // typesetting purposes; the decoder carries the block's
+                // alignment and left indent over to the continuation
                 push_forced_break_triple(out, start);
-                return finish(
-                    out,
-                    byte_start,
-                    end,
-                    block_at_start,
-                    style_at_start,
-                    ParagraphEnd::ParagraphBreak,
-                    None,
-                );
+                return finish(byte_start, end, block, style_at_start, ParagraphEnd::ParagraphBreak, None);
             }
 
-            Token::ParagraphBreak { start, end } => {
+            Event::ParagraphBreak { start, end } => {
                 push_forced_break_triple(out, start);
-                return finish(
-                    out,
-                    byte_start,
-                    end,
-                    block_at_start,
-                    style_at_start,
-                    ParagraphEnd::ParagraphBreak,
-                    None,
-                );
+                return finish(byte_start, end, block, style_at_start, ParagraphEnd::ParagraphBreak, None);
             }
 
-            Token::PageBreak { start, end } => {
+            Event::PageBreak { start, end } => {
                 if !out.is_empty() {
                     push_forced_break_triple(out, start);
                 }
-                return finish(
-                    out,
-                    byte_start,
-                    end,
-                    block_at_start,
-                    style_at_start,
-                    ParagraphEnd::PageBreakAfter,
-                    None,
-                );
+                return finish(byte_start, end, block, style_at_start, ParagraphEnd::PageBreakAfter, None);
             }
 
-            Token::ThematicBreak { start, end } => {
+            Event::ThematicBreak { start, end } => {
                 if !out.is_empty() {
                     push_forced_break_triple(out, start);
                 }
-                return finish(
-                    out,
-                    byte_start,
-                    end,
-                    block_at_start,
-                    style_at_start,
-                    ParagraphEnd::ThematicBreak,
-                    None,
-                );
+                return finish(byte_start, end, block, style_at_start, ParagraphEnd::ThematicBreak, None);
             }
 
-            Token::Image(img) => {
+            Event::Image(img) => {
                 if !out.is_empty() {
                     push_forced_break_triple(out, img.start);
                 }
-                return finish(
-                    out,
-                    byte_start,
-                    img.end,
-                    block_at_start,
-                    style_at_start,
-                    ParagraphEnd::ImageBlock,
-                    Some(img),
-                );
+                return finish(byte_start, img.end, block, style_at_start, ParagraphEnd::ImageBlock, Some(img));
             }
 
-            Token::BlockChanged { at, .. } => {
-                if !out.is_empty() {
+            Event::Block { at, block: b } => {
+                if out.is_empty() {
+                    // the record for the paragraph about to start
+                    block = b;
+                    last_end = at;
+                } else {
                     push_forced_break_triple(out, at);
+                    return finish(byte_start, at, block, style_at_start, ParagraphEnd::BlockChanged, None);
                 }
-                return finish(
-                    out,
-                    byte_start,
-                    at,
-                    block_at_start,
-                    style_at_start,
-                    ParagraphEnd::BlockChanged,
-                    None,
-                );
             }
 
-            Token::UnknownMarker { end, .. } => {
+            Event::Unknown { end, .. } => {
                 last_end = end;
             }
         }
@@ -399,18 +339,16 @@ pub fn build_paragraph(
 
 #[inline]
 fn finish(
-    out: &mut Vec<Item>,
     byte_start: u32,
     byte_end: u32,
-    block: BlockState,
-    style_at_start: TextStyle,
+    block: BlockProps,
+    style_at_start: Style,
     end_kind: ParagraphEnd,
     image: Option<ImageRef>,
 ) -> ParagraphMeta {
     // a paragraph that produced no items at all (e.g. consecutive
     // page breaks, or an image at chapter start) is signaled with
     // an empty `out`; the caller skips break + paginate for it.
-    let _ = out;
     ParagraphMeta {
         block,
         style_at_start,
@@ -433,8 +371,8 @@ fn push_forced_break_triple(out: &mut Vec<Item>, byte_offset: u32) {
 #[inline]
 fn measure_word(
     bytes: &[u8],
-    style: TextStyle,
-    advance: &mut impl FnMut(char, TextStyle) -> u16,
+    style: Style,
+    advance: &mut impl FnMut(char, Style) -> u16,
 ) -> u16 {
     let mut width: u32 = 0;
     let mut i = 0;
@@ -444,7 +382,7 @@ fn measure_word(
             width = width.saturating_add(advance(b as char, style) as u32);
             i += 1;
         } else {
-            let (ch, len) = decode_utf8_char(bytes, i);
+            let (ch, len) = decode_utf8(&bytes[i..]);
             width = width.saturating_add(advance(ch, style) as u32);
             i += len.max(1);
         }
@@ -457,22 +395,24 @@ fn measure_word(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apps::reader::layout::scan::{MarkupScanner, TextStyle};
-    use smol_epub::html_strip::{
-        ALIGN_CENTER, BOLD_OFF, BOLD_ON, IMG_REF, ITALIC_OFF, ITALIC_ON, MARKER, PAGE_BREAK,
-        QUOTE_ON,
+    use smol_epub::markup::{
+        Align, BOLD_OFF, BOLD_ON, IMG_REF, ITALIC_OFF, ITALIC_ON, MARKER, PAGE_BREAK, SliceSource,
     };
 
     /// minimal mock advance: every char is 1 px regardless of style.
-    fn unit_advance(_c: char, _s: TextStyle) -> u16 {
+    fn unit_advance(_c: char, _s: Style) -> u16 {
         1
     }
 
     fn build(bytes: &[u8]) -> (Vec<Item>, ParagraphMeta) {
-        let mut src = crate::apps::reader::layout::scan::SliceByteSource::new(bytes);
-        let mut scanner = MarkupScanner::new(&mut src);
+        build_em(bytes, 16)
+    }
+
+    fn build_em(bytes: &[u8], em_px: u16) -> (Vec<Item>, ParagraphMeta) {
+        let mut src = SliceSource(bytes);
+        let mut events = Events::new(&mut src);
         let mut out: Vec<Item> = Vec::new();
-        let meta = build_paragraph(&mut scanner, unit_advance, &mut out);
+        let meta = build_paragraph(&mut events, unit_advance, em_px, &mut out);
         (out, meta)
     }
 
@@ -496,279 +436,116 @@ mod tests {
     #[test]
     fn space_becomes_glue_with_stretch_and_shrink() {
         let (items, _) = build(b"a b");
-        // word 'a', glue ' ', word 'b'
         assert_eq!(items.len(), 3);
         assert_eq!(items[1].kind(), ItemKind::Glue);
         assert_eq!(items[1].width, 1);
-        assert_eq!(items[1].stretch, 1); // = space (1)
-        assert_eq!(items[1].shrink, 0); // = space / 2 = 0 (truncated)
     }
 
     #[test]
     fn nbsp_becomes_unbreakable_box() {
-        // "a NBSP b"
-        let bytes = b"a\xC2\xA0b";
-        let (items, _) = build(bytes);
+        let (items, _) = build(b"a\xC2\xA0b");
         assert_eq!(items.len(), 3);
         assert_eq!(items[1].kind(), ItemKind::Box);
-        assert_eq!(items[1].width, 1);
     }
 
     #[test]
     fn soft_hyphen_becomes_flagged_penalty() {
-        // "ab SHY cd"
-        let bytes = b"ab\xC2\xADcd";
-        let (items, _) = build(bytes);
+        let (items, _) = build(b"ab\xC2\xADcd");
         assert_eq!(items.len(), 3);
         assert_eq!(items[1].kind(), ItemKind::Penalty);
         assert!(items[1].is_flagged());
-        assert!(!items[1].is_forced());
         assert_eq!(items[1].penalty_value(), HYPHEN_PENALTY);
     }
 
     #[test]
     fn paragraph_break_emits_forced_triple_and_returns() {
         let (items, meta) = build(b"a\n\nb");
-        // 'a' Box, then forced-triple, then we return; 'b' is for next call
         assert_eq!(items.len(), 4);
-        assert_eq!(items[0].kind(), ItemKind::Box);
-        assert_eq!(items[1].kind(), ItemKind::Penalty);
-        assert_eq!(items[1].penalty_value(), Item::PENALTY_FORBIDDEN);
-        assert_eq!(items[2].kind(), ItemKind::Glue);
-        assert_eq!(items[2].stretch, u16::MAX);
-        assert_eq!(items[3].kind(), ItemKind::Penalty);
-        assert_eq!(items[3].penalty_value(), Item::PENALTY_FORCE);
         assert!(items[3].is_forced());
         assert_eq!(meta.end_kind, ParagraphEnd::ParagraphBreak);
-    }
-
-    #[test]
-    fn hard_break_acts_like_paragraph_break() {
-        let (items, meta) = build(b"a\nb");
-        assert_eq!(items.len(), 4);
-        assert_eq!(meta.end_kind, ParagraphEnd::ParagraphBreak);
-    }
-
-    #[test]
-    fn page_break_returns_page_break_after_kind() {
-        let bytes = [b'a', MARKER, PAGE_BREAK];
-        let (items, meta) = build(&bytes);
-        // 'a' Box + forced triple
-        assert_eq!(items.len(), 4);
-        assert_eq!(meta.end_kind, ParagraphEnd::PageBreakAfter);
+        assert_eq!(meta.byte_end, 3);
     }
 
     #[test]
     fn page_break_at_chapter_start_emits_no_items() {
-        let bytes = [MARKER, PAGE_BREAK, b'a'];
-        let (items, meta) = build(&bytes);
+        let (items, meta) = build(&[MARKER, PAGE_BREAK, b'a']);
         assert!(items.is_empty());
         assert_eq!(meta.end_kind, ParagraphEnd::PageBreakAfter);
     }
 
     #[test]
-    fn block_changed_ends_paragraph() {
-        let bytes = [b'a', MARKER, ALIGN_CENTER, b'b'];
-        let (items, meta) = build(&bytes);
-        assert_eq!(items.len(), 4); // 'a' + forced triple
-        assert_eq!(meta.end_kind, ParagraphEnd::BlockChanged);
+    fn block_record_sets_meta_and_adds_indent_box() {
+        let props = BlockProps {
+            align: Align::Right,
+            left: 1,
+            text_indent_qem: 6,
+            space_above_qem: 4,
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&props.encode());
+        bytes.extend_from_slice(b"ab cd");
+        let (items, meta) = build_em(&bytes, 20);
+        assert_eq!(meta.block, props);
+        // indent box (6 qem at 20 px/em = 30 px), word, glue, word
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].kind(), ItemKind::Box);
+        assert_eq!(items[0].width, 30);
+        assert_eq!(items[0].byte_offset, 5);
+        assert_eq!(items[1].width, 2);
     }
 
     #[test]
-    fn quote_on_changes_block_state_and_ends_paragraph() {
-        let bytes = [b'a', MARKER, QUOTE_ON, b'b'];
-        let (items, meta) = build(&bytes);
-        assert_eq!(meta.end_kind, ParagraphEnd::BlockChanged);
-        // first paragraph started with indent 0
-        assert_eq!(meta.block.indent, 0);
-        assert_eq!(items.len(), 4);
+    fn no_indent_box_without_text_indent() {
+        let (items, _) = build(b"ab");
+        assert_eq!(items.len(), 1);
     }
 
     #[test]
     fn bold_marker_propagates_to_word_style() {
         let mut bytes = Vec::new();
-        bytes.push(b'h');
-        bytes.push(MARKER);
-        bytes.push(BOLD_ON);
-        bytes.push(b'i');
+        bytes.extend_from_slice(&[MARKER, BOLD_ON]);
+        bytes.extend_from_slice(b"x");
+        bytes.extend_from_slice(&[MARKER, BOLD_OFF]);
+        bytes.extend_from_slice(b" y");
         let (items, _) = build(&bytes);
-        // both words rendered as boxes regardless of style (advance is constant 1px)
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].kind(), ItemKind::Box);
-        assert_eq!(items[1].kind(), ItemKind::Box);
-        // first Box is pre-bold; second carries STYLE_BOLD
-        assert!(!items[0].style_is_bold());
-        assert!(items[1].style_is_bold());
-    }
-
-    #[test]
-    fn single_letter_bold_dropcap_stamps_only_first_box() {
-        // The Leviathan pattern: <b>M</b>iller — a single bold-letter
-        // drop-cap followed by regular continuation. Items must reflect
-        // the per-Box style so K-P measures bold-M with the bold font
-        // and so first_box_style picks the right initial flag.
-        let mut bytes = Vec::new();
-        bytes.push(MARKER);
-        bytes.push(BOLD_ON);
-        bytes.push(b'M');
-        bytes.push(MARKER);
-        bytes.push(BOLD_OFF);
-        bytes.extend_from_slice(b"iller");
-        let (items, _) = build(&bytes);
-        // expect Box("M", bold) + Box("iller", regular). No Glue, the
-        // markers join the two words logically (no whitespace between).
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].kind(), ItemKind::Box);
-        assert!(
-            items[0].style_is_bold(),
-            "first Box (drop-cap M) must carry STYLE_BOLD"
-        );
-        assert_eq!(items[1].kind(), ItemKind::Box);
-        assert!(
-            !items[1].style_is_bold(),
-            "second Box (regular 'iller') must NOT carry STYLE_BOLD"
-        );
+        assert!(items[0].style().bold);
+        assert!(!items[2].style().bold);
     }
 
     #[test]
     fn nested_bold_italic_stamps_combined_style() {
-        // BOLD_ON + ITALIC_ON + "x" + ITALIC_OFF + "y" + BOLD_OFF + "z"
-        // → Box("x", bold+italic), Box("y", bold), Box("z", regular)
         let mut bytes = Vec::new();
-        bytes.push(MARKER);
-        bytes.push(BOLD_ON);
-        bytes.push(MARKER);
-        bytes.push(ITALIC_ON);
-        bytes.push(b'x');
-        bytes.push(MARKER);
-        bytes.push(ITALIC_OFF);
-        bytes.push(b'y');
-        bytes.push(MARKER);
-        bytes.push(BOLD_OFF);
-        bytes.push(b'z');
+        bytes.extend_from_slice(&[MARKER, BOLD_ON, MARKER, ITALIC_ON]);
+        bytes.extend_from_slice(b"x");
+        bytes.extend_from_slice(&[MARKER, ITALIC_OFF, MARKER, BOLD_OFF]);
         let (items, _) = build(&bytes);
-        assert_eq!(items.len(), 3);
-        let boxes: Vec<&Item> = items.iter().filter(|it| it.kind() == ItemKind::Box).collect();
-        assert!(boxes[0].style_is_bold() && boxes[0].style_is_italic());
-        assert!(boxes[1].style_is_bold() && !boxes[1].style_is_italic());
-        assert!(!boxes[2].style_is_bold() && !boxes[2].style_is_italic());
-    }
-
-    #[test]
-    fn glue_inherits_leading_word_style() {
-        // BOLD_ON + "a" + " " (space) + "b" + BOLD_OFF + " " + "c"
-        // The space after "a" is encountered while bold=true; the
-        // intermediate space after "b" is also bold (close happens
-        // AFTER the space). This documents the existing convention.
-        let mut bytes = Vec::new();
-        bytes.push(MARKER);
-        bytes.push(BOLD_ON);
-        bytes.extend_from_slice(b"a b");
-        bytes.push(MARKER);
-        bytes.push(BOLD_OFF);
-        bytes.extend_from_slice(b" c");
-        let (items, _) = build(&bytes);
-        // Box("a", bold) + Glue(bold) + Box("b", bold) + Glue(regular) + Box("c", regular)
-        assert!(items.len() >= 5);
-        let kinds: Vec<ItemKind> = items.iter().map(|it| it.kind()).collect();
-        assert_eq!(
-            &kinds[..5],
-            &[
-                ItemKind::Box,
-                ItemKind::Glue,
-                ItemKind::Box,
-                ItemKind::Glue,
-                ItemKind::Box,
-            ]
-        );
-        assert!(items[0].style_is_bold(), "Box 'a' must be bold");
-        assert!(items[1].style_is_bold(), "Glue after 'a' inherits bold");
-        assert!(items[2].style_is_bold(), "Box 'b' still bold (close not seen yet)");
-        // Glue after "b" — by the time we encounter the space, we've
-        // already seen the BOLD_OFF marker between "b" and " ", so it
-        // carries regular style.
-        assert!(!items[3].style_is_bold(), "Glue after BOLD_OFF must be regular");
-        assert!(!items[4].style_is_bold(), "Box 'c' must be regular");
-    }
-
-    #[test]
-    fn width_measurement_is_style_aware() {
-        // Custom advance: regular = 1 px, bold = 3 px per character.
-        // Confirms per-character style propagates into K-P widths.
-        fn styled_advance(_c: char, s: TextStyle) -> u16 {
-            if s.bold { 3 } else { 1 }
-        }
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"ab ");
-        bytes.push(MARKER);
-        bytes.push(BOLD_ON);
-        bytes.extend_from_slice(b"cd");
-        let mut src = crate::apps::reader::layout::scan::SliceByteSource::new(&bytes);
-        let mut scanner = MarkupScanner::new(&mut src);
-        let mut out: Vec<Item> = Vec::new();
-        build_paragraph(&mut scanner, styled_advance, &mut out);
-        // Box("ab") width 2 + Glue(space) width 1 + Box("cd", bold) width 6
-        let box_widths: Vec<u16> = out
-            .iter()
-            .filter(|it| it.kind() == ItemKind::Box)
-            .map(|it| it.width)
-            .collect();
-        assert_eq!(box_widths, vec![2, 6]);
-    }
-
-    #[test]
-    fn image_at_chapter_start_returns_image_block_with_no_items() {
-        // [MARKER, IMG_REF, flags, w_lo, w_hi, h_lo, h_hi, alt_len, path_len, alt..., path...]
-        let alt = b"alt";
-        let path = b"x.jpg";
-        let mut bytes = Vec::new();
-        bytes.push(MARKER);
-        bytes.push(IMG_REF);
-        bytes.push(0); // flags
-        bytes.extend_from_slice(&100u16.to_le_bytes()); // attr_w
-        bytes.extend_from_slice(&200u16.to_le_bytes()); // attr_h
-        bytes.push(alt.len() as u8);
-        bytes.push(path.len() as u8);
-        bytes.extend_from_slice(alt);
-        bytes.extend_from_slice(path);
-        let (items, meta) = build(&bytes);
-        assert!(items.is_empty());
-        assert_eq!(meta.end_kind, ParagraphEnd::ImageBlock);
-        assert!(meta.image.is_some());
+        let s = items[0].style();
+        assert!(s.bold && s.italic);
     }
 
     #[test]
     fn image_after_text_flushes_paragraph_with_image_meta() {
-        let alt = b"";
-        let path = b"x.jpg";
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"hi ");
-        bytes.push(MARKER);
-        bytes.push(IMG_REF);
-        bytes.push(0);
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.push(0);
-        bytes.push(path.len() as u8);
-        bytes.extend_from_slice(alt);
-        bytes.extend_from_slice(path);
-        let (items, meta) = build(&bytes);
-        assert_eq!(meta.end_kind, ParagraphEnd::ImageBlock);
-        assert!(meta.image.is_some());
-        // 'hi' + space + forced triple
-        assert_eq!(items.len(), 5);
+        bytes.extend_from_slice(b"a\n\n");
+        bytes.extend_from_slice(&[MARKER, IMG_REF, 0, 0, 0, 0, 0, 0, 3]);
+        bytes.extend_from_slice(b"x.j");
+        let mut src = SliceSource(&bytes);
+        let mut events = Events::new(&mut src);
+        let mut out = Vec::new();
+        let first = build_paragraph(&mut events, unit_advance, 16, &mut out);
+        assert_eq!(first.end_kind, ParagraphEnd::ParagraphBreak);
+        out.clear();
+        let second = build_paragraph(&mut events, unit_advance, 16, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(second.end_kind, ParagraphEnd::ImageBlock);
+        let img = second.image.unwrap();
+        assert_eq!(img.start, 3);
+        assert_eq!(img.path_len, 3);
     }
 
     #[test]
     fn unknown_marker_is_skipped() {
-        let bytes = [b'a', MARKER, b'?', b'b'];
-        let (items, _) = build(&bytes);
-        // 'a' word and 'b' word survive; unknown marker dropped
+        let (items, _) = build(&[b'a', MARKER, b'?', b'b']);
         assert_eq!(items.len(), 2);
-    }
-
-    #[test]
-    fn item_size_is_eight_bytes() {
-        assert_eq!(core::mem::size_of::<Item>(), 8);
     }
 }

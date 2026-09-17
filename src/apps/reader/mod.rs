@@ -41,11 +41,8 @@ use crate::kernel::work_queue::DecodedImage;
 use crate::ui::{Alignment, Region, StackFmt};
 use smol_epub::cache;
 use smol_epub::epub::{self, EpubMeta, EpubSpine, EpubToc, MAX_SPINE, TocSource};
-use smol_epub::html_strip::{
-    BOLD_OFF, BOLD_ON, H1_OFF, H1_ON, H2_OFF, H2_ON, H3_OFF, H3_ON, H4_OFF, H4_ON, H5_OFF, H5_ON,
-    H6_OFF, H6_ON, HEADING_OFF, HEADING_ON, ITALIC_OFF, ITALIC_ON, MARKER, STRIKE_OFF, STRIKE_ON,
-    UNDERLINE_OFF, UNDERLINE_ON,
-};
+use smol_epub::markup::{self, ImageRef, Style as MarkupStyle};
+use layout::LineLayout;
 use smol_epub::zip::{self, ZipIndex};
 
 // chrome margin: used for bottom info bar, loading indicator.
@@ -135,6 +132,11 @@ pub(super) const TEXT_AREA_H: u16 = CHROME_Y - CHROME_PAD - TEXT_Y;
 pub(super) const EOCD_TAIL: usize = 512;
 
 pub(super) const INDENT_PX: u32 = 24;
+
+// the per-page run table: a line rarely changes style more than a few
+// times; past the per-line cap the rest of the line joins the last run
+pub(super) const MAX_RUNS_PER_LINE: usize = 6;
+pub(super) const MAX_PAGE_RUNS: usize = LINES_PER_PAGE * MAX_RUNS_PER_LINE;
 
 // max inline images tracked per page buffer for dimension pre-scan
 pub(super) const MAX_IMAGES_PER_PAGE: usize = 8;
@@ -266,7 +268,6 @@ impl LineSpan {
     // ALIGN_DEFAULT honors the user's text_alignment setting (typically
     // justify); the others override it for that line only.
     pub(super) const ALIGN_DEFAULT: u8 = 0;
-    pub(super) const ALIGN_LEFT: u8 = 1;
     pub(super) const ALIGN_CENTER: u8 = 2;
     pub(super) const ALIGN_RIGHT: u8 = 3;
 
@@ -285,12 +286,56 @@ impl LineSpan {
     //   00 = h3-tier  (heading font, left-aligned)
     //   01 = h2-tier  (heading font, centered)
     //   10 = h1-tier  (heading font, centered, page-break-before)
-    //   11 = reserved
+    //   11 = h4-h6    (bold body face)
     pub(super) const HLEVEL_SHIFT: u8 = 6;
     pub(super) const HLEVEL_MASK: u8 = 0b11 << Self::HLEVEL_SHIFT;
     pub(super) const HLEVEL_H3: u8 = 0 << Self::HLEVEL_SHIFT;
     pub(super) const HLEVEL_H2: u8 = 1 << Self::HLEVEL_SHIFT;
     pub(super) const HLEVEL_H1: u8 = 2 << Self::HLEVEL_SHIFT;
+
+    // `indent` and `align` share `LineLayout`'s encoding: left levels
+    // and first-line indent nibbles; alignment, underline / strike
+    // line-start bits and the gap-above nibble
+    #[inline]
+    pub(super) fn left_levels(&self) -> u8 {
+        self.indent & LineLayout::LEFT_MASK
+    }
+
+    #[inline]
+    pub(super) fn first_indent_qem(&self) -> u8 {
+        self.indent >> LineLayout::FIRST_INDENT_SHIFT
+    }
+
+    #[inline]
+    pub(super) fn align(&self) -> u8 {
+        self.align & LineLayout::ALIGN_MASK
+    }
+
+    #[inline]
+    pub(super) fn gap_qem(&self) -> u8 {
+        self.align >> LineLayout::GAP_SHIFT
+    }
+
+    /// the inline style at the line's first byte; seeds the decoder
+    pub(super) fn start_style(&self) -> MarkupStyle {
+        let heading = if self.flags & Self::FLAG_HEADING != 0 {
+            self.start_hlevel()
+        } else {
+            0
+        };
+        MarkupStyle {
+            bold: self.flags & Self::FLAG_BOLD != 0,
+            italic: self.flags & Self::FLAG_ITALIC != 0,
+            underline: self.align & LineLayout::START_UNDERLINE != 0,
+            strike: self.align & LineLayout::START_STRIKE != 0,
+            heading,
+        }
+    }
+
+    /// flags for a line whose first byte is drawn in `style`
+    pub(super) fn flags_for(style: MarkupStyle, end: u8) -> u8 {
+        LineLayout::style_flags(style) | end
+    }
 
     #[inline]
     pub(super) fn is_soft_wrap(&self) -> bool {
@@ -324,40 +369,50 @@ impl LineSpan {
         match self.flags & Self::HLEVEL_MASK {
             Self::HLEVEL_H1 => 1,
             Self::HLEVEL_H2 => 2,
-            _ => 3,
+            Self::HLEVEL_H3 => 3,
+            _ => 4,
         }
     }
 
     #[inline]
     pub(super) fn is_centered(&self) -> bool {
-        self.align == Self::ALIGN_CENTER
+        self.align() == Self::ALIGN_CENTER
     }
 
     #[inline]
     pub(super) fn is_right_aligned(&self) -> bool {
-        self.align == Self::ALIGN_RIGHT
+        self.align() == Self::ALIGN_RIGHT
     }
 
     #[inline]
     pub(super) fn is_explicit_align(&self) -> bool {
-        self.align != Self::ALIGN_DEFAULT
+        self.align() != Self::ALIGN_DEFAULT
     }
 
-    /// Pack style + line-ending flags. `end` is one of END_BUFFER, END_HARD, END_SOFT.
-    /// `hlevel` is one of HLEVEL_H3, HLEVEL_H2, HLEVEL_H1 (already shifted).
-    pub(super) fn pack_flags(
-        bold: bool,
-        italic: bool,
-        heading: bool,
-        hlevel: u8,
-        end: u8,
-    ) -> u8 {
-        (bold as u8)
-            | ((italic as u8) << 1)
-            | ((heading as u8) << 2)
-            | end
-            | (hlevel & Self::HLEVEL_MASK)
-    }
+}
+
+/// one placed style run of a page line: a byte-contiguous stretch of
+/// text under one inline style, its x after justification and the
+/// index of its first inter-word gap (for the remainder pixels). a
+/// run ends where the next one starts, the line's last at `line_x_end`
+#[derive(Clone, Copy)]
+pub(super) struct Run {
+    pub(super) start: u16,
+    pub(super) len: u16,
+    pub(super) x: i16,
+    /// packed `markup::Style`
+    pub(super) style: u8,
+    pub(super) gap0: u8,
+}
+
+impl Run {
+    pub(super) const EMPTY: Self = Self {
+        start: 0,
+        len: 0,
+        x: 0,
+        style: 0,
+        gap0: 0,
+    };
 }
 
 // page index, content buffer, and read-ahead state
@@ -372,9 +427,16 @@ pub(super) struct PageState {
     pub(super) lines: [LineSpan; LINES_PER_PAGE],
     pub(super) line_count: usize,
 
-    /// Cached justification metrics per line, precomputed after wrapping.
-    /// Avoids re-running `measure_line()` on every strip pass during draw.
-    pub(super) line_measures: [paging::LineMeasure; LINES_PER_PAGE],
+    /// Per-line results of `build_page_runs`: top y within the text
+    /// area, x where the last run ends, per-gap justification (extra
+    /// px, remainder), and the run table slice
+    pub(super) line_y: [u16; LINES_PER_PAGE],
+    pub(super) line_x_end: [i16; LINES_PER_PAGE],
+    pub(super) line_just: [(i16, i16); LINES_PER_PAGE],
+    pub(super) run_first: [u16; LINES_PER_PAGE],
+    pub(super) run_len: [u8; LINES_PER_PAGE],
+    pub(super) runs: [Run; MAX_PAGE_RUNS],
+    pub(super) run_count: usize,
 
     pub(super) prefetch: Vec<u8>,
     pub(super) prefetch_len: usize,
@@ -400,7 +462,13 @@ impl PageState {
             buf_len: 0,
             lines: [LineSpan::EMPTY; LINES_PER_PAGE],
             line_count: 0,
-            line_measures: [paging::LineMeasure::ZERO; LINES_PER_PAGE],
+            line_y: [0u16; LINES_PER_PAGE],
+            line_x_end: [0i16; LINES_PER_PAGE],
+            line_just: [(0i16, 0i16); LINES_PER_PAGE],
+            run_first: [0u16; LINES_PER_PAGE],
+            run_len: [0u8; LINES_PER_PAGE],
+            runs: [Run::EMPTY; MAX_PAGE_RUNS],
+            run_count: 0,
             prefetch: Vec::new(),
             prefetch_len: 0,
             prefetch_page: NO_PREFETCH,
@@ -473,6 +541,11 @@ pub(super) struct EpubState {
     pub(super) img_cached_count: u16,
 
     pub(super) cache_step: Option<smol_epub::cache::StreamStripStep>,
+    // the book's stylesheets, parsed at NeedOpf when the bundle still
+    // needs building and dropped once every chapter is cached; the
+    // stripper resolves every element against them. one entry or none:
+    // the 4.6 KB table lives on the heap only while it is needed
+    pub(super) css: Vec<smol_epub::css::CssRules>,
 
     pub(super) toc: Option<Box<EpubToc>>,
     pub(super) toc_source: Option<TocSource>,
@@ -512,6 +585,7 @@ impl EpubState {
             img_found_count: 0,
             img_cached_count: 0,
             cache_step: None,
+            css: Vec::new(),
             toc: None,
             toc_source: None,
             toc_selected: 0,
@@ -2404,10 +2478,10 @@ impl ReaderApp {
                 let mut img_rendered = false;
                 for i in 0..self.pg.line_count {
                     let span = &self.pg.lines[i];
+                    let y_top = self.text_y as i32 + self.pg.line_y[i] as i32;
 
                     if span.is_image() {
                         if span.is_image_origin() && !img_rendered {
-                            let y_top = self.text_y as i32 + i as i32 * line_h;
                             if let Some(ref img) = self.page_img {
                                 let img_x = self.text_margin as i32
                                     + ((self.text_w as i32 - img.width as i32) / 2).max(0);
@@ -2427,7 +2501,7 @@ impl ReaderApp {
                                 // budget (inline or fullscreen); just clamp to
                                 // remaining vertical space as a safety net
                                 let space_below =
-                                    (self.text_area_h as i32 - i as i32 * line_h).max(0);
+                                    (self.text_area_h as i32 - self.pg.line_y[i] as i32).max(0);
                                 let blit_h = (img.height as i32).min(space_below).max(0) as usize;
 
                                 // center vertically within reserved lines
@@ -2456,20 +2530,13 @@ impl ReaderApp {
                             } else {
                                 // alt-text fallback when no decoded image is
                                 // available (decode failed or hasn't run yet).
-                                // image LineSpan stores alt_len in `indent`;
-                                // alt bytes sit at buf[start - alt_len..start].
-                                let alt_len = span.indent as usize;
-                                let alt_origin = if alt_len > 0
-                                    && (span.start as usize) >= alt_len
-                                {
-                                    Some(span.start as usize - alt_len)
-                                } else {
-                                    None
-                                };
-                                let alt: &[u8] = match alt_origin {
-                                    Some(s) => &self.pg.buf[s..span.start as usize],
-                                    None => b"[image]",
-                                };
+                                // the origin span covers the whole IMG_REF
+                                // record, so the alt text is right there
+                                let page = &self.pg.buf[..self.pg.buf_len];
+                                let alt: &[u8] = ImageRef::parse(page, span.start as usize)
+                                    .map(|r| r.alt(page))
+                                    .filter(|a| !a.is_empty())
+                                    .unwrap_or(b"[image]");
                                 // measure pixel width to center the run
                                 let mut alt_w: u32 = 0;
                                 let mut k = 0usize;
@@ -2507,308 +2574,96 @@ impl ReaderApp {
                         continue;
                     }
 
-                    let start = span.start as usize;
-                    let end = start + span.len as usize;
-                    let baseline = self.text_y as i32 + i as i32 * line_h + ascent;
-                    let x_indent = INDENT_PX as i32 * span.indent as i32;
-
-                    let line = &self.pg.buf[start..end];
-
-                    // alignment offset: shift cursor for ALIGN_CENTER / RIGHT
-                    // by (avail - measured_width) / N. ALIGN_LEFT and DEFAULT
-                    // stay at the indent. headings without an ALIGN marker
-                    // (typically h3-tier) also keep the default left position.
-                    let align_offset: i32 = if span.is_explicit_align() {
-                        let m = self.pg.line_measures[i];
-                        let avail = self.text_w.saturating_sub(INDENT_PX * span.indent as u32);
-                        let spare = avail.saturating_sub(m.width) as i32;
-                        if span.is_centered() {
-                            spare / 2
-                        } else if span.is_right_aligned() {
-                            spare
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    };
-                    let mut cx = self.text_margin as i32 + x_indent + align_offset;
-
-                    // justification: distribute spare (signed) across inter-word
-                    // gaps. stretch and shrink are decided independently:
-                    //
-                    // - stretch is aesthetic (justify-vs-left preference) — only
-                    //   fires when the user picked justified text AND this is a
-                    //   mid-paragraph soft-wrap.
-                    // - shrink is layout-driven — fires whenever K-P signalled
-                    //   it via `extra`, regardless of user alignment preference
-                    //   and regardless of paragraph-end status. without this,
-                    //   single-line shrink-fit paragraphs overflow the column
-                    //   (Stories of Your Life's dense prose, Leviathan ch5's
-                    //   "Using the Knight..." paragraph).
-                    //
-                    // headings and explicit-align lines skip both directions.
-                    let is_heading = (span.flags & LineSpan::FLAG_HEADING) != 0;
-                    let explicit = span.is_explicit_align();
-                    let can_stretch = self.text_alignment == 1
-                        && span.is_soft_wrap()
-                        && !is_heading
-                        && !explicit;
-                    let can_shrink = span.extra_is_shrink() && !is_heading && !explicit;
-                    let (extra_per_gap, remainder) = if can_stretch || can_shrink {
-                        let m = self.pg.line_measures[i];
-                        let avail = self
-                            .text_w
-                            .saturating_sub(INDENT_PX * span.indent as u32)
-                            as i32;
-                        let spare = avail - m.width as i32;
-                        let gaps = m.gaps as i32;
-                        let space_w = fs.advance(' ', span.style()) as i32;
-
-                        if gaps < 2 {
-                            (0, 0)
-                        } else if can_stretch && spare >= 3 && spare * 5 < avail * 2 {
-                            // stretch: distribute positive spare across gaps,
-                            // capped at 3× natural space width per gap so a
-                            // sparse line doesn't open rivers.
-                            let per = spare / gaps;
-                            if per <= space_w.saturating_mul(3) {
-                                (per, spare - per * gaps)
-                            } else {
-                                (0, 0)
-                            }
-                        } else if can_shrink && spare <= -1 {
-                            // shrink: K-P decided this paragraph fits by
-                            // squeezing inter-word spaces. honor it up to K-P's
-                            // own per-glue shrink budget (space/2, matching
-                            // `Item::glue`'s shrink in items.rs and
-                            // `RATIO_SHRINK_MAX` in breaker.rs).
-                            let per = spare / gaps; // signed; rounds toward 0
-                            let floor = -(space_w / 2).max(1);
-                            if per >= floor {
-                                (per, spare - per * gaps)
-                            } else {
-                                // K-P / renderer disagree on widths beyond the
-                                // shrink budget — draw at natural width rather
-                                // than crush letters together.
-                                (0, 0)
-                            }
-                        } else {
-                            (0, 0)
-                        }
-                    } else {
-                        (0, 0)
-                    };
-                    let mut gap_idx: i32 = 0;
-
-                    // skip lines that end left of this strip. natural and
-                    // shrunk lines are bounded by their measured width;
-                    // stretched lines span the whole column and always
-                    // overlap. the early break in the walk below handles
-                    // strips left of the line start
-                    if extra_per_gap <= 0
-                        && remainder <= 0
-                        && win_l > cx + self.pg.line_measures[i].width as i32 + 8
-                    {
-                        continue;
-                    }
-
-                    // Track style by accumulated flags (matches K-P's
-                    // `fonts::Style::from_flags` resolver) so nested
-                    // markup (e.g. `<b><i>x</i></b>`) draws under the
-                    // same style K-P measured. The line's initial
-                    // flags come from `LineSpan::style()`'s underlying
-                    // bits.
-                    let mut in_bold = span.flags & LineSpan::FLAG_BOLD != 0;
-                    let mut in_italic = span.flags & LineSpan::FLAG_ITALIC != 0;
-                    let mut in_heading = span.flags & LineSpan::FLAG_HEADING != 0;
-                    let mut hlevel: u8 = if in_heading { span.start_hlevel() } else { 0 };
-                    let mut sty =
-                        fonts::Style::from_flags(in_bold, in_italic, in_heading, hlevel);
-
-                    // underline / strikethrough are rendered as 1-px horizontal
-                    // strokes drawn after a run ends; each *_x_start records cx
-                    // when the marker turned the decoration on. y offsets:
-                    //   underline = baseline + 1 (just below glyphs)
-                    //   strike    = baseline - ascent / 3 (rough mid-line)
-                    let mut underline_active = false;
-                    let mut strike_active = false;
-                    let mut underline_x_start: i32 = 0;
-                    let mut strike_x_start: i32 = 0;
+                    // text: the page was decoded once at load into placed
+                    // style runs (`build_page_runs`); a strip pass only
+                    // blits the runs that cross its column
+                    let baseline = y_top + ascent;
                     let strike_y = baseline - ascent / 3;
-
-                    let mut j = 0usize;
-                    while j < line.len() {
-                        // pen passed the strip's right edge; nothing further
-                        // on this line can touch it. active underline/strike
-                        // strokes flush below with the current cx (the strip
-                        // clips them to its window)
-                        if cx >= win_r + 8 {
+                    let (per, rem) = self.pg.line_just[i];
+                    let (per, rem) = (per as i32, rem as i32);
+                    let rf = self.pg.run_first[i] as usize;
+                    let rn = self.pg.run_len[i] as usize;
+                    for r in rf..rf + rn {
+                        let run = self.pg.runs[r];
+                        let x0 = run.x as i32;
+                        let x1 = if r + 1 < rf + rn {
+                            self.pg.runs[r + 1].x as i32
+                        } else {
+                            self.pg.line_x_end[i] as i32
+                        };
+                        if x0 >= win_r + 8 {
                             break;
                         }
-                        let b = line[j];
-                        if b == MARKER && j + 1 < line.len() {
-                            match line[j + 1] {
-                                BOLD_ON => in_bold = true,
-                                BOLD_OFF => in_bold = false,
-                                ITALIC_ON => in_italic = true,
-                                ITALIC_OFF => in_italic = false,
-                                HEADING_ON => {
-                                    in_heading = true;
-                                    if hlevel == 0 {
-                                        hlevel = 3;
-                                    }
-                                }
-                                HEADING_OFF => {
-                                    in_heading = false;
-                                    hlevel = 0;
-                                }
-                                H1_ON => {
-                                    in_heading = true;
-                                    hlevel = 1;
-                                }
-                                H2_ON => {
-                                    in_heading = true;
-                                    hlevel = 2;
-                                }
-                                H3_ON => {
-                                    in_heading = true;
-                                    hlevel = 3;
-                                }
-                                H4_ON => {
-                                    in_heading = true;
-                                    hlevel = 4;
-                                }
-                                H5_ON => {
-                                    in_heading = true;
-                                    hlevel = 5;
-                                }
-                                H6_ON => {
-                                    in_heading = true;
-                                    hlevel = 6;
-                                }
-                                H1_OFF | H2_OFF | H3_OFF | H4_OFF | H5_OFF | H6_OFF => {
-                                    in_heading = false;
-                                    hlevel = 0;
-                                }
-                                UNDERLINE_ON => {
-                                    if !underline_active {
-                                        underline_active = true;
-                                        underline_x_start = cx;
-                                    }
-                                }
-                                UNDERLINE_OFF => {
-                                    if underline_active && cx > underline_x_start {
-                                        Rectangle::new(
-                                            Point::new(underline_x_start, baseline + 1),
-                                            Size::new((cx - underline_x_start) as u32, 1),
-                                        )
-                                        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-                                        .draw(strip)
-                                        .ok();
-                                    }
-                                    underline_active = false;
-                                }
-                                STRIKE_ON => {
-                                    if !strike_active {
-                                        strike_active = true;
-                                        strike_x_start = cx;
-                                    }
-                                }
-                                STRIKE_OFF => {
-                                    if strike_active && cx > strike_x_start {
-                                        Rectangle::new(
-                                            Point::new(strike_x_start, strike_y),
-                                            Size::new((cx - strike_x_start) as u32, 1),
-                                        )
-                                        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-                                        .draw(strip)
-                                        .ok();
-                                    }
-                                    strike_active = false;
-                                }
-                                _ => {}
-                            }
-                            sty =
-                                fonts::Style::from_flags(in_bold, in_italic, in_heading, hlevel);
-                            j += 2;
+                        if x1 < win_l - 8 {
                             continue;
                         }
-                        if b >= 0xC0 {
-                            let (ch, seq_len) = decode_utf8_char(line, j);
-                            // SHY (U+00AD): K-P models soft hyphens as
-                            // zero-width Penalty items (items.rs:280)
-                            // so the draw path must also contribute
-                            // zero advance. fonts ship SHY as a visible
-                            // hyphen glyph with positive advance, which
-                            // would overflow every line carrying soft
-                            // hyphens and draw spurious mid-word marks.
-                            // build.rs excludes SHY from the font tables
-                            // for the same reason; this skip is the
-                            // matching renderer-side policy.
-                            if ch == '\u{00AD}' {
-                                j += seq_len;
+                        let ms = markup::Style::unpack(run.style);
+                        let sty = fonts::Style::from_markup(ms);
+                        let run_end = (run.start as usize + run.len as usize).min(self.pg.buf_len);
+                        let bytes = &self.pg.buf[run.start as usize..run_end];
+                        let mut cx = x0;
+                        let mut gap_idx = run.gap0 as i32;
+                        let mut j = 0usize;
+                        while j < bytes.len() {
+                            // pen passed the strip's right edge; nothing
+                            // further on this run can touch it
+                            if cx >= win_r + 8 {
+                                break;
+                            }
+                            let b = bytes[j];
+                            if b >= 0xC0 {
+                                let (ch, seq_len) = decode_utf8_char(bytes, j);
+                                // SHY (U+00AD) is a zero-width break
+                                // opportunity: the fonts ship it as a
+                                // visible hyphen, so never draw it
+                                if ch != '\u{00AD}' {
+                                    cx += fs.draw_char(strip, ch, sty, cx, baseline) as i32;
+                                }
+                                j += seq_len.max(1);
                                 continue;
                             }
-                            cx += fs.draw_char(strip, ch, sty, cx, baseline) as i32;
-                            // justify: add extra space (or shrink, when
-                            // extra_per_gap is negative). NBSP is intentionally
-                            // skipped — it's not a stretchable gap.
-                            if ch == ' ' && (extra_per_gap != 0 || remainder != 0) {
-                                cx += extra_per_gap;
-                                if remainder > 0 && gap_idx < remainder {
+                            if b >= 0x80 || b < bitmap::FIRST_CHAR {
+                                j += 1;
+                                continue;
+                            }
+                            cx += fs.draw_char(strip, b as char, sty, cx, baseline) as i32;
+                            // justify: distribute the spare (signed) at ASCII
+                            // space gaps; the leading `rem` gaps take one
+                            // more pixel each
+                            if b == b' ' && (per != 0 || rem != 0) {
+                                cx += per;
+                                if rem > 0 && gap_idx < rem {
                                     cx += 1;
-                                } else if remainder < 0 && gap_idx < -remainder {
+                                } else if rem < 0 && gap_idx < -rem {
                                     cx -= 1;
                                 }
                                 gap_idx += 1;
                             }
-                            j += seq_len;
-                            continue;
-                        }
-                        if b >= 0x80 {
-                            // continuation byte mid-stream (already consumed
-                            // by a lead byte above, or stray), skip
                             j += 1;
-                            continue;
                         }
-                        if b < bitmap::FIRST_CHAR {
-                            j += 1;
-                            continue; // control char
-                        }
-                        cx += fs.draw_char(strip, b as char, sty, cx, baseline) as i32;
-                        // justify: distribute extra (signed) at ASCII space gaps
-                        if b == b' ' && (extra_per_gap != 0 || remainder != 0) {
-                            cx += extra_per_gap;
-                            if remainder > 0 && gap_idx < remainder {
-                                cx += 1;
-                            } else if remainder < 0 && gap_idx < -remainder {
-                                cx -= 1;
-                            }
-                            gap_idx += 1;
-                        }
-                        j += 1;
-                    }
 
-                    // flush any underline / strike that extends to end of line
-                    // (no closing marker arrived before the buffer ran out)
-                    if underline_active && cx > underline_x_start {
-                        Rectangle::new(
-                            Point::new(underline_x_start, baseline + 1),
-                            Size::new((cx - underline_x_start) as u32, 1),
-                        )
-                        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-                        .draw(strip)
-                        .ok();
-                    }
-                    if strike_active && cx > strike_x_start {
-                        Rectangle::new(
-                            Point::new(strike_x_start, strike_y),
-                            Size::new((cx - strike_x_start) as u32, 1),
-                        )
-                        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-                        .draw(strip)
-                        .ok();
+                        // decorations are 1-px strokes over the run's placed
+                        // extent; the strip clips them to its window
+                        if x1 > x0 {
+                            if ms.underline {
+                                Rectangle::new(
+                                    Point::new(x0, baseline + 1),
+                                    Size::new((x1 - x0) as u32, 1),
+                                )
+                                .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                                .draw(strip)
+                                .ok();
+                            }
+                            if ms.strike {
+                                Rectangle::new(
+                                    Point::new(x0, strike_y),
+                                    Size::new((x1 - x0) as u32, 1),
+                                )
+                                .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                                .draw(strip)
+                                .ok();
+                            }
+                        }
                     }
                 }
             }

@@ -1,6 +1,6 @@
 //! K-P typesetting pipeline.
 //!
-//! Glues `MarkupScanner` → `items::build_paragraph` →
+//! Glues `smol_epub::markup::Events` → `items::build_paragraph` →
 //! `breaker::break_paragraph_with_fallback` → `convert::append_lines`
 //! together. Owns two heap vecs (items + break choices) reused
 //! across every paragraph in a chapter. `Drop` shrinks them back
@@ -19,7 +19,7 @@ use crate::fonts::{FontSet, Style};
 use super::breaker::{break_paragraph_with_fallback, BreakChoice, BreakConfig, BreakScratch};
 use super::items::{self, Item, ParagraphEnd, ParagraphMeta};
 use super::paginate::convert;
-use super::scan::{ImageRef, MarkupScanner, TextStyle};
+use smol_epub::markup::{Events, ImageRef, Style as MarkupStyle};
 use super::{LineLayout, MAX_LINES_PER_CHAPTER};
 
 // ── image budget ──────────────────────────────────────────────────
@@ -134,7 +134,7 @@ impl LayoutPipeline {
     /// this to enforce image atomicity.
     pub fn step(
         &mut self,
-        scanner: &mut MarkupScanner<'_>,
+        scanner: &mut Events<'_>,
         fonts: &FontSet,
         budget: ImageBudget,
         hint: &mut dyn ImageHeightHint,
@@ -152,6 +152,7 @@ impl LayoutPipeline {
         let meta = items::build_paragraph(
             scanner,
             |c, s| advance_for(fonts, c, s) as u16,
+            fonts.em_px(),
             &mut self.items,
         );
 
@@ -189,8 +190,9 @@ impl LayoutPipeline {
             return self.post_step(meta);
         }
 
-        // Width budget: text_w shrunk by indent ⇒ INDENT_PX*indent.
-        let indent_px = (super::super::INDENT_PX * meta.block.indent as u32) as u16;
+        // Width budget: text_w shrunk by the left indent ⇒ INDENT_PX per
+        // level. the first-line indent is already a box in the items.
+        let indent_px = (super::super::INDENT_PX * meta.block.left as u32) as u16;
         let line_width = budget.text_w.saturating_sub(indent_px);
 
         let cfg = BreakConfig {
@@ -271,16 +273,11 @@ impl Drop for LayoutPipeline {
 // ── helpers ───────────────────────────────────────────────────────
 
 #[inline]
-fn advance_for(fonts: &FontSet, ch: char, style: TextStyle) -> u8 {
-    fonts.advance(ch, text_style_to_font_style(style))
-}
-
-#[inline]
-fn text_style_to_font_style(style: TextStyle) -> Style {
-    // Single source of truth — see `fonts::Style::from_flags`. K-P and
-    // the renderer must agree on this resolution or measured line
-    // widths diverge from drawn line widths on nested markup.
-    Style::from_flags(style.bold, style.italic, style.heading, style.hlevel)
+fn advance_for(fonts: &FontSet, ch: char, style: MarkupStyle) -> u8 {
+    // single source of truth: `fonts::Style::from_markup`. K-P and the
+    // renderer must agree on this resolution or measured line widths
+    // diverge from drawn line widths on nested markup
+    fonts.advance(ch, Style::from_markup(style))
 }
 
 /// Number of LineLayouts to reserve for an image block, plus the
@@ -309,7 +306,7 @@ fn image_lines_for(
 /// a slice of what was read. Empty slice when there's no image, or
 /// when the source reports a short read (out-of-range path bytes).
 fn read_image_src<'b>(
-    scanner: &mut super::scan::MarkupScanner<'_>,
+    scanner: &mut Events<'_>,
     image: Option<ImageRef>,
     dst: &'b mut [u8],
 ) -> &'b [u8] {
@@ -592,7 +589,7 @@ mod tests {
 
     #[test]
     fn style_from_flags_h4_to_h6_pick_bold() {
-        // TextStyle::is_h4_h6_bold intent — h4-h6 render as body bold,
+        // h4-h6 render as body bold,
         // not heading font. K-P must agree with the renderer here.
         assert_eq!(Style::from_flags(false, false, true, 4), Style::Bold);
         assert_eq!(Style::from_flags(false, false, true, 5), Style::Bold);
