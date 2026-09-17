@@ -489,13 +489,13 @@ impl super::Kernel {
                 }
             }
 
-            // the display probe owns the panel while it is held: its
-            // step runs here and every redraw is dropped until the
-            // settings screen releases it
-            if let Some(step) = app_mgr.ctx_mut().take_display_probe() {
-                self.screen.display_probe(step).await;
+            // the panel lab owns the panel while it is held: its step
+            // runs here and every redraw is dropped until the settings
+            // screen releases it
+            if let Some((exp, step)) = app_mgr.ctx_mut().take_panel_lab() {
+                self.screen.panel_lab(exp, step).await;
             }
-            if app_mgr.ctx_mut().display_probe_hold() {
+            if app_mgr.ctx_mut().panel_lab_hold() {
                 let _ = app_mgr.take_redraw();
             } else if app_mgr.ctx_mut().render_ready() {
                 let redraw = app_mgr.take_redraw();

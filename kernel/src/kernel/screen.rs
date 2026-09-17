@@ -38,10 +38,12 @@ use embassy_time::{Instant, TimeoutError};
 use esp_hal::delay::Delay;
 
 use crate::board::{Epd, SCREEN_H, SCREEN_W};
-use crate::drivers::ssd1677::{Driven, FullKind, Phase1, Window};
+use crate::drivers::ssd1677::{self, Driven, FullKind, Phase1, Window};
 use crate::drivers::strip::StripBuffer;
 use crate::kernel::plane_map::{PlaneMap, SessionOutcome};
 use crate::ui::{AlignedRegion, Region};
+
+use super::panel_lab;
 
 pub struct Screen {
     epd: Epd,
@@ -288,46 +290,81 @@ impl Screen {
         res
     }
 
-    /// One step of the display probe (Settings > Display Probe): a
-    /// clean clear with the top half black and the bottom half white,
-    /// the four {RED, BW} bit patterns written as four columns, then
-    /// a custom LUT with a single live row. The user reports which
-    /// column moved and in which direction, which fixes the
-    /// controller's LUT bit order and the pulse's polarity; nothing
-    /// else on this panel can be inferred from the datasheet reading.
-    /// Leaves the planes as junk: the next full refresh is promoted
-    /// to a clean clear.
-    pub async fn display_probe(&mut self, step: u8) {
-        let (pulse, row, name) = match step {
-            1 => (0xAAu8, 1u8, "VSL in row 1"),
-            2 => (0x54, 1, "VSH1 in row 1"),
-            3 => (0xFC, 1, "VSH2 in row 1"),
-            4 => (0xAA, 2, "VSL in row 2"),
-            _ => return,
+    /// One step of the panel lab (Settings > Display > Panel Lab): run
+    /// the step's canned operation and log its timing. The panel is
+    /// left holding whatever the op produced so the operator can read
+    /// it; the caller's hold drops redraws until the lab exits. The
+    /// planes are marked junk so the exit repaint is promoted to a
+    /// clean clear.
+    pub async fn panel_lab(&mut self, exp: u8, step: u8) {
+        let Some(e) = panel_lab::EXPERIMENTS.get(exp as usize) else {
+            return;
         };
-        log::info!(
-            "probe: step {} ({}): columns left to right hold (RED,BW) = 00 01 10 11; top half black, bottom half white",
-            step,
-            name
-        );
+        let Some(s) = e.steps.get(step as usize) else {
+            return;
+        };
         let t0 = Instant::now();
-        let draw = |s: &mut StripBuffer| s.fill_flat(Region::new(0, 0, SCREEN_W, SCREEN_H / 2), true);
-        let written = self.epd.write_full_frame(self.strip, &mut self.delay, &draw);
-        let driven = self.epd.start_full_update(written, FullKind::Clean);
-        let clear_ok = self.epd.wait_busy_async("probe clear").await.is_ok();
-        self.epd.finish_full_update(driven);
-        self.epd.write_probe_planes(self.strip);
-        let lut_ok = self.epd.probe_lut_pass(pulse, row).await.is_ok();
+        let ok = self.run_lab_op(s.op).await;
+        log::info!(
+            "panel: exp={} '{}' step={}/{} op={} {} ok={} ms={}",
+            exp + 1,
+            e.name,
+            step + 1,
+            e.steps.len(),
+            s.op.name(),
+            s.op.detail(),
+            ok,
+            t0.elapsed().as_millis()
+        );
         self.planes.clear();
         self.aa_pending = false;
         self.force_ghost_clear();
-        log::info!(
-            "probe: step {} done clear_ok={} lut_ok={} total_ms={}; report which column changed and whether its black half lightened or its white half darkened",
-            step,
-            clear_ok,
-            lut_ok,
-            t0.elapsed().as_millis()
-        );
+    }
+
+    async fn run_lab_op(&mut self, op: panel_lab::LabOp) -> bool {
+        use panel_lab::LabOp;
+        match op {
+            LabOp::Clear => {
+                let draw = |s: &mut StripBuffer| {
+                    s.fill_flat(Region::new(0, 0, SCREEN_W, SCREEN_H / 2), true)
+                };
+                let written = self
+                    .epd
+                    .write_full_frame(self.strip, &mut self.delay, &draw);
+                let driven = self.epd.start_full_update(written, FullKind::Clean);
+                let ok = self.epd.wait_busy_async("panel clear").await.is_ok();
+                self.epd.finish_full_update(driven);
+                ok
+            }
+            LabOp::WriteColumns => {
+                self.epd.write_columns(self.strip);
+                true
+            }
+            LabOp::LutRow { row, vs } => {
+                let lut = panel_lab::lut_with_rows(&[(row, vs)]);
+                self.epd
+                    .lab_lut_pass(&lut, ssd1677::ctrl2::CUSTOM_LUT)
+                    .await
+                    .is_ok()
+            }
+            LabOp::VsProbe { vs } => {
+                let lut = panel_lab::lut_with_rows(&[(0, vs), (3, vs)]);
+                self.epd
+                    .lab_lut_pass(&lut, ssd1677::ctrl2::CUSTOM_LUT)
+                    .await
+                    .is_ok()
+            }
+            LabOp::LutActivate { ctrl2, drive } => {
+                let rows: &[(u8, u8)] = if drive { &[(1, 0xAA), (2, 0x54)] } else { &[] };
+                let lut = panel_lab::lut_with_rows(rows);
+                self.epd.lab_lut_pass(&lut, ctrl2).await.is_ok()
+            }
+            LabOp::Otp { ctrl1, ctrl2 } => self.epd.lab_otp_pass(ctrl1, ctrl2).await.is_ok(),
+            LabOp::Reinit => {
+                self.epd.lab_reinit(&mut self.delay);
+                true
+            }
+        }
     }
 
     /// Partial DU refresh, waiting inline on the busy pin. Falls back

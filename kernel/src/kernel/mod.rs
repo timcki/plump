@@ -16,6 +16,7 @@ pub mod dir_cache;
 pub mod handle;
 pub mod input_policy;
 pub mod nav;
+pub mod panel_lab;
 pub mod plane_map;
 pub mod power_log;
 pub mod rtc_session;

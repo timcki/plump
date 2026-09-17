@@ -35,12 +35,11 @@ use crate::ui::{Alignment, CONTENT_TOP, Painter, Region, SectionLabel, Theme};
 
 use crate::apps::widgets::row::{self, RowFonts, RowLead, RowSpec, ValueChip};
 
+use plump_kernel::kernel::panel_lab::{self, Ask};
+
 use cache::{CacheSheet, SheetResult};
 use layout::{Damage, GUTTER_W, SettingsList};
 use model::{Activation, Domain, InfoId, ROWS, Row, SettingId, Step, ValueFmt};
-
-/// steps of the display probe; see `Screen::display_probe`
-const PROBE_STEPS: u8 = 4;
 
 /// A group outline sits one pixel outside its rows, so the stroke
 /// lands where a separator would and every row is framed at the same
@@ -58,6 +57,40 @@ enum Focus {
     Editing(SettingId),
 }
 
+/// Panel Lab input state.
+///
+/// The panel is held while a session runs, so there is no on-screen
+/// UI: the log carries the experiment, the step, the question and the
+/// candidate answers, and the operator picks with Up/Down and records
+/// with Select.
+#[derive(Clone, Copy)]
+struct LabState {
+    /// false outside a session
+    active: bool,
+    exp: u8,
+    step: u8,
+    /// index of the question being answered; equal to the step's ask
+    /// count once every question is answered
+    ask: u8,
+    /// highlighted answer for the pending question
+    answer: u8,
+    /// every step of the experiment has run and been answered
+    done: bool,
+}
+
+impl LabState {
+    const fn new() -> Self {
+        Self {
+            active: false,
+            exp: 0,
+            step: 0,
+            ask: 0,
+            answer: 0,
+            done: false,
+        }
+    }
+}
+
 pub struct SettingsApp {
     settings: SystemSettings,
     wifi: WifiConfig,
@@ -70,9 +103,8 @@ pub struct SettingsApp {
     /// the Book Cache row's own surface; owns the picker, the two
     /// scopes and the clear in flight
     cache: CacheSheet,
-    /// display probe step on the panel, 0 when the probe is not
-    /// running; Select advances, Back ends it
-    probe_step: u8,
+    /// the Panel Lab's input state; inactive until its row opens
+    lab: LabState,
     /// About group figures, sampled on the background budget: the
     /// battery is an ADC read the status bar already pays for, and
     /// the uptime is the monotonic clock
@@ -100,7 +132,7 @@ impl SettingsApp {
             generation: 0,
             ui_fonts,
             cache: CacheSheet::new(),
-            probe_step: 0,
+            lab: LabState::new(),
             bat_pct: 0,
             bat_mv: 0,
             uptime_secs: 0,
@@ -242,10 +274,8 @@ impl SettingsApp {
                 self.focus = Focus::Editing(id);
                 Damage::Rows([self.list.selected_row_region(), None])
             }
-            Activation::Open if id == SettingId::DisplayProbe => {
-                self.probe_step = 1;
-                log::info!("probe: started; Select runs the next step, Back ends it");
-                ctx.request_display_probe(1);
+            Activation::Open if id == SettingId::PanelLab => {
+                self.lab_enter(ctx);
                 Damage::None
             }
             Activation::Open => {
@@ -291,6 +321,151 @@ impl SettingsApp {
         Transition::None
     }
 
+    // ── panel lab ───────────────────────────────────────────────────
+    //
+    // the panel is held for the whole session, so every result and
+    // every prompt goes to the log. the ops themselves live in the
+    // kernel (`kernel::panel_lab`); this is only the input state. the
+    // prompts are emitted through `panel_lab::dialogue` rather than
+    // `log::info!` so they land under a log target a dev ESP_LOG
+    // actually enables (see that function).
+
+    fn lab_enter(&mut self, ctx: &mut AppContext) {
+        self.lab = LabState {
+            active: true,
+            ..LabState::new()
+        };
+        panel_lab::dialogue(format_args!(
+            "panel: lab started, {} experiments; Up/Down picks one, Select runs the next step, Back exits",
+            panel_lab::EXPERIMENTS.len()
+        ));
+        self.lab_run(ctx);
+    }
+
+    fn lab_run(&mut self, ctx: &mut AppContext) {
+        let Some(e) = panel_lab::EXPERIMENTS.get(self.lab.exp as usize) else {
+            return;
+        };
+        let Some(s) = e.steps.get(self.lab.step as usize) else {
+            return;
+        };
+        self.lab.ask = 0;
+        self.lab.answer = 0;
+        self.lab.done = false;
+        panel_lab::dialogue(format_args!(
+            "panel: experiment {} '{}' ({})",
+            self.lab.exp + 1,
+            e.name,
+            e.sub
+        ));
+        panel_lab::dialogue(format_args!(
+            "panel: step {}/{}: {}",
+            self.lab.step + 1,
+            e.steps.len(),
+            s.op.name()
+        ));
+        if s.asks.is_empty() {
+            panel_lab::dialogue(format_args!(
+                "panel: no question; Select runs the next step"
+            ));
+        } else {
+            self.lab_log_ask(&s.asks[0]);
+        }
+        ctx.request_panel_lab(self.lab.exp, self.lab.step);
+    }
+
+    fn lab_log_ask(&self, ask: &Ask) {
+        panel_lab::dialogue(format_args!("panel: Q {}", ask.question));
+        for (i, a) in ask.answers.iter().enumerate() {
+            let mark = if i as u8 == self.lab.answer { ">" } else { " " };
+            panel_lab::dialogue(format_args!("panel:  {} [{}] {}", mark, i + 1, a));
+        }
+        panel_lab::dialogue(format_args!("panel: Up/Down chooses, Select records"));
+    }
+
+    fn lab_asks(&self) -> &'static [Ask] {
+        panel_lab::EXPERIMENTS
+            .get(self.lab.exp as usize)
+            .and_then(|e| e.steps.get(self.lab.step as usize))
+            .map(|s| s.asks)
+            .unwrap_or(&[])
+    }
+
+    fn lab_select(&mut self, ctx: &mut AppContext) {
+        if self.lab.done {
+            panel_lab::dialogue(format_args!(
+                "panel: experiment done; Up/Down picks another, Back exits"
+            ));
+            return;
+        }
+        let asks = self.lab_asks();
+        if (self.lab.ask as usize) < asks.len() {
+            let ans = asks[self.lab.ask as usize]
+                .answers
+                .get(self.lab.answer as usize)
+                .copied()
+                .unwrap_or("?");
+            panel_lab::dialogue(format_args!("panel: answer {} = {}", self.lab.ask + 1, ans));
+            self.lab.ask += 1;
+            if (self.lab.ask as usize) < asks.len() {
+                self.lab.answer = 0;
+                self.lab_log_ask(&asks[self.lab.ask as usize]);
+                return;
+            }
+        }
+        self.lab_advance(ctx);
+    }
+
+    fn lab_advance(&mut self, ctx: &mut AppContext) {
+        let Some(e) = panel_lab::EXPERIMENTS.get(self.lab.exp as usize) else {
+            return;
+        };
+        if (self.lab.step as usize) + 1 < e.steps.len() {
+            self.lab.step += 1;
+            self.lab_run(ctx);
+        } else {
+            self.lab.done = true;
+            panel_lab::dialogue(format_args!(
+                "panel: experiment {} '{}' complete; Up/Down picks another, Back exits",
+                self.lab.exp + 1,
+                e.name
+            ));
+        }
+    }
+
+    fn lab_vertical(&mut self, down: bool, ctx: &mut AppContext) {
+        let asks = self.lab_asks();
+        if !self.lab.done && (self.lab.ask as usize) < asks.len() {
+            let ask = &asks[self.lab.ask as usize];
+            let n = ask.answers.len() as u8;
+            if n > 0 {
+                self.lab.answer = if down {
+                    (self.lab.answer + 1) % n
+                } else {
+                    (self.lab.answer + n - 1) % n
+                };
+            }
+            self.lab_log_ask(ask);
+            return;
+        }
+        let n = panel_lab::EXPERIMENTS.len() as u8;
+        if n > 0 {
+            self.lab.exp = if down {
+                (self.lab.exp + 1) % n
+            } else {
+                (self.lab.exp + n - 1) % n
+            };
+        }
+        self.lab.step = 0;
+        self.lab_run(ctx);
+    }
+
+    fn lab_exit(&mut self, ctx: &mut AppContext) {
+        self.lab.active = false;
+        panel_lab::dialogue(format_args!("panel: lab ended"));
+        ctx.end_panel_lab();
+    }
+
     // Up / Down: move the cursor, or step the open value. leaving an
     // edited row is what Select and Back are for.
     fn vertical(&mut self, dir: Step, ctx: &mut AppContext) {
@@ -321,7 +496,14 @@ impl SettingsApp {
         let mut value = ValueFmt::new();
         let opens_surface = matches!(id.domain(), Domain::Action);
         if opens_surface {
-            self.cache.row_value(&mut value);
+            // the lab has no figure of its own, and the cache row's
+            // byte count would be nonsense on it
+            match id {
+                SettingId::PanelLab => {
+                    let _ = write!(value, "run \u{2192}");
+                }
+                _ => self.cache.row_value(&mut value),
+            }
         } else {
             id.format(&self.settings, &mut value);
         }
@@ -448,6 +630,7 @@ impl App<AppId> for SettingsApp {
         self.focus = Focus::Browsing;
         self.cache.close();
         self.cache.request_scan();
+        self.lab.active = false;
         // the About figures are sampled here rather than tracked: a
         // clock that repaints itself costs a DU a minute and tells
         // nobody anything they cannot get by leaving and coming back
@@ -459,16 +642,17 @@ impl App<AppId> for SettingsApp {
         if self.cache.is_open() {
             return self.dispatch_to_cache(event, ctx);
         }
-        if self.probe_step > 0 {
+        if self.lab.active {
             match event {
-                ActionEvent::Press(Action::Select) => {
-                    self.probe_step = if self.probe_step >= PROBE_STEPS { 1 } else { self.probe_step + 1 };
-                    ctx.request_display_probe(self.probe_step);
+                ActionEvent::Press(Action::Select) => self.lab_select(ctx),
+                ActionEvent::Press(Action::Next) | ActionEvent::Repeat(Action::Next) => {
+                    self.lab_vertical(true, ctx)
+                }
+                ActionEvent::Press(Action::Prev) | ActionEvent::Repeat(Action::Prev) => {
+                    self.lab_vertical(false, ctx)
                 }
                 ActionEvent::Press(Action::Back) | ActionEvent::LongPress(Action::Back) => {
-                    self.probe_step = 0;
-                    log::info!("probe: ended");
-                    ctx.end_display_probe();
+                    self.lab_exit(ctx)
                 }
                 _ => {}
             }
@@ -507,8 +691,9 @@ impl App<AppId> for SettingsApp {
 
     fn on_horizontal(&mut self, dir: HDir, ctx: &mut AppContext) -> HResult {
         // the sheet navigates on Up/Down and OK alone, but it must not
-        // let a stray Left/Right cycle the tab out from under it
-        if self.cache.is_open() || self.probe_step > 0 {
+        // let a stray Left/Right cycle the tab out from under it; the
+        // panel lab owns the panel outright while it runs
+        if self.cache.is_open() || self.lab.active {
             return HResult::Consumed;
         }
         match self.editor() {
@@ -576,7 +761,7 @@ impl App<AppId> for SettingsApp {
     }
 
     fn captures_menu(&self) -> bool {
-        self.cache.is_open() || self.probe_step > 0
+        self.cache.is_open() || self.lab.active
     }
 
     fn draw(&self, strip: &mut StripBuffer) {

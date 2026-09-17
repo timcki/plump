@@ -299,10 +299,10 @@ struct Loading {
 pub struct AppContext {
     // the pending full redraw wants the real-temperature clear
     clean_refresh: bool,
-    // display probe step to run, and whether the panel is held still
-    // for the user to read a probe result
-    display_probe: Option<u8>,
-    probe_hold: bool,
+    // panel lab step to run, and whether the panel is held still for
+    // the operator to read an experiment result
+    panel_lab: Option<(u8, u8)>,
+    lab_hold: bool,
     msg_buf: [u8; MSG_BUF_SIZE],
     msg_len: usize,
     msg_tag: u8,
@@ -329,8 +329,8 @@ impl AppContext {
             msg_tag: 0,
             redraw: PendingRedraw::None,
             clean_refresh: false,
-            display_probe: None,
-            probe_hold: false,
+            panel_lab: None,
+            lab_hold: false,
             loading: None,
         }
     }
@@ -379,29 +379,29 @@ impl AppContext {
         core::mem::take(&mut self.clean_refresh)
     }
 
-    /// Run step `step` of the display probe (see `Screen::display_probe`)
-    /// and hold the panel still afterwards so the result can be read:
-    /// redraws are dropped until `end_display_probe`.
-    pub fn request_display_probe(&mut self, step: u8) {
-        self.display_probe = Some(step);
-        self.probe_hold = true;
+    /// Run step `step` of experiment `exp` of the panel lab (see
+    /// `Screen::panel_lab`) and hold the panel still afterwards so the
+    /// result can be read: redraws are dropped until `end_panel_lab`.
+    pub fn request_panel_lab(&mut self, exp: u8, step: u8) {
+        self.panel_lab = Some((exp, step));
+        self.lab_hold = true;
     }
 
-    /// Release the probe hold and repaint; the screen promotes the
-    /// repaint to a clean clear since the planes hold probe patterns.
-    pub fn end_display_probe(&mut self) {
-        self.probe_hold = false;
-        self.display_probe = None;
+    /// Release the lab hold and repaint; the screen promotes the
+    /// repaint to a clean clear since the planes hold test patterns.
+    pub fn end_panel_lab(&mut self) {
+        self.lab_hold = false;
+        self.panel_lab = None;
         self.request_full_redraw();
     }
 
-    pub fn take_display_probe(&mut self) -> Option<u8> {
-        self.display_probe.take()
+    pub fn take_panel_lab(&mut self) -> Option<(u8, u8)> {
+        self.panel_lab.take()
     }
 
     #[inline]
-    pub fn display_probe_hold(&self) -> bool {
-        self.probe_hold
+    pub fn panel_lab_hold(&self) -> bool {
+        self.lab_hold
     }
 
     // union `region` into whatever is pending, preserving its urgency:

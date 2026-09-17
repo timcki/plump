@@ -69,8 +69,10 @@ mod cmd {
 }
 
 // DISPLAY_UPDATE_CONTROL_2 bits. the base byte of a waveform selects
-// what the activation runs; `kick` ors in the power bits
-mod ctrl2 {
+// what the activation runs; `kick` ors in the power bits.
+// `pub(crate)` so the panel lab can exercise activations the
+// production paths never use
+pub(crate) mod ctrl2 {
     /// Power-up bits, added only when the panel is actually off.
     pub const POWER_ON: u8 = 0xC0; // CLOCK_ON + ANALOG_ON
     /// Power-down-after-refresh bits, added under the sunlight policy.
@@ -116,7 +118,7 @@ mod ctrl2 {
 ///
 /// Waveform data from CrossPoint Reader (open-source, tuned for X4 display).
 #[rustfmt::skip]
-static LUT_GRAYSCALE: [u8; 112] = [
+pub(crate) static LUT_GRAYSCALE: [u8; 112] = [
     // VS[0..4] waveform entries (5 × 10 bytes = 50 bytes)
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 00 no change
     0x54, 0x54, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 01 light gray
@@ -885,13 +887,13 @@ where
         }
     }
 
-    /// Display probe, step 2: write the four {RED, BW} bit patterns
-    /// into both planes as four columns of the portrait screen (left
-    /// to right: 00, 01, 10, 11), without a refresh. The pattern's
-    /// high bit goes to RED RAM, its low bit to BW RAM; which of the
-    /// two the controller treats as the high bit of its LUT index is
-    /// exactly what the probe measures.
-    pub(crate) fn write_probe_planes(&mut self, strip: &mut StripBuffer) {
+    /// Panel-lab plane writer: the four {RED, BW} bit patterns as four
+    /// columns of the portrait screen (left to right 00, 01, 10, 11),
+    /// into both planes, without a refresh. The pattern's high bit goes
+    /// to RED RAM, its low bit to BW RAM; which of the two the
+    /// controller treats as the high bit of its LUT index is exactly
+    /// what the lab measures.
+    pub(crate) fn write_columns(&mut self, strip: &mut StripBuffer) {
         let Window { px, py, pw, ph } = Window::FULL;
         let max_rows = StripBuffer::max_rows_for_width(pw);
         let rb = (pw / 8) as usize;
@@ -918,30 +920,50 @@ where
         }
     }
 
-    /// Display probe, step 3: run a custom LUT whose only live row is
-    /// `row`, carrying twelve phases of `pulse` (a VS byte: 0xAA is
-    /// VSL, 0x54 VSH1, 0xFC VSH2), with the gray LUT's timing and
-    /// voltages. Only the column whose plane pattern the controller
-    /// maps to `row` moves, and the direction it moves in on the
-    /// black half against the white half gives the pulse's polarity.
-    pub(crate) async fn probe_lut_pass(
+    /// Panel-lab custom-LUT pass: load `lut` (a full 112-byte blob),
+    /// set the whole-panel window, activate with `ctrl2` and wait.
+    /// `0x21` is written as the single parameter byte the datasheet
+    /// defines; which activation actually consumes the loaded LUT is
+    /// one of the things the lab measures.
+    pub(crate) async fn lab_lut_pass(
         &mut self,
-        pulse: u8,
-        row: u8,
+        lut: &[u8; 112],
+        ctrl2: u8,
     ) -> Result<(), embassy_time::TimeoutError> {
-        let mut lut = LUT_GRAYSCALE;
-        for r in 0..5 {
-            lut[r * 10..r * 10 + 10].fill(0);
-        }
-        let r = (row as usize).min(3) * 10;
-        lut[r..r + 3].fill(pulse);
-        self.load_custom_lut(&lut);
+        self.load_custom_lut(lut);
         let Window { px, py, pw, ph } = Window::FULL;
         self.set_partial_ram_area(px, py, pw, ph);
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
-        self.send_data(&[0x00, 0x00]);
-        self.kick(ctrl2::CUSTOM_LUT);
-        self.wait_busy_async("probe lut").await
+        self.send_data(&[0x00]);
+        self.kick(ctrl2);
+        self.wait_busy_async("panel lut").await
+    }
+
+    /// Panel-lab register reinit: reprogram the controller (SW_RESET
+    /// plus the init sequence). The only way to put back whatever the
+    /// OTP loaded into the registers a custom LUT pass overwrote
+    /// (voltages via 0x03/0x04/0x2C). SW_RESET drops the analog rails,
+    /// so the power latch must not keep claiming they are up.
+    pub(crate) fn lab_reinit(&mut self, delay: &mut Delay) {
+        self.init_display(delay);
+        self.power = PanelPower::Off;
+    }
+
+    /// Panel-lab OTP pass: activate the factory waveform over the whole
+    /// panel with the given `0x21` parameter bytes. `ctrl1` is a slice
+    /// so the lab can compare the datasheet's one byte against the two
+    /// the production paths send.
+    pub(crate) async fn lab_otp_pass(
+        &mut self,
+        ctrl1: &[u8],
+        ctrl2: u8,
+    ) -> Result<(), embassy_time::TimeoutError> {
+        let Window { px, py, pw, ph } = Window::FULL;
+        self.set_partial_ram_area(px, py, pw, ph);
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
+        self.send_data(ctrl1);
+        self.kick(ctrl2);
+        self.wait_busy_async("panel otp").await
     }
 
     /// Perform a grayscale antialiasing pass.
