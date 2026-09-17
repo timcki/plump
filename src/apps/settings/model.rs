@@ -103,6 +103,7 @@ pub enum SettingId {
     TextAa,
     GhostClear,
     SunlightFix,
+    DisplayProbe,
     SleepAfter,
     SwapButtons,
     BookCache,
@@ -153,6 +154,7 @@ pub const ROWS: &[Row] = &[
     Row::Item(SettingId::TextAa),
     Row::Item(SettingId::GhostClear),
     Row::Item(SettingId::SunlightFix),
+    Row::Item(SettingId::DisplayProbe),
     Row::Section("System"),
     Row::Item(SettingId::SleepAfter),
     Row::Item(SettingId::SwapButtons),
@@ -203,6 +205,7 @@ impl SettingId {
             Self::TextAa => "Text AA",
             Self::GhostClear => "Ghost Clear",
             Self::SunlightFix => "Sunlight Fix",
+            Self::DisplayProbe => "Display Probe",
             Self::SleepAfter => "Sleep After",
             Self::SwapButtons => "Swap Buttons",
             Self::BookCache => "Book Cache",
@@ -257,7 +260,7 @@ impl SettingId {
                 off: "No",
                 on: "Yes",
             },
-            Self::BookCache => Domain::Action,
+            Self::BookCache | Self::DisplayProbe => Domain::Action,
         }
     }
 
@@ -274,6 +277,7 @@ impl SettingId {
             Self::SunlightFix => "powers the panel down after each refresh",
             Self::SwapButtons => "next page on the upper button",
             Self::BookCache => "text, layout and figures kept on the card",
+            Self::DisplayProbe => "measures the panel's LUT plane order",
             _ => "",
         }
     }
@@ -308,7 +312,7 @@ impl SettingId {
             Self::SunlightFix => s.sunlight_fix as u16,
             Self::SleepAfter => s.sleep_timeout,
             Self::SwapButtons => s.swap_buttons as u16,
-            Self::BookCache => 0,
+            Self::BookCache | Self::DisplayProbe => 0,
         }
     }
 
@@ -326,7 +330,7 @@ impl SettingId {
             Self::SunlightFix => s.sunlight_fix = v != 0,
             Self::SleepAfter => s.sleep_timeout = v,
             Self::SwapButtons => s.swap_buttons = v != 0,
-            Self::BookCache => {}
+            Self::BookCache | Self::DisplayProbe => {}
         }
     }
 

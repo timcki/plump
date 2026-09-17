@@ -299,6 +299,10 @@ struct Loading {
 pub struct AppContext {
     // the pending full redraw wants the real-temperature clear
     clean_refresh: bool,
+    // display probe step to run, and whether the panel is held still
+    // for the user to read a probe result
+    display_probe: Option<u8>,
+    probe_hold: bool,
     msg_buf: [u8; MSG_BUF_SIZE],
     msg_len: usize,
     msg_tag: u8,
@@ -325,6 +329,8 @@ impl AppContext {
             msg_tag: 0,
             redraw: PendingRedraw::None,
             clean_refresh: false,
+            display_probe: None,
+            probe_hold: false,
             loading: None,
         }
     }
@@ -371,6 +377,31 @@ impl AppContext {
     /// consumed by the render.
     pub fn take_clean_refresh(&mut self) -> bool {
         core::mem::take(&mut self.clean_refresh)
+    }
+
+    /// Run step `step` of the display probe (see `Screen::display_probe`)
+    /// and hold the panel still afterwards so the result can be read:
+    /// redraws are dropped until `end_display_probe`.
+    pub fn request_display_probe(&mut self, step: u8) {
+        self.display_probe = Some(step);
+        self.probe_hold = true;
+    }
+
+    /// Release the probe hold and repaint; the screen promotes the
+    /// repaint to a clean clear since the planes hold probe patterns.
+    pub fn end_display_probe(&mut self) {
+        self.probe_hold = false;
+        self.display_probe = None;
+        self.request_full_redraw();
+    }
+
+    pub fn take_display_probe(&mut self) -> Option<u8> {
+        self.display_probe.take()
+    }
+
+    #[inline]
+    pub fn display_probe_hold(&self) -> bool {
+        self.probe_hold
     }
 
     // union `region` into whatever is pending, preserving its urgency:

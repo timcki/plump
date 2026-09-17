@@ -39,6 +39,9 @@ use cache::{CacheSheet, SheetResult};
 use layout::{Damage, GUTTER_W, SettingsList};
 use model::{Activation, Domain, InfoId, ROWS, Row, SettingId, Step, ValueFmt};
 
+/// steps of the display probe; see `Screen::display_probe`
+const PROBE_STEPS: u8 = 4;
+
 /// A group outline sits one pixel outside its rows, so the stroke
 /// lands where a separator would and every row is framed at the same
 /// distance above and below.
@@ -67,6 +70,9 @@ pub struct SettingsApp {
     /// the Book Cache row's own surface; owns the picker, the two
     /// scopes and the clear in flight
     cache: CacheSheet,
+    /// display probe step on the panel, 0 when the probe is not
+    /// running; Select advances, Back ends it
+    probe_step: u8,
     /// About group figures, sampled on the background budget: the
     /// battery is an ADC read the status bar already pays for, and
     /// the uptime is the monotonic clock
@@ -94,6 +100,7 @@ impl SettingsApp {
             generation: 0,
             ui_fonts,
             cache: CacheSheet::new(),
+            probe_step: 0,
             bat_pct: 0,
             bat_mv: 0,
             uptime_secs: 0,
@@ -234,6 +241,12 @@ impl SettingsApp {
             Activation::Edit => {
                 self.focus = Focus::Editing(id);
                 Damage::Rows([self.list.selected_row_region(), None])
+            }
+            Activation::Open if id == SettingId::DisplayProbe => {
+                self.probe_step = 1;
+                log::info!("probe: started; Select runs the next step, Back ends it");
+                ctx.request_display_probe(1);
+                Damage::None
             }
             Activation::Open => {
                 self.cache.open();
@@ -446,6 +459,21 @@ impl App<AppId> for SettingsApp {
         if self.cache.is_open() {
             return self.dispatch_to_cache(event, ctx);
         }
+        if self.probe_step > 0 {
+            match event {
+                ActionEvent::Press(Action::Select) => {
+                    self.probe_step = if self.probe_step >= PROBE_STEPS { 1 } else { self.probe_step + 1 };
+                    ctx.request_display_probe(self.probe_step);
+                }
+                ActionEvent::Press(Action::Back) | ActionEvent::LongPress(Action::Back) => {
+                    self.probe_step = 0;
+                    log::info!("probe: ended");
+                    ctx.end_display_probe();
+                }
+                _ => {}
+            }
+            return Transition::None;
+        }
 
         match event {
             ActionEvent::LongPress(Action::Back) => Transition::Home,
@@ -480,7 +508,7 @@ impl App<AppId> for SettingsApp {
     fn on_horizontal(&mut self, dir: HDir, ctx: &mut AppContext) -> HResult {
         // the sheet navigates on Up/Down and OK alone, but it must not
         // let a stray Left/Right cycle the tab out from under it
-        if self.cache.is_open() {
+        if self.cache.is_open() || self.probe_step > 0 {
             return HResult::Consumed;
         }
         match self.editor() {
@@ -548,7 +576,7 @@ impl App<AppId> for SettingsApp {
     }
 
     fn captures_menu(&self) -> bool {
-        self.cache.is_open()
+        self.cache.is_open() || self.probe_step > 0
     }
 
     fn draw(&self, strip: &mut StripBuffer) {

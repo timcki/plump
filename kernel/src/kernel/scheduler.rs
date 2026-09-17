@@ -489,7 +489,15 @@ impl super::Kernel {
                 }
             }
 
-            if app_mgr.ctx_mut().render_ready() {
+            // the display probe owns the panel while it is held: its
+            // step runs here and every redraw is dropped until the
+            // settings screen releases it
+            if let Some(step) = app_mgr.ctx_mut().take_display_probe() {
+                self.screen.display_probe(step).await;
+            }
+            if app_mgr.ctx_mut().display_probe_hold() {
+                let _ = app_mgr.take_redraw();
+            } else if app_mgr.ctx_mut().render_ready() {
                 let redraw = app_mgr.take_redraw();
                 if self.render(app_mgr, redraw).await.wants_sleep() {
                     self.sleep_with_session(app_mgr, "power held").await;

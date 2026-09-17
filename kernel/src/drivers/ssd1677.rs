@@ -885,6 +885,65 @@ where
         }
     }
 
+    /// Display probe, step 2: write the four {RED, BW} bit patterns
+    /// into both planes as four columns of the portrait screen (left
+    /// to right: 00, 01, 10, 11), without a refresh. The pattern's
+    /// high bit goes to RED RAM, its low bit to BW RAM; which of the
+    /// two the controller treats as the high bit of its LUT index is
+    /// exactly what the probe measures.
+    pub(crate) fn write_probe_planes(&mut self, strip: &mut StripBuffer) {
+        let Window { px, py, pw, ph } = Window::FULL;
+        let max_rows = StripBuffer::max_rows_for_width(pw);
+        let rb = (pw / 8) as usize;
+        for (ram_cmd, bit) in [(cmd::WRITE_RAM_RED, 1u8), (cmd::WRITE_RAM_BW, 0u8)] {
+            let mut y = py;
+            while y < py + ph {
+                let rows = max_rows.min(py + ph - y);
+                strip.begin_window(px, y, pw, rows);
+                {
+                    let data = strip.data_mut();
+                    for r in 0..rows as usize {
+                        // a physical row is one portrait column
+                        let lx = (HEIGHT as usize - 1).saturating_sub(y as usize + r);
+                        let pattern = (lx * 4 / HEIGHT as usize).min(3) as u8;
+                        let v = if (pattern >> bit) & 1 == 1 { 0xFF } else { 0x00 };
+                        data[r * rb..(r + 1) * rb].fill(v);
+                    }
+                }
+                self.set_partial_ram_area(px, y, pw, rows);
+                self.send_command(ram_cmd);
+                self.send_data(strip.data());
+                y += rows;
+            }
+        }
+    }
+
+    /// Display probe, step 3: run a custom LUT whose only live row is
+    /// `row`, carrying twelve phases of `pulse` (a VS byte: 0xAA is
+    /// VSL, 0x54 VSH1, 0xFC VSH2), with the gray LUT's timing and
+    /// voltages. Only the column whose plane pattern the controller
+    /// maps to `row` moves, and the direction it moves in on the
+    /// black half against the white half gives the pulse's polarity.
+    pub(crate) async fn probe_lut_pass(
+        &mut self,
+        pulse: u8,
+        row: u8,
+    ) -> Result<(), embassy_time::TimeoutError> {
+        let mut lut = LUT_GRAYSCALE;
+        for r in 0..5 {
+            lut[r * 10..r * 10 + 10].fill(0);
+        }
+        let r = (row as usize).min(3) * 10;
+        lut[r..r + 3].fill(pulse);
+        self.load_custom_lut(&lut);
+        let Window { px, py, pw, ph } = Window::FULL;
+        self.set_partial_ram_area(px, py, pw, ph);
+        self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
+        self.send_data(&[0x00, 0x00]);
+        self.kick(ctrl2::CUSTOM_LUT);
+        self.wait_busy_async("probe lut").await
+    }
+
     /// Perform a grayscale antialiasing pass.
     ///
     /// Renders content once per strip in GrayDual mode, writing LSB plane

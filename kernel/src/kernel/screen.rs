@@ -288,6 +288,48 @@ impl Screen {
         res
     }
 
+    /// One step of the display probe (Settings > Display Probe): a
+    /// clean clear with the top half black and the bottom half white,
+    /// the four {RED, BW} bit patterns written as four columns, then
+    /// a custom LUT with a single live row. The user reports which
+    /// column moved and in which direction, which fixes the
+    /// controller's LUT bit order and the pulse's polarity; nothing
+    /// else on this panel can be inferred from the datasheet reading.
+    /// Leaves the planes as junk: the next full refresh is promoted
+    /// to a clean clear.
+    pub async fn display_probe(&mut self, step: u8) {
+        let (pulse, row, name) = match step {
+            1 => (0xAAu8, 1u8, "VSL in row 1"),
+            2 => (0x54, 1, "VSH1 in row 1"),
+            3 => (0xFC, 1, "VSH2 in row 1"),
+            4 => (0xAA, 2, "VSL in row 2"),
+            _ => return,
+        };
+        log::info!(
+            "probe: step {} ({}): columns left to right hold (RED,BW) = 00 01 10 11; top half black, bottom half white",
+            step,
+            name
+        );
+        let t0 = Instant::now();
+        let draw = |s: &mut StripBuffer| s.fill_flat(Region::new(0, 0, SCREEN_W, SCREEN_H / 2), true);
+        let written = self.epd.write_full_frame(self.strip, &mut self.delay, &draw);
+        let driven = self.epd.start_full_update(written, FullKind::Clean);
+        let clear_ok = self.epd.wait_busy_async("probe clear").await.is_ok();
+        self.epd.finish_full_update(driven);
+        self.epd.write_probe_planes(self.strip);
+        let lut_ok = self.epd.probe_lut_pass(pulse, row).await.is_ok();
+        self.planes.clear();
+        self.aa_pending = false;
+        self.force_ghost_clear();
+        log::info!(
+            "probe: step {} done clear_ok={} lut_ok={} total_ms={}; report which column changed and whether its black half lightened or its white half darkened",
+            step,
+            clear_ok,
+            lut_ok,
+            t0.elapsed().as_millis()
+        );
+    }
+
     /// Partial DU refresh, waiting inline on the busy pin. Falls back
     /// to a full GC when the panel has not been refreshed yet. For
     /// paths with no background work to overlap (wifi upload screens).
