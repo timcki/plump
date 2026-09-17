@@ -665,9 +665,12 @@ impl EpubState {
         let mut result = f(max_w, max_h);
 
         if matches!(&result, Err(e) if e.is_oom()) && !self.ch_cache.is_empty() {
-            log::debug!(
-                "{}: decode out of memory, releasing {} KB ch_cache and retrying",
+            let heap = esp_alloc::HEAP.stats();
+            log::info!(
+                "{}: decode out of memory at {}/{}K, releasing {} KB ch_cache and retrying",
                 label,
+                heap.current_usage / 1024,
+                heap.size / 1024,
                 self.ch_cache.len() / 1024,
             );
             self.ch_cache = Vec::new();

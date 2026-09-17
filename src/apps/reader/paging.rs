@@ -1214,7 +1214,13 @@ fn justify_params(
     space_w: i32,
 ) -> (i32, i32) {
     let is_heading = span.flags & LineSpan::FLAG_HEADING != 0;
-    let explicit = span.is_explicit_align();
+    // only centred and right-aligned lines are placed by their natural
+    // width. a stylesheet's `text-align: left` (Calibre puts it on every
+    // body paragraph of Exhalation) follows the reader's own setting
+    // exactly like the default, and K-P ran the same breaker for it, so
+    // refusing to stretch or shrink there leaves every line ragged or
+    // overflowing
+    let explicit = span.is_centered() || span.is_right_aligned();
     let can_stretch = text_alignment == 1 && span.is_soft_wrap() && !is_heading && !explicit;
     let can_shrink = span.extra_is_shrink() && !is_heading && !explicit;
     if !(can_stretch || can_shrink) {

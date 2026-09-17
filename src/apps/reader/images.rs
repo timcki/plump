@@ -13,7 +13,7 @@ use crate::kernel::work_queue::DecodedImage;
 use plump_kernel::util::hash;
 use smol_epub::cache;
 use smol_epub::epub;
-use smol_epub::markup::{IMG_HEADER_LEN, ImageRef, MARKER};
+use smol_epub::markup::{ImageRef, MARKER};
 use smol_epub::zip::{self, ZipIndex};
 
 use crate::error::{Error, ErrorKind};
@@ -69,16 +69,18 @@ impl ReaderApp {
             self.fullscreen_img = has_img && !has_text;
         }
 
-        // copy src path to a local buf to avoid borrowing self.buf below
+        // the origin line spans the whole IMG_REF record (marker, header,
+        // alt text, path), so parse it and copy only the path to a local
+        // buf to avoid borrowing self.buf below
         let mut src_buf = [0u8; 128];
         let mut src_len = 0usize;
         for i in 0..self.pg.line_count {
             if self.pg.lines[i].is_image_origin() {
-                let start = self.pg.lines[i].start as usize;
-                let len = self.pg.lines[i].len as usize;
-                if start + len <= self.pg.buf_len {
-                    let n = len.min(src_buf.len());
-                    src_buf[..n].copy_from_slice(&self.pg.buf[start..start + n]);
+                let page = &self.pg.buf[..self.pg.buf_len];
+                if let Some(img) = ImageRef::parse(page, self.pg.lines[i].start as usize) {
+                    let path = img.path(page);
+                    let n = path.len().min(src_buf.len());
+                    src_buf[..n].copy_from_slice(&path[..n]);
                     src_len = n;
                 }
                 break;
@@ -304,7 +306,14 @@ impl ReaderApp {
                 self.page_img = Some(img);
             }
             Err(e) => {
-                log::warn!("reader: image decode failed: {}", e);
+                let heap = esp_alloc::HEAP.stats();
+                log::warn!(
+                    "reader: image decode failed: {} (heap {}/{}K peak {}K)",
+                    e,
+                    heap.current_usage / 1024,
+                    heap.size / 1024,
+                    heap.max_usage / 1024,
+                );
             }
         }
     }
@@ -339,17 +348,13 @@ impl ReaderApp {
         let text_area_h = self.text_area_h;
         let max_inline_h = super::inline_img_max_h(text_area_h);
 
-        // scan for [MARKER, IMG_REF, flags, w_lo, w_hi, h_lo, h_hi, alt_len,
-        // path_len, alt..., path...] sequences. ignore the flags / dims for
-        // now (the actual height comes from peek_cached / peek_source); the
-        // structural parse just needs alt_len + path_len to find the path.
+        // walk the page's records for IMG_REFs. the flags / dims are
+        // ignored here (the actual height comes from peek_cached /
+        // peek_source); only the path matters
         let mut i = 0usize;
-        while i + IMG_HEADER_LEN <= buf_len
-            && (self.img_height_count as usize) < MAX_IMAGES_PER_PAGE
-        {
-            let Some(img) = ImageRef::parse(&self.pg.buf[..buf_len], i) else {
-                i += 1;
-                continue;
+        while (self.img_height_count as usize) < MAX_IMAGES_PER_PAGE {
+            let Ok(img) = ImageRef::find_next(&self.pg.buf[..buf_len], i) else {
+                break;
             };
             let path_start = img.path_start as usize;
             let path_len = img.path_len as usize;
@@ -458,12 +463,17 @@ impl ReaderApp {
                 break;
             }
 
+            // walk record by record; a raw byte scan would mistake a
+            // block record's payload for an image header. the walk
+            // stops at a record the window cuts, and the next read
+            // starts there so it fits whole
             let mut i = 0;
-            while i + IMG_HEADER_LEN <= n {
-                let Some(img) = ImageRef::parse(&self.pg.prefetch[..n], i) else {
-                    i += 1;
-                    continue;
+            let stop = loop {
+                let img = match ImageRef::find_next(&self.pg.prefetch[..n], i) {
+                    Ok(img) => img,
+                    Err(stop) => break stop,
                 };
+                let rec_start = img.start as usize;
                 let path_start = img.path_start as usize;
                 let path_len = img.path_len as usize;
                 let payload_end = img.end as usize;
@@ -549,10 +559,16 @@ impl ReaderApp {
                         continue;
                     }
 
+                    // heap use here is what the decode competes with;
+                    // the 5 s stats line samples too rarely to show it
+                    let heap = esp_alloc::HEAP.stats();
                     log::info!(
-                        "precache: streaming {} ({} bytes)",
+                        "precache: streaming {} ({} bytes) heap {}/{}K peak {}K",
                         full_path,
                         entry.uncomp_size,
+                        heap.current_usage / 1024,
+                        heap.size / 1024,
+                        heap.max_usage / 1024,
                     );
                     let img_w = self.text_w as u16;
                     let img_h = self.text_area_h;
@@ -572,7 +588,14 @@ impl ReaderApp {
                             self.epub.large_img_fails = 0;
                         }
                         Err(e) => {
-                            log::warn!("precache: streaming failed: {}", e);
+                            let heap = esp_alloc::HEAP.stats();
+                            log::warn!(
+                                "precache: streaming failed: {} (heap {}/{}K peak {}K)",
+                                e,
+                                heap.current_usage / 1024,
+                                heap.size / 1024,
+                                heap.max_usage / 1024,
+                            );
                             let _ = k.sd().write_in_plump_subdir(dir, img_file, &[]);
                             // a decode that failed even at the smallest
                             // budget says the heap is gone right now, not
@@ -645,18 +668,15 @@ impl ReaderApp {
                 // submit().  retry on next poll instead of skipping.
                 log::info!("precache: queue race, will retry {}", full_path);
                 return Ok(ScanResult::Dispatched {
-                    resume_offset: (offset + i) as u32,
+                    resume_offset: (offset + rec_start) as u32,
                 });
-            }
+            };
 
-            // advance with overlap large enough that any IMG_REF payload that
-            // spans a chunk boundary fits entirely in the next read. Worst
-            // case is IMG_HEADER_LEN + IMG_ALT_CAP (48) + path_len_max (135)
-            // ~= 192 bytes; round up to 256.
+            // a record cut at the chapter's own end is truncated for good
             if offset + n >= ch_size {
                 break;
             }
-            offset += n.saturating_sub(256).max(1);
+            offset += stop.max(1);
         }
 
         Ok(ScanResult::NoneFound)
