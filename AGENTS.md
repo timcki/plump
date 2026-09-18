@@ -43,7 +43,16 @@ GPIO5  EPD RST              GPIO13 battery latch (raw register GPIO)
 - `riscv32imc-unknown-none-elf` target (auto-installed by toolchain file)
 - `espflash` (`cargo install espflash`)
 - XTEink X4 connected via USB (ESP32-C3 built-in USB-JTAG/serial)
-- Sibling directory `../smol-epub` (clone from `github.com/hansmrtn/smol-epub`)
+
+### Vendored dependencies
+
+The versions of `smol-epub`, `embedded-sdmmc` and `esp-alloc` that plump uses are part of this repository:
+
+- `vendor/smol-epub` owns EPUB parsing, HTML/CSS stripping, the markup stream, hyphenation and image decoding
+- `vendor/embedded-sdmmc-rs` owns the FAT and SD implementation, with plump's patches listed in its `PLUMP-VENDOR.md`
+- `vendor/esp-alloc` is the allocator, patched in through `[patch.crates-io]`; see its `PLUMP-VENDOR.md`
+
+These vendored directories are the source of truth. Do not depend on sibling checkouts or replace their `Cargo.toml` path dependencies with external Git repositories. Make changes to these packages in place and commit them with the plump changes that require them.
 
 ### Build → flash → monitor in one command
 
@@ -210,10 +219,12 @@ Then every 5 seconds: heap usage, stack watermark, battery percentage, uptime, S
 │                                   single contiguous heap (linkall.x,
 │                                   esp32c3-plump.x, stack-plump.x)
 ├── vendor/
-│   └── embedded-sdmmc-rs/          hansmrtn async fork of embedded-sdmmc
-│                                   with a local patch (FAT32 directory
-│                                   walk stops at the end marker); see
-│                                   PLUMP-VENDOR.md inside
+│   ├── smol-epub/                  EPUB parser, markup stream, hyphenation,
+│   │                               and JPEG/PNG decoders used by the reader
+│   ├── embedded-sdmmc-rs/          FAT/SD implementation with plump's
+│   │                               patches; see PLUMP-VENDOR.md inside
+│   └── esp-alloc/                  allocator with O(1) stats and in-place
+│                                   realloc; see PLUMP-VENDOR.md inside
 ├── assets/
 │   ├── fonts/                      TTF files (regular, bold, italic)
 │   └── upload.html                 web UI for WiFi upload mode
@@ -394,7 +405,7 @@ Styling is resolved **once, at strip time**, and rendered from a stream that eve
 
 **Hyphenation.** `smol_epub::hyphen` wraps the `hypher` crate (Typst's Liang tries; English and Polish are compiled in, 43 KB of flash) behind smol-epub's `hyphenation` feature. The book's `dc:language` (`EpubMeta::lang`) picks the patterns; no language or an unknown one means only soft hyphens and explicit hyphens can break a word. `items::build_paragraph` turns each break point into a flagged `Item::discretionary` whose pre-break width is the hyphen glyph, and `breaker::consider_break` adds that width when breaking there; an explicit hyphen inside a word is a cheaper, unflagged break that adds nothing. No record bit marks a hyphenated line: `build_page_runs` sees a line that ends inside a word (letter on both sides, or at a soft hyphen) and appends the hyphen glyph to the line's width and drawing. `preindex.kp` logs `hyphenated=` per chapter for tuning `HYPHEN_PENALTY`.
 
-To add an inline style: a marker pair in `markup.rs`, an arm in `Events::next_event`, a field in `markup::Style`, the stripper emitting it (`open_elem`), and a face or decoration in `fonts::Style::from_markup` / the draw loop. To add a block property: a field in `BlockProps` and its record, the stripper's `flush_prefix`, and wherever `LineLayout` needs to carry it. Bump `CONTENT_FMT_LATEST` for stream changes and `LAYOUT_ALGO_VERSION` for `LineRecord` bit changes. `cargo run --example strip_dump -- chapter.xhtml style.css` in `../smol-epub` shows what a real chapter strips to.
+To add an inline style: a marker pair in `vendor/smol-epub/src/markup.rs`, an arm in `Events::next_event`, a field in `markup::Style`, the stripper emitting it (`open_elem`), and a face or decoration in `fonts::Style::from_markup` / the draw loop. To add a block property: a field in `BlockProps` and its record, the stripper's `flush_prefix`, and wherever `LineLayout` needs to carry it. Bump `CONTENT_FMT_LATEST` for stream changes and `LAYOUT_ALGO_VERSION` for `LineRecord` bit changes. Run `cargo run --example strip_dump -- chapter.xhtml style.css` from `vendor/smol-epub` to inspect how a real chapter strips.
 
 ### Image decode
 

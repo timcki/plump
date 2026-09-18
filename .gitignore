@@ -15,3 +15,4 @@ target/
 *.md
 !/README.md
 !/AGENTS.md
+!/vendor/smol-epub/README.md

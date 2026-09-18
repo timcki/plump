@@ -1,7 +1,7 @@
 [workspace]
 members = [".", "kernel"]
 # vendored crates with local patches; path dependencies, not members
-exclude = ["vendor/embedded-sdmmc-rs", "vendor/esp-alloc"]
+exclude = ["vendor/embedded-sdmmc-rs", "vendor/esp-alloc", "vendor/smol-epub"]
 
 [workspace.dependencies]
 esp-hal  = { version = "1.0.0", features = ["esp32c3", "log-04", "unstable"] }
@@ -15,7 +15,7 @@ embedded-hal-bus   = "0.3.0"
 embedded-graphics-core = "0.4.1"
 embedded-graphics      = "0.8.2"
 embedded-sdmmc = { path = "vendor/embedded-sdmmc-rs" }
-smol-epub      = { path = "../smol-epub", features = ["async", "hyphenation"] }
+smol-epub      = { path = "vendor/smol-epub", features = ["async", "hyphenation"] }
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
 nb  = "1.1.0"

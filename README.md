@@ -21,7 +21,7 @@ It's roughly split into a kernel (`kernel/`: drivers, scheduler, storage, EPD re
 
 ## Build
 
-Needs stable Rust ≥ 1.88 (`rust-toolchain.toml` pulls in `riscv32imc-unknown-none-elf`), [`espflash`](https://github.com/esp-rs/espflash), and a sibling checkout of [`timcki/smol-epub`](https://github.com/timcki/smol-epub) (a fork of [`hansmrtn/smol-epub`](https://github.com/hansmrtn/smol-epub) carrying the progressive-JPEG work).
+Needs stable Rust ≥ 1.88 (`rust-toolchain.toml` pulls in `riscv32imc-unknown-none-elf`) and [`espflash`](https://github.com/esp-rs/espflash). The [`timcki/smol-epub`](https://github.com/timcki/smol-epub) fork is vendored under `vendor/smol-epub`.
 
 ```sh
 cargo run --release   # build, flash over USB, open the serial monitor
