@@ -720,8 +720,8 @@ where
     }
 
     /// Physical window for a logical region, for callers that drive a
-    /// waveform over an area they did not just write (the deferred AA
-    /// pass over everything refreshed since the last one).
+    /// waveform over an area they did not just write (the full-screen
+    /// gray and revert passes).
     pub(crate) fn region_state(&self, x: u16, y: u16, w: u16, h: u16) -> Option<Window> {
         self.align_partial_region(x, y, w, h)
     }

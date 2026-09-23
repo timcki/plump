@@ -236,13 +236,6 @@ pub enum GrayscaleMode {
     /// post-GC refresh. Best for screens with rare, deliberate redraws
     /// (Reader page turns) where the latency hides naturally.
     Immediate,
-    /// Hold the grayscale pass until the screen has been redraw-idle
-    /// for `DEFERRED_GRAYSCALE_DELAY`. The pass is always full-screen
-    /// and a windowed partial over the coded panel first neutralizes
-    /// it (full revert plus plane rewrite), so this suits screens
-    /// whose redraws are full-screen anyway; a list screen pays the
-    /// neutralize on every cursor move.
-    Deferred,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -809,9 +802,8 @@ pub trait AppLayer {
     fn set_chrome_state(&mut self, _battery_pct: u8, _today_pages: u16, _today_secs: u32) {}
 
     fn ghost_clear_every(&self) -> u32;
-    /// Decide whether to run the grayscale AA pass for the current
-    /// frame and, if so, whether to fire it immediately or defer it
-    /// to the next redraw-idle window. See `GrayscaleMode`.
+    /// Whether to run the grayscale AA pass for the current frame.
+    /// See `GrayscaleMode`.
     fn grayscale_mode(&self) -> GrayscaleMode;
 
     // boot-time init: load settings, populate caches, enter first app

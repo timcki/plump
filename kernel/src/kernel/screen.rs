@@ -55,10 +55,6 @@ pub struct Screen {
     // area absent from the map is in sync: delta DUs are safe there
     planes: PlaneMap,
 
-    // something was driven to plain BW since the last AA pass, so a
-    // deferred fire has work. the fire is always full-screen (see the
-    // whole-panel rule above), so no rect bookkeeping is needed
-    aa_pending: bool,
 
     // partial refreshes since the last full GC; the scheduler promotes
     // to a full clear once this reaches ghost_clear_every
@@ -176,7 +172,6 @@ impl Screen {
             strip,
             delay,
             planes: PlaneMap::new(),
-            aa_pending: false,
             partials: 0,
             force_gc: false,
         }
@@ -317,7 +312,6 @@ impl Screen {
             t0.elapsed().as_millis()
         );
         self.planes.clear();
-        self.aa_pending = false;
         self.force_ghost_clear();
     }
 
@@ -482,7 +476,6 @@ impl Screen {
 
         let driven = self.epd.partial_start_du(written);
         self.partials = self.partials.saturating_add(1);
-        self.aa_pending = true;
 
         // one line per partial while the refresh artefacts are being
         // chased. `outside` is the part of the stale map this window
@@ -525,7 +518,6 @@ impl Screen {
         // the whole screen correctly stays marked for re-drive. gray
         // loss is moot: the running GC wipes the panel gray anyway
         let _ = self.planes.apply(FULL_REGION, SessionOutcome::Abandoned);
-        self.aa_pending = true;
         Wave {
             screen: self,
             driven,
@@ -576,26 +568,10 @@ impl Screen {
         if self.planes.apply(FULL_REGION, SessionOutcome::Grayed) {
             self.force_ghost_clear();
         }
-        self.aa_pending = false;
         if res.is_err() {
             self.force_ghost_clear();
         }
         res
-    }
-
-    /// Deferred grayscale AA pass: full-screen when anything was
-    /// driven to plain BW since the last pass, no-op otherwise. Always
-    /// full-screen because the gray LUT has a single no-change state
-    /// ({0,0}); any plain content left in RAM outside a smaller window
-    /// would take a gray pulse along with it (whole-panel rule).
-    pub async fn grayscale_fresh<F>(&mut self, draw: &F) -> Result<(), TimeoutError>
-    where
-        F: Fn(&mut StripBuffer),
-    {
-        if !self.aa_pending {
-            return Ok(());
-        }
-        self.grayscale_full(draw).await
     }
 }
 
@@ -709,7 +685,6 @@ impl Settled<'_, Du> {
         if s.planes.apply(self.region, SessionOutcome::Grayed) {
             s.force_ghost_clear();
         }
-        s.aa_pending = false;
         if res.is_err() {
             s.force_ghost_clear();
         }

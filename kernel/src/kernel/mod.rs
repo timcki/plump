@@ -160,10 +160,6 @@ pub struct Services {
     /// `Services::battery_pct_for_ui`.
     pub(crate) battery_pct_shown: u8,
 
-    // deferred grayscale-AA fire; armed by the render path when the
-    // active app uses `GrayscaleMode::Deferred`
-    pub(crate) aa: DeferredAa,
-
     // power-button policy state machine; resolves raw power events
     // into semantic inputs (MenuTap) or sleep requests
     pub(crate) input_policy: input_policy::InputPolicyState,
@@ -200,53 +196,6 @@ pub struct Services {
 
     // mirrored from applied.sleep_timeout; 0 disables idle sleep
     pub(crate) idle_timeout_mins: u16,
-}
-
-/// Armed deferred grayscale-AA fire.
-///
-/// The main loop fires the AA pass once the armed instant has passed
-/// AND no new redraw is pending. Every render decides the arm exactly
-/// once (see the scheduler's `ClosePlan`); sleep and a `text_aa`
-/// toggle cancel it.
-#[derive(Default)]
-pub(crate) struct DeferredAa {
-    at: Option<embassy_time::Instant>,
-}
-
-impl DeferredAa {
-    pub const fn new() -> Self {
-        Self { at: None }
-    }
-
-    /// Arm for `at`, or cancel when the close plan carries no arm.
-    #[inline]
-    pub fn set(&mut self, at: Option<embassy_time::Instant>) {
-        self.at = at;
-    }
-
-    #[inline]
-    pub fn cancel(&mut self) {
-        self.at = None;
-    }
-
-    /// Instant the park should wake at, so fire latency is near zero.
-    #[inline]
-    pub fn deadline(&self) -> Option<embassy_time::Instant> {
-        self.at
-    }
-
-    /// Disarm and report true when the idle window has elapsed. Leaves
-    /// the arm in place while it has not.
-    #[inline]
-    pub fn take_due(&mut self, now: embassy_time::Instant) -> bool {
-        match self.at {
-            Some(at) if now >= at => {
-                self.at = None;
-                true
-            }
-            _ => false,
-        }
-    }
 }
 
 /// A deadline that re-arms itself when it fires.
@@ -354,7 +303,6 @@ impl Kernel {
                 sd_ok,
                 cached_battery_mv: battery_mv,
                 battery_pct_shown: crate::drivers::battery::battery_percentage(battery_mv),
-                aa: DeferredAa::new(),
                 input_policy: input_policy::InputPolicyState::new(),
                 applied: AppliedSettings::new(),
                 day_stats,

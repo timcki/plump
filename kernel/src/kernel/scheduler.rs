@@ -21,11 +21,6 @@ use log::{debug, info};
 
 use super::app::{AppIdType, AppLayer, GrayscaleMode, Redraw, Transition};
 
-/// Idle window before a `GrayscaleMode::Deferred` AA pass fires. Sized
-/// to feel "settled" without making the user wait noticeably: shorter
-/// than a normal reading pause, longer than a single keypress
-/// repeat-rate.
-const DEFERRED_GRAYSCALE_DELAY: Duration = Duration::from_millis(800);
 use super::input_policy::{ResolvedInput, SemanticInput};
 use crate::drivers::battery;
 use crate::drivers::input::Event;
@@ -48,19 +43,7 @@ enum InputResult<Id> {
     Sleep,
 }
 
-/// Action deferred until the EPD waveform completes.
-///
-/// Nothing constructs these any more: `wave_window` stopped
-/// dispatching input mid-waveform, which was the only producer. The
-/// plumbing is left threaded through `render` for now rather than
-/// unpicked from ~15 sites in the same change that fixed the display;
-/// it wants its own pass, with the panel in front of you.
-enum DeferredAction<Id> {
-    Transition(Transition<Id>),
-    Semantic(SemanticInput),
-}
-
-/// What the caller should do after an input pass or a render.
+/// What the caller should do after an input pass.
 ///
 /// Sleep entry is async (it renders a sleep screen), so the sync
 /// halves report it instead of doing it; naming the two outcomes keeps
@@ -74,22 +57,9 @@ enum AfterInput {
 
 impl AfterInput {
     #[inline]
-    const fn sleep_if(cond: bool) -> Self {
-        if cond { Self::Sleep } else { Self::Continue }
-    }
-
-    #[inline]
     const fn wants_sleep(self) -> bool {
         matches!(self, Self::Sleep)
     }
-}
-
-/// What a waveform window collected while the EPD was busy.
-struct WaveOutcome<Id> {
-    /// First input that needs applying once the refresh completes.
-    deferred: Option<DeferredAction<Id>>,
-    /// A power-long-press arrived during the waveform.
-    sleep: bool,
 }
 
 /// What closes a refresh session once its waveform has settled.
@@ -97,40 +67,25 @@ struct WaveOutcome<Id> {
 /// Both render paths derive this from the same three inputs (whether
 /// the frame was overtaken mid-waveform, the `text_aa` setting, and
 /// the app's `GrayscaleMode`) and then interpret it with their own
-/// closers, so the partial and full paths cannot drift apart. Each
-/// path writes the deferred-AA arm exactly once, from the plan.
+/// closers, so the partial and full paths cannot drift apart.
 enum ClosePlan {
     /// The frame was overtaken: skip phase 3 (partial) or the AA pass
-    /// (full), and cancel any armed deferred fire.
+    /// (full).
     Abandon,
     /// Plain phase 3, nothing more.
     SyncRed,
     /// Grayscale AA pass in place of phase 3.
     GrayNow,
-    /// Phase 3 now, deferred AA fire at the given instant.
-    SyncThenArm(Instant),
 }
 
 impl ClosePlan {
     fn decide(interrupted: bool, aa_enabled: bool, mode: GrayscaleMode) -> Self {
         if interrupted {
-            return Self::Abandon;
-        }
-        match mode {
-            GrayscaleMode::Immediate if aa_enabled => Self::GrayNow,
-            GrayscaleMode::Deferred if aa_enabled => {
-                Self::SyncThenArm(Instant::now() + DEFERRED_GRAYSCALE_DELAY)
-            }
-            _ => Self::SyncRed,
-        }
-    }
-
-    /// The deferred-AA arm this plan implies; every other plan cancels.
-    #[inline]
-    const fn aa_arm(&self) -> Option<Instant> {
-        match self {
-            Self::SyncThenArm(at) => Some(*at),
-            _ => None,
+            Self::Abandon
+        } else if aa_enabled && mode == GrayscaleMode::Immediate {
+            Self::GrayNow
+        } else {
+            Self::SyncRed
         }
     }
 }
@@ -501,31 +456,12 @@ impl super::Kernel {
                 let _ = app_mgr.take_redraw();
             } else if app_mgr.ctx_mut().render_ready() {
                 let redraw = app_mgr.take_redraw();
-                if self.render(app_mgr, redraw).await.wants_sleep() {
-                    self.sleep_with_session(app_mgr, "power held", true).await;
-                    continue;
-                }
-            }
-
-            // deferred grayscale fire: when the active app uses
-            // `GrayscaleMode::Deferred` the previous render armed
-            // `svc.aa`. fire the AA pass once the idle window has
-            // elapsed and the screen is still settled (no pending
-            // redraw, AA setting still on, no power-down in progress).
-            // the park below wakes at the armed instant, so fire
-            // latency is near zero.
-            if !app_mgr.system_settings().text_aa
-                || !matches!(app_mgr.grayscale_mode(), GrayscaleMode::Deferred)
-            {
-                self.svc.aa.cancel();
-            } else if !app_mgr.has_redraw() && self.svc.aa.take_due(Instant::now()) {
-                self.fire_deferred_grayscale(app_mgr).await;
+                self.render(app_mgr, redraw).await;
             }
 
             // re-run the loop instead of parking when work is already
             // pending: an interrupted Progress chain (sleep/special
-            // exit above) or a redraw made ready by a deferred action
-            // applied during the render's waveform
+            // exit above) or a redraw marked during the render
             if matches!(outcome, super::app::BgOutcome::Progress { more: true })
                 || app_mgr.ctx_mut().render_ready()
             {
@@ -547,9 +483,6 @@ impl super::Kernel {
                 deadline = deadline.min(d);
             }
             if let Some(d) = app_mgr.ctx_mut().next_render_deadline() {
-                deadline = deadline.min(d);
-            }
-            if let Some(d) = self.svc.aa.deadline() {
                 deadline = deadline.min(d);
             }
             if let Some(d) = self.panel_idle_off_due() {
@@ -630,22 +563,9 @@ impl super::Kernel {
 }
 
 impl super::Services {
-    /// Shared helper: run a hardware event through the input policy and
-    /// dispatch forwarded raw events to the app layer.
-    ///
-    /// Both `handle_input` (normal path) and `wave_window`
-    /// (waveform path) call this so the policy resolution logic cannot
-    /// drift between the two sites. Semantic inputs are returned to the
-    /// caller so the waveform path can defer them until refresh completes.
-    ///
-    /// `suppress_forward`: when true, forwarded raw events are dropped
-    /// (used during EPD waveform when the quick-menu overlay is open).
-    fn resolve_input<A: AppLayer>(
-        &mut self,
-        hw_event: Event,
-        app_mgr: &mut A,
-        suppress_forward: bool,
-    ) -> InputResult<A::Id> {
+    /// Run a hardware event through the input policy and dispatch
+    /// forwarded raw events to the app layer.
+    fn resolve_input<A: AppLayer>(&mut self, hw_event: Event, app_mgr: &mut A) -> InputResult<A::Id> {
         match self.input_policy.resolve(hw_event) {
             ResolvedInput::RequestSleep => {
                 info!("input_policy: RequestSleep");
@@ -653,9 +573,6 @@ impl super::Services {
             }
             ResolvedInput::Semantic(s) => InputResult::Semantic(s),
             ResolvedInput::Forward(ev) => {
-                if suppress_forward {
-                    return InputResult::Nothing;
-                }
                 let suppressed_before = app_mgr.suppress_deferred_input();
                 let t = app_mgr.dispatch_event(ev, &mut *self.bm_cache);
                 if app_mgr.take_sleep_request() {
@@ -674,29 +591,11 @@ impl super::Services {
         }
     }
 
-    fn apply_deferred_action<A: AppLayer>(
-        &mut self,
-        action: DeferredAction<A::Id>,
-        app_mgr: &mut A,
-    ) {
-        match action {
-            DeferredAction::Transition(t) => {
-                app_mgr.apply_transition(t, &mut self.handle());
-            }
-            DeferredAction::Semantic(input) => {
-                let t = app_mgr.dispatch_semantic(input);
-                if t != Transition::None {
-                    app_mgr.apply_transition(t, &mut self.handle());
-                }
-            }
-        }
-    }
-
     fn handle_input<A: AppLayer>(&mut self, hw_event: Event, app_mgr: &mut A) -> AfterInput {
         self.last_activity = Instant::now();
         self.input_events = self.input_events.wrapping_add(1);
 
-        match self.resolve_input(hw_event, app_mgr, false) {
+        match self.resolve_input(hw_event, app_mgr) {
             InputResult::Sleep => AfterInput::Sleep,
             InputResult::Transition(t) => {
                 app_mgr.apply_transition(t, &mut self.handle());
@@ -889,9 +788,7 @@ fn screen_partials(screen: &super::screen::Screen) -> u32 {
 impl super::Kernel {
     // partial refreshes use DU waveform (~400 ms); after ghost_clear_every
     // partials, a full GC refresh (~600 ms at faked temp) clears ghosting
-    //
-    // reports Sleep if a power-long-press arrived during the waveform
-    async fn render<A: AppLayer>(&mut self, app_mgr: &mut A, redraw: Redraw) -> AfterInput {
+    async fn render<A: AppLayer>(&mut self, app_mgr: &mut A, redraw: Redraw) {
         crate::perf_begin!(_render_t0);
 
         #[cfg(feature = "perf")]
@@ -902,7 +799,6 @@ impl super::Kernel {
         };
         #[cfg(feature = "perf")]
         let mut actual_mode = "none";
-        let mut sleep_requested = false;
         let active = app_mgr.active();
         debug!("render: begin active={:?} redraw={:?}", active, redraw);
 
@@ -943,17 +839,13 @@ impl super::Kernel {
                                 r, redrive, stale, write_ms
                             );
                             let t_wave = Instant::now();
-                            let WaveOutcome { deferred, sleep } =
-                                svc.wave_window(&mut wave, app_mgr).await;
-                            sleep_requested = sleep;
+                            svc.wave_window(&mut wave, app_mgr).await;
                             let settled = wave.settle();
                             let wave_ms = t_wave.elapsed().as_millis();
                             debug!(
-                                "render: partial waveform done region={:?} pending_redraw={} deferred={} sleep={} ({}ms)",
+                                "render: partial waveform done region={:?} pending_redraw={} ({}ms)",
                                 r,
                                 app_mgr.has_redraw(),
-                                deferred.is_some(),
-                                sleep,
                                 wave_ms
                             );
                             crate::perf_event!(
@@ -969,21 +861,18 @@ impl super::Kernel {
                             );
 
                             let plan = ClosePlan::decide(
-                                app_mgr.has_redraw() || deferred.is_some(),
+                                app_mgr.has_redraw(),
                                 app_mgr.system_settings().text_aa,
                                 app_mgr.grayscale_mode(),
                             );
-                            // the plan is the only writer of the arm on
-                            // this path; nothing below reads it
-                            svc.aa.set(plan.aa_arm());
 
                             match plan {
                                 ClosePlan::Abandon => {
                                     // skip phase 3 when content changed
-                                    // mid-DU or a deferred action is queued
-                                    // (the screen will be redrawn right
-                                    // after); the next partial recovers the
-                                    // desynchronised RED RAM via inv_red.
+                                    // mid-DU (the screen will be redrawn
+                                    // right after); the next partial
+                                    // recovers the desynchronised RED RAM
+                                    // via inv_red.
                                     //
                                     // discriminator for the page-turn AA
                                     // hunt: any turn logging this line
@@ -991,45 +880,26 @@ impl super::Kernel {
                                     // landed mid-waveform
                                     crate::perf_event!(
                                         "render",
-                                        "partial_abandon pending_redraw={} deferred={} region_x={} region_y={} region_w={} region_h={}",
+                                        "partial_abandon pending_redraw={} region_x={} region_y={} region_w={} region_h={}",
                                         app_mgr.has_redraw(),
-                                        deferred.is_some(),
                                         r.x,
                                         r.y,
                                         r.w,
                                         r.h
                                     );
-                                    // re-mark only when nothing else
-                                    // did. a frame is abandoned because
-                                    // the app already marked what
-                                    // changed, and re-marking the whole
-                                    // region on top of that ratchets:
-                                    // the union can only grow, so one
-                                    // move that spans the screen makes
-                                    // every later keypress re-drive the
-                                    // whole content band via inv_red,
-                                    // 400ms at a time, while repeat
-                                    // input arrives every 150ms. the
-                                    // panel took a full-area pulse per
-                                    // keystroke and turned to ink. the
-                                    // deferred-only case has no other
-                                    // mark, so it keeps this one
-                                    // which half of `interrupted` fired
-                                    // decides the fix: a redraw means
-                                    // something marked dirty inside the
-                                    // waveform (input, or a background
-                                    // step), a deferred action means a
-                                    // transition is queued
+                                    // only a redraw marked inside the
+                                    // waveform abandons a frame, and that
+                                    // mark already covers what changed.
+                                    // never re-mark the region on top:
+                                    // the union only grows, so one move
+                                    // spanning the screen made every later
+                                    // keypress re-drive the whole content
+                                    // band via inv_red and inked the panel
                                     log::info!(
-                                        "render: abandon redraw={} deferred={} write_ms={} wave_ms={}",
-                                        app_mgr.has_redraw(),
-                                        deferred.is_some(),
+                                        "render: abandon write_ms={} wave_ms={}",
                                         write_ms,
                                         wave_ms
                                     );
-                                    if !app_mgr.has_redraw() {
-                                        app_mgr.ctx_mut().mark_dirty(r);
-                                    }
                                     settled.abandon();
                                 }
                                 ClosePlan::GrayNow => {
@@ -1045,7 +915,7 @@ impl super::Kernel {
                                         );
                                     }
                                 }
-                                ClosePlan::SyncRed | ClosePlan::SyncThenArm(_) => {
+                                ClosePlan::SyncRed => {
                                     log::info!(
                                         "render: sync write_ms={} wave_ms={}",
                                         write_ms,
@@ -1054,10 +924,6 @@ impl super::Kernel {
                                     let draw = |s: &mut StripBuffer| app_mgr.draw(s);
                                     settled.sync_red(&draw);
                                 }
-                            }
-
-                            if let Some(action) = deferred {
-                                svc.apply_deferred_action(action, app_mgr);
                             }
 
                             break 'render;
@@ -1101,33 +967,29 @@ impl super::Kernel {
                 debug!("render: full frame written ({}ms)", write_ms);
 
                 let t_wave = Instant::now();
-                let WaveOutcome { deferred, sleep } = svc.wave_window(&mut wave, app_mgr).await;
-                sleep_requested = sleep;
+                svc.wave_window(&mut wave, app_mgr).await;
                 wave.settle().finish();
                 let wave_ms = t_wave.elapsed().as_millis();
                 debug!(
-                    "render: full waveform done pending_redraw={} deferred={} sleep={} ({}ms)",
+                    "render: full waveform done pending_redraw={} ({}ms)",
                     app_mgr.has_redraw(),
-                    deferred.is_some(),
-                    sleep,
                     wave_ms
                 );
                 crate::perf_event!("render", "full write_ms={} wave_ms={}", write_ms, wave_ms);
 
                 // after a full GC refresh the panel is left in plain BW.
-                // re-apply grayscale AA per the current `GrayscaleMode`
-                // (or arm the deferred timer). the pass marks the screen
+                // re-apply grayscale AA per the current `GrayscaleMode`.
+                // the pass marks the screen
                 // gray-coded; the next partial reverts and runs a delta.
                 //
                 // finish() already closed the session, so the plan's
                 // sync arms carry no work here: only GrayNow has a
                 // closer, and Abandon just means "skip the AA pass"
                 let plan = ClosePlan::decide(
-                    app_mgr.has_redraw() || deferred.is_some(),
+                    app_mgr.has_redraw(),
                     app_mgr.system_settings().text_aa,
                     app_mgr.grayscale_mode(),
                 );
-                svc.aa.set(plan.aa_arm());
 
                 if matches!(plan, ClosePlan::GrayNow) {
                     let draw = |s: &mut StripBuffer| app_mgr.draw(s);
@@ -1137,19 +999,14 @@ impl super::Kernel {
                         );
                     }
                 }
-
-                if let Some(action) = deferred {
-                    svc.apply_deferred_action(action, app_mgr);
-                }
             }
         } // 'render
 
         svc.last_refresh = Instant::now();
         debug!(
-            "render: end active={:?} pending_redraw={} sleep_requested={}",
+            "render: end active={:?} pending_redraw={}",
             app_mgr.active(),
             app_mgr.has_redraw(),
-            sleep_requested
         );
         crate::perf_event!(
             "render",
@@ -1158,36 +1015,7 @@ impl super::Kernel {
             actual_mode,
             _render_t0.elapsed().as_millis()
         );
-
-        AfterInput::sleep_if(sleep_requested)
     }
-
-    // run a grayscale_pass over everything refreshed since the last
-    // one, on top of an already-rendered BW image. fires only from the
-    // main loop after the deferred-AA timer expires; panel power is
-    // normally still latched on from the last partial DU, so the pass
-    // skips the booster start entirely.
-    async fn fire_deferred_grayscale<A: AppLayer>(&mut self, app_mgr: &mut A) {
-        let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-        let t0 = Instant::now();
-        let res = self.screen.grayscale_fresh(&draw).await;
-        self.svc.last_refresh = Instant::now();
-        if res.is_err() {
-            log::warn!(
-                "render: deferred grayscale_pass timed out, forcing full GC next frame"
-            );
-            return;
-        }
-        // the screen is now marked stale: the panel holds gray levels
-        // the RAM planes cannot express, so the next partial re-drives
-        // the region it touches instead of computing a delta. recovery
-        // is scoped to that region, so a small mark stays small
-        debug!(
-            "render: deferred grayscale_pass complete ({}ms)",
-            t0.elapsed().as_millis()
-        );
-    }
-
 }
 
 impl super::Services {
@@ -1206,29 +1034,18 @@ impl super::Services {
     // the app is out of work, park on the busy-pin edge instead of
     // polling, so waveform completion wakes us immediately.
     //
-    // first deferred action wins; hold reset prevents the held
-    // button from re-firing LongPress/Repeat for the waveform
-    //
-    // the outcome carries the deferred action and whether a
-    // power-long-press arrived, so the caller can sleep after the EPD
-    // finishes
+    // input is left queued for the main loop (see below)
     async fn wave_window<A: AppLayer, M>(
         &mut self,
         wave: &mut super::screen::Wave<'_, M>,
         app_mgr: &mut A,
-    ) -> WaveOutcome<A::Id> {
+    ) {
         // derived from the driver's own busy-pin bound; without a timed
         // arm in the parks, a stuck-high busy pin would park the whole
         // loop forever
         const WAVEFORM_GUARD: Duration =
             Duration::from_millis(crate::drivers::ssd1677::BUSY_TIMEOUT_MS);
         let guard_at = Instant::now() + WAVEFORM_GUARD;
-
-        // both stay empty now that input is not consumed here; the
-        // caller's shape is unchanged so a future mid-wave action
-        // (a worker result that needs applying, say) has a slot
-        let deferred: Option<DeferredAction<A::Id>> = None;
-        let sleep_requested = false;
 
         loop {
             if !wave.is_busy() {
@@ -1282,11 +1099,6 @@ impl super::Services {
             // (the deadline check lives in the main loop only)
             self.run_due_housekeeping();
         }
-
-        WaveOutcome {
-            deferred,
-            sleep: sleep_requested,
-        }
     }
 }
 
@@ -1302,10 +1114,6 @@ impl super::Kernel {
     /// has nobody watching and goes straight to the sleep screen.
     async fn sleep_with_session<A: AppLayer>(&mut self, app_mgr: &mut A, reason: &str, ack: bool) {
         let sleep_start = Instant::now();
-
-        // about to deep-sleep, cancel any pending grayscale-AA fire so
-        // it doesn't run with stale state on wake.
-        self.svc.aa.cancel();
 
         // save active app state (reader position) to bookmark cache
         // before collecting session, so bookmarks stay in sync
