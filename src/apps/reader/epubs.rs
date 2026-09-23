@@ -1021,6 +1021,13 @@ impl ReaderApp {
                         if !work_queue::is_idle() {
                             self.epub.bg_cache = BgCacheState::WaitImage;
                             BgOutcome::WaitingExternal
+                        } else if crate::kernel::tasks::input_pending() {
+                            // the scan stopped for a press: asking to be
+                            // called again at once would restart it into
+                            // the same press (inside a waveform, where
+                            // input is not dispatched, for the whole
+                            // waveform). resume once the press is handled
+                            BgOutcome::Progress { more: false }
                         } else {
                             BgOutcome::Progress { more: true }
                         }

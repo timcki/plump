@@ -267,7 +267,7 @@ Embassy executor on esp-rtos. Five concurrent tasks:
 | Task | Role | File |
 |------|------|------|
 | `main` | Event loop: input dispatch, app work, rendering | `kernel/scheduler.rs` |
-| `input_task` | 10 ms ADC poll (adaptive: fast when active, slow when idle), debounce, battery read | `kernel/tasks.rs` |
+| `input_task` | (interrupt executor) 10 ms ADC poll (adaptive: fast when active, slow when idle), debounce, battery read | `kernel/tasks.rs` |
 | `housekeeping_task` | Status bar (5s), SD check (30s), bookmark flush (30s) | `kernel/tasks.rs` |
 | `idle_timeout_task` | Configurable idle timer, signals deep sleep | `kernel/tasks.rs` |
 | `worker_task` | Background CPU-heavy work (image decode) | `kernel/work_queue.rs` |
@@ -310,13 +310,13 @@ EPD and SD share one SPI2 bus via `CriticalSectionDevice` (RefCell under the hoo
 3. `render()` touches the EPD; during the waveform window `Services::wave_window` runs SD I/O because the EPD charge pump is driving pixels with no SPI commands
 4. No SD I/O outside these three sites
 
-The `Kernel` is split into a `Screen` half (EPD + strip + delay) and a `Services` half (SD, caches, policy state); a `Wave` session borrows the screen half while `wave_window` works the services half, so the phase interleaving is checked by the borrow checker. Violating the SPI ordering at runtime panics (RefCell double-borrow), never corrupts — enforced by the single-threaded executor, there's no preemption.
+The `Kernel` is split into a `Screen` half (EPD + strip + delay) and a `Services` half (SD, caches, policy state); a `Wave` session borrows the screen half while `wave_window` works the services half, so the phase interleaving is checked by the borrow checker. Violating the SPI ordering at runtime panics (RefCell double-borrow), never corrupts — enforced by the single-threaded executor; the only pre-emption is `input_task` on its interrupt executor, which never touches the bus.
 
 ### Input system
 
 Two ADC resistance ladders at 100 Hz (adaptive: fast when active, 50 ms slow when idle). 4-sample oversampling per read. 15 ms debounce, 1 s long-press, 150 ms repeat. The `InputDriver` produces raw `Event`s (Press/Release/LongPress/Repeat of physical `Button`). The `ButtonMapper` translates these to semantic `ActionEvent`s (Next/Prev/Select/Back/Menu). Apps never see hardware buttons.
 
-**Sampling during long work.** The ladders have no interrupt, so a press is only seen when someone samples the ADC, and on this single-core executor `input_task` only runs between steps. A decode, scan or cache step that runs for a few hundred ms would let a whole press start and end between two samples. The driver therefore lives in `tasks::SAMPLER` (installed from `main` with `install_input`), and `tasks::sample_input()` takes a sample whenever a fast tick has passed since the last one: every `KernelHandle::sd()` call does it, which covers everything an app does chunk by chunk off the card, and the worker's JPEG decode does it every 1 KB read (`SampledReader` in `main.rs`). Events wait in `INPUT_EVENTS` until the scheduler gets the CPU back. Background work that can be picked up again checks `tasks::input_pending()` and stops early: the reader's inline image precache abandons its decode (and retries the same image later, with no failure marker), and the image scan stops between chapters.
+**Input during long work.** The ladders have no interrupt, so a press is only seen when someone samples the ADC. A decode, scan or cache step on the thread-mode executor runs for hundreds of ms without yielding, which would let a whole press start and end between two samples. `input_task` therefore runs on its own `InterruptExecutor` (software interrupt 1, priority 1, started in `main.rs`): its 10 ms timer pre-empts thread-mode work, so presses are sampled on time and wait in `INPUT_EVENTS` until the scheduler gets the CPU back (`tasks::try_next_event` / `next_event`). Background work that can be picked up again checks `tasks::input_pending()`, which counts queued presses, long presses and repeats but not releases, and stops early: the reader's inline image precache abandons its decode (and retries the same image later, with no failure marker), and the image scan stops between chapters. A step that stopped for a press reports `Progress { more: false }` so a waveform window (which leaves input queued) parks instead of restarting it; the main loop's background chain turns that back into `more: true` once it has dispatched the press.
 
 ### Navigation
 

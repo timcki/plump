@@ -25,12 +25,9 @@ impl<'k> KernelHandle<'k> {
         Self { svc }
     }
 
-    /// Direct access to the SD storage for file I/O. every long
-    /// operation an app runs goes through here chunk by chunk, so this
-    /// is also where the buttons get sampled while it runs
+    /// Direct access to the SD storage for file I/O.
     #[inline]
     pub fn sd(&self) -> &SdStorage {
-        super::tasks::sample_input();
         &self.svc.sd
     }
 

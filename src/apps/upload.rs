@@ -1568,7 +1568,7 @@ fn put_response_header(w: &mut DnsBuf<'_>) {
 /// exists, so Right on the last tab is a no-op instead of an exit.
 async fn wait_for_exit(mapper: &ButtonMapper) -> UploadExit {
     loop {
-        let hw = tasks::INPUT_EVENTS.receive().await;
+        let hw = tasks::next_event().await;
         let action = match mapper.map_event(hw) {
             ActionEvent::Press(a) | ActionEvent::LongPress(a) | ActionEvent::Repeat(a) => a,
             _ => continue,

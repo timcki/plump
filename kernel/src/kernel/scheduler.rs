@@ -360,7 +360,7 @@ impl super::Kernel {
 
             // drain queued input; a burst of keypresses coalesces into
             // one pass over the loop body instead of one render each
-            while let Ok(ev) = tasks::INPUT_EVENTS.try_receive() {
+            while let Some(ev) = tasks::try_next_event() {
                 if matches!(ev, Event::LongPress(_)) {
                     debug!("scheduler: received {:?}", ev);
                 }
@@ -399,9 +399,10 @@ impl super::Kernel {
             // background steps are bounded and sync; between steps we
             // poll for input so the user can interrupt long-running
             // multi-step operations (e.g. chapter caching). the
-            // yield_now lets input_task/worker_task actually run during
-            // a long Progress chain; without an await point they starve
-            // on the cooperative executor
+            // yield_now lets worker_task actually run during a long
+            // Progress chain; without an await point it starves on the
+            // cooperative executor (input_task runs on its own
+            // interrupt executor and pre-empts regardless)
             let mut outcome;
             'bg: loop {
                 outcome = {
@@ -409,8 +410,12 @@ impl super::Kernel {
                     app_mgr.run_background_step(&mut handle, super::app::BgBudget::new())
                 };
 
-                // check for pending input between steps
-                if let Ok(ev) = tasks::INPUT_EVENTS.try_receive() {
+                // drain pending input between steps; one event per step
+                // would hold a press's release (or a second press) back
+                // by a whole step
+                let mut took_input = false;
+                while let Some(ev) = tasks::try_next_event() {
+                    took_input = true;
                     if self.dispatch_input(ev, app_mgr).await.wants_sleep() {
                         // sleep returns; restart main loop
                         break 'bg;
@@ -418,6 +423,12 @@ impl super::Kernel {
                     if app_mgr.needs_special_mode() {
                         break 'bg;
                     }
+                }
+                // a step that stopped early for a press reports no more
+                // work so it is not re-entered into that press; the
+                // press is handled now, so the chain carries on
+                if took_input && matches!(outcome, super::app::BgOutcome::Progress { more: false }) {
+                    outcome = super::app::BgOutcome::Progress { more: true };
                 }
 
                 match outcome {
@@ -546,7 +557,7 @@ impl super::Kernel {
             }
 
             let ev = select3(
-                tasks::INPUT_EVENTS.receive(),
+                tasks::next_event(),
                 worker_arm(matches!(outcome, super::app::BgOutcome::WaitingExternal)),
                 Timer::at(deadline),
             )
