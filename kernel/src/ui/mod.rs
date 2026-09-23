@@ -1,7 +1,7 @@
 // widget primitives for 1-bit e-paper displays
 //
 // font-independent: Region, Alignment, stack measurement, StackFmt
-// font-dependent widgets (BitmapLabel, QuickMenu, ButtonFeedback)
+// font-dependent widgets (BitmapLabel, QuickMenu)
 // live in the distro's apps::widgets module
 
 pub mod layout;

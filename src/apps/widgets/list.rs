@@ -1,8 +1,7 @@
 // list selection and scrolling helper
 //
-// consolidates the repeated pattern of managing a selection cursor
-// within a scrollable list. handles wrapping, scroll adjustment,
-// and visibility calculations.
+// a selection cursor within a scrollable list: wrapping moves and
+// scroll adjustment
 use crate::ui::{wrap_next, wrap_prev};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -21,11 +20,6 @@ impl ListSelection {
             count,
             visible,
         }
-    }
-
-    pub fn reset(&mut self) {
-        self.selected = 0;
-        self.scroll = 0;
     }
 
     pub fn set_count(&mut self, count: usize) {
@@ -76,75 +70,6 @@ impl ListSelection {
         self.selected != old
     }
 
-    pub fn move_down(&mut self) -> bool {
-        if self.count == 0 || self.selected + 1 >= self.count {
-            return false;
-        }
-        self.selected += 1;
-        self.scroll_into_view();
-        true
-    }
-
-    pub fn move_up(&mut self) -> bool {
-        if self.count == 0 || self.selected == 0 {
-            return false;
-        }
-        self.selected -= 1;
-        self.scroll_into_view();
-        true
-    }
-
-    pub fn page_down(&mut self) -> bool {
-        if self.count == 0 {
-            return false;
-        }
-        let old = self.selected;
-        self.selected = (self.selected + self.visible).min(self.count - 1);
-        self.scroll_into_view();
-        self.selected != old
-    }
-
-    pub fn page_up(&mut self) -> bool {
-        if self.count == 0 {
-            return false;
-        }
-        let old = self.selected;
-        self.selected = self.selected.saturating_sub(self.visible);
-        self.scroll_into_view();
-        self.selected != old
-    }
-
-    pub fn jump_to_start(&mut self) -> bool {
-        if self.count == 0 || self.selected == 0 {
-            return false;
-        }
-        self.selected = 0;
-        self.scroll = 0;
-        true
-    }
-
-    pub fn jump_to_end(&mut self) -> bool {
-        if self.count == 0 || self.selected == self.count - 1 {
-            return false;
-        }
-        self.selected = self.count - 1;
-        self.scroll_into_view();
-        true
-    }
-
-    pub fn select(&mut self, index: usize) -> bool {
-        if self.count == 0 {
-            return false;
-        }
-        let index = index.min(self.count - 1);
-        if self.selected == index {
-            return false;
-        }
-        self.selected = index;
-        self.scroll_into_view();
-        true
-    }
-
     pub fn scroll_into_view(&mut self) {
         if self.count == 0 || self.visible == 0 {
             return;
@@ -170,27 +95,5 @@ impl ListSelection {
     pub fn visible_count(&self) -> usize {
         self.visible.min(self.count.saturating_sub(self.scroll))
     }
-
-    pub fn is_visible(&self, index: usize) -> bool {
-        index >= self.scroll && index < self.scroll + self.visible
-    }
-
-    pub fn to_visible_index(&self, index: usize) -> Option<usize> {
-        if self.is_visible(index) {
-            Some(index - self.scroll)
-        } else {
-            None
-        }
-    }
 }
 
-/// ensure `selected` is visible in a scrolling window of `visible` rows.
-/// adjusts `scroll` in place. use this when ListSelection is too
-/// heavyweight (e.g. when visible count is dynamic).
-pub fn ensure_visible(selected: usize, scroll: &mut usize, visible: usize) {
-    if selected < *scroll {
-        *scroll = selected;
-    } else if selected >= *scroll + visible {
-        *scroll = selected + 1 - visible;
-    }
-}

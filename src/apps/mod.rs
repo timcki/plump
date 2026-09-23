@@ -49,7 +49,6 @@ impl AppIdType for AppId {
 }
 
 pub type Transition = crate::kernel::app::Transition<AppId>;
-pub type NavEvent = crate::kernel::app::NavEvent<AppId>;
 pub type Launcher = crate::kernel::app::Launcher<AppId>;
 
 pub use crate::kernel::app::{

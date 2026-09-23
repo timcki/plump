@@ -1438,11 +1438,6 @@ impl ReaderApp {
         Ok(())
     }
 
-    // public accessors for home screen display
-    pub fn reading_stats(&self) -> &crate::apps::stats::ReadingStats {
-        &self.stats
-    }
-
     #[inline]
     pub fn has_book(&self) -> bool {
         !self.filename.is_empty()
@@ -3741,20 +3736,12 @@ impl App<AppId> for ReaderApp {
         let _ = write!(out, " \u{00B7} {}% read", self.progress_pct());
     }
 
-    fn hide_button_bar(&self) -> bool {
-        true
-    }
-
     /// The reader never shows the shared top status bar: its stat
     /// fields change with every page turn, so each turn used to pay a
     /// separate bar refresh (DU + gray pass) right after the page
     /// settled. The "show chrome" setting still controls the reader's
     /// own bottom info bar.
     fn show_top_status(&self) -> bool {
-        false
-    }
-
-    fn show_tab_bar(&self) -> bool {
         false
     }
 

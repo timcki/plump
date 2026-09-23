@@ -20,16 +20,6 @@ pub const FIRST_CHAR: u8 = 0x20;
 pub const LAST_CHAR: u8 = 0x7E;
 pub const GLYPH_COUNT: usize = (LAST_CHAR - FIRST_CHAR + 1) as usize;
 
-// map a raw byte to a printable ascii char, or '?' if out of range
-#[inline]
-pub fn byte_to_char(b: u8) -> char {
-    if (FIRST_CHAR..=LAST_CHAR).contains(&b) {
-        b as char
-    } else {
-        '?'
-    }
-}
-
 // metrics and bitmap location for a single rasterised glyph
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -113,16 +103,6 @@ impl BitmapFont {
         }
     }
 
-    // true if this font has a real glyph for ch (not just '?' fallback)
-    #[inline]
-    pub fn has_glyph(&self, ch: char) -> bool {
-        let code = ch as u32;
-        if code >= FIRST_CHAR as u32 && code <= LAST_CHAR as u32 {
-            return true;
-        }
-        self.ext_codepoints.binary_search(&code).is_ok()
-    }
-
     // horizontal advance for a single character
     #[inline]
     pub fn advance(&self, ch: char) -> u8 {
@@ -164,11 +144,6 @@ impl BitmapFont {
     #[inline]
     pub fn measure_str(&self, text: &str) -> u16 {
         text.chars().map(|c| self.advance(c) as u16).sum()
-    }
-
-    // total width in pixels of a &[u8] slice (decodes utf-8)
-    pub fn measure_bytes(&self, text: &[u8]) -> u16 {
-        Utf8Iter::new(text).map(|c| self.advance(c) as u16).sum()
     }
 
     /// Find the byte offset at which `text` should be truncated so that
@@ -223,11 +198,6 @@ impl BitmapFont {
         g.advance
     }
 
-    // draw a &str at (cx, baseline) in black, return final x
-    pub fn draw_str(&self, strip: &mut StripBuffer, text: &str, cx: i32, baseline: i32) -> i32 {
-        self.draw_str_fg(strip, text, BinaryColor::On, cx, baseline)
-    }
-
     // draw a &str with given foreground, return final x
     pub fn draw_str_fg(
         &self,
@@ -249,22 +219,6 @@ impl BitmapFont {
         let mut x = cx;
         for ch in Utf8Iter::new(text) {
             x += self.draw_char(strip, ch, x, baseline) as i32;
-        }
-        x
-    }
-
-    // draw a &[u8] with given foreground, return final x
-    pub fn draw_bytes_fg(
-        &self,
-        strip: &mut StripBuffer,
-        text: &[u8],
-        fg: BinaryColor,
-        cx: i32,
-        baseline: i32,
-    ) -> i32 {
-        let mut x = cx;
-        for ch in Utf8Iter::new(text) {
-            x += self.draw_char_fg(strip, ch, fg, x, baseline) as i32;
         }
         x
     }

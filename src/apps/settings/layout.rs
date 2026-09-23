@@ -86,10 +86,6 @@ impl Damage {
         }
     }
 
-    #[inline]
-    pub fn is_none(self) -> bool {
-        matches!(self, Self::None)
-    }
 }
 
 pub struct SettingsList {

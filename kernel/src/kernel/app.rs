@@ -600,22 +600,9 @@ pub trait App<Id> {
         Ok(())
     }
 
-    fn hide_button_bar(&self) -> bool {
-        false
-    }
-
     /// True if the manager should paint the shared top status bar
-    /// above this app's content. Reader keeps this on (same today /
-    /// battery line as other tabs) but draws its own page footer in
-    /// place of the tab bar, so it overrides `show_tab_bar`.
+    /// above this app's content. The reader turns it off.
     fn show_top_status(&self) -> bool {
-        true
-    }
-
-    /// True if the manager should paint the shared bottom tab bar
-    /// below this app's content. Reader returns false because it
-    /// paints its own progress footer instead.
-    fn show_tab_bar(&self) -> bool {
         true
     }
 

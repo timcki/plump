@@ -16,7 +16,7 @@ use crate::apps::upload::UploadExit;
 use crate::apps::widgets::quick_menu::{
     MAX_APP_ACTIONS, MenuContext, QuickAction, QuickMenuResult,
 };
-use crate::apps::widgets::{ButtonFeedback, QuickMenu, SleepCard};
+use crate::apps::widgets::{QuickMenu, SleepCard};
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::input::Event;
@@ -108,7 +108,6 @@ pub struct AppManager {
     pub stats: &'static mut StatsApp,
 
     pub quick_menu: &'static mut QuickMenu,
-    pub bumps: &'static mut ButtonFeedback,
 
     // filled right before the active app drops its heap for sleep,
     // painted by the kernel's sleep passes through `draw_sleep_overlay`
@@ -220,7 +219,6 @@ impl AppManager {
         settings: &'static mut SettingsApp,
         stats: &'static mut StatsApp,
         quick_menu: &'static mut QuickMenu,
-        bumps: &'static mut ButtonFeedback,
         sleep_card: &'static mut SleepCard,
         mapper: ButtonMapper,
     ) -> Self {
@@ -232,7 +230,6 @@ impl AppManager {
             settings,
             stats,
             quick_menu,
-            bumps,
             sleep_card,
             mapper,
             nav: AppNav::new(Tab::Home),
@@ -253,66 +250,6 @@ impl AppManager {
         self.chrome.top.active = tab;
     }
 
-    /// Currently active tab in the new nav model. Chrome reads this
-    /// to highlight the right tab in the bottom bar.
-    #[inline]
-    pub fn active_tab(&self) -> Tab {
-        self.nav.active_tab()
-    }
-
-    /// Currently open modal, if any.
-    #[inline]
-    pub fn active_modal(&self) -> Option<Modal> {
-        self.nav.modal()
-    }
-
-    /// Combined view: tab or modal-over-tab. Useful for chrome
-    /// decisions ("show the chrome only when no modal is open"
-    /// happens via `App::show_chrome` on the active app, not here).
-    #[inline]
-    pub fn active_nav_slot(&self) -> AppNavSlot {
-        self.nav.active_slot()
-    }
-
-    #[inline]
-    pub fn active(&self) -> AppId {
-        self.launcher.active()
-    }
-
-    #[inline]
-    pub fn ctx(&self) -> &AppContext {
-        &self.launcher.ctx
-    }
-
-    #[inline]
-    pub fn ctx_mut(&mut self) -> &mut AppContext {
-        &mut self.launcher.ctx
-    }
-
-    #[inline]
-    pub fn has_redraw(&self) -> bool {
-        self.launcher.ctx.has_redraw()
-    }
-
-    #[inline]
-    pub fn take_redraw(&mut self) -> Redraw {
-        self.launcher.ctx.take_redraw()
-    }
-
-    #[inline]
-    pub fn request_full_redraw(&mut self) {
-        self.launcher.ctx.request_full_redraw();
-    }
-
-    #[inline]
-    pub fn apply_nav(&mut self, transition: Transition) -> Option<crate::apps::NavEvent> {
-        let result = self.launcher.apply(transition);
-        if result.is_some() {
-            self.sync_nav_from_launcher();
-        }
-        result
-    }
-
     pub fn load_eager_settings(&mut self, k: &mut KernelHandle<'_>) {
         self.settings.load_eager(k);
         self.propagate_fonts();
@@ -323,15 +260,6 @@ impl AppManager {
     fn sync_button_config(&mut self) {
         let swap = self.settings.system_settings().swap_buttons;
         self.mapper.set_swap(swap);
-        if self.bumps.set_swap(swap) {
-            // labels changed, need to redraw the button bar
-            self.launcher.ctx.mark_dirty(crate::ui::Region::new(
-                0,
-                crate::board::SCREEN_H - crate::ui::BUTTON_BAR_H,
-                crate::board::SCREEN_W,
-                crate::ui::BUTTON_BAR_H,
-            ));
-        }
     }
 
     pub fn load_home_recent(&mut self, k: &mut KernelHandle<'_>) {
@@ -883,9 +811,6 @@ impl AppManager {
 
     pub fn draw(&self, strip: &mut StripBuffer) {
         let active = self.launcher.active();
-        // `show_tab_bar` now only says whether this screen is a tab
-        // screen at all; there is one bar and it lives at the top
-        let show_tabs = with_app_ref!(active, self, |app| app.show_tab_bar());
 
         if let Some(under) = self.reader_backdrop() {
             self.draw_screen(under, strip);
@@ -900,15 +825,6 @@ impl AppManager {
 
         if self.quick_menu.open {
             self.quick_menu.draw(strip);
-        }
-
-        // legacy button feedback bumps: only drawn when the active app
-        // does NOT use the new chrome (today, only Reader). once
-        // chunk G lands the new reader footer, button feedback gets
-        // deleted entirely in chunk N.
-        let hide = with_app_ref!(active, self, |app| app.hide_button_bar());
-        if !hide && !show_tabs {
-            self.bumps.draw(strip);
         }
 
         // the sleep modal wins over every overlay, the menu included
@@ -969,7 +885,6 @@ impl AppManager {
         self.reader.set_chrome_font(chrome);
         self.reader.set_ui_font_size(ui_idx);
         self.quick_menu.set_ui_font_size(ui_idx);
-        self.bumps.set_chrome_font(fonts::button_label_font());
     }
 
     fn sync_quick_menu(&mut self) {
@@ -995,16 +910,6 @@ impl AppManager {
                 }
             }
         }
-    }
-
-    #[inline]
-    pub fn system_settings(&self) -> &crate::kernel::config::SystemSettings {
-        self.settings.system_settings()
-    }
-
-    #[inline]
-    pub fn settings_generation(&self) -> u32 {
-        self.settings.generation()
     }
 
     pub fn ghost_clear_every(&self) -> u32 {
@@ -1082,14 +987,6 @@ impl AppLayer for AppManager {
 
     fn on_swap_buttons_changed(&mut self, swap: bool) {
         self.mapper.set_swap(swap);
-        if self.bumps.set_swap(swap) {
-            self.launcher.ctx.mark_dirty(crate::ui::Region::new(
-                0,
-                crate::board::SCREEN_H - crate::ui::BUTTON_BAR_H,
-                crate::board::SCREEN_W,
-                crate::ui::BUTTON_BAR_H,
-            ));
-        }
     }
 
     fn set_chrome_state(&mut self, battery_pct: u8, today_pages: u16, today_secs: u32) {

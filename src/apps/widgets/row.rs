@@ -79,11 +79,7 @@ impl CoverBox {
 /// however few rows the list held.
 const COVER_PAD: u16 = 10;
 
-pub const COVER_W: u16 = CoverBox::Mini.w();
 pub const COVER_H: u16 = CoverBox::Mini.h();
-
-/// Row height for a list whose lead is a Mini cover.
-pub const COVER_ROW_H: u16 = CoverBox::Mini.row_h();
 
 /// Row height everywhere else: one line of UI body text with room
 /// around it. It is the floor `row_height` never goes under, not a
@@ -214,25 +210,6 @@ impl<'a> RowSpec<'a> {
         self
     }
 
-    pub fn lead(mut self, lead: RowLead<'a>) -> Self {
-        self.lead = lead;
-        self
-    }
-
-    pub fn selected(mut self, selected: bool) -> Self {
-        self.selected = selected;
-        self
-    }
-
-    pub fn progress(mut self, done: u32, total: u32) -> Self {
-        self.progress = Some((done, total));
-        self
-    }
-
-    pub fn chip(mut self, chip: ValueChip) -> Self {
-        self.chip = chip;
-        self
-    }
 }
 
 /// Where a row sits in its group, which decides its separator and
@@ -251,10 +228,6 @@ impl RowEdges {
         }
     }
 
-    pub const ONLY: Self = Self {
-        first: true,
-        last: true,
-    };
 }
 
 fn rounded(strip: &mut StripBuffer, r: Region, radius: u32, style: PrimitiveStyle<BinaryColor>) {

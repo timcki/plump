@@ -23,7 +23,7 @@ use crate::fonts::{self, bitmap::BitmapFont};
 use crate::ui::Region;
 
 use super::row::{self, RowEdges, RowFonts};
-pub use super::row::{ICON_BOOKMARK, RowLead, RowSpec, ValueChip, draw_ellipsized};
+pub use super::row::{RowLead, RowSpec, ValueChip, draw_ellipsized};
 
 pub const SHEET_MARGIN: u16 = 20;
 pub const SHEET_X: u16 = SHEET_MARGIN;

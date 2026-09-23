@@ -58,7 +58,6 @@ pub enum ReaderFont {
     Atkinson,
 }
 
-pub const NUM_READER_FONTS: u8 = 2;
 pub const READER_FONT_NAMES: &[&str] = &["Bookerly", "Atkinson"];
 
 impl ReaderFont {
@@ -248,12 +247,6 @@ pub fn chrome_font() -> &'static BitmapFont {
     ui_body_font(0)
 }
 
-// button label font (edge-of-screen action labels)
-#[inline]
-pub fn button_label_font() -> &'static BitmapFont {
-    ui_body_font(0)
-}
-
 /// Phosphor icon font for chrome widgets. Tab bar uses MEDIUM (idx 2);
 /// panel rows pick smaller sizes via the same dispatch.
 #[inline]
@@ -369,13 +362,6 @@ impl FontSet {
         Self::for_family(font.family(), idx)
     }
 
-    /// Build a FontSet for UI. Inter when present; Bookerly fallback
-    /// when no Inter TTF was supplied at build time.
-    #[inline]
-    pub fn for_ui(idx: u8) -> Self {
-        Self::for_family(ui_family(), idx)
-    }
-
     #[inline]
     pub fn font(&self, style: Style) -> &'static BitmapFont {
         match style {
@@ -406,11 +392,6 @@ impl FontSet {
     #[inline]
     pub fn advance(&self, ch: char, style: Style) -> u8 {
         self.font(style).advance(ch)
-    }
-
-    #[inline]
-    pub fn advance_byte(&self, b: u8, style: Style) -> u8 {
-        self.font(style).advance(bitmap::byte_to_char(b))
     }
 
     /// Pair kerning between two glyphs of one word drawn in `style`.
@@ -445,14 +426,4 @@ impl FontSet {
         self.font(style).draw_bytes(strip, text, cx, baseline)
     }
 
-    pub fn draw_str(
-        &self,
-        strip: &mut StripBuffer,
-        text: &str,
-        style: Style,
-        cx: i32,
-        baseline: i32,
-    ) -> i32 {
-        self.font(style).draw_str(strip, text, cx, baseline)
-    }
 }

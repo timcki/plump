@@ -121,7 +121,6 @@ pub enum InfoId {
 }
 
 impl InfoId {
-    pub const ALL: [Self; 4] = [Self::Version, Self::Storage, Self::Battery, Self::Uptime];
 
     pub const fn label(self) -> &'static str {
         match self {
