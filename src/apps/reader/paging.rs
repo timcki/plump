@@ -1342,6 +1342,23 @@ fn measure_bytes(bytes: &[u8], fs: &fonts::FontSet, style: fonts::Style) -> u32 
     w.max(0) as u32
 }
 
+/// Merge the first pair of adjacent runs in `runs[first..*count]` that
+/// share a style and touch in the buffer (a width split), freeing a
+/// slot. Pass 1 only: `x` still holds natural widths.
+fn merge_width_split(runs: &mut [Run], first: usize, count: &mut usize) -> bool {
+    for r in first..count.saturating_sub(1) {
+        let (a, b) = (runs[r], runs[r + 1]);
+        if a.style == b.style && a.start as u32 + a.len as u32 == b.start as u32 {
+            runs[r].len = a.len + b.len;
+            runs[r].x = a.x.saturating_add(b.x);
+            runs.copy_within(r + 2..*count, r + 1);
+            *count -= 1;
+            return true;
+        }
+    }
+    false
+}
+
 impl ReaderApp {
     /// Decode the loaded page once: per-line vertical positions, natural
     /// widths and gap counts, justification, and the style runs the
@@ -1397,7 +1414,9 @@ impl ReaderApp {
                 let mut src = SliceSource(&buf[..end]);
                 let mut ev = Events::resume(&mut src, start, span.start_style(), BlockProps::DEFAULT);
                 let mut n_runs = 0usize;
+                let mut after_space = false;
                 while let Some(e) = ev.next_event() {
+                    let is_word = matches!(e, Event::Word { .. });
                     let (s, e_end, style, adv, is_gap) = match e {
                         Event::Word { start, end, style } => {
                             let fsty = fonts::Style::from_markup(style);
@@ -1425,12 +1444,34 @@ impl ReaderApp {
                         trailing = 0;
                     }
                     let packed = style.pack();
-                    let extend = n_runs > 0 && {
+                    let continues = n_runs > 0 && {
                         let last = &runs[pg.run_count - 1];
-                        (last.style == packed && last.start as u32 + last.len as u32 == s)
-                            || n_runs >= MAX_RUNS_PER_LINE
-                            || pg.run_count >= MAX_PAGE_RUNS
+                        last.style == packed && last.start as u32 + last.len as u32 == s
                     };
+                    let full = |n: usize, count: usize| {
+                        n >= MAX_RUNS_PER_LINE || count >= MAX_PAGE_RUNS
+                    };
+                    // a style change takes back a slot a width split used
+                    if n_runs > 0
+                        && !continues
+                        && full(n_runs, pg.run_count)
+                        && merge_width_split(runs, first_run, &mut pg.run_count)
+                    {
+                        n_runs -= 1;
+                    }
+                    // split a long run at a word start: each run is a
+                    // point a strip pass can start drawing from, so a
+                    // pass skips whole runs left of its column instead
+                    // of walking every glyph from the line start. after
+                    // a space the kerning pair is already broken, so the
+                    // split draws the same pixels
+                    let split = continues
+                        && is_word
+                        && after_space
+                        && runs[pg.run_count - 1].x as i32 >= text_w / MAX_RUNS_PER_LINE as i32
+                        && !full(n_runs, pg.run_count);
+                    after_space = is_gap;
+                    let extend = n_runs > 0 && ((continues && !split) || full(n_runs, pg.run_count));
                     if extend {
                         let last = &mut runs[pg.run_count - 1];
                         last.len = (e_end - last.start as u32) as u16;
