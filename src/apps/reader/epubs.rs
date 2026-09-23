@@ -13,6 +13,7 @@ use smol_epub::epub;
 use crate::error::{Error, ErrorKind};
 use crate::kernel::KernelHandle;
 use crate::kernel::work_queue;
+use plump_kernel::drivers::storage::OpenMode;
 use plump_kernel::kernel::bundle;
 use plump_kernel::kernel::bundle::{BundleFile, SectionId, SectionRange};
 use plump_kernel::util::hash;
@@ -308,24 +309,39 @@ impl EpubState {
 
         bundle::write_header(k.sd(), self.name_hash, &hdr)?;
 
-        // write finalized spine entries
-        for i in 0..spine_len {
-            let (off, size) = self.chapter_table[i];
-            let entry = bundle::SpineEntry {
-                content_offset: off,
-                content_size: size,
-                text_bytes: size,
-                flags: if self.ch_cached[i] {
-                    bundle::SPINE_FLAG_CACHED
-                } else {
-                    0
-                },
-                _reserved: 0,
-            };
-            let bytes = entry.encode();
-            let at = hdr.range(SectionId::Spine).offset
-                + (i * bundle::SPINE_ENTRY_SIZE) as u32;
-            bundle::write_at(k.sd(), self.name_hash, at, &bytes)?;
+        // write finalized spine entries: one open, a block of entries
+        // per write instead of an open, a read-modify-write and a close
+        // per 16-byte entry
+        {
+            const PER_WRITE: usize = 512 / bundle::SPINE_ENTRY_SIZE;
+            let mut file = bundle::open(k.sd(), self.name_hash, OpenMode::Write)?;
+            let spine_at = hdr.range(SectionId::Spine).offset;
+            let mut buf = [0u8; PER_WRITE * bundle::SPINE_ENTRY_SIZE];
+            let mut first = 0usize;
+            while first < spine_len {
+                let n = (spine_len - first).min(PER_WRITE);
+                for j in 0..n {
+                    let i = first + j;
+                    let (off, size) = self.chapter_table[i];
+                    let entry = bundle::SpineEntry {
+                        content_offset: off,
+                        content_size: size,
+                        text_bytes: size,
+                        flags: if self.ch_cached[i] {
+                            bundle::SPINE_FLAG_CACHED
+                        } else {
+                            0
+                        },
+                        _reserved: 0,
+                    };
+                    let at = j * bundle::SPINE_ENTRY_SIZE;
+                    buf[at..at + bundle::SPINE_ENTRY_SIZE].copy_from_slice(&entry.encode());
+                }
+                let at = spine_at + (first * bundle::SPINE_ENTRY_SIZE) as u32;
+                file.write_at(at, &buf[..n * bundle::SPINE_ENTRY_SIZE])?;
+                first += n;
+            }
+            file.close()?;
         }
 
         // zero-fill the PidxDir region so its contents are well-defined
@@ -419,20 +435,15 @@ impl EpubState {
         );
         hdr.set_flag(bundle::FLAG_IS_EPUB, true);
 
-        // create file by writing header at offset 0
-        bundle::write_header(k.sd(), self.name_hash, &hdr)?;
-
-        // append zeroed spine entries in 64-byte chunks
-        let mut remaining = spine_section_size(spine_len) as usize;
-        let zeros = [0u8; 64];
-        let mut off = hdr.range(SectionId::Spine).offset;
-        while remaining > 0 {
-            let chunk = remaining.min(zeros.len());
-            bundle::write_at(k.sd(), self.name_hash, off, &zeros[..chunk])?;
-            off += chunk as u32;
-            remaining -= chunk;
-        }
-        Ok(())
+        // one open: the header at offset 0, then the zeroed spine
+        let mut file = bundle::open(k.sd(), self.name_hash, OpenMode::Write)?;
+        file.write_at(0, &hdr.encode())?;
+        bundle::zero_fill_in(
+            &mut file,
+            hdr.range(SectionId::Spine).offset,
+            spine_section_size(spine_len),
+        )?;
+        file.close()
     }
 
     /// Advance one step of in-progress chapter caching.

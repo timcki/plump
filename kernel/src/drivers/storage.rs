@@ -374,9 +374,10 @@ impl SdStorageInner {
     }
 
     fn delete(&self, dir: RawDirectory, name: &str) -> crate::error::Result<()> {
-        self.mgr
-            .delete_entry_in_dir(dir, name)
-            .map_err(|_| Error::new(ErrorKind::DeleteFailed, "delete"))
+        self.mgr.delete_entry_in_dir(dir, name).map_err(|e| match e {
+            embedded_sdmmc::Error::NotFound => Error::new(ErrorKind::NotFound, "delete"),
+            _ => Error::new(ErrorKind::DeleteFailed, "delete"),
+        })
     }
 
     fn open_dir(&self, name: &str) -> crate::error::Result<RawDirectory> {
@@ -615,6 +616,9 @@ impl SdStorage {
         // here. an open file does not need its directory open
         let (dir, close_dir) = match scope {
             Scope::Root => (inner.root, false),
+            // the data dir by name (settings, bookmarks, RECENT) is
+            // the cached handle, not a root scan per call
+            Scope::Named(d) if d == inner.data_dir.get() => (inner.data_handle()?, false),
             Scope::Named(d) => (inner.open_dir(d)?, true),
             Scope::Data => (inner.data_handle()?, false),
             Scope::DataSub(sub) => {
@@ -832,29 +836,23 @@ impl SdStorage {
         }
     }
 
-    /// Ensure a subdirectory exists under the data directory.
+    /// Ensure a subdirectory exists under the data directory. Free
+    /// once the subdirectory's handle is cached, so callers can ask
+    /// before every write.
     pub fn ensure_plump_subdir(&self, name: &str) -> crate::error::Result<()> {
-        let exists = self.with_scope(Scope::Data, |inner, dir| {
-            match inner.mgr.open_dir(dir, name) {
-                Ok(sub) => {
-                    let _ = inner.mgr.close_dir(sub);
-                    Ok(true)
-                }
-                Err(_) => Ok(false),
+        let inner = inner(self)?;
+        if let Ok((dir, cached)) = inner.sub_handle(name) {
+            if !cached {
+                let _ = inner.mgr.close_dir(dir);
             }
-        })?;
-
-        if exists {
             return Ok(());
         }
-
-        self.with_scope(Scope::Data, |inner, dir| {
-            match inner.mgr.make_dir_in_dir(dir, name) {
-                Ok(()) => Ok(()),
-                Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
-                Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_plump_subdir")),
-            }
-        })
+        let data = inner.data_handle()?;
+        match inner.mgr.make_dir_in_dir(data, name) {
+            Ok(()) => Ok(()),
+            Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
+            Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_plump_subdir")),
+        }
     }
 
     // data dir direct file operations (cache files live directly in the data dir)

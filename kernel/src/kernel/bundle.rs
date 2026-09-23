@@ -861,6 +861,17 @@ pub fn read_at(
     sd.read_chunk_in_plump_subdir(BOOKS_DIR, bundle_file_str(&n), offset, buf)
 }
 
+/// open the bundle once for a run of reads or writes (see
+/// [`crate::drivers::storage::File`]); `OpenMode::Write` creates it
+pub fn open(
+    sd: &SdStorage,
+    name_hash: u32,
+    mode: crate::drivers::storage::OpenMode,
+) -> crate::error::Result<File<'_>> {
+    let n = bundle_file_name(name_hash);
+    sd.open_in_plump_subdir(BOOKS_DIR, bundle_file_str(&n), mode)
+}
+
 /// append bytes to the bundle (creates the file if missing)
 pub fn append(sd: &SdStorage, name_hash: u32, data: &[u8]) -> crate::error::Result<()> {
     let n = bundle_file_name(name_hash);
@@ -885,7 +896,7 @@ pub fn delete(sd: &SdStorage, name_hash: u32) -> crate::error::Result<()> {
     match sd.delete_in_plump_subdir(BOOKS_DIR, bundle_file_str(&n)) {
         Ok(()) => Ok(()),
         // treat missing-file as success; other errors propagate
-        Err(e) if matches!(e.kind(), crate::error::ErrorKind::OpenFile) => Ok(()),
+        Err(e) if matches!(e.kind(), crate::error::ErrorKind::NotFound) => Ok(()),
         Err(e) => Err(e),
     }
 }
@@ -1270,8 +1281,9 @@ impl<'h, 'sd> Section<'h, 'sd> {
     }
 }
 
-// 256-byte zero block used by `zero_fill` to avoid allocating.
-const ZERO_BLOCK: [u8; 256] = [0u8; 256];
+// zeros for `zero_fill_in`, in flash rather than on the stack; 4 KB
+// is eight blocks, one multi-block write each
+static ZERO_CHUNK: [u8; 4096] = [0u8; 4096];
 
 fn zero_fill(
     sd: &SdStorage,
@@ -1279,11 +1291,21 @@ fn zero_fill(
     offset: u32,
     bytes: u32,
 ) -> crate::error::Result<()> {
+    let mut file = open(sd, name_hash, crate::drivers::storage::OpenMode::Write)?;
+    zero_fill_in(&mut file, offset, bytes)?;
+    file.close()
+}
+
+/// write `bytes` zero bytes at `offset` of an open file
+pub fn zero_fill_in(file: &mut File<'_>, offset: u32, bytes: u32) -> crate::error::Result<()> {
     let mut written: u32 = 0;
     while written < bytes {
-        let remaining = bytes - written;
-        let chunk = remaining.min(ZERO_BLOCK.len() as u32) as usize;
-        write_at(sd, name_hash, offset + written, &ZERO_BLOCK[..chunk])?;
+        let chunk = (bytes - written).min(ZERO_CHUNK.len() as u32) as usize;
+        if written == 0 {
+            file.write_at(offset, &ZERO_CHUNK[..chunk])?;
+        } else {
+            file.write(&ZERO_CHUNK[..chunk])?;
+        }
         written += chunk as u32;
     }
     Ok(())
