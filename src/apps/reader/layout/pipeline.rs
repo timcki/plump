@@ -378,8 +378,10 @@ fn check_cap(out_lines: &Vec<LineLayout>) -> Result<(), TypesetError> {
 // lines the output tables grow by at a time. Vec's doubling rule made
 // the step past 2048 lines hold a 24 KB table and its 48 KB successor
 // at once, which is what sank Exhalation's 120 KB novella when the
-// reader already held 38 KB; a fixed exact chunk keeps the transient
-// at one chunk, and TLSF extends the topmost block in place anyway
+// reader already held 38 KB. a fixed exact chunk keeps the growth
+// small, and the allocator's realloc (vendor/esp-alloc) extends the
+// table in place when the block after it is free; only a move holds
+// the old and new tables at once
 const OUT_GROW_LINES: usize = 512;
 
 // reserve room for one paragraph's worth of output in both parallel

@@ -1,7 +1,7 @@
 [workspace]
 members = [".", "kernel"]
-# vendored crate with a local patch; a path dependency, not a member
-exclude = ["vendor/embedded-sdmmc-rs"]
+# vendored crates with local patches; path dependencies, not members
+exclude = ["vendor/embedded-sdmmc-rs", "vendor/esp-alloc"]
 
 [workspace.dependencies]
 esp-hal  = { version = "1.0.0", features = ["esp32c3", "log-04", "unstable"] }
@@ -92,3 +92,8 @@ incremental      = false
 lto              = 'fat'
 opt-level        = 's'
 overflow-checks  = false
+
+# esp-radio depends on esp-alloc too, so the vendored copy goes in as a
+# patch rather than a path dependency (one allocator, one crate)
+[patch.crates-io]
+esp-alloc = { path = "vendor/esp-alloc" }
