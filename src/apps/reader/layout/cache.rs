@@ -38,9 +38,6 @@ const _: () = assert!(bundle::PAGE_RECORD_SIZE == bundle::LINE_RECORD_SIZE);
 pub struct LoadedChapter {
     pub pages: Vec<PageLayout>,
     pub lines: Vec<LineLayout>,
-    /// chapter content size at layout time; callers can compare
-    /// against the live spine entry to detect content drift.
-    pub byte_size: u32,
 }
 
 /// load cached layout for `ch` if it exists and the on-disk key
@@ -177,7 +174,6 @@ pub fn load_layoutidx(
     Some(LoadedChapter {
         pages,
         lines,
-        byte_size: dir_entry.byte_size,
     })
 }
 

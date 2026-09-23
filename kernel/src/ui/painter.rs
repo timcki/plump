@@ -16,7 +16,7 @@
 use embedded_graphics::{
     pixelcolor::BinaryColor,
     prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
+    primitives::Rectangle,
 };
 
 use crate::drivers::strip::StripBuffer;
@@ -54,16 +54,6 @@ impl<'a> Painter<'a> {
         self.theme
     }
 
-    /// Re-borrow with a different foreground color (same clip).
-    pub fn with_fg(&mut self, fg: BinaryColor) -> Painter<'_> {
-        Painter {
-            strip: &mut *self.strip,
-            region: self.region,
-            fg,
-            theme: self.theme,
-        }
-    }
-
     /// Direct mutable access to the underlying strip buffer. Use
     /// sparingly; widgets that need glyph blits should call this and
     /// then go through `StripBuffer`'s blit_* methods with their own
@@ -95,26 +85,6 @@ impl<'a> Painter<'a> {
         }
         let r = Region::new(x0, y, x1 - x0, 1);
         self.fill_in(r, self.fg);
-    }
-
-    /// Rounded rectangle, stroked or filled in the foreground color.
-    ///
-    /// On 1-bit e-paper at small radii the corners are barely visible;
-    /// `radius == 0` falls through to a sharp rect for free.
-    pub fn rounded_rect(&mut self, r: Region, radius: u16, fill: bool) {
-        use embedded_graphics::primitives::RoundedRectangle;
-        if r.w == 0 || r.h == 0 {
-            return;
-        }
-        let rect = Rectangle::new(r.top_left(), Size::new(r.w as u32, r.h as u32));
-        let style = if fill {
-            PrimitiveStyle::with_fill(self.fg)
-        } else {
-            PrimitiveStyle::with_stroke(self.fg, self.theme.panel_stroke as u32)
-        };
-        let _ = RoundedRectangle::with_equal_corners(rect, Size::new(radius as u32, radius as u32))
-            .into_styled(style)
-            .draw(self.strip);
     }
 
     /// True if `r` overlaps the current clip. Cheap pre-check for

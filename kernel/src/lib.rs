@@ -17,4 +17,4 @@ pub mod ui;
 pub mod util;
 
 // re-export core error types at crate root
-pub use error::{Error, ErrorKind, Result, ResultExt};
+pub use error::{Error, ErrorKind, Result};

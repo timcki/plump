@@ -181,7 +181,6 @@ pub struct ParagraphMeta {
     /// the paragraph's block properties (from its block record, or the
     /// defaults / continuation of the block a hard break split)
     pub block: BlockProps,
-    pub style_at_start: Style,
     pub end_kind: ParagraphEnd,
     pub byte_start: u32,
     pub byte_end: u32,
@@ -234,7 +233,6 @@ pub fn build_paragraph(
     lang: Option<Lang>,
     out: &mut Vec<Item>,
 ) -> ParagraphMeta {
-    let style_at_start = events.style();
     let byte_start = events.offset();
     let mut block = events.block();
     let mut last_end: u32 = byte_start;
@@ -259,7 +257,7 @@ pub fn build_paragraph(
 
     loop {
         let Some(ev) = events.next_event() else {
-            return finish(byte_start, last_end, block, style_at_start, ParagraphEnd::EndOfBuffer, None);
+            return finish(byte_start, last_end, block, ParagraphEnd::EndOfBuffer, None);
         };
 
         match ev {
@@ -353,33 +351,33 @@ pub fn build_paragraph(
                 // typesetting purposes; the decoder carries the block's
                 // alignment and left indent over to the continuation
                 push_forced_break_triple(out, start);
-                return finish(byte_start, end, block, style_at_start, ParagraphEnd::ParagraphBreak, None);
+                return finish(byte_start, end, block, ParagraphEnd::ParagraphBreak, None);
             }
 
             Event::ParagraphBreak { start, end } => {
                 push_forced_break_triple(out, start);
-                return finish(byte_start, end, block, style_at_start, ParagraphEnd::ParagraphBreak, None);
+                return finish(byte_start, end, block, ParagraphEnd::ParagraphBreak, None);
             }
 
             Event::PageBreak { start, end } => {
                 if !out.is_empty() {
                     push_forced_break_triple(out, start);
                 }
-                return finish(byte_start, end, block, style_at_start, ParagraphEnd::PageBreakAfter, None);
+                return finish(byte_start, end, block, ParagraphEnd::PageBreakAfter, None);
             }
 
             Event::ThematicBreak { start, end } => {
                 if !out.is_empty() {
                     push_forced_break_triple(out, start);
                 }
-                return finish(byte_start, end, block, style_at_start, ParagraphEnd::ThematicBreak, None);
+                return finish(byte_start, end, block, ParagraphEnd::ThematicBreak, None);
             }
 
             Event::Image(img) => {
                 if !out.is_empty() {
                     push_forced_break_triple(out, img.start);
                 }
-                return finish(byte_start, img.end, block, style_at_start, ParagraphEnd::ImageBlock, Some(img));
+                return finish(byte_start, img.end, block, ParagraphEnd::ImageBlock, Some(img));
             }
 
             Event::Block { at, block: b } => {
@@ -389,7 +387,7 @@ pub fn build_paragraph(
                     last_end = at;
                 } else {
                     push_forced_break_triple(out, at);
-                    return finish(byte_start, at, block, style_at_start, ParagraphEnd::BlockChanged, None);
+                    return finish(byte_start, at, block, ParagraphEnd::BlockChanged, None);
                 }
             }
 
@@ -407,7 +405,6 @@ fn finish(
     byte_start: u32,
     byte_end: u32,
     block: BlockProps,
-    style_at_start: Style,
     end_kind: ParagraphEnd,
     image: Option<ImageRef>,
 ) -> ParagraphMeta {
@@ -416,7 +413,6 @@ fn finish(
     // an empty `out`; the caller skips break + paginate for it.
     ParagraphMeta {
         block,
-        style_at_start,
         end_kind,
         byte_start,
         byte_end,

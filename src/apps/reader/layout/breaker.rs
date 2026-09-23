@@ -48,10 +48,6 @@ impl ChoiceFlags {
     pub fn insert(&mut self, f: Self) {
         self.0 |= f.0;
     }
-    #[inline]
-    pub fn bits(self) -> u8 {
-        self.0
-    }
 }
 
 /// One paragraph line, as decided by the breaker.
@@ -82,10 +78,6 @@ impl BreakChoice {
             r => Adjustment::Shrink((-r) as u16),
         }
     }
-
-    pub fn raw_ratio_q8(&self) -> i16 {
-        self.adjustment_ratio_q8
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,7 +92,6 @@ pub enum Adjustment {
 pub struct BreakConfig {
     pub line_width: u16,
     pub tolerance: u16,
-    pub looseness: i8,
     pub line_penalty: u16,
     pub double_hyphen_demerit: u16,
     pub adjacent_loose_demerit: u16,
@@ -121,18 +112,12 @@ impl BreakConfig {
         // emergency_stretch so pathological narrow-column paragraphs
         // still find a solution.
         tolerance: 200,
-        looseness: 0,
         line_penalty: 10,
         double_hyphen_demerit: 100,
         adjacent_loose_demerit: 100,
         max_items: 2048,
         emergency_stretch: 0,
     };
-
-    pub const fn with_line_width(mut self, w: u16) -> Self {
-        self.line_width = w;
-        self
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,6 +228,7 @@ impl BreakScratch {
 /// On success, `out` is appended with one `BreakChoice` per emitted
 /// line in order; the last choice's `flags` carries `LAST_LINE`.
 /// `out` is not cleared by the function — the caller does that.
+#[cfg(test)]
 pub fn break_paragraph(
     items: &[Item],
     cfg: &BreakConfig,

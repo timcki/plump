@@ -4,8 +4,8 @@
 // synchronous, wrapping async ops with poll_once (SPI bus is blocking
 // so every .await resolves immediately)
 //
-// returns the unified Error type (re-exported as StorageError for
-// backward compat); apps receive it through KernelHandle
+// returns the unified Error type; apps receive it through
+// KernelHandle
 
 use core::cmp::Ordering;
 use core::ops::ControlFlow;
@@ -27,9 +27,6 @@ pub const TITLE_CAP: usize = 64;
 /// tab and the trailing newline. The reader in `dir_cache` sizes its
 /// carry buffer from this, so the two cannot drift apart.
 pub const MAX_TITLE_LINE: usize = 128;
-
-// backward-compatible alias
-pub type StorageError = Error;
 
 #[derive(Clone, Copy)]
 pub struct DirEntry {

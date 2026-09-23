@@ -907,7 +907,7 @@ impl ReaderApp {
             first_paint_full: false,
             spine_hint: 0,
 
-            qa_buf: [QuickAction::trigger(0, "", ""); QA_MAX],
+            qa_buf: [QuickAction::trigger(0, ""); QA_MAX],
             qa_count: 0,
 
             stats: crate::apps::stats::ReadingStats::EMPTY,
@@ -1565,7 +1565,7 @@ impl ReaderApp {
         if self.is_epub && self.epub.toc.as_ref().is_some_and(|t| !t.is_empty()) {
             let mut pos = StackFmt::<16>::new();
             let _ = write!(pos, "{} / {}", self.epub.chapter + 1, self.epub.spine.len());
-            self.qa_buf[n] = QuickAction::trigger(QA_TOC, "Contents", "Open")
+            self.qa_buf[n] = QuickAction::trigger(QA_TOC, "Contents")
                 .with_icon(sheet::ICON_LIST)
                 .with_value(pos.as_str());
             n += 1;

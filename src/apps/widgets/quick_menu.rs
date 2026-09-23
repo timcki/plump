@@ -146,7 +146,7 @@ impl QuickMenu {
                         value,
                         options,
                     },
-                    QuickActionKind::Trigger { .. } => MenuItemKind::AppTrigger { id: a.id },
+                    QuickActionKind::Trigger => MenuItemKind::AppTrigger { id: a.id },
                     QuickActionKind::Info => MenuItemKind::AppInfo,
                 },
             };

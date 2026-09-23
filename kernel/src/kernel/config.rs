@@ -172,16 +172,6 @@ impl SystemSettings {
         }
     }
 
-    /// Look up the active reading theme.
-    pub fn reading_theme(&self) -> &'static ReadingTheme {
-        ReadingTheme::from_idx(self.reading_theme)
-    }
-
-    /// Return the display name for the current text alignment.
-    pub fn text_alignment_name(&self) -> &'static str {
-        text_alignment_name(self.text_alignment)
-    }
-
     pub fn sanitize(&mut self) {
         self.sanitize_with_max_font(Self::DEFAULT_MAX_FONT_IDX);
     }

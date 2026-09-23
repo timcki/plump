@@ -226,7 +226,7 @@ impl HomeApp {
             needs_load: false,
             bat_pct: 0,
             library_count: 0,
-            qa_buf: [QuickAction::trigger(0, "", ""); 2],
+            qa_buf: [QuickAction::trigger(0, ""); 2],
             qa_count: 0,
         }
     }
@@ -423,10 +423,10 @@ impl HomeApp {
         }
         let mut pct = StackFmt::<8>::new();
         let _ = write!(pct, "{}%", self.recent_progress);
-        self.qa_buf[0] = QuickAction::trigger(QA_CONTINUE, "Continue reading", "Open")
+        self.qa_buf[0] = QuickAction::trigger(QA_CONTINUE, "Continue reading")
             .with_icon(ICON_PLAY)
             .with_value(pct.as_str());
-        self.qa_buf[1] = QuickAction::trigger(QA_CONTENTS, "Contents", "Open").with_icon(ICON_LIST);
+        self.qa_buf[1] = QuickAction::trigger(QA_CONTENTS, "Contents").with_icon(ICON_LIST);
         self.qa_count = 2;
     }
 

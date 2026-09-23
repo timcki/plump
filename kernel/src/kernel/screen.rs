@@ -177,12 +177,6 @@ impl Screen {
         }
     }
 
-    /// True while the panel holds AA gray levels (codes in RAM).
-    #[inline]
-    pub fn gray_coded(&self) -> bool {
-        self.planes.has_gray()
-    }
-
     /// Drop the panel's analog rails after an idle stretch. The next
     /// refresh pays the ~100ms booster start inside its waveform; a
     /// panel left powered draws the booster's quiescent current for

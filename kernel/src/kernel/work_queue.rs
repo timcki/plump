@@ -159,11 +159,6 @@ pub struct WorkResult {
 }
 
 impl WorkResult {
-    /// Generation this result was submitted under.
-    #[inline]
-    pub fn generation(&self) -> WorkGen {
-        self.generation
-    }
 
     #[inline]
     pub fn is_current(&self) -> bool {

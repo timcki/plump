@@ -57,10 +57,7 @@ pub use crate::kernel::app::{
 };
 
 // unified error types
-pub use crate::kernel::{Error, ErrorKind, Result, ResultExt};
-
-// backward-compatible alias
-pub use crate::kernel::StorageError;
+pub use crate::kernel::{Error, ErrorKind, Result};
 
 // ── nav rebuild types (unused until chunk B.3+) ───────────────────────
 

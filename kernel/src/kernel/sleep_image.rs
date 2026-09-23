@@ -37,7 +37,6 @@ const MAX_BATCH_BYTES: usize = 16 * 1024;
 pub struct SleepImage {
     pub chunks: [Vec<u8>; CHUNK_COUNT],
     pub width: u16,
-    pub height: u16,
     pub stride: u16,
 }
 
@@ -407,7 +406,6 @@ pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
     Some(SleepImage {
         chunks,
         width: IMG_W as u16,
-        height: IMG_H as u16,
         stride: OUT_STRIDE as u16,
     })
 }

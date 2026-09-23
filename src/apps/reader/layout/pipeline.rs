@@ -57,11 +57,11 @@ pub trait ImageHeightHint {
     fn rendered_height(&mut self, src: &[u8]) -> Option<u16>;
 }
 
-/// No-op `ImageHeightHint` used by host tests and the legacy code path
-/// that has no SD access. Always returns `None`, preserving the
-/// pre-trait fallback behaviour.
+/// No-op `ImageHeightHint` for host tests. Always returns `None`.
+#[cfg(test)]
 pub struct NoImageHint;
 
+#[cfg(test)]
 impl ImageHeightHint for NoImageHint {
     #[inline]
     fn rendered_height(&mut self, _src: &[u8]) -> Option<u16> {

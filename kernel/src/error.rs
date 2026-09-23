@@ -10,14 +10,12 @@ use core::fmt;
 pub enum ErrorKind {
     // storage / sd card
     NoCard,
-    OpenVolume,
     OpenDir,
     OpenFile,
     ReadFailed,
     WriteFailed,
     SeekFailed,
     DeleteFailed,
-    DirFull,
     NotFound,
 
     // data / parsing
@@ -27,7 +25,6 @@ pub enum ErrorKind {
 
     // resources
     OutOfMemory,
-    BufferTooSmall,
 
     // network (upload)
     NetworkIo,
@@ -41,40 +38,21 @@ impl ErrorKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NoCard => "no sd card",
-            Self::OpenVolume => "open volume failed",
             Self::OpenDir => "open dir failed",
             Self::OpenFile => "open file failed",
             Self::ReadFailed => "read failed",
             Self::WriteFailed => "write failed",
             Self::SeekFailed => "seek failed",
             Self::DeleteFailed => "delete failed",
-            Self::DirFull => "directory full",
             Self::NotFound => "not found",
             Self::ParseFailed => "parse failed",
             Self::InvalidData => "invalid data",
             Self::BadEncoding => "bad encoding",
             Self::OutOfMemory => "out of memory",
-            Self::BufferTooSmall => "buffer too small",
             Self::NetworkIo => "network error",
             Self::Protocol => "protocol error",
             Self::Other => "error",
         }
-    }
-
-    pub const fn is_storage(self) -> bool {
-        matches!(
-            self,
-            Self::NoCard
-                | Self::OpenVolume
-                | Self::OpenDir
-                | Self::OpenFile
-                | Self::ReadFailed
-                | Self::WriteFailed
-                | Self::SeekFailed
-                | Self::DeleteFailed
-                | Self::DirFull
-                | Self::NotFound
-        )
     }
 }
 
@@ -117,16 +95,6 @@ impl Error {
             kind: self.kind,
             source,
         }
-    }
-
-    #[inline]
-    pub const fn is_storage(&self) -> bool {
-        self.kind.is_storage()
-    }
-
-    #[inline]
-    pub const fn as_str(&self) -> &'static str {
-        self.kind.as_str()
     }
 }
 
@@ -201,63 +169,6 @@ impl From<Error> for &'static str {
             e.source
         }
     }
-}
-
-// ergonomic source tagging on Result<T, Error> and
-// Result<T, &'static str> (smol-epub returns)
-pub trait ResultExt<T> {
-    fn source(self, src: &'static str) -> Result<T>;
-    fn map_kind(self, kind: ErrorKind, src: &'static str) -> Result<T>;
-}
-
-impl<T> ResultExt<T> for Result<T> {
-    #[inline]
-    fn source(self, src: &'static str) -> Result<T> {
-        self.map_err(|e| e.with_source(src))
-    }
-
-    #[inline]
-    fn map_kind(self, kind: ErrorKind, src: &'static str) -> Result<T> {
-        self.map_err(|_| Error::new(kind, src))
-    }
-}
-
-impl<T> ResultExt<T> for core::result::Result<T, &'static str> {
-    #[inline]
-    fn source(self, src: &'static str) -> Result<T> {
-        self.map_err(|msg| Error::from(msg).with_source(src))
-    }
-
-    #[inline]
-    fn map_kind(self, kind: ErrorKind, src: &'static str) -> Result<T> {
-        self.map_err(|_| Error::new(kind, src))
-    }
-}
-
-// create an Error with module_path!() as source
-//   err!(ReadFailed)
-//   err!(OpenFile, "epub_init_zip")
-#[macro_export]
-macro_rules! err {
-    ($kind:ident) => {
-        $crate::error::Error::new($crate::error::ErrorKind::$kind, module_path!())
-    };
-    ($kind:ident, $src:expr) => {
-        $crate::error::Error::new($crate::error::ErrorKind::$kind, $src)
-    };
-}
-
-// map any Result<T, _> into an Error of the given kind
-//   or_err!(mgr.read(file, buf).await, ReadFailed)
-#[macro_export]
-macro_rules! or_err {
-    ($result:expr, $kind:ident) => {
-        ($result)
-            .map_err(|_| $crate::error::Error::new($crate::error::ErrorKind::$kind, module_path!()))
-    };
-    ($result:expr, $kind:ident, $src:expr) => {
-        ($result).map_err(|_| $crate::error::Error::new($crate::error::ErrorKind::$kind, $src))
-    };
 }
 
 pub type Result<T> = core::result::Result<T, Error>;

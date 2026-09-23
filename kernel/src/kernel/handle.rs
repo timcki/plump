@@ -44,11 +44,6 @@ impl<'k> KernelHandle<'k> {
         self.svc.cached_battery_mv
     }
 
-    #[inline]
-    pub fn sd_ok(&self) -> bool {
-        self.svc.sd_ok
-    }
-
     pub fn ensure_dir_cache_loaded(&mut self) -> Result<()> {
         let k = &mut *self.svc;
         k.dir_cache.ensure_loaded(&k.sd)

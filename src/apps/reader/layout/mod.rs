@@ -21,12 +21,6 @@
 //! and falls back to a greedy first-fit only when the breaker
 //! rejects an input outright.
 
-// `LineLayout::EMPTY`, several scanner accessors, and a few
-// fitness/flag accessors are exercised by host-test infrastructure
-// that doesn't compile on the device target — silence dead-code
-// warnings here rather than peppering individual `#[allow]`s.
-#![allow(dead_code)]
-
 pub mod cache;
 
 pub mod items;
@@ -236,6 +230,7 @@ pub struct LineLayout {
 }
 
 impl LineLayout {
+    #[cfg(test)]
     pub const EMPTY: Self = Self {
         start_byte: 0,
         end_byte: 0,
@@ -266,9 +261,8 @@ impl LineLayout {
     // align mirrors LineSpan; kept independent so this module compiles
     // without depending on the renderer-side type.
     pub const ALIGN_DEFAULT: u8 = 0;
-    pub const ALIGN_LEFT: u8 = 1;
+    #[cfg(test)]
     pub const ALIGN_CENTER: u8 = 2;
-    pub const ALIGN_RIGHT: u8 = 3;
     pub const ALIGN_MASK: u8 = 0x03;
     pub const START_UNDERLINE: u8 = 1 << 2;
     pub const START_STRIKE: u8 = 1 << 3;
@@ -290,14 +284,17 @@ impl LineLayout {
     pub fn is_page_break_before(&self) -> bool {
         self.flags & Self::FLAG_PAGE_BREAK_BEFORE != 0
     }
+    #[cfg(test)]
     #[inline]
     pub fn left_levels(&self) -> u8 {
         self.indent & Self::LEFT_MASK
     }
+    #[cfg(test)]
     #[inline]
     pub fn first_indent_qem(&self) -> u8 {
         self.indent >> Self::FIRST_INDENT_SHIFT
     }
+    #[cfg(test)]
     #[inline]
     pub fn align(&self) -> u8 {
         self.align & Self::ALIGN_MASK
@@ -306,10 +303,12 @@ impl LineLayout {
     pub fn gap_qem(&self) -> u8 {
         self.align >> Self::GAP_SHIFT
     }
+    #[cfg(test)]
     #[inline]
     pub fn starts_underline(&self) -> bool {
         self.align & Self::START_UNDERLINE != 0
     }
+    #[cfg(test)]
     #[inline]
     pub fn starts_strike(&self) -> bool {
         self.align & Self::START_STRIKE != 0
@@ -355,7 +354,8 @@ impl LineLayout {
     }
 
     /// the inline style in force at the line's first byte, as recorded
-    /// by the typesetter; the renderer seeds its decoder with it
+    /// by the typesetter (the renderer decodes it through `LineSpan`)
+    #[cfg(test)]
     pub fn start_style(&self) -> Style {
         let heading = if self.is_heading() {
             match self.hlevel() {
@@ -377,15 +377,9 @@ impl LineLayout {
     }
     #[inline]
     pub fn is_heading(&self) -> bool { self.flags & Self::FLAG_HEADING != 0 }
+    #[cfg(test)]
     #[inline]
     pub fn hlevel(&self) -> u8 { self.flags & Self::HLEVEL_MASK }
-
-    /// True when the renderer is allowed to distribute extra-byte spare
-    /// across inter-word gaps for justification.
-    #[inline]
-    pub fn may_justify(&self) -> bool {
-        !self.is_paragraph_end() && !self.is_heading() && !self.is_image()
-    }
 
     pub fn to_record(&self) -> bundle::LineRecord {
         bundle::LineRecord {

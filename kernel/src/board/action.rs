@@ -59,10 +59,6 @@ impl ButtonMapper {
         self.swap_buttons = swap;
     }
 
-    pub fn is_swapped(&self) -> bool {
-        self.swap_buttons
-    }
-
     // never inlined: llvm lowers roles() to per-call-site switch
     // tables in dram, and the perf build sits within bytes of the
     // linker's 160K heap assert; one out-of-line copy keeps it flat

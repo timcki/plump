@@ -610,7 +610,6 @@ pub mod convert {
         fn meta() -> ParagraphMeta {
             ParagraphMeta {
                 block: BlockProps::DEFAULT,
-                style_at_start: Style::PLAIN,
                 end_kind: ParagraphEnd::ParagraphBreak,
                 byte_start: 0,
                 byte_end: 0,

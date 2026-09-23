@@ -158,8 +158,8 @@ Then every 5 seconds: heap usage, stack watermark, battery percentage, uptime, S
 │   ├── ui/
 │   │   ├── mod.rs                  unified re-exports + chrome
 │   │   └── chrome/                 top bar (THE navigation: nameplate +
-│   │                               two named arms + battery), panel,
-│   │                               section label, filter chip
+│   │                               two named arms + battery), section
+│   │                               label
 │   └── apps/
 │       ├── mod.rs                  AppId, Modal, Tab + Nav aliases
 │       ├── tab.rs                  Tab enum, neighbour helpers, icon
@@ -204,11 +204,7 @@ Then every 5 seconds: heap usage, stack watermark, battery percentage, uptime, S
 │           │                       battery)
 │           ├── quick_menu.rs       Menu-button sheet (app actions +
 │           │                       clear ghosting, go home / sleep)
-│           ├── button_feedback.rs  legacy bumps (drawn only when chrome
-│           │                       is hidden)
-│           ├── selectable_row.rs   inverted-color selection highlight
-│           ├── list.rs             ListSelection cursor + scrolling helper
-│           └── format.rs           position/percentage formatting helpers
+│           └── list.rs             ListSelection cursor + scrolling helper
 │
 ├── ld/                             vendored linker chain: pinned stack +
 │                                   single contiguous heap (linkall.x,
@@ -248,7 +244,7 @@ The distro implements `AppLayer` via `AppManager` in `src/apps/manager.rs`, whic
 - `DirCache` — ~10 KB (128 directory entries)
 - `StripBuffer` — ~4 KB
 - `BookmarkCache` — ~1 KB
-- `Launcher`, `QuickMenu`, `ButtonFeedback` — smaller
+- `Launcher`, `QuickMenu` — smaller
 
 **No `dyn` dispatch.** The `with_app!()` macro in `manager.rs` matches on `AppId` and calls concrete methods. No trait objects, no heap-allocated closures.
 
@@ -427,7 +423,7 @@ Dedicated Embassy task for CPU-heavy operations (currently: image decode). Chann
 
 ### Error handling
 
-Unified `Error` type (`Copy`, 1 discriminant byte + 1 `&'static str` source tag). `ErrorKind` covers storage, parsing, resources, network, and catch-all. The `err!()` and `or_err!()` macros attach `module_path!()` as the source. `ResultExt` trait provides ergonomic `.source()` and `.map_kind()` on `Result`. Interop with smol-epub's `Result<T, &'static str>` via `From` impls.
+Unified `Error` type (`Copy`, 1 discriminant byte + 1 `&'static str` source tag). `ErrorKind` covers storage, parsing, resources, network, and catch-all. `Error::with_source` retags an error with the caller's site. Interop with smol-epub's `Result<T, &'static str>` via `From` impls.
 
 ### WiFi upload
 

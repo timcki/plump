@@ -100,9 +100,7 @@ pub enum QuickActionKind {
         value: u8,
         options: &'static [&'static str],
     },
-    Trigger {
-        display: &'static str,
-    },
+    Trigger,
     /// a row that reports instead of acting: the cursor skips it
     Info,
 }
@@ -137,11 +135,11 @@ impl QuickAction {
         }
     }
 
-    pub const fn trigger(id: u8, label: &'static str, display: &'static str) -> Self {
+    pub const fn trigger(id: u8, label: &'static str) -> Self {
         Self {
             id,
             label,
-            kind: QuickActionKind::Trigger { display },
+            kind: QuickActionKind::Trigger,
             icon: None,
             value: FixedStr::EMPTY,
             progress: None,

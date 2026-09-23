@@ -52,10 +52,6 @@ impl BmListEntry {
     pub const EMPTY: Self = Self {
         filename: FixedStr::EMPTY,
     };
-
-    pub fn filename_str(&self) -> &str {
-        self.filename.as_str()
-    }
 }
 
 // 16-slot LRU bookmark cache; flushed to _PLUMP/BKMK.BIN periodically
@@ -313,11 +309,6 @@ impl Loaded<'_> {
     #[inline]
     pub fn load_all(&self, out: &mut [BmListEntry]) -> usize {
         self.cache.list_all(out)
-    }
-
-    #[inline]
-    pub fn save(&mut self, filename: &[u8], byte_offset: u32, chapter: u16) {
-        self.cache.write_slot(filename, byte_offset, chapter);
     }
 
     /// Drop this book's reading position. Nothing rebuilds it: the

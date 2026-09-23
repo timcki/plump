@@ -29,10 +29,7 @@ pub mod wake;
 pub mod work_queue;
 
 // Unified error types (primary home: crate::error)
-pub use crate::error::{Error, ErrorKind, Result, ResultExt};
-
-// backward-compatible alias
-pub use crate::drivers::storage::StorageError;
+pub use crate::error::{Error, ErrorKind, Result};
 
 pub use app::{
     App, AppContext, AppIdType, AppLayer, BgBudget, BgOutcome, Launcher, NavEvent, PendingSetting,

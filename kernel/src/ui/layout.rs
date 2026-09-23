@@ -19,4 +19,3 @@ const THEME: Theme = Theme::default_v1();
 pub const CONTENT_TOP: u16 = THEME.top_bar_h + THEME.margin_sm;
 pub const LARGE_MARGIN: u16 = 16;
 pub const FULL_CONTENT_W: u16 = SCREEN_W - 2 * LARGE_MARGIN;
-pub const HEADER_W: u16 = 300;

@@ -18,11 +18,8 @@ pub struct Theme {
     pub margin_sm: u16,
     pub section_gap: u16,
 
-    // panel
-    pub panel_radius: u16,
-    pub panel_stroke: u16,
+    // rows
     pub row_h: u16,
-    pub row_h_compact: u16,
 
     // chrome bars
     pub top_bar_h: u16,
@@ -40,10 +37,7 @@ impl Theme {
             margin_md: 12,
             margin_sm: 8,
             section_gap: 14,
-            panel_radius: 6,
-            panel_stroke: 2,
             row_h: 44,
-            row_h_compact: 32,
             // the top bar is the navigation now: a screen nameplate
             // flanked by its two neighbours. all three are body text
             // (the current one bold), so the height is margin around

@@ -469,7 +469,7 @@ impl AppManager {
         let borrow_home =
             active != AppId::Home && active != AppId::Reader && self.home.has_recent();
         let mut meta = crate::ui::StackFmt::<64>::new();
-        let mut combined = [QuickAction::trigger(0, "", ""); MAX_APP_ACTIONS];
+        let mut combined = [QuickAction::trigger(0, ""); MAX_APP_ACTIONS];
         let mut n = 0;
         if borrow_home {
             self.home.menu_meta(&mut meta);

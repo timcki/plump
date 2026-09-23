@@ -50,16 +50,6 @@ impl<T: Copy + Eq, M: Copy + Eq> Nav<T, M> {
     }
 
     #[inline]
-    pub fn active_tab(&self) -> T {
-        self.active_tab
-    }
-
-    #[inline]
-    pub fn modal(&self) -> Option<M> {
-        self.modal
-    }
-
-    #[inline]
     pub fn active_slot(&self) -> NavSlot<T, M> {
         match self.modal {
             Some(m) => NavSlot::Modal(m),
