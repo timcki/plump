@@ -191,6 +191,12 @@ impl ReaderApp {
             self.pg.buf_len = n;
             self.pg.prefetch_page = NO_PREFETCH;
             self.pg.prefetch_len = 0;
+            // pages come from ch_cache here, so the 8 KB prefetch
+            // buffer only serves the image scan; drop it once that is
+            // not running
+            if !self.pg.prefetch.is_empty() && self.epub.bg_cache == super::BgCacheState::Idle {
+                self.pg.prefetch = Vec::new();
+            }
             plump_kernel::perf_event!(
                 "reader",
                 "load_prefetch.read src=ch_cache bytes={} elapsed_ms={}",
@@ -575,62 +581,102 @@ impl ReaderApp {
 
         let line_h = self.font_line_h.max(1) as u32;
         let src = loaded.lines;
-        let mut lines: Vec<LineLayout> = Vec::new();
-        let mut blocks: Vec<u8> = Vec::new();
-        if lines.try_reserve(src.len()).is_err() || blocks.try_reserve(src.len()).is_err() {
-            return false;
-        }
 
+        // an image origin plus its stored filler run (filler = zero-byte
+        // IMAGE line, same shape adopt_loaded_chapter counts): the run's
+        // stored length and the length it needs at this line height
+        let image_block = |i: usize| -> (usize, usize) {
+            let l = src[i];
+            let mut old_block = 1usize;
+            while i + old_block < src.len()
+                && src[i + old_block].is_image()
+                && src[i + old_block].start_byte == 0
+                && src[i + old_block].end_byte == 0
+            {
+                old_block += 1;
+            }
+            // reserved height rides the origin's extra byte in 4 px
+            // units; 0 = unknown, keep the stored count
+            let stored_h = (l.extra as u32) * 4;
+            let new_block = if stored_h > 0 {
+                stored_h.div_ceil(line_h).clamp(1, u8::MAX as u32) as usize
+            } else {
+                old_block
+            };
+            (old_block, new_block)
+        };
+
+        // size the result first: when no image block changes length the
+        // loaded table is adopted as it is, and otherwise the new one is
+        // reserved once, exactly, instead of growing while `src` is live
+        let mut total = 0usize;
+        let mut resized = false;
         let mut i = 0usize;
         while i < src.len() {
-            let l = src[i];
-            if l.is_image() {
-                // origin + its stored filler run (filler = zero-byte
-                // IMAGE line, same shape adopt_loaded_chapter counts)
-                let mut old_block = 1usize;
-                while i + old_block < src.len()
-                    && src[i + old_block].is_image()
-                    && src[i + old_block].start_byte == 0
-                    && src[i + old_block].end_byte == 0
-                {
-                    old_block += 1;
-                }
-                // reserved height rides the origin's extra byte in
-                // 4 px units; 0 = unknown, keep the stored count
-                let stored_h = (l.extra as u32) * 4;
-                let new_block = if stored_h > 0 {
-                    stored_h.div_ceil(line_h).clamp(1, u8::MAX as u32) as usize
-                } else {
-                    old_block
-                };
-                if lines.len() + new_block > MAX_LINES_PER_CHAPTER {
-                    return false;
-                }
-                if lines.try_reserve(new_block).is_err()
-                    || blocks.try_reserve(new_block).is_err()
-                {
-                    return false;
-                }
-                lines.push(l);
-                blocks.push(new_block.min(u8::MAX as usize) as u8);
-                for _ in 1..new_block {
-                    lines.push(LineLayout {
-                        start_byte: 0,
-                        end_byte: 0,
-                        flags: LineLayout::FLAG_IMAGE,
-                        indent: 0,
-                        align: LineLayout::ALIGN_DEFAULT,
-                        extra: 0,
-                    });
-                    blocks.push(0);
-                }
+            if src[i].is_image() {
+                let (old_block, new_block) = image_block(i);
+                resized |= new_block != old_block;
+                total += new_block;
                 i += old_block;
             } else {
-                lines.push(l);
-                blocks.push(0);
+                total += 1;
                 i += 1;
             }
         }
+        if total > MAX_LINES_PER_CHAPTER {
+            return false;
+        }
+
+        let mut blocks: Vec<u8> = Vec::new();
+        if blocks.try_reserve_exact(total).is_err() {
+            return false;
+        }
+        let lines: Vec<LineLayout> = if resized {
+            let mut lines = Vec::new();
+            if lines.try_reserve_exact(total).is_err() {
+                return false;
+            }
+            let mut i = 0usize;
+            while i < src.len() {
+                let l = src[i];
+                if l.is_image() {
+                    let (old_block, new_block) = image_block(i);
+                    lines.push(l);
+                    blocks.push(new_block.min(u8::MAX as usize) as u8);
+                    for _ in 1..new_block {
+                        lines.push(LineLayout {
+                            start_byte: 0,
+                            end_byte: 0,
+                            flags: LineLayout::FLAG_IMAGE,
+                            indent: 0,
+                            align: LineLayout::ALIGN_DEFAULT,
+                            extra: 0,
+                        });
+                        blocks.push(0);
+                    }
+                    i += old_block;
+                } else {
+                    lines.push(l);
+                    blocks.push(0);
+                    i += 1;
+                }
+            }
+            lines
+        } else {
+            let mut i = 0usize;
+            while i < src.len() {
+                if src[i].is_image() {
+                    let (old_block, _) = image_block(i);
+                    blocks.push(old_block.min(u8::MAX as usize) as u8);
+                    blocks.extend(core::iter::repeat_n(0, old_block - 1));
+                    i += old_block;
+                } else {
+                    blocks.push(0);
+                    i += 1;
+                }
+            }
+            src
+        };
 
         let spacing = PageSpacing {
             em_px: self.fonts.map(|f| f.em_px()).unwrap_or(self.font_line_h),

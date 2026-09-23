@@ -740,6 +740,11 @@ impl ReaderApp {
         }
 
         log::info!("precache: all images scanned");
+        // the scan window; a page load that streams off the card
+        // allocates it again
+        if !self.epub.ch_cache.is_empty() {
+            self.pg.prefetch = Vec::new();
+        }
         Ok(false)
     }
 
