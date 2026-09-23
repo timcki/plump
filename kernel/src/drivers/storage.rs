@@ -1,8 +1,7 @@
 // sd card file operations
 //
-// all I/O through embedded-sdmmc AsyncVolumeManager; functions are
-// synchronous, wrapping async ops with poll_once (SPI bus is blocking
-// so every .await resolves immediately)
+// all I/O through the embedded-sdmmc VolumeManager, synchronous over
+// the blocking SPI bus
 //
 // returns the unified Error type; apps receive it through
 // KernelHandle
@@ -12,7 +11,7 @@ use core::ops::ControlFlow;
 
 use embedded_sdmmc::{Mode, RawFile};
 
-use crate::drivers::sdcard::{SdStorage, SdStorageInner, poll_once};
+use crate::drivers::sdcard::{SdStorage, SdStorageInner};
 use crate::error::{Error, ErrorKind};
 use crate::kernel::daystats::DayKey;
 use crate::util::FixedStr;
@@ -214,34 +213,32 @@ fn sfn_to_bytes(name: &embedded_sdmmc::ShortFileName, out: &mut [u8; 13]) -> u8 
     pos as u8
 }
 
-// async file operations on SdStorageInner — replaces the old op_* macros.
-// none use ? internally so caller cleanup is never bypassed.
+// file operations on SdStorageInner, one open/close each. none use ?
+// between open and close, so the close is never bypassed
 
 use embedded_sdmmc::RawDirectory;
 
 impl SdStorageInner {
-    async fn file_size(&mut self, dir: RawDirectory, name: &str) -> crate::error::Result<u32> {
+    fn file_size(&self, dir: RawDirectory, name: &str) -> crate::error::Result<u32> {
         self.mgr
             .find_directory_entry(dir, name)
-            .await
             .map(|e| e.size)
             .map_err(|_| Error::new(ErrorKind::OpenFile, "file_size"))
     }
 
-    async fn file_mtime(
-        &mut self,
+    fn file_mtime(
+        &self,
         dir: RawDirectory,
         name: &str,
     ) -> crate::error::Result<embedded_sdmmc::Timestamp> {
         self.mgr
             .find_directory_entry(dir, name)
-            .await
             .map(|e| e.mtime)
             .map_err(|_| Error::new(ErrorKind::OpenFile, "file_mtime"))
     }
 
-    async fn read_chunk(
-        &mut self,
+    fn read_chunk(
+        &self,
         dir: RawDirectory,
         name: &str,
         offset: u32,
@@ -250,18 +247,16 @@ impl SdStorageInner {
         let file = self
             .mgr
             .open_file_in_dir(dir, name, Mode::ReadOnly)
-            .await
             .map_err(|_| Error::new(ErrorKind::OpenFile, "read_chunk"))?;
 
         let result = match self.mgr.file_seek_from_start(file, offset) {
             Ok(()) => self
                 .mgr
                 .read(file, buf)
-                .await
                 .map_err(|_| Error::new(ErrorKind::ReadFailed, "read_chunk")),
             Err(_) => Err(Error::new(ErrorKind::SeekFailed, "read_chunk")),
         };
-        let _ = self.mgr.close_file(file).await;
+        let _ = self.mgr.close_file(file);
         if let Ok(n) = &result {
             crate::perf::counters::inc_sd_reads();
             crate::perf::counters::add_sd_bytes_read(*n as u32);
@@ -269,8 +264,8 @@ impl SdStorageInner {
         result
     }
 
-    async fn read_start(
-        &mut self,
+    fn read_start(
+        &self,
         dir: RawDirectory,
         name: &str,
         buf: &mut [u8],
@@ -278,16 +273,14 @@ impl SdStorageInner {
         let file = self
             .mgr
             .open_file_in_dir(dir, name, Mode::ReadOnly)
-            .await
             .map_err(|_| Error::new(ErrorKind::OpenFile, "read_start"))?;
 
         let size = self.mgr.file_length(file).unwrap_or(0);
         let result = self
             .mgr
             .read(file, buf)
-            .await
             .map_err(|_| Error::new(ErrorKind::ReadFailed, "read_start"));
-        let _ = self.mgr.close_file(file).await;
+        let _ = self.mgr.close_file(file);
         result.map(|n| {
             crate::perf::counters::inc_sd_reads();
             crate::perf::counters::add_sd_bytes_read(n as u32);
@@ -295,8 +288,8 @@ impl SdStorageInner {
         })
     }
 
-    async fn write_file(
-        &mut self,
+    fn write_file(
+        &self,
         dir: RawDirectory,
         name: &str,
         data: &[u8],
@@ -304,7 +297,6 @@ impl SdStorageInner {
         let file = self
             .mgr
             .open_file_in_dir(dir, name, Mode::ReadWriteCreateOrTruncate)
-            .await
             .map_err(|_| Error::new(ErrorKind::OpenFile, "write"))?;
 
         let result = if data.is_empty() {
@@ -312,10 +304,9 @@ impl SdStorageInner {
         } else {
             self.mgr
                 .write(file, data)
-                .await
                 .map_err(|_| Error::new(ErrorKind::WriteFailed, "write"))
         };
-        let _ = self.mgr.close_file(file).await;
+        let _ = self.mgr.close_file(file);
         if result.is_ok() {
             crate::perf::counters::inc_sd_writes();
             crate::perf::counters::add_sd_bytes_written(data.len() as u32);
@@ -323,8 +314,8 @@ impl SdStorageInner {
         result
     }
 
-    async fn append(
-        &mut self,
+    fn append(
+        &self,
         dir: RawDirectory,
         name: &str,
         data: &[u8],
@@ -332,7 +323,6 @@ impl SdStorageInner {
         let file = self
             .mgr
             .open_file_in_dir(dir, name, Mode::ReadWriteCreateOrAppend)
-            .await
             .map_err(|_| Error::new(ErrorKind::OpenFile, "append"))?;
 
         let result = if data.is_empty() {
@@ -340,10 +330,9 @@ impl SdStorageInner {
         } else {
             self.mgr
                 .write(file, data)
-                .await
                 .map_err(|_| Error::new(ErrorKind::WriteFailed, "append"))
         };
-        let _ = self.mgr.close_file(file).await;
+        let _ = self.mgr.close_file(file);
         if result.is_ok() {
             crate::perf::counters::inc_sd_writes();
             crate::perf::counters::add_sd_bytes_written(data.len() as u32);
@@ -353,8 +342,8 @@ impl SdStorageInner {
 
     // seek-then-write, shared by the data-dir and data-subdir entry
     // points; `tag` is their distinct error source string
-    async fn write_at(
-        &mut self,
+    fn write_at(
+        &self,
         dir: RawDirectory,
         name: &str,
         offset: u32,
@@ -364,7 +353,7 @@ impl SdStorageInner {
         let file = match self
             .mgr
             .open_file_in_dir(dir, name, Mode::ReadWriteCreateOrAppend)
-            .await
+            
         {
             Ok(f) => f,
             Err(_) => return Err(Error::new(ErrorKind::OpenFile, tag)),
@@ -373,11 +362,10 @@ impl SdStorageInner {
             Ok(()) => self
                 .mgr
                 .write(file, data)
-                .await
                 .map_err(|_| Error::new(ErrorKind::WriteFailed, tag)),
             Err(_) => Err(Error::new(ErrorKind::SeekFailed, tag)),
         };
-        let _ = self.mgr.close_file(file).await;
+        let _ = self.mgr.close_file(file);
         if result.is_ok() {
             crate::perf::counters::inc_sd_writes();
             crate::perf::counters::add_sd_bytes_written(data.len() as u32);
@@ -385,48 +373,45 @@ impl SdStorageInner {
         result
     }
 
-    async fn delete(&mut self, dir: RawDirectory, name: &str) -> crate::error::Result<()> {
+    fn delete(&self, dir: RawDirectory, name: &str) -> crate::error::Result<()> {
         self.mgr
             .delete_entry_in_dir(dir, name)
-            .await
             .map_err(|_| Error::new(ErrorKind::DeleteFailed, "delete"))
     }
 
-    async fn open_dir(&mut self, name: &str) -> crate::error::Result<RawDirectory> {
+    fn open_dir(&self, name: &str) -> crate::error::Result<RawDirectory> {
         self.mgr
             .open_dir(self.root, name)
-            .await
             .map_err(|_| Error::new(ErrorKind::OpenDir, "open_dir"))
     }
 
     /// The data directory, opened once and kept for the device
     /// lifetime.
-    async fn data_handle(&mut self) -> crate::error::Result<RawDirectory> {
-        if let Some(dir) = self.data_handle {
+    fn data_handle(&self) -> crate::error::Result<RawDirectory> {
+        if let Some(dir) = self.data_handle.get() {
             return Ok(dir);
         }
-        let dir = self.open_dir(self.data_dir).await?;
-        self.data_handle = Some(dir);
+        let dir = self.open_dir(self.data_dir.get())?;
+        self.data_handle.set(Some(dir));
         Ok(dir)
     }
 
     /// A subdirectory of the data dir. The bool says whether the
     /// handle is cached; an uncached one (table full, name too long)
     /// belongs to the caller, who closes it after use.
-    async fn sub_handle(&mut self, name: &str) -> crate::error::Result<(RawDirectory, bool)> {
-        for (cached, dir) in self.sub_handles.iter().flatten() {
+    fn sub_handle(&self, name: &str) -> crate::error::Result<(RawDirectory, bool)> {
+        for (cached, dir) in self.sub_handles.borrow().iter().flatten() {
             if cached.as_str() == name {
                 return Ok((*dir, true));
             }
         }
-        let parent = self.data_handle().await?;
+        let parent = self.data_handle()?;
         let dir = self
             .mgr
             .open_dir(parent, name)
-            .await
             .map_err(|_| Error::new(ErrorKind::OpenDir, "sub_handle"))?;
         if name.len() <= 12
-            && let Some(free) = self.sub_handles.iter_mut().find(|s| s.is_none())
+            && let Some(free) = self.sub_handles.borrow_mut().iter_mut().find(|s| s.is_none())
         {
             *free = Some((FixedStr::from_bytes(name.as_bytes()), dir));
             return Ok((dir, true));
@@ -437,8 +422,8 @@ impl SdStorageInner {
     /// Close and forget one cached subdirectory handle, if it is
     /// cached. Removing a directory goes through here first: FAT will
     /// not unlink an entry that is still open.
-    pub(crate) fn close_sub_handle(&mut self, name: &str) {
-        for slot in self.sub_handles.iter_mut() {
+    pub(crate) fn close_sub_handle(&self, name: &str) {
+        for slot in self.sub_handles.borrow_mut().iter_mut() {
             let Some((cached, dir)) = *slot else { continue };
             if cached.as_str() == name {
                 *slot = None;
@@ -449,11 +434,11 @@ impl SdStorageInner {
     }
 
     /// Close every cached directory handle (data dir change, halt).
-    pub(crate) fn drop_dir_handles(&mut self) {
+    pub(crate) fn drop_dir_handles(&self) {
         if let Some(dir) = self.data_handle.take() {
             let _ = self.mgr.close_dir(dir);
         }
-        for slot in self.sub_handles.iter_mut() {
+        for slot in self.sub_handles.borrow_mut().iter_mut() {
             if let Some((_, dir)) = slot.take() {
                 let _ = self.mgr.close_dir(dir);
             }
@@ -461,19 +446,54 @@ impl SdStorageInner {
     }
 }
 
-/// Read-only handle to an open file, valid inside
-/// [`SdStorage::with_file_in_plump_subdir`]. Each `read_at` is one seek
-/// plus one read on the already-open file, so a caller that needs
-/// several pieces of one file pays the directory lookup once.
-pub struct FileReader<'a> {
-    inner: &'a mut SdStorageInner,
-    raw: RawFile,
+/// How [`SdStorage`]'s `open_*` functions open a file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpenMode {
+    /// Read only; the file must exist.
+    Read,
+    /// Read and write, created when missing, contents kept.
+    Write,
+    /// Read and write, created when missing, emptied when present.
+    Truncate,
 }
 
-impl FileReader<'_> {
+impl OpenMode {
+    fn fat(self) -> Mode {
+        match self {
+            Self::Read => Mode::ReadOnly,
+            Self::Write => Mode::ReadWriteCreateOrAppend,
+            Self::Truncate => Mode::ReadWriteCreateOrTruncate,
+        }
+    }
+}
+
+/// An open file on the SD card.
+///
+/// Opening scans the directory; every call on the handle after that
+/// is a seek plus the transfer, so a caller that touches one file
+/// several times opens it once. The handle holds no borrow of the
+/// storage between calls, so two files can be open and in use at once
+/// (an EPUB read beside a bundle append). The volume manager allows
+/// four open files.
+///
+/// Closing is automatic on drop; call [`close`](File::close) when the
+/// close error matters (it is the only way to observe it).
+#[must_use = "a File closes when dropped; bind it to use it"]
+pub struct File<'sd> {
+    inner: &'sd SdStorageInner,
+    // None only between close() taking it and self being dropped
+    raw: Option<RawFile>,
+}
+
+impl File<'_> {
+    #[inline]
+    fn raw(&self) -> RawFile {
+        self.raw.expect("File used after close")
+    }
+
     /// File size in bytes.
     pub fn len(&self) -> u32 {
-        self.inner.mgr.file_length(self.raw).unwrap_or(0)
+        self.inner.mgr.file_length(self.raw()).unwrap_or(0)
     }
 
     #[inline]
@@ -484,21 +504,78 @@ impl FileReader<'_> {
     /// Read `buf.len()` bytes at `offset`; returns the count actually
     /// read (short at end of file).
     pub fn read_at(&mut self, offset: u32, buf: &mut [u8]) -> crate::error::Result<usize> {
+        let raw = self.raw();
         self.inner
             .mgr
-            .file_seek_from_start(self.raw, offset)
-            .map_err(|_| Error::new(ErrorKind::SeekFailed, "FileReader::read_at"))?;
-        let n = poll_once(self.inner.mgr.read(self.raw, buf))
-            .map_err(|_| Error::new(ErrorKind::ReadFailed, "FileReader::read_at"))?;
+            .file_seek_from_start(raw, offset)
+            .map_err(|_| Error::new(ErrorKind::SeekFailed, "File::read_at"))?;
+        let n = self
+            .inner
+            .mgr
+            .read(raw, buf)
+            .map_err(|_| Error::new(ErrorKind::ReadFailed, "File::read_at"))?;
         crate::perf::counters::inc_sd_reads();
         crate::perf::counters::add_sd_bytes_read(n as u32);
         Ok(n)
     }
+
+    /// Write `data` at the current position (the end, for a file just
+    /// opened for writing).
+    pub fn write(&mut self, data: &[u8]) -> crate::error::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .mgr
+            .write(self.raw(), data)
+            .map_err(|_| Error::new(ErrorKind::WriteFailed, "File::write"))?;
+        crate::perf::counters::inc_sd_writes();
+        crate::perf::counters::add_sd_bytes_written(data.len() as u32);
+        Ok(())
+    }
+
+    /// Write `data` at `offset`. Bytes past `offset + data.len()` are
+    /// kept; writing past the end extends the file.
+    pub fn write_at(&mut self, offset: u32, data: &[u8]) -> crate::error::Result<()> {
+        self.inner
+            .mgr
+            .file_seek_from_start(self.raw(), offset)
+            .map_err(|_| Error::new(ErrorKind::SeekFailed, "File::write_at"))?;
+        self.write(data)
+    }
+
+    /// Write `data` at the end of the file.
+    pub fn append(&mut self, data: &[u8]) -> crate::error::Result<()> {
+        self.inner
+            .mgr
+            .file_seek_from_end(self.raw(), 0)
+            .map_err(|_| Error::new(ErrorKind::SeekFailed, "File::append"))?;
+        self.write(data)
+    }
+
+    /// Close the file, flushing its metadata, and report the result.
+    pub fn close(mut self) -> crate::error::Result<()> {
+        // take() first: Drop must not close a second time
+        let raw = self.raw.take().expect("File::close called twice");
+        self.inner
+            .mgr
+            .close_file(raw)
+            .map_err(|_| Error::new(ErrorKind::WriteFailed, "File::close"))
+    }
 }
 
-fn borrow(sd: &SdStorage) -> core::result::Result<core::cell::RefMut<'_, SdStorageInner>, Error> {
-    sd.borrow_inner()
-        .ok_or(Error::new(ErrorKind::NoCard, "storage::borrow"))
+impl Drop for File<'_> {
+    fn drop(&mut self) {
+        if let Some(raw) = self.raw.take()
+            && self.inner.mgr.close_file(raw).is_err()
+        {
+            log::error!("File: close on drop failed");
+        }
+    }
+}
+
+fn inner(sd: &SdStorage) -> core::result::Result<&SdStorageInner, Error> {
+    sd.inner().ok_or(Error::new(ErrorKind::NoCard, "storage::inner"))
 }
 
 /// Which directory a file operation resolves against.
@@ -518,76 +595,6 @@ enum Scope<'a> {
     DataSub(&'a str),
 }
 
-// streaming file handle: keeps one file open across multiple writes.
-//
-// the handle borrows the storage it came from, so it cannot outlive
-// it, and closes the file when dropped, so no path leaves the volume
-// manager holding an open handle it will never see again
-
-/// Handle to an open file on the SD card.
-///
-/// Created via [`SdStorage::create_file`]. Closing is automatic on
-/// drop; call [`close()`](FileWriter::close) instead when the close
-/// error matters (it is the only way to observe it).
-#[must_use = "a FileWriter closes its file when dropped; bind it to write"]
-pub struct FileWriter<'sd> {
-    sd: &'sd SdStorage,
-    // None only between close() taking it and self being dropped
-    raw: Option<RawFile>,
-}
-
-impl FileWriter<'_> {
-    /// Write a chunk of data to the open file.
-    pub fn write(&self, data: &[u8]) -> crate::error::Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        let raw = self.raw.expect("FileWriter::write after close");
-        poll_once(async {
-            let mut guard = borrow(self.sd)?;
-            guard
-                .mgr
-                .write(raw, data)
-                .await
-                .map_err(|_| Error::new(ErrorKind::WriteFailed, "OpenFile::write"))?;
-            crate::perf::counters::inc_sd_writes();
-            crate::perf::counters::add_sd_bytes_written(data.len() as u32);
-            Ok(())
-        })
-    }
-
-    /// Close the file, flushing metadata to SD, and report the result.
-    ///
-    /// Dropping does the same close but discards the error, so callers
-    /// that must know the data landed close explicitly.
-    pub fn close(mut self) -> crate::error::Result<()> {
-        // take() first: Drop must not close a second time
-        let raw = self.raw.take().expect("FileWriter::close called twice");
-        Self::close_raw(self.sd, raw)
-    }
-
-    fn close_raw(sd: &SdStorage, raw: RawFile) -> crate::error::Result<()> {
-        poll_once(async {
-            let mut guard = borrow(sd)?;
-            guard
-                .mgr
-                .close_file(raw)
-                .await
-                .map_err(|_| Error::new(ErrorKind::WriteFailed, "OpenFile::close"))
-        })
-    }
-}
-
-impl Drop for FileWriter<'_> {
-    fn drop(&mut self) {
-        if let Some(raw) = self.raw.take()
-            && let Err(e) = Self::close_raw(self.sd, raw)
-        {
-            log::error!("FileWriter: close on drop failed: {}", e);
-        }
-    }
-}
-
 impl SdStorage {
     /// Open `scope`'s directory chain, run `op` against the innermost
     /// directory, then close every directory this call opened.
@@ -597,27 +604,26 @@ impl SdStorage {
     /// an async closure so it can borrow the volume manager across its
     /// own awaits; monomorphised per call site, so the abstraction
     /// costs nothing over the hand-written open/run/close.
-    async fn with_scope<F, T>(&self, scope: Scope<'_>, op: F) -> crate::error::Result<T>
+    fn with_scope<'s, F, T>(&'s self, scope: Scope<'_>, op: F) -> crate::error::Result<T>
     where
-        F: AsyncFnOnce(&mut SdStorageInner, RawDirectory) -> crate::error::Result<T>,
+        F: FnOnce(&'s SdStorageInner, RawDirectory) -> crate::error::Result<T>,
     {
-        let mut guard = borrow(self)?;
-        let inner = &mut *guard;
+        let inner = inner(self)?;
 
         // root, the data dir and its cached subdirs stay open for the
         // device lifetime, so only a directory opened here is closed
-        // here
+        // here. an open file does not need its directory open
         let (dir, close_dir) = match scope {
             Scope::Root => (inner.root, false),
-            Scope::Named(d) => (inner.open_dir(d).await?, true),
-            Scope::Data => (inner.data_handle().await?, false),
+            Scope::Named(d) => (inner.open_dir(d)?, true),
+            Scope::Data => (inner.data_handle()?, false),
             Scope::DataSub(sub) => {
-                let (dir, cached) = inner.sub_handle(sub).await?;
+                let (dir, cached) = inner.sub_handle(sub)?;
                 (dir, !cached)
             }
         };
 
-        let result = op(inner, dir).await;
+        let result = op(inner, dir);
 
         if close_dir {
             let _ = inner.mgr.close_dir(dir);
@@ -625,39 +631,62 @@ impl SdStorage {
         result
     }
 
-    /// Create (or truncate) a file in the root directory and return
-    /// a [`FileWriter`] handle for streaming writes.
-    pub fn create_file(&self, name: &str) -> crate::error::Result<FileWriter<'_>> {
-        let raw = poll_once(self.with_scope(Scope::Root, async |inner, dir| {
-            inner
+    fn open_in(&self, scope: Scope<'_>, name: &str, mode: OpenMode) -> crate::error::Result<File<'_>> {
+        self.with_scope(scope, |inner, dir| {
+            let raw = inner
                 .mgr
-                .open_file_in_dir(dir, name, Mode::ReadWriteCreateOrTruncate)
-                .await
-                .map_err(|_| Error::new(ErrorKind::OpenFile, "SdStorage::create_file"))
-        }))?;
-        Ok(FileWriter {
-            sd: self,
-            raw: Some(raw),
+                .open_file_in_dir(dir, name, mode.fat())
+                .map_err(|_| Error::new(ErrorKind::OpenFile, "SdStorage::open"))?;
+            Ok(File {
+                inner,
+                raw: Some(raw),
+            })
         })
+    }
+
+    /// Open a file in the root directory.
+    pub fn open_in_root(&self, name: &str, mode: OpenMode) -> crate::error::Result<File<'_>> {
+        self.open_in(Scope::Root, name, mode)
+    }
+
+    /// Open a file in the data directory.
+    pub fn open_in_plump(&self, name: &str, mode: OpenMode) -> crate::error::Result<File<'_>> {
+        self.open_in(Scope::Data, name, mode)
+    }
+
+    /// Open a file in <data_dir>/<dir>/.
+    pub fn open_in_plump_subdir(
+        &self,
+        dir: &str,
+        name: &str,
+        mode: OpenMode,
+    ) -> crate::error::Result<File<'_>> {
+        self.open_in(Scope::DataSub(dir), name, mode)
+    }
+
+    /// Create (or truncate) a file in the root directory for streaming
+    /// writes.
+    pub fn create_file(&self, name: &str) -> crate::error::Result<File<'_>> {
+        self.open_in_root(name, OpenMode::Truncate)
     }
 
     /// Write an entire file atomically (create/truncate + write + close).
     pub fn write_file(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
-        poll_once(self.with_scope(Scope::Root, async |inner, dir| {
-            inner.write_file(dir, name, data).await
-        }))
+        self.with_scope(Scope::Root, |inner, dir| {
+            inner.write_file(dir, name, data)
+        })
     }
 
     /// Delete a file from the root directory.
     pub fn delete_file(&self, name: &str) -> crate::error::Result<()> {
-        poll_once(self.with_scope(Scope::Root, async |inner, dir| {
-            inner.delete(dir, name).await
-        }))
+        self.with_scope(Scope::Root, |inner, dir| {
+            inner.delete(dir, name)
+        })
     }
 
     /// List supported files in the root directory.
     pub fn list_root_files(&self, buf: &mut [DirEntry]) -> crate::error::Result<usize> {
-        poll_once(self.with_scope(Scope::Root, async |inner, dir| {
+        self.with_scope(Scope::Root, |inner, dir| {
             let mut count = 0usize;
             let mut total = 0usize;
 
@@ -693,7 +722,6 @@ impl SdStorage {
                     }
                     ControlFlow::Continue(())
                 })
-                .await
                 .map_err(|_| Error::new(ErrorKind::ReadFailed, "list_root_files"))?;
 
             if total > count {
@@ -705,16 +733,16 @@ impl SdStorage {
                 );
             }
             Ok(count)
-        }))
+        })
     }
 
     // root file reads
 
     /// Get the size of a file in the root directory.
     pub fn file_size(&self, name: &str) -> crate::error::Result<u32> {
-        poll_once(self.with_scope(Scope::Root, async |inner, dir| {
-            inner.file_size(dir, name).await
-        }))
+        self.with_scope(Scope::Root, |inner, dir| {
+            inner.file_size(dir, name)
+        })
     }
 
     /// Read a chunk from a file in the root directory at the given offset.
@@ -724,9 +752,9 @@ impl SdStorage {
         offset: u32,
         buf: &mut [u8],
     ) -> crate::error::Result<usize> {
-        poll_once(self.with_scope(Scope::Root, async |inner, dir| {
-            inner.read_chunk(dir, name, offset, buf).await
-        }))
+        self.with_scope(Scope::Root, |inner, dir| {
+            inner.read_chunk(dir, name, offset, buf)
+        })
     }
 
     /// Read from the start of a file in the root directory.
@@ -736,9 +764,9 @@ impl SdStorage {
         name: &str,
         buf: &mut [u8],
     ) -> crate::error::Result<(u32, usize)> {
-        poll_once(self.with_scope(Scope::Root, async |inner, dir| {
-            inner.read_start(dir, name, buf).await
-        }))
+        self.with_scope(Scope::Root, |inner, dir| {
+            inner.read_start(dir, name, buf)
+        })
     }
 
     // named-directory file operations
@@ -750,9 +778,9 @@ impl SdStorage {
         name: &str,
         data: &[u8],
     ) -> crate::error::Result<()> {
-        poll_once(self.with_scope(Scope::Named(dir), async |inner, dir_h| {
-            inner.write_file(dir_h, name, data).await
-        }))
+        self.with_scope(Scope::Named(dir), |inner, dir_h| {
+            inner.write_file(dir_h, name, data)
+        })
     }
 
     /// Read from the start of a file in a named subdirectory of root.
@@ -763,9 +791,9 @@ impl SdStorage {
         name: &str,
         buf: &mut [u8],
     ) -> crate::error::Result<(u32, usize)> {
-        poll_once(self.with_scope(Scope::Named(dir), async |inner, dir_h| {
-            inner.read_start(dir_h, name, buf).await
-        }))
+        self.with_scope(Scope::Named(dir), |inner, dir_h| {
+            inner.read_start(dir_h, name, buf)
+        })
     }
 
     // _PLUMP/ directory management
@@ -776,58 +804,57 @@ impl SdStorage {
     /// so existing SD cards keep working. Creates `_PLUMP` only when
     /// neither directory is found.
     // TODO: rename _PULP to _PLUMP on-disk and drop legacy fallback
-    pub async fn ensure_plump_dir_async(&self) -> crate::error::Result<()> {
-        let mut guard = borrow(self)?;
-        let inner = &mut *guard;
+    pub fn ensure_plump_dir(&self) -> crate::error::Result<()> {
+        let inner = inner(self)?;
         inner.drop_dir_handles();
 
         // Try the current name first.
-        if let Ok(dir) = inner.mgr.open_dir(inner.root, PLUMP_DIR).await {
+        if let Ok(dir) = inner.mgr.open_dir(inner.root, PLUMP_DIR) {
             let _ = inner.mgr.close_dir(dir);
-            inner.data_dir = PLUMP_DIR;
+            inner.data_dir.set(PLUMP_DIR);
             return Ok(());
         }
 
         // Fall back to the legacy directory if it exists.
-        if let Ok(dir) = inner.mgr.open_dir(inner.root, LEGACY_DIR).await {
+        if let Ok(dir) = inner.mgr.open_dir(inner.root, LEGACY_DIR) {
             let _ = inner.mgr.close_dir(dir);
-            inner.data_dir = LEGACY_DIR;
+            inner.data_dir.set(LEGACY_DIR);
             log::info!("data dir: using legacy {}", LEGACY_DIR);
             return Ok(());
         }
 
         // Neither exists — create the new one.
-        inner.data_dir = PLUMP_DIR;
-        match inner.mgr.make_dir_in_dir(inner.root, PLUMP_DIR).await {
+        inner.data_dir.set(PLUMP_DIR);
+        match inner.mgr.make_dir_in_dir(inner.root, PLUMP_DIR) {
             Ok(()) => Ok(()),
             Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
-            Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_plump_dir_async")),
+            Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_plump_dir")),
         }
     }
 
     /// Ensure a subdirectory exists under the data directory.
     pub fn ensure_plump_subdir(&self, name: &str) -> crate::error::Result<()> {
-        let exists = poll_once(self.with_scope(Scope::Data, async |inner, dir| {
-            match inner.mgr.open_dir(dir, name).await {
+        let exists = self.with_scope(Scope::Data, |inner, dir| {
+            match inner.mgr.open_dir(dir, name) {
                 Ok(sub) => {
                     let _ = inner.mgr.close_dir(sub);
                     Ok(true)
                 }
                 Err(_) => Ok(false),
             }
-        }))?;
+        })?;
 
         if exists {
             return Ok(());
         }
 
-        poll_once(self.with_scope(Scope::Data, async |inner, dir| {
-            match inner.mgr.make_dir_in_dir(dir, name).await {
+        self.with_scope(Scope::Data, |inner, dir| {
+            match inner.mgr.make_dir_in_dir(dir, name) {
                 Ok(()) => Ok(()),
                 Err(embedded_sdmmc::Error::DirAlreadyExists) => Ok(()),
                 Err(_) => Err(Error::new(ErrorKind::WriteFailed, "ensure_plump_subdir")),
             }
-        }))
+        })
     }
 
     // data dir direct file operations (cache files live directly in the data dir)
@@ -839,23 +866,23 @@ impl SdStorage {
         offset: u32,
         buf: &mut [u8],
     ) -> crate::error::Result<usize> {
-        poll_once(self.with_scope(Scope::Data, async |inner, dir| {
-            inner.read_chunk(dir, name, offset, buf).await
-        }))
+        self.with_scope(Scope::Data, |inner, dir| {
+            inner.read_chunk(dir, name, offset, buf)
+        })
     }
 
     /// Write (create/truncate) a file in the data directory.
     pub fn write_in_plump(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
-        poll_once(self.with_scope(Scope::Data, async |inner, dir| {
-            inner.write_file(dir, name, data).await
-        }))
+        self.with_scope(Scope::Data, |inner, dir| {
+            inner.write_file(dir, name, data)
+        })
     }
 
     /// Append data to a file in the data directory.
     pub fn append_in_plump(&self, name: &str, data: &[u8]) -> crate::error::Result<()> {
-        poll_once(self.with_scope(Scope::Data, async |inner, dir| {
-            inner.append(dir, name, data).await
-        }))
+        self.with_scope(Scope::Data, |inner, dir| {
+            inner.append(dir, name, data)
+        })
     }
 
     /// Day-of-year-since-1970 key derived from a file's FAT mtime in
@@ -867,18 +894,18 @@ impl SdStorage {
     /// callers can compare two keys for inequality to detect a
     /// rollover without doing real calendar math.
     pub fn file_mtime_day_key_in_plump(&self, name: &str) -> Option<DayKey> {
-        poll_once(self.with_scope(Scope::Data, async |inner, dir| {
-            inner.file_mtime(dir, name).await
-        }))
+        self.with_scope(Scope::Data, |inner, dir| {
+            inner.file_mtime(dir, name)
+        })
         .ok()
         .and_then(timestamp_to_day_key)
     }
 
     /// Delete a file in the data directory.
     pub fn delete_in_plump(&self, name: &str) -> crate::error::Result<()> {
-        poll_once(self.with_scope(Scope::Data, async |inner, dir| {
-            inner.delete(dir, name).await
-        }))
+        self.with_scope(Scope::Data, |inner, dir| {
+            inner.delete(dir, name)
+        })
     }
 
     /// Seek to offset and write data in a file in the data directory.
@@ -888,9 +915,9 @@ impl SdStorage {
         offset: u32,
         data: &[u8],
     ) -> crate::error::Result<()> {
-        poll_once(self.with_scope(Scope::Data, async |inner, dir| {
-            inner.write_at(dir, name, offset, data, "write_at").await
-        }))
+        self.with_scope(Scope::Data, |inner, dir| {
+            inner.write_at(dir, name, offset, data, "write_at")
+        })
     }
 
     // data dir subdirectory file operations
@@ -902,9 +929,9 @@ impl SdStorage {
         name: &str,
         data: &[u8],
     ) -> crate::error::Result<()> {
-        poll_once(self.with_scope(Scope::DataSub(dir), async |inner, sub| {
-            inner.write_file(sub, name, data).await
-        }))
+        self.with_scope(Scope::DataSub(dir), |inner, sub| {
+            inner.write_file(sub, name, data)
+        })
     }
 
     /// Append data to a file in <data_dir>/<dir>/.
@@ -914,9 +941,9 @@ impl SdStorage {
         name: &str,
         data: &[u8],
     ) -> crate::error::Result<()> {
-        poll_once(self.with_scope(Scope::DataSub(dir), async |inner, sub| {
-            inner.append(sub, name, data).await
-        }))
+        self.with_scope(Scope::DataSub(dir), |inner, sub| {
+            inner.append(sub, name, data)
+        })
     }
 
     /// Read a chunk from a file in <data_dir>/<dir>/.
@@ -927,9 +954,9 @@ impl SdStorage {
         offset: u32,
         buf: &mut [u8],
     ) -> crate::error::Result<usize> {
-        poll_once(self.with_scope(Scope::DataSub(dir), async |inner, sub| {
-            inner.read_chunk(sub, name, offset, buf).await
-        }))
+        self.with_scope(Scope::DataSub(dir), |inner, sub| {
+            inner.read_chunk(sub, name, offset, buf)
+        })
     }
 
     /// Open a file in <data_dir>/<dir>/ once and run `f` against it;
@@ -940,26 +967,10 @@ impl SdStorage {
         &self,
         dir: &str,
         name: &str,
-        f: impl FnOnce(&mut FileReader<'_>) -> crate::error::Result<T>,
+        f: impl FnOnce(&mut File<'_>) -> crate::error::Result<T>,
     ) -> crate::error::Result<T> {
-        poll_once(
-            self.with_scope(Scope::DataSub(dir), async move |inner, sub| {
-                let raw = inner
-                    .mgr
-                    .open_file_in_dir(sub, name, Mode::ReadOnly)
-                    .await
-                    .map_err(|_| Error::new(ErrorKind::OpenFile, "with_file_in_plump_subdir"))?;
-                let result = {
-                    let mut reader = FileReader {
-                        inner: &mut *inner,
-                        raw,
-                    };
-                    f(&mut reader)
-                };
-                let _ = inner.mgr.close_file(raw).await;
-                result
-            }),
-        )
+        let mut file = self.open_in_plump_subdir(dir, name, OpenMode::Read)?;
+        f(&mut file)
     }
 
     /// Get the size of a file in <data_dir>/<dir>/.
@@ -968,9 +979,9 @@ impl SdStorage {
         dir: &str,
         name: &str,
     ) -> crate::error::Result<u32> {
-        poll_once(self.with_scope(Scope::DataSub(dir), async |inner, sub| {
-            inner.file_size(sub, name).await
-        }))
+        self.with_scope(Scope::DataSub(dir), |inner, sub| {
+            inner.file_size(sub, name)
+        })
     }
 
     /// Seek to offset and write data in a file in <data_dir>/<dir>/.
@@ -986,11 +997,11 @@ impl SdStorage {
         offset: u32,
         data: &[u8],
     ) -> crate::error::Result<()> {
-        poll_once(self.with_scope(Scope::DataSub(dir), async |inner, sub| {
+        self.with_scope(Scope::DataSub(dir), |inner, sub| {
             inner
                 .write_at(sub, name, offset, data, "write_at_sub")
-                .await
-        }))
+                
+        })
     }
 
     /// Delete a file in <data_dir>/<dir>/.
@@ -999,9 +1010,9 @@ impl SdStorage {
         dir: &str,
         name: &str,
     ) -> crate::error::Result<()> {
-        poll_once(self.with_scope(Scope::DataSub(dir), async |inner, sub| {
-            inner.delete(sub, name).await
-        }))
+        self.with_scope(Scope::DataSub(dir), |inner, sub| {
+            inner.delete(sub, name)
+        })
     }
 
     // whole-subdirectory operations (per-book cache clearing)
@@ -1012,7 +1023,7 @@ impl SdStorage {
     /// `OpenDir` error, which callers reading a cache size treat as
     /// zero rather than a failure.
     pub fn measure_plump_subdir(&self, dir: &str) -> crate::error::Result<SubdirUsage> {
-        poll_once(self.with_scope(Scope::DataSub(dir), async |inner, sub| {
+        self.with_scope(Scope::DataSub(dir), |inner, sub| {
             let mut usage = SubdirUsage::EMPTY;
             inner
                 .mgr
@@ -1023,10 +1034,9 @@ impl SdStorage {
                     }
                     ControlFlow::Continue(())
                 })
-                .await
                 .map_err(|_| Error::new(ErrorKind::ReadFailed, "measure_plump_subdir"))?;
             Ok(usage)
-        }))
+        })
     }
 
     /// Delete up to [`PURGE_BATCH`] files from <data_dir>/<dir>/.
@@ -1039,7 +1049,7 @@ impl SdStorage {
     /// The walk and the unlinks are separate passes: deleting entries
     /// while iterating the same directory would invalidate the walk.
     pub fn purge_plump_subdir(&self, dir: &str) -> crate::error::Result<PurgeStep> {
-        poll_once(self.with_scope(Scope::DataSub(dir), async |inner, sub| {
+        self.with_scope(Scope::DataSub(dir), |inner, sub| {
             let mut names = [([0u8; 13], 0u8, 0u32); PURGE_BATCH];
             let mut found = 0usize;
             let mut more = false;
@@ -1060,7 +1070,6 @@ impl SdStorage {
                     found += 1;
                     ControlFlow::Continue(())
                 })
-                .await
                 .map_err(|_| Error::new(ErrorKind::ReadFailed, "purge_plump_subdir"))?;
 
             let mut step = PurgeStep {
@@ -1073,7 +1082,7 @@ impl SdStorage {
                     Ok(n) => n,
                     Err(_) => continue,
                 };
-                match inner.delete(sub, name).await {
+                match inner.delete(sub, name) {
                     Ok(()) => {
                         step.deleted = step.deleted.saturating_add(1);
                         step.bytes = step.bytes.saturating_add(*size);
@@ -1089,7 +1098,7 @@ impl SdStorage {
                 }
             }
             Ok(step)
-        }))
+        })
     }
 
     /// Remove the (empty) directory <data_dir>/<dir>/.
@@ -1098,10 +1107,10 @@ impl SdStorage {
     /// one may well be holding one of the cached `sub_handles`, so the
     /// handle is closed before the entry goes.
     pub fn remove_plump_subdir(&self, dir: &str) -> crate::error::Result<()> {
-        poll_once(self.with_scope(Scope::Data, async |inner, data| {
+        self.with_scope(Scope::Data, |inner, data| {
             inner.close_sub_handle(dir);
-            inner.delete(data, dir).await
-        }))
+            inner.delete(data, dir)
+        })
     }
 
     // title mapping

@@ -1,60 +1,20 @@
-// sd card over SPI: sync SdCard + async volume manager
+// sd card over SPI: sync SdCard + sync volume manager
 //
-// sync SdCard handles the SD protocol (CMD0, init, sector I/O)
-// using embedded_hal SpiDevice + DelayNs traits
-//
-// BlockDeviceAdapter bridges sync BlockDevice to AsyncBlockDevice
-// so AsyncVolumeManager can consume it
-//
-// poll_once drives file-I/O futures to completion in a single poll
-// (SPI bus is blocking, so every .await resolves immediately)
+// SdCard handles the SD protocol (CMD0, init, sector I/O) over the
+// shared blocking SPI bus; VolumeManager keeps its state behind its
+// own RefCell and takes &self, so an open file handle holds no borrow
+// and several can be in use at once
 
-use core::cell::RefCell;
-use core::future::Future;
-use core::pin::pin;
-use core::task::{Context, Poll, Waker};
+use core::cell::{Cell, RefCell};
 use embedded_hal::delay::DelayNs;
 
 use embedded_sdmmc::{
-    AsyncBlockDevice, AsyncVolumeManager, Block, BlockCount, BlockDevice, BlockIdx, RawDirectory,
-    RawVolume, SdCard, TimeSource, Timestamp, VolumeIdx,
+    RawDirectory, RawVolume, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager,
 };
 use log::info;
 
 use crate::board::SdSpiDevice;
 use crate::util::FixedStr;
-
-// sync BlockDevice -> AsyncBlockDevice adapter
-//
-// sync SdCard uses RefCell internally, takes &self for BlockDevice
-// methods; we delegate AsyncBlockDevice &mut self to the inner &self
-// methods. All resolve immediately since SPI is DMA-blocking
-
-pub(crate) struct BlockDeviceAdapter<D: BlockDevice>(D);
-
-impl<D: BlockDevice> AsyncBlockDevice for BlockDeviceAdapter<D> {
-    type Error = D::Error;
-
-    async fn read(
-        &mut self,
-        blocks: &mut [Block],
-        start_block_idx: BlockIdx,
-    ) -> Result<(), Self::Error> {
-        self.0.read(blocks, start_block_idx)
-    }
-
-    async fn write(
-        &mut self,
-        blocks: &[Block],
-        start_block_idx: BlockIdx,
-    ) -> Result<(), Self::Error> {
-        self.0.write(blocks, start_block_idx)
-    }
-
-    async fn num_blocks(&mut self) -> Result<BlockCount, Self::Error> {
-        self.0.num_blocks()
-    }
-}
 
 // no RTC on this board
 
@@ -76,37 +36,35 @@ impl TimeSource for NullTimeSource {
 // type aliases
 
 pub type SyncSdCard = SdCard<SdSpiDevice, esp_hal::delay::Delay>;
-pub(crate) type SdBlockDev = BlockDeviceAdapter<SyncSdCard>;
 // directory budget: root + data dir + cached subdirs + one transient
 // open for Scope::Named or an uncached subdir
-pub(crate) type VolMgr = AsyncVolumeManager<SdBlockDev, NullTimeSource, 8, 4, 1>;
+pub(crate) type VolMgr = VolumeManager<SyncSdCard, NullTimeSource, 8, 4, 1>;
 
 // subdirectory handles kept open alongside the data dir (BOOKS,
 // STATS, ...); names longer than the FixedStr are never cached
 pub(crate) const SUB_HANDLES: usize = 4;
 
-// persistent volume manager state, held behind RefCell for interior
-// mutability (AsyncVolumeManager requires &mut self)
+// persistent volume manager state; every field is borrowed only for
+// the length of one call, never across a caller's closure
 
 pub(crate) struct SdStorageInner {
     pub(crate) mgr: VolMgr,
     pub(crate) vol: RawVolume,
     pub(crate) root: RawDirectory,
     /// Resolved data directory name ("_PLUMP" or legacy "_PULP").
-    pub(crate) data_dir: &'static str,
+    pub(crate) data_dir: Cell<&'static str>,
     /// data directory handle, opened on first use and kept for the
     /// device lifetime: every directory open scans its parent on SD
-    pub(crate) data_handle: Option<RawDirectory>,
+    pub(crate) data_handle: Cell<Option<RawDirectory>>,
     /// subdirectories of the data dir, same lifetime, keyed by name
-    pub(crate) sub_handles: [Option<(FixedStr<12>, RawDirectory)>; SUB_HANDLES],
+    pub(crate) sub_handles: RefCell<[Option<(FixedStr<12>, RawDirectory)>; SUB_HANDLES]>,
 }
 
-// holds a persistently-mounted AsyncVolumeManager with volume 0 and
-// root directory kept open for the device lifetime; RefCell provides
-// interior mutability so storage functions can take &SdStorage
+// holds a persistently-mounted VolumeManager with volume 0 and the
+// root directory kept open for the device lifetime
 
 pub struct SdStorage {
-    inner: Option<RefCell<SdStorageInner>>,
+    inner: Option<SdStorageInner>,
 }
 
 impl SdStorage {
@@ -147,11 +105,10 @@ impl SdStorage {
     //
     // opens volume 0 (first MBR partition) and keeps the root
     // directory open for the device lifetime
-    pub async fn mount(sd: SyncSdCard) -> Self {
-        let adapter = BlockDeviceAdapter(sd);
-        let mut mgr: VolMgr = AsyncVolumeManager::new_with_limits(adapter, NullTimeSource, 5000);
+    pub fn mount(sd: SyncSdCard) -> Self {
+        let mgr: VolMgr = VolumeManager::new_with_limits(sd, NullTimeSource, 5000);
 
-        let vol = match mgr.open_raw_volume(VolumeIdx(0)).await {
+        let vol = match mgr.open_raw_volume(VolumeIdx(0)) {
             Ok(v) => v,
             Err(e) => {
                 info!("SD card: open volume failed: {}", e);
@@ -163,21 +120,21 @@ impl SdStorage {
             Ok(d) => d,
             Err(e) => {
                 info!("SD card: open root dir failed: {}", e);
-                let _ = mgr.close_volume(vol).await;
+                let _ = mgr.close_volume(vol);
                 return Self { inner: None };
             }
         };
 
         info!("SD card: filesystem mounted");
         Self {
-            inner: Some(RefCell::new(SdStorageInner {
+            inner: Some(SdStorageInner {
                 mgr,
                 vol,
                 root,
-                data_dir: crate::drivers::storage::PLUMP_DIR,
-                data_handle: None,
-                sub_handles: [None; SUB_HANDLES],
-            })),
+                data_dir: Cell::new(crate::drivers::storage::PLUMP_DIR),
+                data_handle: Cell::new(None),
+                sub_handles: RefCell::new([None; SUB_HANDLES]),
+            }),
         }
     }
 
@@ -190,46 +147,23 @@ impl SdStorage {
     #[inline]
     pub fn data_dir(&self) -> &'static str {
         match &self.inner {
-            Some(cell) => cell.borrow().data_dir,
+            Some(inner) => inner.data_dir.get(),
             None => crate::drivers::storage::PLUMP_DIR,
         }
     }
 
     #[inline]
-    pub(crate) fn borrow_inner(&self) -> Option<core::cell::RefMut<'_, SdStorageInner>> {
-        self.inner.as_ref().map(|c| c.borrow_mut())
+    pub(crate) fn inner(&self) -> Option<&SdStorageInner> {
+        self.inner.as_ref()
     }
 
     // flush pending writes and close fat handles; best-effort before halt.
     // after this call no further sd i/o is possible until mcu reset
     pub fn flush_and_close(&self) {
-        if let Some(ref cell) = self.inner {
-            let mut guard = cell.borrow_mut();
-            let inner = &mut *guard;
+        if let Some(inner) = &self.inner {
             inner.drop_dir_handles();
             let _ = inner.mgr.close_dir(inner.root);
-            poll_once(async {
-                let _ = inner.mgr.close_volume(inner.vol).await;
-            });
+            let _ = inner.mgr.close_volume(inner.vol);
         }
-    }
-}
-
-// drive a future to completion in exactly one poll
-//
-// correct because the SPI bus is blocking and the sync SdCard
-// completes every operation before returning - no inner .await
-// ever returns Pending
-//
-// only use for file-level operations (open, read, write, seek,
-// iterate); mount runs inside the real Embassy executor
-
-pub fn poll_once<T>(fut: impl Future<Output = T>) -> T {
-    let waker: &Waker = Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    let mut fut = pin!(fut);
-    match fut.as_mut().poll(&mut cx) {
-        Poll::Ready(v) => v,
-        Poll::Pending => panic!("poll_once: future pended -- SPI must be in Blocking mode"),
     }
 }

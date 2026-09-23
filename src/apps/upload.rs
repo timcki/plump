@@ -330,17 +330,17 @@ enum ServerEvent {
 
 /// Removes the partial file when an upload does not run to completion.
 ///
-/// The FAT handle itself is the [`storage::FileWriter`]'s business: it
+/// The FAT handle itself is the [`storage::File`]'s business: it
 /// closes on drop, so this guard only owns the commit decision.
 struct UploadFileGuard<'a> {
-    file: Option<storage::FileWriter<'a>>,
+    file: Option<storage::File<'a>>,
     sd: &'a SdStorage,
     name: FileName,
     committed: bool,
 }
 
 impl<'a> UploadFileGuard<'a> {
-    fn new(file: storage::FileWriter<'a>, sd: &'a SdStorage, name: FileName) -> Self {
+    fn new(file: storage::File<'a>, sd: &'a SdStorage, name: FileName) -> Self {
         Self {
             file: Some(file),
             sd,
@@ -349,9 +349,9 @@ impl<'a> UploadFileGuard<'a> {
         }
     }
 
-    fn write(&self, data: &[u8]) -> crate::error::Result<()> {
+    fn write(&mut self, data: &[u8]) -> crate::error::Result<()> {
         self.file
-            .as_ref()
+            .as_mut()
             .expect("upload file already closed")
             .write(data)
     }
@@ -1002,7 +1002,7 @@ where
 
     // open file once for the entire upload (create/truncate)
     let file = sd.create_file(name_str).map_err(|_| "create failed")?;
-    let file = UploadFileGuard::new(file, sd, file_name);
+    let mut file = UploadFileGuard::new(file, sd, file_name);
 
     // holdback last end_marker.len() bytes to detect boundary spanning two reads
 

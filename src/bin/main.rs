@@ -129,7 +129,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let sd = match board.storage.sd_card {
         Some(card) => {
             console.push("sd: card detected");
-            SdStorage::mount(card).await
+            SdStorage::mount(card)
         }
         None => {
             console.push("sd: not found");
@@ -140,7 +140,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let sd_ok = sd.probe_ok();
     if sd_ok {
         console.push("sd: fat32 mounted");
-        if let Err(e) = sd.ensure_plump_dir_async().await {
+        if let Err(e) = sd.ensure_plump_dir() {
             console.push("sd: plump dir failed");
             log::warn!("ensure_plump_dir: {:?}", e);
         }

@@ -133,7 +133,7 @@ Then every 5 seconds: heap usage, stack watermark, battery percentage, uptime, S
 │       │   ├── mod.rs              driver re-exports
 │       │   ├── ssd1677.rs          EPD display driver — 3-phase partial refresh, strip streaming
 │       │   ├── strip.rs            4 KB strip buffer — rotation, glyph blitting, DrawTarget impl
-│       │   ├── sdcard.rs           SD card init, sync-to-async adapter, poll_once
+│       │   ├── sdcard.rs           SD card init, volume mount, cached dir handles
 │       │   ├── storage.rs          FAT filesystem ops — CRUD for root, _PULP/, subdirs
 │       │   ├── input.rs            ADC button polling, debounce, long-press, repeat
 │       │   └── battery.rs          ADC-to-millivolt conversion, percentage interpolation
@@ -250,7 +250,7 @@ The distro implements `AppLayer` via `AppManager` in `src/apps/manager.rs`, whic
 
 **No `std::fmt`.** Stack-based formatting via `StackFmt<N>` and `BorrowedFmt` in `kernel/src/ui/stack_fmt.rs`. These are `fmt::Write` implementations over fixed-size stack buffers that silently truncate on overflow.
 
-**No `std::io`.** All file I/O goes through `KernelHandle` → `storage.rs` → `embedded-sdmmc` `AsyncVolumeManager`. The `poll_once` function drives async futures to completion in a single poll — correct because the SPI bus is blocking (DMA completes before return, never pends).
+**No `std::io`.** All file I/O goes through `KernelHandle` → `storage.rs` → the vendored `embedded-sdmmc` sync `VolumeManager`, which is synchronous over the blocking SPI bus and keeps its state behind its own `RefCell`, so every storage call takes `&self`.
 
 **No `String` / `Vec` in hot paths.** `alloc::vec::Vec` is used only in the EPUB reader for chapter text buffers and image decode. Everything else uses fixed-size arrays and stack buffers.
 
@@ -466,5 +466,4 @@ A row that opens a surface instead of stepping a value takes `Domain::Action` (i
 - **log::info! for everything.** Serial output is the primary debugging tool. Err on the side of logging too much — it costs nothing when the device isn't connected to USB.
 - **Dirty-region tracking.** Always call `ctx.mark_dirty(region)` with the tightest possible region. The renderer only refreshes the dirty area. Full-screen redraws are expensive (~600ms for GC).
 - **Yield for fairness.** Long-running sync work should intersperse `embassy_futures::yield_now().await` calls to let other tasks run.
-- **poll_once is sacred.** Only use it for operations that are guaranteed to complete in a single poll (sync SPI). If the future could pend, it will panic.
-- **One file open per read session.** Every `open_file_in_dir` scans the directory on SD, so a caller that needs several pieces of one file goes through `SdStorage::with_file_in_plump_subdir` (or `bundle::with_reader` for bundles) and does its reads on the open `FileReader`. The data dir and its subdirs (`BOOKS`, `STATS`) are opened once and cached in `SdStorageInner`; only `Scope::Named` opens a directory per call.
+- **Open a file once per session.** Every open scans the directory on SD, so a caller that touches one file several times opens it once (`SdStorage::open_in_root` / `open_in_plump` / `open_in_plump_subdir`, `with_file_in_plump_subdir`, `bundle::with_reader`) and works on the returned `File` (`read_at`, `write_at`, `append`, `len`; closed on drop). A `File` holds no borrow of the storage between calls, so an EPUB read and a bundle append can be open at once; the volume manager allows four open files. The data dir and its subdirs (`BOOKS`, `STATS`) are opened once and cached in `SdStorageInner`; only `Scope::Named` opens a directory per call.

@@ -18,7 +18,7 @@
 // io module wraps SdStorage to read/write bundle bytes by name_hash.
 
 use crate::drivers::sdcard::SdStorage;
-use crate::drivers::storage::FileReader;
+use crate::drivers::storage::File;
 use crate::util::FixedStr;
 
 // ── on-disk layout: directory + filename ───────────────────────────
@@ -908,14 +908,14 @@ pub fn read_header(sd: &SdStorage, name_hash: u32) -> Option<BundleHeader> {
 pub fn with_reader<T>(
     sd: &SdStorage,
     name_hash: u32,
-    f: impl FnOnce(&mut FileReader<'_>) -> crate::error::Result<T>,
+    f: impl FnOnce(&mut File<'_>) -> crate::error::Result<T>,
 ) -> crate::error::Result<T> {
     let n = bundle_file_name(name_hash);
     sd.with_file_in_plump_subdir(BOOKS_DIR, bundle_file_str(&n), f)
 }
 
 /// decode the header of an open bundle; None when short or invalid
-pub fn read_header_in(r: &mut FileReader<'_>) -> Option<BundleHeader> {
+pub fn read_header_in(r: &mut File<'_>) -> Option<BundleHeader> {
     let mut buf = [0u8; HEADER_SIZE];
     let nread = r.read_at(0, &mut buf).ok()?;
     if nread < HEADER_SIZE {
@@ -944,7 +944,7 @@ pub fn cached_total_pages(sd: &SdStorage, name_hash: u32) -> Option<u32> {
 /// `cached_total_pages` for an open bundle whose header is already
 /// decoded, so a caller reading the cover in the same session pays no
 /// second file open
-pub fn total_pages_in(r: &mut FileReader<'_>, hdr: &BundleHeader) -> Option<u32> {
+pub fn total_pages_in(r: &mut File<'_>, hdr: &BundleHeader) -> Option<u32> {
     if !hdr.has_flag(FLAG_PAGEIDX_READY) {
         return None;
     }

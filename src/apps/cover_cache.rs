@@ -15,7 +15,7 @@
 
 use alloc::vec::Vec;
 
-use plump_kernel::drivers::storage::FileReader;
+use plump_kernel::drivers::storage::File;
 use plump_kernel::kernel::bundle::{
     self, BundleError, BundleFile, BundleHeader, CoverKind, CoverVariant, CoversHeader, SectionId,
     SectionRange,
@@ -186,7 +186,7 @@ impl VariantTable {
 
 /// Covers header plus variant table of an open bundle, fetched with a
 /// single read. None when covers aren't ready or the section is short.
-fn variant_table_in(r: &mut FileReader<'_>, hdr: &BundleHeader) -> Option<VariantTable> {
+fn variant_table_in(r: &mut File<'_>, hdr: &BundleHeader) -> Option<VariantTable> {
     if !hdr.has_flag(bundle::FLAG_COVERS_READY) {
         return None;
     }
@@ -212,7 +212,7 @@ fn variant_table_in(r: &mut FileReader<'_>, hdr: &BundleHeader) -> Option<Varian
 /// The `prefer` variant (or the first available) of an open bundle:
 /// one read for the table, one for the bitmap.
 fn read_cover_in(
-    r: &mut FileReader<'_>,
+    r: &mut File<'_>,
     hdr: &BundleHeader,
     prefer: CoverKind,
 ) -> Option<DecodedImage> {
