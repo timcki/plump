@@ -37,10 +37,15 @@ fn is_actionable(ev: &Event) -> bool {
     !matches!(ev, Event::Release(_))
 }
 
-fn queue_event(ev: Event) {
-    if INPUT_EVENTS.try_send(ev).is_ok() && is_actionable(&ev) {
+// false when the channel is full
+fn queue_event(ev: Event) -> bool {
+    if INPUT_EVENTS.try_send(ev).is_err() {
+        return false;
+    }
+    if is_actionable(&ev) {
         ACTIONABLE.lock(|n| n.set(n.get().saturating_add(1)));
     }
+    true
 }
 
 fn note_taken(ev: &Event) {
@@ -83,6 +88,10 @@ pub async fn input_task(mut input: InputDriver) -> ! {
     // with the adaptive poll rate, so 3000 ticks silently meant 150s
     // at the slow rate
     let mut battery_at = Instant::now() + Duration::from_secs(timing::BATTERY_INTERVAL_SECS);
+    // a release that met a full channel (repeats pile up while a long
+    // waveform holds the scheduler). dropping it would leave the policy
+    // believing the button is still held, so it is retried each tick
+    let mut held_release: Option<Event> = None;
 
     loop {
         // adaptive polling: fast rate during active input, slow when idle
@@ -96,10 +105,22 @@ pub async fn input_task(mut input: InputDriver) -> ! {
         if RESET_HOLD.try_take().is_some() {
             input.reset_hold_state();
         }
+        if let Some(ev) = held_release
+            && queue_event(ev)
+        {
+            held_release = None;
+        }
         let mut got = false;
         while let Some(ev) = input.poll() {
-            queue_event(ev);
             got = true;
+            if held_release.is_some() {
+                // nothing may overtake the stuck release; a press made
+                // meanwhile is dropped together with its own release
+                continue;
+            }
+            if !queue_event(ev) && matches!(ev, Event::Release(_)) {
+                held_release = Some(ev);
+            }
         }
 
         if Instant::now() >= battery_at {
