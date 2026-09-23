@@ -948,6 +948,12 @@ where
                 fat.delete_directory_entry(&mut data.block_cache, parent_dir_info, &sfn)?
             }
         }
+        // plump patch: give the clusters back. the entry goes first, so
+        // a power cut in between leaks the chain rather than leaving an
+        // entry that points at free clusters
+        match &mut data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => fat.free_cluster_chain(&mut data.block_cache, dir_entry.cluster)?,
+        }
 
         Ok(())
     }

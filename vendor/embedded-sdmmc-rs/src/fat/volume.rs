@@ -986,12 +986,19 @@ impl FatVolume {
                 };
 
                 // Walk the directory
+                let mut prev_block = None;
                 while let Some(cluster) = current_cluster {
                     // Scan the cluster / root dir a block at a time
                     for block_idx in first_dir_block_num.range(dir_size) {
-                        match self.delete_entry_in_block(block_cache, match_name, block_idx) {
+                        match self.delete_entry_in_block(
+                            block_cache,
+                            match_name,
+                            block_idx,
+                            prev_block,
+                        ) {
                             Err(Error::NotFound) => {
                                 // Carry on
+                                prev_block = Some(block_idx);
                             }
                             x => {
                                 // Either we deleted it OK, or there was some
@@ -1023,15 +1030,22 @@ impl FatVolume {
                     _ => Some(dir_info.cluster),
                 };
                 // Walk the directory
+                let mut prev_block = None;
                 while let Some(cluster) = current_cluster {
                     // Scan the cluster a block at a time
                     let start_block_idx = self.cluster_to_block(cluster);
                     for block_idx in
                         start_block_idx.range(BlockCount(u32::from(self.blocks_per_cluster)))
                     {
-                        match self.delete_entry_in_block(block_cache, match_name, block_idx) {
+                        match self.delete_entry_in_block(
+                            block_cache,
+                            match_name,
+                            block_idx,
+                            prev_block,
+                        ) {
                             Err(Error::NotFound) => {
                                 // Carry on
+                                prev_block = Some(block_idx);
                                 continue;
                             }
                             x => {
@@ -1055,12 +1069,16 @@ impl FatVolume {
     /// Deletes a directory entry from a block of directory entries.
     ///
     /// Entries are marked as deleted by setting the first byte of the file name
-    /// to a special value.
+    /// to a special value. The long-name slots in front of the entry
+    /// (checksum-matched, running back into `prev_block` when the entry
+    /// sits at the top of its block) are marked the same way; plump
+    /// patch, upstream left them behind as orphans.
     fn delete_entry_in_block<D>(
         &self,
         block_cache: &mut BlockCache<D>,
         match_name: &ShortFileName,
         block_idx: BlockIdx,
+        prev_block: Option<BlockIdx>,
     ) -> Result<(), Error<D::Error>>
     where
         D: BlockDevice,
@@ -1069,20 +1087,60 @@ impl FatVolume {
         let block = block_cache
             .read_mut(block_idx)
             .map_err(Error::DeviceError)?;
+        let mut found = None;
         for (i, dir_entry_bytes) in block.chunks_exact_mut(OnDiskDirEntry::LEN).enumerate() {
             let dir_entry = OnDiskDirEntry::new(dir_entry_bytes);
             if dir_entry.is_end() {
                 // Can quit early
                 break;
             } else if dir_entry.matches(match_name) {
-                let start = i * OnDiskDirEntry::LEN;
-                // set first byte to the 'unused' marker
-                block[start] = 0xE5;
-                trace!("Updating directory");
-                return block_cache.write_back().map_err(Error::DeviceError);
+                found = Some(i);
+                break;
             }
         }
-        Err(Error::NotFound)
+        let Some(i) = found else {
+            return Err(Error::NotFound);
+        };
+        let start = i * OnDiskDirEntry::LEN;
+        let sum = lfn_checksum(&block[start..start + 11]);
+        // set first byte to the 'unused' marker
+        block[start] = 0xE5;
+        let reached_top = mark_lfn_slots(&mut block[..start], sum);
+        trace!("Updating directory");
+        block_cache.write_back().map_err(Error::DeviceError)?;
+        if reached_top && let Some(prev) = prev_block {
+            let block = block_cache.read_mut(prev).map_err(Error::DeviceError)?;
+            mark_lfn_slots(&mut block[..], sum);
+            block_cache.write_back().map_err(Error::DeviceError)?;
+        }
+        Ok(())
+    }
+
+    /// Free every cluster of the chain starting at `first`, the first
+    /// one included (a deleted file's clusters). plump patch: upstream
+    /// deleted the directory entry and leaked the chain.
+    pub(crate) fn free_cluster_chain<D>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        first: ClusterId,
+    ) -> Result<(), Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        if first.0 < RESERVED_ENTRIES {
+            // no cluster was ever allocated
+            return Ok(());
+        }
+        self.truncate_cluster_chain(block_cache, first)?;
+        self.update_fat(block_cache, first, ClusterId::EMPTY)?;
+        if let Some(ref mut number_free_cluster) = self.free_clusters_count {
+            *number_free_cluster += 1;
+        }
+        match self.next_free_cluster {
+            Some(c) if c.0 <= first.0 => {}
+            _ => self.next_free_cluster = Some(first),
+        }
+        Ok(())
     }
 
     /// Finds the next free cluster after the start_cluster and before end_cluster
@@ -1276,6 +1334,11 @@ impl FatVolume {
                 }
                 Err(Error::EndOfFile) => {
                     self.update_fat(block_cache, next, ClusterId::EMPTY)?;
+                    // plump patch: the last cluster is freed too, and
+                    // upstream broke out before counting it
+                    if let Some(ref mut number_free_cluster) = self.free_clusters_count {
+                        *number_free_cluster += 1;
+                    };
                     break;
                 }
                 Err(e) => return Err(e),
@@ -1504,3 +1567,29 @@ mod tests {
 // End Of File
 //
 // ****************************************************************************
+
+/// Checksum of an 11-byte short name, as stored in byte 13 of each of
+/// its long-name slots.
+fn lfn_checksum(name: &[u8]) -> u8 {
+    name.iter()
+        .fold(0u8, |sum, &b| sum.rotate_right(1).wrapping_add(b))
+}
+
+/// Mark the long-name slots at the end of `entries` (walking back from
+/// the last one) that belong to a short name with checksum `sum` as
+/// deleted. True when the walk reached the start of `entries` still on
+/// matching slots, so the run may continue in the block before.
+fn mark_lfn_slots(entries: &mut [u8], sum: u8) -> bool {
+    let mut end = entries.len();
+    while end >= OnDiskDirEntry::LEN {
+        let off = end - OnDiskDirEntry::LEN;
+        let slot = &mut entries[off..end];
+        let is_lfn = slot[11] == 0x0F && slot[0] != 0xE5 && slot[0] != 0x00;
+        if !is_lfn || slot[13] != sum {
+            return false;
+        }
+        slot[0] = 0xE5;
+        end = off;
+    }
+    true
+}
