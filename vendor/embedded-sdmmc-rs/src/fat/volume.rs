@@ -167,6 +167,9 @@ pub struct FatVolume {
     pub(crate) free_clusters_count: Option<u32>,
     /// Number of the next expected free cluster
     pub(crate) next_free_cluster: Option<ClusterId>,
+    /// The on-disk FSInfo free count has been marked unknown for this
+    /// mount (plump patch, see `invalidate_info_sector`)
+    pub(crate) info_invalidated: bool,
     /// Total number of clusters
     pub(crate) cluster_count: u32,
     /// Type of FAT
@@ -204,6 +207,37 @@ impl FatVolume {
                 block_cache.write_back()?;
             }
         }
+        Ok(())
+    }
+
+    /// Mark the on-disk FSInfo free count unknown, once per mount.
+    ///
+    /// plump patch: upstream rewrote FSInfo on every file flush (a read
+    /// and a write per close). The count is only a hint, and 0xFFFFFFFF
+    /// is the spec's "unknown", so the first cluster allocation or free
+    /// after mount writes that and nothing else touches FSInfo until
+    /// unmount (`close_volume`) writes the real values. A power cut in between leaves a count
+    /// the next mount does not trust, never a stale one it does. The
+    /// next-free hint on disk is left alone; a stale hint only costs a
+    /// longer scan.
+    pub fn invalidate_info_sector<D>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+    ) -> Result<(), Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        if self.info_invalidated {
+            return Ok(());
+        }
+        if let FatSpecificInfo::Fat32(fat32_info) = &self.fat_specific_info {
+            let block = block_cache
+                .read_mut(fat32_info.info_location)
+                .map_err(Error::DeviceError)?;
+            block[488..492].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+            block_cache.write_back()?;
+        }
+        self.info_invalidated = true;
         Ok(())
     }
 
@@ -1131,6 +1165,7 @@ impl FatVolume {
             // no cluster was ever allocated
             return Ok(());
         }
+        self.invalidate_info_sector(block_cache)?;
         self.truncate_cluster_chain(block_cache, first)?;
         self.update_fat(block_cache, first, ClusterId::EMPTY)?;
         if let Some(ref mut number_free_cluster) = self.free_clusters_count {
@@ -1229,6 +1264,7 @@ impl FatVolume {
         D: BlockDevice,
     {
         debug!("Allocating new cluster, prev_cluster={:?}", prev_cluster);
+        self.invalidate_info_sector(block_cache)?;
         let end_cluster = ClusterId(self.cluster_count + RESERVED_ENTRIES);
         let start_cluster = match self.next_free_cluster {
             Some(cluster) if cluster.0 < end_cluster.0 => cluster,
@@ -1318,6 +1354,7 @@ impl FatVolume {
                 Err(e) => return Err(e),
             }
         };
+        self.invalidate_info_sector(block_cache)?;
         if let Some(ref mut next_free_cluster) = self.next_free_cluster {
             if next_free_cluster.0 > next.0 {
                 *next_free_cluster = next;
@@ -1501,6 +1538,7 @@ where
                 second_fat_start,
                 free_clusters_count: None,
                 next_free_cluster: None,
+                info_invalidated: false,
                 cluster_count: bpb.total_clusters(),
                 fat_specific_info: FatSpecificInfo::Fat16(Fat16Info {
                     root_entries_count: bpb.root_entries_count(),
@@ -1527,6 +1565,7 @@ where
                 second_fat_start,
                 free_clusters_count: None,
                 next_free_cluster: None,
+                info_invalidated: false,
                 cluster_count: bpb.total_clusters(),
                 fat_specific_info: FatSpecificInfo::Fat32(Fat32Info {
                     info_location: lba_start + info_location,

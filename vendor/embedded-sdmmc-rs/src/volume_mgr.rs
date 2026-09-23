@@ -1081,9 +1081,12 @@ where
             return Err(Error::ReadOnly);
         }
 
-        data.open_files[file_idx].dirty = true;
-
+        // plump patch: `dirty` means the directory entry needs writing,
+        // so it is set only when something recorded there changes (the
+        // first cluster, the size, the archive bit, the mtime); an
+        // in-place write closes without touching the entry
         if data.open_files[file_idx].entry.cluster.0 < fat::RESERVED_ENTRIES {
+            data.open_files[file_idx].dirty = true;
             // file doesn't have a valid allocated cluster (possible zero-length file), allocate one
             data.open_files[file_idx].entry.cluster =
                 match data.open_volumes[volume_idx].volume_type {
@@ -1184,14 +1187,20 @@ where
             if new_offset > data.open_files[file_idx].entry.size {
                 // We made it longer
                 data.open_files[file_idx].update_length(new_offset);
+                data.open_files[file_idx].dirty = true;
             }
             data.open_files[file_idx]
                 .seek_from_start(new_offset)
                 .unwrap();
             // Entry update deferred to file close, for performance.
         }
-        data.open_files[file_idx].entry.attributes.set_archive(true);
-        data.open_files[file_idx].entry.mtime = self.time_source.get_timestamp();
+        let now = self.time_source.get_timestamp();
+        let f = &mut data.open_files[file_idx];
+        if !f.entry.attributes.is_archive() || f.entry.mtime != now {
+            f.entry.attributes.set_archive(true);
+            f.entry.mtime = now;
+            f.dirty = true;
+        }
         Ok(())
     }
 
@@ -1222,8 +1231,9 @@ where
             let volume_idx = data.get_volume_by_id(data.open_files[file_id].raw_volume)?;
             match &mut data.open_volumes[volume_idx].volume_type {
                 VolumeType::Fat(fat) => {
-                    debug!("Updating FAT info sector");
-                    fat.update_info_sector(&mut data.block_cache)?;
+                    // plump patch: no FSInfo rewrite here; the first
+                    // allocation or free of the mount marks it unknown
+                    // (`invalidate_info_sector`) and unmount writes it
                     debug!("Updating dir entry {:?}", data.open_files[file_id].entry);
                     if data.open_files[file_id].entry.size != 0 {
                         // If you have a length, you must have a cluster
