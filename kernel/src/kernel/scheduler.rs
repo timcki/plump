@@ -312,16 +312,7 @@ impl super::Kernel {
 
         {
             let active = app_mgr.active();
-            {
-                let ctx = app_mgr.ctx_mut();
-                info!(
-                    "boot: first frame active={:?} loading_active={} loading='{}' pct={}",
-                    active,
-                    ctx.loading_active(),
-                    ctx.loading_msg(),
-                    ctx.loading_pct()
-                );
-            }
+            info!("boot: first frame active={:?}", active);
 
             let t0 = Instant::now();
             let draw = |s: &mut StripBuffer| app_mgr.draw(s);
@@ -386,7 +377,7 @@ impl super::Kernel {
             // idle sleep by deadline (checked only here, never during a
             // waveform)
             if self.svc.idle_deadline().is_some_and(|d| Instant::now() >= d) {
-                self.sleep_with_session(app_mgr, "idle timeout").await;
+                self.sleep_with_session(app_mgr, "idle timeout", false).await;
                 self.svc.last_activity = Instant::now();
                 continue;
             }
@@ -500,7 +491,7 @@ impl super::Kernel {
             } else if app_mgr.ctx_mut().render_ready() {
                 let redraw = app_mgr.take_redraw();
                 if self.render(app_mgr, redraw).await.wants_sleep() {
-                    self.sleep_with_session(app_mgr, "power held").await;
+                    self.sleep_with_session(app_mgr, "power held", true).await;
                     continue;
                 }
             }
@@ -573,7 +564,7 @@ impl super::Kernel {
     async fn dispatch_input<A: AppLayer>(&mut self, ev: Event, app_mgr: &mut A) -> AfterInput {
         let after = self.svc.handle_input(ev, app_mgr);
         if after.wants_sleep() {
-            self.sleep_with_session(app_mgr, "power held").await;
+            self.sleep_with_session(app_mgr, "power held", true).await;
         }
         after
     }
@@ -776,6 +767,79 @@ impl super::Services {
         }
     }
 
+    // everything sleep does before the panel: session to RTC and SD,
+    // the power log line, the active app's heap drop, the bookmark
+    // flush and the wallpaper load. SD work only, so it can run inside
+    // a waveform (the sleep modal's)
+    fn sleep_prep<A: AppLayer>(
+        &mut self,
+        app_mgr: &mut A,
+        reason: &str,
+    ) -> Option<super::sleep_image::SleepImage> {
+        use super::rtc_session::RtcSession;
+
+        // collect session state from app layer
+        let t0 = Instant::now();
+        let mut session = RtcSession::zeroed();
+        app_mgr.collect_session(&mut session);
+
+        // increment wake count for debugging
+        session.increment_wake_count();
+
+        // mark valid BEFORE saving so both RTC and SD get the magic
+        session.mark_valid();
+
+        // save to RTC memory (fast path, works on USB / stable power)
+        session.rtc_save();
+
+        // save to SD card (reliable fallback for battery wake)
+        session.save_to_sd(&self.sd);
+        info!(
+            "sleep: session saved to RTC + SD ({}ms)",
+            t0.elapsed().as_millis()
+        );
+        super::power_log::sleep(
+            &self.sd,
+            self.sd_ok,
+            reason,
+            &app_mgr.active(),
+            super::uptime_secs() as u64,
+            self.input_events,
+            self.cached_battery_mv,
+            session.wake_count(),
+        );
+
+        // let the active app drop transient heap (reader chapter cache,
+        // decoded images, etc.) BEFORE the wallpaper allocator runs.
+        // session capture must happen first because collect_session
+        // reads reader state we're about to free.
+        info!("sleep: freeing active app transient heap...");
+        let t0 = Instant::now();
+        app_mgr.on_active_pre_sleep(&mut self.handle());
+        info!(
+            "sleep: active app cleanup ({}ms)",
+            t0.elapsed().as_millis()
+        );
+
+        info!("sleep: flushing bookmarks...");
+        let t0 = Instant::now();
+        if self.bm_cache.is_dirty() {
+            self.bm_cache.flush(&self.sd);
+        }
+        info!("sleep: bookmark flush ({}ms)", t0.elapsed().as_millis());
+
+        // load sleep wallpaper from SD before putting the card to sleep
+        info!("sleep: loading wallpaper from SD...");
+        let t0 = Instant::now();
+        let sleep_img = super::sleep_image::load_sleep_image(&self.sd);
+        if sleep_img.is_some() {
+            info!("sleep: wallpaper loaded ({}ms)", t0.elapsed().as_millis());
+        } else {
+            info!("sleep: no wallpaper found ({}ms)", t0.elapsed().as_millis());
+        }
+        sleep_img
+    }
+
     // flush today's reading stats and re-derive today_key from the
     // file's now-advanced FAT mtime, so a same-session calendar
     // rollover is detected before the next boot. no-op when nothing is
@@ -829,17 +893,7 @@ impl super::Kernel {
         let mut actual_mode = "none";
         let mut sleep_requested = false;
         let active = app_mgr.active();
-        {
-            let ctx = app_mgr.ctx_mut();
-            debug!(
-                "render: begin active={:?} redraw={:?} loading_active={} loading='{}' pct={}",
-                active,
-                redraw,
-                ctx.loading_active(),
-                ctx.loading_msg(),
-                ctx.loading_pct()
-            );
-        }
+        debug!("render: begin active={:?} redraw={:?}", active, redraw);
 
         let super::Kernel { screen, svc } = self;
 
@@ -1231,9 +1285,11 @@ impl super::Kernel {
     // RTC FAST memory is the fast path but is lost on battery wake
     // due to brownout resets (voltage sag wipes the RTC power domain).
     // the SD copy is the reliable fallback (~20ms extra).
-    async fn sleep_with_session<A: AppLayer>(&mut self, app_mgr: &mut A, reason: &str) {
-        use super::rtc_session::RtcSession;
-
+    /// `ack` is true for a sleep the user asked for (power held, the
+    /// menu's Sleep row): the app layer's sleep modal goes up at once
+    /// and the save work runs inside its waveform. idle-timeout sleep
+    /// has nobody watching and goes straight to the sleep screen.
+    async fn sleep_with_session<A: AppLayer>(&mut self, app_mgr: &mut A, reason: &str, ack: bool) {
         let sleep_start = Instant::now();
 
         // about to deep-sleep, cancel any pending grayscale-AA fire so
@@ -1248,8 +1304,10 @@ impl super::Kernel {
         // up to 30s of reading stats would be lost without this
         self.svc.flush_day_stats();
 
-        // force flush deferred app persistence (RECENT, reading stats)
-        // before deep sleep so no dirty state is lost
+        // force flush deferred app persistence (RECENT, reading stats,
+        // the book record) before deep sleep so no dirty state is
+        // lost. it runs before the modal is drawn: the modal says the
+        // place is saved, and this is the write that saves it
         // TODO: decide policy on force-flush failure here: keep the
         // current best-effort behavior, retry, or abort/defer sleep to
         // preserve durability guarantees more strictly.
@@ -1260,50 +1318,57 @@ impl super::Kernel {
             info!("sleep: flush_deferred_persistence error: {}", e);
         }
 
-        // collect session state from app layer
+        let sleep_img = if ack && app_mgr.show_sleep_ack() {
+            self.sleep_prep_under_ack(app_mgr, reason).await
+        } else {
+            self.svc.sleep_prep(app_mgr, reason)
+        };
+
+        self.enter_sleep(&*app_mgr, reason, sleep_start, sleep_img).await;
+    }
+
+    // paint the app with its sleep modal as a partial and run the
+    // sleep prep while the waveform plays: the charge pump drives the
+    // panel with no SPI traffic, and the prep is almost all SD I/O, so
+    // the modal costs its own RAM write rather than a refresh stacked
+    // in front of the sleep screen
+    async fn sleep_prep_under_ack<A: AppLayer>(
+        &mut self,
+        app_mgr: &mut A,
+        reason: &str,
+    ) -> Option<super::sleep_image::SleepImage> {
+        let super::Kernel { screen, svc } = self;
         let t0 = Instant::now();
-        let mut session = RtcSession::zeroed();
-        app_mgr.collect_session(&mut session);
+        let wave = {
+            let draw = |s: &mut StripBuffer| app_mgr.draw(s);
+            let full = crate::ui::Region::new(0, 0, crate::board::SCREEN_W, crate::board::SCREEN_H);
+            match screen.plan_partial(full, &draw) {
+                Ok(super::screen::PartialPlan::Ready(wave)) => Ok(wave),
+                Ok(super::screen::PartialPlan::RevertFirst(pending)) => pending.proceed(&draw).await,
+                Err(e) => Err(e),
+            }
+        };
+        let Ok(mut wave) = wave else {
+            info!("sleep: modal refresh refused, sleeping without it");
+            return svc.sleep_prep(app_mgr, reason);
+        };
+        info!("sleep: modal written ({}ms)", t0.elapsed().as_millis());
 
-        // increment wake count for debugging
-        session.increment_wake_count();
+        let sleep_img = svc.sleep_prep(app_mgr, reason);
 
-        // mark valid BEFORE saving so both RTC and SD get the magic
-        session.mark_valid();
-
-        // save to RTC memory (fast path, works on USB / stable power)
-        session.rtc_save();
-
-        // save to SD card (reliable fallback for battery wake)
-        session.save_to_sd(&self.svc.sd);
+        let t1 = Instant::now();
+        let guard = Timer::after(Duration::from_millis(
+            crate::drivers::ssd1677::BUSY_TIMEOUT_MS,
+        ));
+        embassy_futures::select::select(wave.until_idle(), guard).await;
         info!(
-            "sleep: session saved to RTC + SD ({}ms)",
-            t0.elapsed().as_millis()
+            "sleep: modal waveform outlasted the prep by {}ms",
+            t1.elapsed().as_millis()
         );
-        super::power_log::sleep(
-            &self.svc.sd,
-            self.svc.sd_ok,
-            reason,
-            &app_mgr.active(),
-            super::uptime_secs() as u64,
-            self.svc.input_events,
-            self.svc.cached_battery_mv,
-            session.wake_count(),
-        );
-
-        // let the active app drop transient heap (reader chapter cache,
-        // decoded images, etc.) BEFORE the wallpaper allocator runs in
-        // enter_sleep. session capture must happen first because
-        // collect_session reads reader state we're about to free.
-        info!("sleep: freeing active app transient heap...");
-        let t0 = Instant::now();
-        app_mgr.on_active_pre_sleep(&mut self.handle());
-        info!(
-            "sleep: active app cleanup ({}ms)",
-            t0.elapsed().as_millis()
-        );
-
-        self.enter_sleep(&*app_mgr, reason, sleep_start).await;
+        // no phase 3: the sleep screen's full clear rewrites both
+        // planes, and the app has dropped the heap its frame drew from
+        wave.settle().abandon();
+        sleep_img
     }
 
     // flush bookmarks, render sleep screen, enter MCU deep sleep;
@@ -1311,7 +1376,13 @@ impl super::Kernel {
     //
     // uses a custom sleep config that keeps RTC FAST memory powered
     // so session state survives the sleep cycle (~1-2µA extra)
-    async fn enter_sleep<A: AppLayer>(&mut self, app_mgr: &A, reason: &str, sleep_start: Instant) {
+    async fn enter_sleep<A: AppLayer>(
+        &mut self,
+        app_mgr: &A,
+        reason: &str,
+        sleep_start: Instant,
+        sleep_img: Option<super::sleep_image::SleepImage>,
+    ) {
         use embedded_graphics::mono_font::MonoTextStyle;
         use embedded_graphics::mono_font::ascii::FONT_9X18;
         use embedded_graphics::pixelcolor::BinaryColor;
@@ -1322,23 +1393,6 @@ impl super::Kernel {
         use esp_hal::rtc_cntl::sleep::{RtcSleepConfig, RtcioWakeupSource, WakeupLevel};
 
         info!("{}: entering sleep...", reason);
-
-        info!("sleep: flushing bookmarks...");
-        let t0 = Instant::now();
-        if self.svc.bm_cache.is_dirty() {
-            self.svc.bm_cache.flush(&self.svc.sd);
-        }
-        info!("sleep: bookmark flush ({}ms)", t0.elapsed().as_millis());
-
-        // load sleep wallpaper from SD before putting the card to sleep
-        info!("sleep: loading wallpaper from SD...");
-        let t0 = Instant::now();
-        let sleep_img = super::sleep_image::load_sleep_image(&self.svc.sd);
-        if sleep_img.is_some() {
-            info!("sleep: wallpaper loaded ({}ms)", t0.elapsed().as_millis());
-        } else {
-            info!("sleep: no wallpaper found ({}ms)", t0.elapsed().as_millis());
-        }
 
         info!("sleep: putting SD card to sleep...");
         let t0 = Instant::now();

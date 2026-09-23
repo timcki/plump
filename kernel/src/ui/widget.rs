@@ -1,12 +1,10 @@
-// region geometry, alignment helpers, progress bar, loading indicator
+// region geometry, alignment helpers, progress bar
 
 use embedded_graphics::{
-    mono_font::MonoTextStyle, mono_font::ascii::FONT_9X18, pixelcolor::BinaryColor, prelude::*,
-    primitives::PrimitiveStyle, primitives::Rectangle, text::Text,
+    pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle, primitives::Rectangle,
 };
 
 use crate::drivers::strip::StripBuffer;
-use crate::ui::stack_fmt::BorrowedFmt;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Region {
@@ -326,52 +324,5 @@ impl ProgressBar {
             .draw(strip)
             .unwrap();
         }
-    }
-}
-
-/// Loading indicator for 1-bit e-paper.
-///
-/// Draws `"msg...pct%"` centered vertically in the region using the
-/// built-in FONT_9X18 mono font; works without any custom bitmap
-/// fonts loaded, usable from any app or the kernel itself.
-///
-/// ```text
-/// LoadingIndicator::new(region, "Loading", 25)       => "Loading...25%"
-/// LoadingIndicator::new(region, "Caching 3/15", 20)  => "Caching 3/15...20%"
-/// ```
-pub struct LoadingIndicator<'a> {
-    pub region: Region,
-    pub msg: &'a str,
-    pub pct: u8,
-}
-
-impl<'a> LoadingIndicator<'a> {
-    pub const fn new(region: Region, msg: &'a str, pct: u8) -> Self {
-        Self { region, msg, pct }
-    }
-
-    pub fn draw(&self, strip: &mut StripBuffer) {
-        use core::fmt::Write;
-
-        // clear region
-        self.region
-            .to_rect()
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
-            .draw(strip)
-            .unwrap();
-
-        // format "msg...pct%"
-        let mut buf = [0u8; 48];
-        let mut fmt = BorrowedFmt::new(&mut buf);
-        let _ = write!(fmt, "{}...{}%", self.msg, self.pct.min(100));
-        let text = fmt.as_str();
-
-        // FONT_9X18: 9px wide, 18px tall, ~14px ascent
-        // center vertically; baseline = region.y + (h + 9) / 2
-        let style = MonoTextStyle::new(&FONT_9X18, BinaryColor::On);
-        let baseline_y = self.region.y as i32 + (self.region.h as i32 + 9) / 2;
-        Text::new(text, Point::new(self.region.x as i32 + 2, baseline_y), style)
-            .draw(strip)
-            .unwrap();
     }
 }

@@ -1,8 +1,6 @@
 // app lifecycle manager: nav stack, dispatch, font propagation, draw
 //
 // all dispatch is static (monomorphized via with_app!); no dyn, no vtable
-// loading indicator is drawn between app content and overlays so it
-// sits on top of page content but under quick menu and button bumps
 
 use crate::apps::home::{self, HomeApp};
 use crate::apps::library::LibraryApp;
@@ -136,6 +134,9 @@ pub struct AppManager {
 
     // set by the quick menu's Sleep row, drained by the scheduler
     sleep_requested: bool,
+    // a sleep the user asked for has started: the sleep modal goes on
+    // top of everything in the frame the kernel paints next
+    sleep_ack: bool,
 }
 
 /// map a (legacy) `AppId` to the `Tab` it represents in the new model,
@@ -238,6 +239,7 @@ impl AppManager {
             chrome: Chrome::new(),
             upload_return_tab: Tab::Home,
             sleep_requested: false,
+            sleep_ack: false,
         }
     }
 
@@ -506,11 +508,10 @@ impl AppManager {
                 session.reader_font_size,
             );
 
-            // Wake-to-reader should use the rich cover loading screen on
-            // the very first frame instead of flashing a generic resume
-            // screen before background restore reloads cached assets.
+            // the wake sheet names the book and shows its cover from the
+            // first frame, before the pipeline has reopened anything
             if self.launcher.active() == AppId::Reader {
-                self.reader.prepare_restore_loading_screen(k);
+                self.reader.prepare_restore_loading_sheet(k);
             }
         }
 
@@ -518,7 +519,7 @@ impl AppManager {
         self.propagate_fonts();
 
         // the reader paints its own first frame after wake: a full
-        // clear once the page, or its loading screen, is due. every
+        // clear once the page, or its loading sheet, is due. every
         // other app repaints now
         if self.launcher.active() != AppId::Reader {
             self.launcher.ctx.request_full_redraw();
@@ -798,7 +799,6 @@ impl AppManager {
             }
 
             self.propagate_fonts();
-            self.launcher.ctx.clear_loading();
 
             if nav.to != AppId::Upload {
                 if nav.resume {
@@ -817,8 +817,9 @@ impl AppManager {
                     .ctx
                     .mark_dirty(Region::new(0, 0, SCREEN_W, SCREEN_H));
             } else if nav.to != AppId::Reader {
-                // the reader holds its first frame until the page or
-                // its loading screen is due (a full clear either way)
+                // the reader holds its first frame until the page is
+                // ready (a full clear) or its loading sheet is due (a
+                // partial over this screen, which the panel still shows)
                 self.launcher.ctx.request_full_redraw();
             }
         }
@@ -854,20 +855,23 @@ impl AppManager {
         combined
     }
 
-    pub fn draw(&self, strip: &mut StripBuffer) {
-        let active = self.launcher.active();
-        let show_top = with_app_ref!(active, self, |app| app.show_top_status());
-        let show_tabs = with_app_ref!(active, self, |app| app.show_tab_bar());
+    /// The screen beneath the reader while a book it was opened from
+    /// is loading: the sheet goes up over it, as an overlay would
+    fn reader_backdrop(&self) -> Option<AppId> {
+        let depth = self.launcher.depth();
+        (self.launcher.active() == AppId::Reader
+            && depth >= 2
+            && self.reader.loads_over_origin())
+        .then(|| self.launcher.stack_at(depth - 2))
+        .filter(|&id| id != AppId::Reader && id != AppId::Upload)
+    }
 
-        with_app_ref!(active, self, |app| app.draw(strip));
-
-        // shared chrome is drawn on top of the app's content so the
-        // bars always win the painter's-algorithm over any app pixel
-        // that strays into the bar regions.
-        // `show_tabs` now only says whether this screen is a tab
-        // screen at all; there is one bar and it lives at the top
-        let _ = show_tabs;
-        if show_top {
+    /// One app's content plus the shared top bar when it has one. the
+    /// bar is drawn after the content so it wins the painter's
+    /// algorithm over any app pixel that strays into it
+    fn draw_screen(&self, id: AppId, strip: &mut StripBuffer) {
+        with_app_ref!(id, self, |app| app.draw(strip));
+        if with_app_ref!(id, self, |app| app.show_top_status()) {
             let theme = Theme::default_v1();
             let mut painter = Painter::new(strip, &theme);
             self.chrome.draw_top(&mut painter, &crate::ui::TopFonts {
@@ -875,22 +879,18 @@ impl AppManager {
                 small: fonts::chrome_font(),
             });
         }
+    }
 
-        // loading indicator: after app content, before overlays.
-        // the reader draws its own centered loading screen while a
-        // book is opening, so suppress the generic indicator there.
-        let suppress_loading = active == AppId::Reader && self.reader.shows_loading_screen();
-        if self.launcher.ctx.loading_active() && !suppress_loading {
-            let region = self.launcher.ctx.loading_region();
-            if region.intersects(strip.logical_window()) {
-                crate::ui::LoadingIndicator::new(
-                    region,
-                    self.launcher.ctx.loading_msg(),
-                    self.launcher.ctx.loading_pct(),
-                )
-                .draw(strip);
-            }
+    pub fn draw(&self, strip: &mut StripBuffer) {
+        let active = self.launcher.active();
+        // `show_tab_bar` now only says whether this screen is a tab
+        // screen at all; there is one bar and it lives at the top
+        let show_tabs = with_app_ref!(active, self, |app| app.show_tab_bar());
+
+        if let Some(under) = self.reader_backdrop() {
+            self.draw_screen(under, strip);
         }
+        self.draw_screen(active, strip);
 
         // the settings cache sheet is an overlay like the quick menu:
         // drawn after the chrome so the bars do not slice its edges
@@ -910,6 +910,31 @@ impl AppManager {
         if !hide && !show_tabs {
             self.bumps.draw(strip);
         }
+
+        // the sleep modal wins over every overlay, the menu included
+        if self.sleep_ack {
+            self.draw_sleep_modal(strip);
+        }
+    }
+
+    /// The modal names the book only when one is on screen: anywhere
+    /// else the screen behind it (or the sleep card a moment later)
+    /// already does
+    fn draw_sleep_modal(&self, strip: &mut StripBuffer) {
+        let ss = self.settings.system_settings();
+        let mut place = crate::ui::StackFmt::<64>::new();
+        let title = (self.launcher.active() == AppId::Reader)
+            .then(|| self.reader.sleep_modal_book(&mut place))
+            .flatten();
+        let book = title.map(|title| crate::apps::widgets::sleep_modal::SleepBook {
+            title,
+            title_font: fonts::heading_font(
+                fonts::ReaderFont::from_idx(ss.reader_font).family(),
+                ss.ui_font_size_idx,
+            ),
+            place: place.as_str(),
+        });
+        crate::apps::widgets::sleep_modal::draw(strip, ss.ui_font_size_idx, book.as_ref());
     }
 
     pub fn propagate_fonts(&mut self) {
@@ -1144,6 +1169,11 @@ impl AppLayer for AppManager {
 
     fn on_active_pre_sleep(&mut self, k: &mut KernelHandle<'_>) {
         AppManager::on_active_pre_sleep(self, k);
+    }
+
+    fn show_sleep_ack(&mut self) -> bool {
+        self.sleep_ack = true;
+        true
     }
 
     fn has_sleep_overlay(&self) -> bool {

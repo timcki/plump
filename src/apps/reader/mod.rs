@@ -1,6 +1,7 @@
 mod epubs;
 mod images;
 mod layout;
+mod loading;
 mod paging;
 
 pub use plump_kernel::util::decode_utf8_char;
@@ -43,6 +44,7 @@ use smol_epub::cache;
 use smol_epub::epub::{self, EpubMeta, EpubSpine, EpubToc, MAX_SPINE, TocSource};
 use smol_epub::markup::{self, ImageRef, Style as MarkupStyle};
 use layout::LineLayout;
+use loading::{LoadingReason, SheetFace};
 use smol_epub::zip::{self, ZipIndex};
 
 // chrome margin: used for bottom info bar, loading indicator.
@@ -96,27 +98,6 @@ const BAR_GAP: u16 = 12;
 const BAR_W: u16 = 96;
 pub(super) const FOOTER_REGION: Region =
     Region::new(MARGIN, CHROME_Y, SCREEN_W - 2 * MARGIN, CHROME_H);
-
-// loading stage row: a tracked caption with the percent on the
-// right and a hairline bar beneath, sitting above the footer. the
-// only part of a loading screen that repaints while a book opens
-const STAGE_H: u16 = 34;
-const STAGE_CAP_H: u16 = 18;
-const STAGE_BOTTOM_GAP: u16 = 20;
-pub(super) const STAGE_REGION: Region = Region::new(
-    MARGIN,
-    CHROME_Y - CHROME_PAD - STAGE_BOTTOM_GAP - STAGE_H,
-    SCREEN_W - 2 * MARGIN,
-    STAGE_H,
-);
-
-// how long a loading state may run before its screen is painted:
-// anything faster lands as one refresh, the page itself. a wake
-// starts from the sleep wallpaper, which is fine to look at, and
-// its bundle reopen routinely takes a second: hold longer there so
-// the plate does not flash for a moment before the page
-const LOADING_HOLD_MS: u64 = 400;
-const LOADING_HOLD_RESUME_MS: u64 = 1500;
 
 // contents sheet: rows in the bottom-anchored state
 const CONTENTS_ROWS: usize = 8;
@@ -187,14 +168,11 @@ pub(super) const POSITION_OVERLAY: Region = Region::new(
     POSITION_OVERLAY_H,
 );
 
-const LOADING_W: u16 = SCREEN_W - 2 * MARGIN - 16;
-const LOADING_H: u16 = 24;
-pub(super) const LOADING_REGION: Region = Region::new(MARGIN, TEXT_Y, LOADING_W, LOADING_H);
-
 pub const QA_FONT_SIZE: u8 = 1;
 pub(super) const QA_PREV_CHAPTER: u8 = 3;
 pub(super) const QA_NEXT_CHAPTER: u8 = 4;
 pub(super) const QA_TOC: u8 = 5;
+pub(super) const QA_CACHE: u8 = 6;
 
 pub(super) const QA_MAX: usize = 4;
 
@@ -734,17 +712,6 @@ enum PendingPositionChange {
     Jump,
 }
 
-/// Why the reader is loading. Entering a book (open, wake) shows
-/// the plate; moving inside it (chapter change, new font) shows the
-/// strip. See mockups/xteink_x4_reader_loading.html.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LoadingReason {
-    Open,
-    Resume,
-    Chapter,
-    Font,
-}
-
 pub struct ReaderApp {
     pub(super) filename: FixedStr<32>,
     pub(super) title: FixedStr<64>,
@@ -791,8 +758,6 @@ pub struct ReaderApp {
     pub(super) page_img: Option<DecodedImage>,
     pub(super) fullscreen_img: bool,
     pub(super) defer_image_decode: bool,
-    // caching-indicator update deferred out of a waveform-window step
-    cache_ui_stale: bool,
 
     pub(super) fonts: Option<fonts::FontSet>,
     pub(super) font_line_h: u16,
@@ -838,12 +803,15 @@ pub struct ReaderApp {
     // home menu "Contents": show the sheet once the book is ready
     open_contents_on_ready: bool,
     loading_reason: LoadingReason,
-    /// the loading screen is on the panel for this episode
-    loading_painted: bool,
+    /// the hold is over or a slow step is next: the sheet should be up
+    loading_due: bool,
+    /// what the sheet on the panel shows; None until it is marked
+    /// this episode
+    sheet: Option<Box<SheetFace>>,
     loading_since: embassy_time::Instant,
     /// first frame after entering the book or waking: full clear
     first_paint_full: bool,
-    /// chapter count from the bundle header, for the plate before
+    /// chapter count from the bundle header, for the sheet before
     /// the OPF is parsed (wake); 0 when unknown
     spine_hint: u16,
     pub(super) qa_buf: [QuickAction; QA_MAX],
@@ -903,7 +871,6 @@ impl ReaderApp {
             page_img: None,
             fullscreen_img: false,
             defer_image_decode: false,
-            cache_ui_stale: false,
 
             fonts: None,
             font_line_h: LINE_H,
@@ -934,7 +901,8 @@ impl ReaderApp {
             toc_pages_stale: false,
             open_contents_on_ready: false,
             loading_reason: LoadingReason::Open,
-            loading_painted: false,
+            loading_due: false,
+            sheet: None,
             loading_since: embassy_time::Instant::from_ticks(0),
             first_paint_full: false,
             spine_hint: 0,
@@ -1038,388 +1006,19 @@ impl ReaderApp {
         self.state == State::Ready
     }
 
-    pub fn shows_loading_screen(&self) -> bool {
+    pub(super) fn is_loading(&self) -> bool {
         !matches!(self.state, State::Ready | State::ShowToc | State::Error)
     }
 
-    fn loading_visual_region(&self) -> Region {
-        Region::new(
-            self.text_margin,
-            self.text_y,
-            self.text_w as u16,
-            self.text_area_h,
-        )
-    }
-
-    /// Start a loading episode. nothing is painted until the hold runs
-    /// out or a slow step is next (`loading_tick`, `paint_loading`), so
-    /// a fast open, wake or chapter change lands as one refresh
-    fn begin_loading(&mut self, reason: LoadingReason) {
-        self.loading_reason = reason;
-        self.loading_painted = false;
-        self.loading_since = embassy_time::Instant::now();
-    }
-
-    /// Put the loading screen up now: plate or strip, plus the footer
-    fn paint_loading(&mut self, ctx: &mut AppContext) {
-        if self.loading_painted {
-            return;
-        }
-        self.loading_painted = true;
-        log::info!(
-            "reader: loading screen {:?} after {} ms in {:?}",
-            self.loading_reason,
-            self.loading_since.elapsed().as_millis(),
-            self.state
-        );
-        if self.first_paint_full {
-            self.first_paint_full = false;
-            ctx.request_full_redraw();
-        } else if matches!(self.loading_reason, LoadingReason::Open | LoadingReason::Resume) {
-            ctx.mark_dirty(PAGE_REGION);
-        } else {
-            ctx.mark_dirty(self.loading_visual_region());
-        }
-    }
-
-    /// Hold check, run before every pipeline step
-    fn loading_tick(&mut self, ctx: &mut AppContext) {
-        if self.loading_painted || !self.shows_loading_screen() {
-            return;
-        }
-        let hold = if self.loading_reason == LoadingReason::Resume {
-            LOADING_HOLD_RESUME_MS
-        } else {
-            LOADING_HOLD_MS
-        };
-        if self.loading_since.elapsed().as_millis() >= hold {
-            self.paint_loading(ctx);
-        }
-    }
-
-    /// The page, or an error, is ready: repaint, as a full clear when
-    /// this is the first frame after entering the book or waking
+    /// The page is ready: repaint, as a full clear when this is the
+    /// first frame after entering the book or waking
     fn mark_page_ready(&mut self, ctx: &mut AppContext) {
+        self.sheet = None;
         if self.first_paint_full {
             self.first_paint_full = false;
             ctx.request_full_redraw();
         } else {
             ctx.mark_dirty(PAGE_REGION);
-        }
-    }
-
-    /// A stage changed: repaint the stage row if the screen is up
-    fn set_loading_ui(&self, ctx: &mut AppContext) {
-        if self.loading_painted && self.shows_loading_screen() {
-            ctx.mark_dirty(STAGE_REGION);
-        }
-    }
-
-    /// Caption (uppercase, tracked) and right-hand value of the stage
-    /// row; the percent for the bar, None for an error
-    fn loading_stage(&self, cap: &mut StackFmt<48>, val: &mut StackFmt<48>) -> Option<u8> {
-        if let Some(e) = self.error {
-            let _ = write!(cap, "COULD NOT OPEN");
-            let _ = write!(val, "{}", e);
-            return None;
-        }
-        let n = self.epub.spine.len();
-        let ch = self.epub.chapter as usize + 1;
-        let pct = match self.state {
-            State::NeedBookmark | State::NeedInit | State::NeedOpf | State::NeedToc => {
-                let _ = write!(
-                    cap,
-                    "{}",
-                    if self.loading_reason == LoadingReason::Resume {
-                        "RESUMING"
-                    } else {
-                        "OPENING"
-                    }
-                );
-                match self.state {
-                    State::NeedBookmark => 5,
-                    State::NeedInit => 15,
-                    State::NeedOpf => 25,
-                    _ => 40,
-                }
-            }
-            State::NeedCache => {
-                if n > 0 {
-                    let _ = write!(cap, "CACHING CHAPTER {} OF {}", ch, n);
-                } else {
-                    let _ = write!(cap, "CACHING");
-                }
-                55
-            }
-            State::NeedIndex => {
-                if self.typeset_oom_waits > 0 {
-                    let _ = write!(cap, "WAITING FOR IMAGES");
-                } else if self.loading_reason == LoadingReason::Font {
-                    let _ = write!(cap, "TYPESETTING \u{00B7} ");
-                    let name = fonts::FONT_SIZE_NAMES
-                        .get(self.book_font_size_idx as usize)
-                        .copied()
-                        .unwrap_or("");
-                    for c in name.chars() {
-                        let _ = cap.write_char(c.to_ascii_uppercase());
-                    }
-                } else if self.is_epub && n > 0 {
-                    let _ = write!(cap, "TYPESETTING CHAPTER {} OF {}", ch, n);
-                } else {
-                    let _ = write!(cap, "TYPESETTING");
-                }
-                75
-            }
-            State::NeedPage => {
-                let _ = write!(cap, "OPENING PAGE");
-                90
-            }
-            State::Ready | State::ShowToc => {
-                let _ = write!(cap, "READY");
-                100
-            }
-            State::Error => 0,
-        };
-        let _ = write!(val, "{}%", pct);
-        Some(pct)
-    }
-
-    /// Where the book will open: chapter and percent, "from the start"
-    /// for a book without a bookmark, page or size for plain text
-    fn loading_resume_line(&self, out: &mut StackFmt<48>) {
-        if self.is_epub {
-            let n = self.epub.spine.len();
-            let ch = self.epub.chapter as usize + 1;
-            let fresh = self.epub.chapter == 0 && self.restore_offset.unwrap_or(0) == 0;
-            if n == 0 {
-                // before the OPF: what the bundle header knows
-                match (ch > 1, self.spine_hint as usize) {
-                    (true, hint) if hint > 0 => {
-                        let _ = write!(out, "Chapter {} of {}", ch, hint);
-                    }
-                    (true, _) => {
-                        let _ = write!(out, "Chapter {}", ch);
-                    }
-                    (false, hint) if hint > 0 => {
-                        let _ = write!(out, "{} chapters", hint);
-                    }
-                    _ => {}
-                }
-            } else if fresh {
-                let _ = write!(out, "From the start \u{00B7} {} chapters", n);
-            } else {
-                let _ = write!(
-                    out,
-                    "Chapter {} of {} \u{00B7} {}% read",
-                    ch,
-                    n,
-                    self.progress_pct()
-                );
-            }
-        } else if self.file_size > 0 {
-            match self.restore_page_hint {
-                Some(p) if p > 0 => {
-                    let _ = write!(out, "Page {}", p + 1);
-                }
-                _ => {
-                    let _ = write!(out, "{} KB", self.file_size / 1024);
-                }
-            }
-        }
-    }
-
-    fn placeholder_id(&self) -> u32 {
-        if self.is_epub && self.epub.name_hash != 0 {
-            self.epub.name_hash
-        } else {
-            self.filename
-                .as_bytes()
-                .iter()
-                .fold(0x811c_9dc5u32, |h, &b| (h ^ b as u32).wrapping_mul(0x0100_0193))
-        }
-    }
-
-    /// The loading screen (mockups/xteink_x4_reader_loading.html,
-    /// option A). entering a book shows the plate: cover, title,
-    /// author, rule, resume line. moving inside it shows the strip:
-    /// the text area cleared. both end in the stage row above the
-    /// footer, and only that row repaints while the pipeline runs
-    fn draw_loading_screen(&self, strip: &mut StripBuffer) {
-        if strip.gray_mode() != GrayMode::Bw {
-            return;
-        }
-        if matches!(self.loading_reason, LoadingReason::Open | LoadingReason::Resume) {
-            self.draw_loading_plate(strip, self.loading_visual_region());
-        }
-        self.draw_stage_row(strip);
-        if self.show_chrome {
-            self.draw_footer(strip);
-        }
-    }
-
-    fn draw_loading_plate(&self, strip: &mut StripBuffer, area: Region) {
-        use crate::apps::cover_cache::{CARD_THUMB_H, CARD_THUMB_W};
-        const COVER_TOP: u16 = 104;
-        const TITLE_GAP: u16 = 30;
-        const RULE_W: u16 = 34;
-
-        let cover = Region::new(
-            area.x + area.w.saturating_sub(CARD_THUMB_W) / 2,
-            area.y + COVER_TOP,
-            CARD_THUMB_W,
-            CARD_THUMB_H,
-        );
-        match self.loading_cover.as_ref() {
-            Some(img) => {
-                let x = cover.x + cover.w.saturating_sub(img.width) / 2;
-                let y = cover.y + cover.h.saturating_sub(img.height) / 2;
-                strip.blit_1bpp(
-                    &img.data,
-                    0,
-                    img.width as usize,
-                    img.height as usize,
-                    img.stride,
-                    x as i32,
-                    y as i32,
-                    true,
-                );
-            }
-            None => {
-                // the library's placeholder shape stands in until the
-                // real cover is extracted after the page is up
-                let theme = plump_kernel::ui::Theme::default_v1();
-                let mut p = plump_kernel::ui::Painter::new(strip, &theme);
-                crate::apps::cover_placeholder::draw_cover(&mut p, cover, self.placeholder_id());
-            }
-        }
-
-        let family = self.reader_font.family();
-        let title = self.display_name();
-        let title_font = if title.len() > 40 {
-            fonts::heading_font(family, 2)
-        } else {
-            fonts::heading_font(family, 3)
-        };
-        let lh = title_font.line_height;
-        let (first, rest) = split_title_line(title_font, title, area.w);
-        let mut y = cover.y + cover.h + TITLE_GAP;
-        title_font.draw_aligned(
-            strip,
-            Region::new(area.x, y, area.w, lh),
-            first,
-            Alignment::Center,
-            BinaryColor::On,
-        );
-        y += lh;
-        if !rest.is_empty() {
-            draw_truncated_text(
-                strip,
-                title_font,
-                Region::new(area.x, y, area.w, lh),
-                rest,
-                Alignment::Center,
-                BinaryColor::On,
-            );
-            y += lh;
-        }
-
-        let author = if self.is_epub {
-            self.epub.meta.author_str()
-        } else {
-            ""
-        };
-        if !author.is_empty() {
-            let small = fonts::ui_body_font(1);
-            y += 8;
-            draw_truncated_text(
-                strip,
-                small,
-                Region::new(area.x, y, area.w, small.line_height),
-                author,
-                Alignment::Center,
-                BinaryColor::On,
-            );
-            y += small.line_height;
-        }
-
-        y += 22;
-        Rectangle::new(
-            Point::new((area.x + area.w.saturating_sub(RULE_W) / 2) as i32, y as i32),
-            Size::new(RULE_W as u32, 1),
-        )
-        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-        .draw(strip)
-        .ok();
-        y += 20;
-
-        let mut line = StackFmt::<48>::new();
-        self.loading_resume_line(&mut line);
-        if !line.is_empty() {
-            let f = fonts::chrome_font();
-            draw_truncated_text(
-                strip,
-                f,
-                Region::new(area.x, y, area.w, f.line_height),
-                line.as_str(),
-                Alignment::Center,
-                BinaryColor::On,
-            );
-        }
-    }
-
-    fn draw_stage_row(&self, strip: &mut StripBuffer) {
-        let r = STAGE_REGION;
-        if !r.intersects(strip.logical_window()) {
-            return;
-        }
-        let font = fonts::chrome_font();
-        let mut cap = StackFmt::<48>::new();
-        let mut val = StackFmt::<48>::new();
-        let pct = self.loading_stage(&mut cap, &mut val);
-        let baseline = r.y as i32 + ((STAGE_CAP_H + font.ascent) / 2) as i32;
-        sheet::draw_tracked(strip, font, cap.as_str(), 1, r.x as i32, baseline, BinaryColor::On);
-        match pct {
-            Some(pct) => {
-                if !val.is_empty() {
-                    let w = sheet::tracked_width(font, val.as_str(), 1);
-                    sheet::draw_tracked(
-                        strip,
-                        font,
-                        val.as_str(),
-                        1,
-                        (r.x + r.w - w) as i32,
-                        baseline,
-                        BinaryColor::On,
-                    );
-                }
-                // track: 1 px line across the width, fill: 2 px high up
-                // to the position, like the footer bar
-                let bar_y = r.y + STAGE_CAP_H + 8;
-                Rectangle::new(
-                    Point::new(r.x as i32, (bar_y + 1) as i32),
-                    Size::new(r.w as u32, 1),
-                )
-                .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-                .draw(strip)
-                .ok();
-                let filled = (r.w as u32 * pct.min(100) as u32) / 100;
-                if filled > 0 {
-                    Rectangle::new(Point::new(r.x as i32, bar_y as i32), Size::new(filled, 2))
-                        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-                        .draw(strip)
-                        .ok();
-                }
-            }
-            None => {
-                // error: the message takes the bar's place
-                sheet::draw_ellipsized(
-                    strip,
-                    font,
-                    Region::new(r.x, r.y + STAGE_CAP_H, r.w, r.h - STAGE_CAP_H),
-                    val.as_str(),
-                    BinaryColor::On,
-                );
-            }
         }
     }
 
@@ -1534,36 +1133,6 @@ impl ReaderApp {
         false
     }
 
-    // update the kernel loading indicator with current caching progress.
-    // uses a unified percentage: chapters contribute 0-80%, images 80-100%.
-    fn cache_loading_pct(&self) -> u8 {
-        let cached_ch = self.cached_chapter_count();
-        let total_ch = self.epub.spine.len();
-        let img_found = self.epub.img_found_count as usize;
-        let img_cached = self.epub.img_cached_count as usize;
-
-        let in_chapter_phase = matches!(
-            self.epub.bg_cache,
-            BgCacheState::CacheChapter | BgCacheState::WaitNearbyImage
-        ) && cached_ch < total_ch;
-
-        if in_chapter_phase {
-            // chapters: 0% to 80%
-            if total_ch > 0 {
-                ((cached_ch * 80) / total_ch).min(80) as u8
-            } else {
-                80
-            }
-        } else {
-            // image phase: 80% to 100%
-            if img_found > 0 {
-                (80 + (img_cached * 20) / img_found).min(100) as u8
-            } else {
-                80
-            }
-        }
-    }
-
     // drain pending day-stats deltas (chunk F) into the kernel's
     // shared DayStats. cheap (a couple of u16/u32 adds + rollover
     // check), safe to run every pass
@@ -1576,30 +1145,6 @@ impl ReaderApp {
             self.day_pages_pending = 0;
             self.day_secs_pending = 0;
         }
-    }
-
-    fn set_cache_loading(&self, ctx: &mut AppContext) {
-        let cached_ch = self.cached_chapter_count();
-        let total_ch = self.epub.spine.len();
-        let img_found = self.epub.img_found_count as usize;
-        let img_cached = self.epub.img_cached_count as usize;
-
-        let mut lbuf = StackFmt::<28>::new();
-
-        let in_chapter_phase = matches!(
-            self.epub.bg_cache,
-            BgCacheState::CacheChapter | BgCacheState::WaitNearbyImage
-        ) && cached_ch < total_ch;
-
-        if in_chapter_phase {
-            let _ = write!(lbuf, "Caching {}/{}", cached_ch, total_ch);
-        } else if img_found > 0 {
-            let _ = write!(lbuf, "Caching images {}/{}", img_cached, img_found);
-        } else {
-            let _ = write!(lbuf, "Caching images");
-        }
-
-        ctx.set_loading(LOADING_REGION, lbuf.as_str(), self.cache_loading_pct());
     }
 
     // ── deferred persistence ────────────────────────────────────────
@@ -1648,7 +1193,6 @@ impl ReaderApp {
         if let Some(change) = self.pending_position_change.take() {
             self.commit_position_change(change);
         }
-        ctx.clear_loading();
         self.mark_page_ready(ctx);
     }
 
@@ -1906,6 +1450,31 @@ impl ReaderApp {
 
     /// Describe the open book to the sleep card. Runs before
     /// `on_pre_sleep`, so the TOC and stats are still in memory.
+    /// The sleep modal's book line: the title, with where the reader
+    /// stopped written to `place`; None unless a page is on screen.
+    /// the same figures the sleep card is filled from
+    pub fn sleep_modal_book(&self, place: &mut StackFmt<64>) -> Option<&str> {
+        if !matches!(self.state, State::Ready | State::ShowToc) {
+            return None;
+        }
+        let pages = if self.is_epub {
+            self.book_position()
+        } else {
+            (self.pg.fully_indexed && self.pg.total_pages > 0)
+                .then(|| (self.pg.page as u32 + 1, self.pg.total_pages as u32))
+        };
+        let (no, count) = if self.is_epub { self.chapter_numbering() } else { (0, 0) };
+        if let Some((page, total)) = pages {
+            let _ = write!(place, "page {} of {}", page, total);
+        } else if no > 0 {
+            let _ = write!(place, "chapter {} of {}", no, count);
+        } else {
+            let _ = write!(place, "{}% read", self.progress_pct());
+        }
+        let _ = write!(place, " \u{00B7} place saved");
+        Some(self.display_name())
+    }
+
     pub fn fill_sleep_card(&self, card: &mut crate::apps::widgets::SleepCard) {
         let author = if self.is_epub {
             let n = (self.epub.meta.author_len as usize).min(self.epub.meta.author.len());
@@ -1944,7 +1513,9 @@ impl ReaderApp {
     }
 
     // transition to error state with consistent handling
-    fn enter_error(&mut self, ctx: &mut AppContext, e: Error) {
+    // the error takes the loading sheet's place, drawn on the next
+    // step that may repaint
+    fn enter_error(&mut self, _ctx: &mut AppContext, e: Error) {
         if self.stats_pause_clock() {
             self.stats_dirty = true;
             self.arm_persist_debounce();
@@ -1952,8 +1523,7 @@ impl ReaderApp {
         self.pending_position_change = None;
         self.error = Some(e);
         self.state = State::Error;
-        ctx.clear_loading();
-        self.mark_page_ready(ctx);
+        self.paint_loading();
     }
 
     // run one step of image work queue polling while suspended;
@@ -2006,7 +1576,6 @@ impl ReaderApp {
             n += 1;
         }
 
-        // font size last
         self.qa_buf[n] = QuickAction::cycle(
             QA_FONT_SIZE,
             "Book font",
@@ -2016,7 +1585,42 @@ impl ReaderApp {
         .with_icon(sheet::ICON_TEXT_AA);
         n += 1;
 
+        // the rest of the book still caching: reported, not chosen
+        if let Some((label, done, total)) = self.bg_cache_progress() {
+            let mut row = QuickAction::info(QA_CACHE, label).with_icon(sheet::ICON_ARROWS_CLOCKWISE);
+            if total > 0 {
+                let mut val = StackFmt::<16>::new();
+                let _ = write!(val, "{} / {}", done, total);
+                row = row.with_value(val.as_str()).with_progress(done, total);
+            }
+            self.qa_buf[n] = row;
+            n += 1;
+        }
+
         self.qa_count = n as u8;
+    }
+
+    /// What background caching is working through and how far along
+    /// it is, for the menu's Preparing row; None once it is done
+    fn bg_cache_progress(&self) -> Option<(&'static str, u16, u16)> {
+        if !self.has_bg_work() {
+            return None;
+        }
+        let cached = self.cached_chapter_count() as u16;
+        let total = self.epub.spine.len() as u16;
+        let chapters = matches!(
+            self.epub.bg_cache,
+            BgCacheState::CacheChapter | BgCacheState::WaitNearbyImage
+        ) && cached < total;
+        Some(if chapters {
+            ("Preparing book", cached, total)
+        } else {
+            (
+                "Preparing images",
+                self.epub.img_cached_count,
+                self.epub.img_found_count,
+            )
+        })
     }
 
     fn apply_font_metrics(&mut self) {
@@ -2145,7 +1749,6 @@ impl ReaderApp {
         self.error = None;
         self.show_position = false;
         self.defer_image_decode = true;
-        self.cache_ui_stale = false;
         self.goto_last_page = false;
         self.recent_dirty = false;
         self.pending_position_change = Some(PendingPositionChange::RestoreReady);
@@ -2154,6 +1757,7 @@ impl ReaderApp {
         self.pending_title_save = false;
         self.pending_cover_thumb = false;
         self.loading_cover = None;
+        self.sheet = None;
         self.spine_hint = 0;
         self.persist_next_flush_at = None;
         self.apply_font_metrics();
@@ -2313,7 +1917,7 @@ impl ReaderApp {
         self.loading_cover = crate::apps::cover_cache::load_cover_variant_for(
             k,
             self.filename.as_bytes(),
-            plump_kernel::kernel::bundle::CoverKind::Card,
+            plump_kernel::kernel::bundle::CoverKind::Mini,
         );
 
         if let Some(ref img) = self.loading_cover {
@@ -2329,13 +1933,13 @@ impl ReaderApp {
         }
     }
 
-    pub(crate) fn prepare_restore_loading_screen(&mut self, k: &mut KernelHandle<'_>) {
+    pub(crate) fn prepare_restore_loading_sheet(&mut self, k: &mut KernelHandle<'_>) {
         let _ = self.try_load_cached_cover_thumb(k);
         self.prefill_title_from_bundle(k);
     }
 
     /// Title and chapter count from the bundle header, before the
-    /// zip is even opened: the wake plate and footer then show the
+    /// zip is even opened: the wake sheet and footer then show the
     /// book, not its file name. the pipeline re-reads both later
     fn prefill_title_from_bundle(&mut self, k: &mut KernelHandle<'_>) {
         use plump_kernel::kernel::bundle;
@@ -2490,21 +2094,6 @@ fn draw_chrome_text(
 
 /// First line of a title that may wrap once: the longest prefix
 /// that fits, cut back to a word boundary, and the remainder
-fn split_title_line<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> (&'a str, &'a str) {
-    let cut = font.truncate_len(text, max_w);
-    if cut >= text.len() {
-        return (text, "");
-    }
-    let mut n = cut;
-    while n > 0 && !text.is_char_boundary(n) {
-        n -= 1;
-    }
-    match text[..n].rfind(' ') {
-        Some(sp) if sp > 0 => (&text[..sp], text[sp + 1..].trim_start()),
-        _ => (&text[..n], &text[n..]),
-    }
-}
-
 fn draw_truncated_text(
     strip: &mut StripBuffer,
     font: &'static BitmapFont,
@@ -2535,8 +2124,7 @@ fn draw_truncated_text(
 // contents sheet, footer position and the page painter
 impl ReaderApp {
     /// One-line footer: the title, and how far through the book you
-    /// are as the tube the sleep card draws. Under the page and under
-    /// every loading screen, in the same place.
+    /// are as the tube the sleep card draws.
     fn draw_footer(&self, strip: &mut StripBuffer) {
         let cf = self.chrome_font;
         FOOTER_REGION
@@ -2573,37 +2161,6 @@ impl ReaderApp {
             );
         }
 
-        // background caching is the one thing left that reports from
-        // down here: it is transient, and nothing else says the book
-        // is still being read off the card
-        let mut sbuf = StackFmt::<24>::new();
-        if self.is_epub && self.epub.bg_cache != BgCacheState::Idle {
-            let cached = self.cached_chapter_count();
-            let total = self.epub.spine.len();
-            if cached < total {
-                let _ = write!(sbuf, "[{}/{}]", cached, total);
-            } else if self.epub.img_found_count > 0 {
-                let _ = write!(
-                    sbuf,
-                    "[img {}/{}]",
-                    self.epub.img_cached_count, self.epub.img_found_count,
-                );
-            } else {
-                let _ = write!(sbuf, "[img]");
-            }
-        }
-        if !sbuf.as_str().is_empty() {
-            let w = cf.map_or(0, |font| font.measure_str(sbuf.as_str()));
-            right_x = right_x.saturating_sub(BAR_GAP + w);
-            draw_chrome_text(
-                strip,
-                Region::new(right_x, CHROME_Y, w, CHROME_H),
-                sbuf.as_str(),
-                Alignment::CenterRight,
-                cf,
-            );
-        }
-
         let name = self.display_name();
         let title_w = right_x.saturating_sub(MARGIN + BAR_GAP);
         let title_r = Region::new(MARGIN, CHROME_Y, title_w, CHROME_H);
@@ -2628,20 +2185,10 @@ impl ReaderApp {
             self.draw_footer(strip);
         }
 
-        if self.error.is_some() {
-            self.draw_loading_screen(strip);
-            return;
-        }
-
-        // loading states: fresh opens/restores get the centered
-        // cover/title loading screen, while in-reader page turns and
-        // chapter jumps stay intentionally blank so they don't flash
-        // book metadata between chapters.
-        if self.shows_loading_screen() {
-            // the hold: nothing until the loading screen is due
-            if self.loading_painted {
-                self.draw_loading_screen(strip);
-            }
+        // loading or failed: the sheet alone, over the screen the
+        // manager drew beneath or over paper; nothing through the hold
+        if self.error.is_some() || self.is_loading() {
+            self.draw_loading_sheet(strip);
             return;
         }
 
@@ -3200,266 +2747,8 @@ impl ReaderApp {
     }
 }
 
-impl App<AppId> for ReaderApp {
-    fn on_enter(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
-        let msg = ctx.message();
-        self.filename.set(msg);
-        self.open_contents_on_ready = ctx.message_tag() == MSG_TAG_OPEN_CONTENTS;
-        self.toc_expanded = false;
-        self.toc_pages = [0; MAX_SPINE];
-
-        self.title.set(self.filename.as_bytes());
-        self.title_is_real = false;
-
-        // Bump to a new work-queue generation and drain stale work
-        // from any previous book (covers the case where on_enter is
-        // called without a preceding on_exit, e.g. Replace transition).
-        self.epub.work_gen = Some(work_queue::reset());
-        self.epub.bg_cache = BgCacheState::Idle;
-        self.epub.ch_cached = [false; cache::MAX_CACHE_CHAPTERS];
-        self.epub.img_scan_wrapped = false;
-        self.epub.skip_large_img = false;
-        self.epub.large_img_fails = 0;
-        self.epub.img_retry = None;
-
-        self.is_epub = epub::is_epub_filename(self.name());
-        self.rebuild_quick_actions();
-        self.apply_theme_layout();
-        self.reset_paging();
-        self.typeset_stale = false;
-        self.pagination_stale = false;
-        self.epub.ch_cache = Vec::new();
-        self.file_size = 0;
-        self.epub.chapter = 0;
-        self.error = None;
-        self.show_position = false;
-        self.defer_image_decode = true;
-        self.cache_ui_stale = false;
-        self.goto_last_page = false;
-        self.restore_offset = None;
-        self.restore_page_hint = None;
-        self.pending_position = None;
-        self.restore_anchor = None;
-        self.restore_fmt = 0;
-        self.restore_layout_key = 0;
-        self.last_saved_pos = None;
-        self.record_seq = 0;
-        self.recent_dirty = false;
-        self.pending_position_change = Some(PendingPositionChange::OpenReady);
-        self.defer_open_work_once = false;
-        self.pending_toc_parse = false;
-        self.pending_title_save = false;
-        self.pending_cover_thumb = false;
-        self.loading_cover = None;
-        self.spine_hint = 0;
-        self.persist_next_flush_at = None;
-
-        self.apply_font_metrics();
-
-        let _ = self.try_load_cached_cover_thumb(k);
-
-        // load existing stats for this book
-        self.stats_last_uptime = crate::kernel::uptime_secs();
-        self.stats_dirty = false;
-        self.stats_clock_running = false;
-
-        self.state = State::NeedBookmark;
-
-        log::info!("reader: opening {}", self.name());
-
-        self.begin_loading(LoadingReason::Open);
-        self.first_paint_full = true;
-    }
-
-    fn on_exit(&mut self) {
-        // Cancel any in-flight background cache work so the worker
-        // doesn't write stale results after we switch books.
-        if self.is_epub {
-            work_queue::reset();
-            self.epub.bg_cache = BgCacheState::Idle;
-        }
-
-        self.pg.line_count = 0;
-        self.pg.buf_len = 0;
-        self.pg.prefetch_page = NO_PREFETCH;
-        if self.stats_pause_clock() {
-            self.stats_dirty = true;
-            self.arm_persist_debounce();
-        }
-
-        self.pg.prefetch_len = 0;
-        self.restore_offset = None;
-        self.restore_page_hint = None;
-        // NOTE: recent_dirty / stats_dirty intentionally NOT cleared here;
-        // flush_deferred_persistence(Transition) runs before on_exit and
-        // handles them. if it failed, dirty state is kept for retry.
-        self.pending_position_change = None;
-        self.defer_open_work_once = false;
-        self.pending_toc_parse = false;
-        self.pending_title_save = false;
-        self.pending_cover_thumb = false;
-        self.loading_cover = None;
-        self.show_position = false;
-        self.epub.ch_cache = Vec::new();
-        self.page_img = None;
-
-        if self.is_epub {
-            self.epub.toc = None;
-            self.epub.toc_source = None;
-        }
-    }
-
-    fn on_suspend(&mut self) {
-        // pause the reading-time clock so menu/Home time isn't counted
-        if self.stats_pause_clock() {
-            self.stats_dirty = true;
-            self.arm_persist_debounce();
-        }
-        // background caching continues while suspended -- the worker
-        // task runs independently and our work_gen stays valid
-    }
-
-    fn on_pre_sleep(&mut self, _k: &mut KernelHandle<'_>) {
-        // drop transient heap the reader no longer needs before deep
-        // sleep. MCU resets on wake so any retained heap is lost
-        // anyway; freeing now makes room for the sleep wallpaper
-        // allocator (~96KB) which would otherwise OOM and fall back
-        // to the plain text screen.
-        //
-        // wake restores via restore_state which resets the state
-        // machine to NeedBookmark; NeedOpf/NeedToc re-parse metadata
-        // from SD, NeedIndex re-reads the chapter cache. one-time
-        // cost: ~1-2s on the first page turn after wake.
-        let kp_state = self.pg.chapter_lines.capacity() * size_of::<crate::apps::reader::layout::LineLayout>()
-            + self.pg.kp_pages.capacity() * size_of::<crate::apps::reader::layout::PageLayout>()
-            + self.pg.image_block_lines.capacity();
-        let freed = self.epub.ch_cache.capacity()
-            + self.pg.prefetch.capacity()
-            + self.page_img.as_ref().map_or(0, |i| i.data.capacity())
-            + self.loading_cover.as_ref().map_or(0, |i| i.data.capacity())
-            + self.epub.toc.as_ref().map_or(0, |_| size_of::<EpubToc>())
-            + kp_state;
-
-        // cancel any in-flight image decode so the worker drops its buffer
-        work_queue::reset();
-
-        self.epub.ch_cache = Vec::new();
-        self.pg.prefetch = Vec::new();
-        self.pg.prefetch_len = 0;
-        self.page_img = None;
-        self.loading_cover = None;
-        // toc/toc_source re-parsed on wake via NeedToc state
-        self.epub.toc = None;
-        self.epub.toc_source = None;
-
-        // K-P chapter state is biggest hidden retainer for long
-        // chapters: 2113 LineLayout × 16 B ≈ 33 KB for "Seventy-Two
-        // Letters". With ch_cache freed but K-P state retained, the
-        // wallpaper allocator OOMs. The on-disk PIDX cache means
-        // re-typesetting on wake is fast (cache hit, no K-P pass).
-        self.pg.clear_kp_layout();
-
-        log::info!(
-            "reader: pre-sleep freed ~{}KB of transient heap",
-            freed / 1024
-        );
-    }
-
-    fn on_resume(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
-        // resume reading-time clock
-        self.stats_resume_clock();
-
-        // Restore our generation so the worker considers in-flight
-        // results current again (another app may have submitted work
-        // under a different generation while we were suspended).
-        if let Some(g) = self.epub.work_gen {
-            work_queue::resume(g);
-        }
-
-        // re-derive text area geometry from the (possibly changed) theme
-        self.apply_theme_layout();
-        self.apply_font_metrics();
-
-        // the propagate_fonts setters flag staleness when a layout
-        // input changed while we were suspended; the in-RAM page
-        // tables are keyed to the old metrics. states before
-        // NeedIndex have no page tables yet and finish the open with
-        // the new metrics on their own, so only re-index once the
-        // pipeline has reached (or passed) indexing.
-        let layout_changed = self.typeset_stale || self.pagination_stale;
-        let typeset_changed = self.typeset_stale;
-        self.typeset_stale = false;
-        self.pagination_stale = false;
-        if layout_changed
-            && matches!(
-                self.state,
-                State::NeedIndex | State::NeedPage | State::Ready | State::ShowToc
-            )
-        {
-            // keep the reading position across the re-layout: NeedPage
-            // maps the byte offset back to a page once re-indexed
-            if self.restore_offset.is_none()
-                && matches!(self.state, State::Ready | State::ShowToc)
-            {
-                self.restore_offset = Some(self.byte_offset());
-                self.restore_page_hint = Some(self.pg.page);
-            }
-            self.reset_paging();
-            // invalidate the persisted layout only when the breaks
-            // moved (font, family, text width): a spacing-only change
-            // keeps the cached line table and preindex re-paginates it
-            // in RAM instead of re-typesetting.
-            if typeset_changed && self.is_epub {
-                let new_key = layout::LayoutKey::current(
-                    self.book_font_size_idx,
-                    self.reader_font.to_idx(),
-                    plump_kernel::kernel::bundle::CONTENT_FMT_LATEST,
-                    self.text_w as u16,
-                    self.font_line_h,
-                    self.max_lines,
-                );
-                let spine_len = self.epub.spine.len();
-                let name_hash = self.epub.name_hash;
-                if let Err(e) =
-                    layout::cache::invalidate_layoutidx(k, name_hash, spine_len, &new_key)
-                {
-                    log::warn!("reader: invalidate_layoutidx failed: {}", e);
-                }
-            }
-            if self.is_epub && self.epub.chapters_cached {
-                self.state = State::NeedIndex;
-            } else {
-                self.state = State::NeedPage;
-            }
-            self.begin_loading(LoadingReason::Font);
-            self.paint_loading(ctx);
-        }
-        ctx.mark_dirty(PAGE_REGION);
-    }
-
-    fn background_step(
-        &mut self,
-        ctx: &mut AppContext,
-        k: &mut KernelHandle<'_>,
-        budget: BgBudget,
-    ) -> BgOutcome {
-        // drain every pass so the stats stay current no matter which
-        // pass flushes them
-        self.drain_day_stats(k);
-
-        // apply a caching-indicator update that was held back during
-        // a waveform-window step
-        if self.cache_ui_stale && budget.allows_repaint() {
-            self.cache_ui_stale = false;
-            if self.epub.bg_cache == BgCacheState::Idle {
-                ctx.clear_loading();
-            } else {
-                self.set_cache_loading(ctx);
-            }
-        }
-
-        // loading hold: the screen goes up once it is overdue
-        self.loading_tick(ctx);
+impl ReaderApp {
+    fn pipeline_step(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) -> BgOutcome {
 
         // Phase 1: Open pipeline (NeedBookmark..NeedPage)
         // Each state does ONE step and returns Progress { more: true }
@@ -3468,9 +2757,7 @@ impl App<AppId> for ReaderApp {
                 plump_kernel::perf_begin!(_t0);
                 self.record_load(k);
                 self.bookmark_load(k);
-                if self.try_load_cached_cover_thumb(k) {
-                    ctx.mark_dirty(self.loading_visual_region());
-                }
+                self.try_load_cached_cover_thumb(k);
 
                 if self.is_epub {
                     self.epub.zip.clear();
@@ -3479,10 +2766,8 @@ impl App<AppId> for ReaderApp {
                     self.epub.chapters_cached = false;
                     self.goto_last_page = false;
                     self.state = State::NeedInit;
-                    self.set_loading_ui(ctx);
                 } else {
                     self.state = State::NeedPage;
-                    self.set_loading_ui(ctx);
                 }
                 plump_kernel::perf_event!(
                     "reader",
@@ -3501,7 +2786,6 @@ impl App<AppId> for ReaderApp {
                     Ok(()) => {
                         self.try_prefill_title_from_cache_header(k);
                         self.state = State::NeedOpf;
-                        self.set_loading_ui(ctx);
                         plump_kernel::perf_event!(
                             "reader",
                             "NeedInit ok to=NeedOpf elapsed_ms={}",
@@ -3550,7 +2834,6 @@ impl App<AppId> for ReaderApp {
                                 h.has_flag(plump_kernel::kernel::bundle::FLAG_CORE_READY)
                             });
                         self.state = State::NeedToc;
-                        self.set_loading_ui(ctx);
                         plump_kernel::perf_event!(
                             "reader",
                             "NeedOpf ok to=NeedToc spine_len={} elapsed_ms={}",
@@ -3586,7 +2869,6 @@ impl App<AppId> for ReaderApp {
                 // the Contents row exists only once the toc does
                 self.rebuild_quick_actions();
                 self.state = State::NeedCache;
-                self.set_loading_ui(ctx);
                 plump_kernel::perf_event!(
                     "reader",
                     "NeedToc to=NeedCache elapsed_ms={}",
@@ -3601,7 +2883,6 @@ impl App<AppId> for ReaderApp {
                     Ok(true) => {
                         // cache hit
                         self.state = State::NeedIndex;
-                        self.set_loading_ui(ctx);
                         plump_kernel::perf_event!(
                             "reader",
                             "NeedCache hit=true to=NeedIndex elapsed_ms={}",
@@ -3611,8 +2892,8 @@ impl App<AppId> for ReaderApp {
                     }
                     Ok(false) => {
                         // cache miss: start/continue caching the current chapter.
-                        // seconds of work, so the loading screen goes up first
-                        self.paint_loading(ctx);
+                        // seconds of work, so the sheet is due now
+                        self.paint_loading();
                         let ch = self.epub.chapter as usize;
                         let fname = self.filename;
                 let epub_name = fname.as_str();
@@ -3653,7 +2934,6 @@ impl App<AppId> for ReaderApp {
                                 }
 
                                 self.state = State::NeedIndex;
-                                self.set_loading_ui(ctx);
                                 plump_kernel::perf_event!(
                                     "reader",
                                     "NeedCache hit=false ch={} to=NeedIndex elapsed_ms={}",
@@ -3706,8 +2986,8 @@ impl App<AppId> for ReaderApp {
                 let epub_name = fname.as_str();
 
                     // the chapter still has to be cached: seconds, so the
-                    // loading screen goes up first
-                    self.paint_loading(ctx);
+                    // sheet is due now
+                    self.paint_loading();
                     if self.epub.cache_step.is_none() {
                         if let Err(e) = self.epub.cache_chapter_begin(k, ch, &epub_name) {
                             plump_kernel::perf_event!(
@@ -3747,10 +3027,12 @@ impl App<AppId> for ReaderApp {
                 }
 
                 // no layout for this chapter at this font means a full
-                // typeset, seconds on a long chapter: show the screen
-                // before it, not after
-                if !self.loading_painted && self.is_epub && !self.chapter_has_layout(k) {
-                    self.paint_loading(ctx);
+                // typeset, seconds on a long chapter: end the step so
+                // the sheet renders before it, not after. the typeset
+                // then runs in the sheet's own waveform window
+                if !self.loading_due && self.is_epub && !self.chapter_has_layout(k) {
+                    self.paint_loading();
+                    return BgOutcome::Progress { more: true };
                 }
 
                 let want_last = self.goto_last_page;
@@ -3818,7 +3100,6 @@ impl App<AppId> for ReaderApp {
                     }
                 } else {
                     self.state = State::NeedPage;
-                    self.set_loading_ui(ctx);
                     plump_kernel::perf_event!(
                         "reader",
                         "NeedIndex to=NeedPage pages={} fully_indexed={} elapsed_ms={}",
@@ -3946,56 +3227,282 @@ impl App<AppId> for ReaderApp {
             State::Ready | State::ShowToc | State::NeedIndex | State::NeedPage
         ) && self.epub.bg_cache != BgCacheState::Idle
         {
-            // indicator repaints are held back during waveform-window
-            // steps: the mark would force the closing phase to abandon
-            // and re-drive the whole region (serial signature:
-            // partial_abandon right after a chapter-cross turn). the
-            // deferred paint lands via cache_ui_stale on the next
-            // permissive step
-            let can_paint = budget.allows_repaint();
-            if !ctx.loading_active() {
-                if can_paint {
-                    self.set_cache_loading(ctx);
-                } else {
-                    self.cache_ui_stale = true;
-                }
-            }
-            let prev_count = self.cached_chapter_count();
-            let prev_bg = self.epub.bg_cache;
-            let prev_img_found = self.epub.img_found_count;
-            let prev_img_cached = self.epub.img_cached_count;
-            let prev_pct = self.cache_loading_pct();
+            // nothing on the page reports this: it only feeds the
+            // menu's Preparing row, which is read when the menu opens
+            let prev = self.bg_cache_progress();
             let outcome = self.bg_cache_step_sync(k);
-            if self.epub.bg_cache == BgCacheState::Idle {
-                if can_paint {
-                    ctx.clear_loading();
-                    self.cache_ui_stale = false;
-                } else {
-                    self.cache_ui_stale = true;
-                }
-            } else if self.cached_chapter_count() != prev_count
-                || self.epub.bg_cache != prev_bg
-                || self.epub.img_found_count != prev_img_found
-                || self.epub.img_cached_count != prev_img_cached
-            {
-                // with the page visible, every indicator repaint costs a
-                // DU refresh, so throttle to 10% steps; the loading
-                // screen keeps per-chapter granularity
-                if self.shows_loading_screen()
-                    || self.cache_loading_pct() / 10 != prev_pct / 10
-                {
-                    if can_paint {
-                        self.set_cache_loading(ctx);
-                        self.cache_ui_stale = false;
-                    } else {
-                        self.cache_ui_stale = true;
-                    }
-                }
+            if self.bg_cache_progress() != prev {
+                self.rebuild_quick_actions();
             }
             return outcome;
         }
 
         BgOutcome::Idle
+    }
+}
+
+impl App<AppId> for ReaderApp {
+    fn on_enter(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
+        let msg = ctx.message();
+        self.filename.set(msg);
+        self.open_contents_on_ready = ctx.message_tag() == MSG_TAG_OPEN_CONTENTS;
+        self.toc_expanded = false;
+        self.toc_pages = [0; MAX_SPINE];
+
+        self.title.set(self.filename.as_bytes());
+        self.title_is_real = false;
+
+        // Bump to a new work-queue generation and drain stale work
+        // from any previous book (covers the case where on_enter is
+        // called without a preceding on_exit, e.g. Replace transition).
+        self.epub.work_gen = Some(work_queue::reset());
+        self.epub.bg_cache = BgCacheState::Idle;
+        self.epub.ch_cached = [false; cache::MAX_CACHE_CHAPTERS];
+        self.epub.img_scan_wrapped = false;
+        self.epub.skip_large_img = false;
+        self.epub.large_img_fails = 0;
+        self.epub.img_retry = None;
+
+        self.is_epub = epub::is_epub_filename(self.name());
+        self.rebuild_quick_actions();
+        self.apply_theme_layout();
+        self.reset_paging();
+        self.typeset_stale = false;
+        self.pagination_stale = false;
+        self.epub.ch_cache = Vec::new();
+        self.file_size = 0;
+        self.epub.chapter = 0;
+        self.error = None;
+        self.show_position = false;
+        self.defer_image_decode = true;
+        self.goto_last_page = false;
+        self.restore_offset = None;
+        self.restore_page_hint = None;
+        self.pending_position = None;
+        self.restore_anchor = None;
+        self.restore_fmt = 0;
+        self.restore_layout_key = 0;
+        self.last_saved_pos = None;
+        self.record_seq = 0;
+        self.recent_dirty = false;
+        self.pending_position_change = Some(PendingPositionChange::OpenReady);
+        self.defer_open_work_once = false;
+        self.pending_toc_parse = false;
+        self.pending_title_save = false;
+        self.pending_cover_thumb = false;
+        self.loading_cover = None;
+        self.sheet = None;
+        self.spine_hint = 0;
+        self.persist_next_flush_at = None;
+
+        self.apply_font_metrics();
+
+        let _ = self.try_load_cached_cover_thumb(k);
+
+        // load existing stats for this book
+        self.stats_last_uptime = crate::kernel::uptime_secs();
+        self.stats_dirty = false;
+        self.stats_clock_running = false;
+
+        self.state = State::NeedBookmark;
+
+        log::info!("reader: opening {}", self.name());
+
+        self.begin_loading(LoadingReason::Open);
+        self.first_paint_full = true;
+    }
+
+    fn on_exit(&mut self) {
+        // Cancel any in-flight background cache work so the worker
+        // doesn't write stale results after we switch books.
+        if self.is_epub {
+            work_queue::reset();
+            self.epub.bg_cache = BgCacheState::Idle;
+        }
+
+        self.pg.line_count = 0;
+        self.pg.buf_len = 0;
+        self.pg.prefetch_page = NO_PREFETCH;
+        if self.stats_pause_clock() {
+            self.stats_dirty = true;
+            self.arm_persist_debounce();
+        }
+
+        self.pg.prefetch_len = 0;
+        self.restore_offset = None;
+        self.restore_page_hint = None;
+        // NOTE: recent_dirty / stats_dirty intentionally NOT cleared here;
+        // flush_deferred_persistence(Transition) runs before on_exit and
+        // handles them. if it failed, dirty state is kept for retry.
+        self.pending_position_change = None;
+        self.defer_open_work_once = false;
+        self.pending_toc_parse = false;
+        self.pending_title_save = false;
+        self.pending_cover_thumb = false;
+        self.loading_cover = None;
+        self.sheet = None;
+        self.show_position = false;
+        self.epub.ch_cache = Vec::new();
+        self.page_img = None;
+
+        if self.is_epub {
+            self.epub.toc = None;
+            self.epub.toc_source = None;
+        }
+    }
+
+    fn on_suspend(&mut self) {
+        // pause the reading-time clock so menu/Home time isn't counted
+        if self.stats_pause_clock() {
+            self.stats_dirty = true;
+            self.arm_persist_debounce();
+        }
+        // background caching continues while suspended -- the worker
+        // task runs independently and our work_gen stays valid
+    }
+
+    fn on_pre_sleep(&mut self, _k: &mut KernelHandle<'_>) {
+        // drop transient heap the reader no longer needs before deep
+        // sleep. MCU resets on wake so any retained heap is lost
+        // anyway; freeing now makes room for the sleep wallpaper
+        // allocator (~96KB) which would otherwise OOM and fall back
+        // to the plain text screen.
+        //
+        // wake restores via restore_state which resets the state
+        // machine to NeedBookmark; NeedOpf/NeedToc re-parse metadata
+        // from SD, NeedIndex re-reads the chapter cache. one-time
+        // cost: ~1-2s on the first page turn after wake.
+        let kp_state = self.pg.chapter_lines.capacity() * size_of::<crate::apps::reader::layout::LineLayout>()
+            + self.pg.kp_pages.capacity() * size_of::<crate::apps::reader::layout::PageLayout>()
+            + self.pg.image_block_lines.capacity();
+        let freed = self.epub.ch_cache.capacity()
+            + self.pg.prefetch.capacity()
+            + self.page_img.as_ref().map_or(0, |i| i.data.capacity())
+            + self.loading_cover.as_ref().map_or(0, |i| i.data.capacity())
+            + self.epub.toc.as_ref().map_or(0, |_| size_of::<EpubToc>())
+            + kp_state;
+
+        // cancel any in-flight image decode so the worker drops its buffer
+        work_queue::reset();
+
+        self.epub.ch_cache = Vec::new();
+        self.pg.prefetch = Vec::new();
+        self.pg.prefetch_len = 0;
+        self.page_img = None;
+        self.loading_cover = None;
+        self.sheet = None;
+        // toc/toc_source re-parsed on wake via NeedToc state
+        self.epub.toc = None;
+        self.epub.toc_source = None;
+
+        // K-P chapter state is biggest hidden retainer for long
+        // chapters: 2113 LineLayout × 16 B ≈ 33 KB for "Seventy-Two
+        // Letters". With ch_cache freed but K-P state retained, the
+        // wallpaper allocator OOMs. The on-disk PIDX cache means
+        // re-typesetting on wake is fast (cache hit, no K-P pass).
+        self.pg.clear_kp_layout();
+
+        log::info!(
+            "reader: pre-sleep freed ~{}KB of transient heap",
+            freed / 1024
+        );
+    }
+
+    fn on_resume(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>) {
+        // resume reading-time clock
+        self.stats_resume_clock();
+        // caching ran on while suspended; the menu's row catches up
+        self.rebuild_quick_actions();
+
+        // Restore our generation so the worker considers in-flight
+        // results current again (another app may have submitted work
+        // under a different generation while we were suspended).
+        if let Some(g) = self.epub.work_gen {
+            work_queue::resume(g);
+        }
+
+        // re-derive text area geometry from the (possibly changed) theme
+        self.apply_theme_layout();
+        self.apply_font_metrics();
+
+        // the propagate_fonts setters flag staleness when a layout
+        // input changed while we were suspended; the in-RAM page
+        // tables are keyed to the old metrics. states before
+        // NeedIndex have no page tables yet and finish the open with
+        // the new metrics on their own, so only re-index once the
+        // pipeline has reached (or passed) indexing.
+        let layout_changed = self.typeset_stale || self.pagination_stale;
+        let typeset_changed = self.typeset_stale;
+        self.typeset_stale = false;
+        self.pagination_stale = false;
+        if layout_changed
+            && matches!(
+                self.state,
+                State::NeedIndex | State::NeedPage | State::Ready | State::ShowToc
+            )
+        {
+            // keep the reading position across the re-layout: NeedPage
+            // maps the byte offset back to a page once re-indexed
+            if self.restore_offset.is_none()
+                && matches!(self.state, State::Ready | State::ShowToc)
+            {
+                self.restore_offset = Some(self.byte_offset());
+                self.restore_page_hint = Some(self.pg.page);
+            }
+            self.reset_paging();
+            // invalidate the persisted layout only when the breaks
+            // moved (font, family, text width): a spacing-only change
+            // keeps the cached line table and preindex re-paginates it
+            // in RAM instead of re-typesetting.
+            if typeset_changed && self.is_epub {
+                let new_key = layout::LayoutKey::current(
+                    self.book_font_size_idx,
+                    self.reader_font.to_idx(),
+                    plump_kernel::kernel::bundle::CONTENT_FMT_LATEST,
+                    self.text_w as u16,
+                    self.font_line_h,
+                    self.max_lines,
+                );
+                let spine_len = self.epub.spine.len();
+                let name_hash = self.epub.name_hash;
+                if let Err(e) =
+                    layout::cache::invalidate_layoutidx(k, name_hash, spine_len, &new_key)
+                {
+                    log::warn!("reader: invalidate_layoutidx failed: {}", e);
+                }
+            }
+            if self.is_epub && self.epub.chapters_cached {
+                self.state = State::NeedIndex;
+            } else {
+                self.state = State::NeedPage;
+            }
+            self.begin_loading(LoadingReason::Font);
+            self.paint_loading();
+            self.refresh_sheet(ctx, true);
+        }
+        ctx.mark_dirty(PAGE_REGION);
+    }
+
+    fn background_step(
+        &mut self,
+        ctx: &mut AppContext,
+        k: &mut KernelHandle<'_>,
+        budget: BgBudget,
+    ) -> BgOutcome {
+        // drain every pass so the stats stay current no matter which
+        // pass flushes them
+        self.drain_day_stats(k);
+
+        // loading hold: the sheet is due once it is overdue
+        self.loading_tick();
+
+        let outcome = self.pipeline_step(ctx, k);
+
+        // whatever the step moved on, the sheet catches up with it
+        // here, and only where a repaint is allowed; a waveform-window
+        // step leaves it to the permissive step after the render
+        self.refresh_sheet(ctx, budget.allows_repaint());
+        outcome
     }
 
     fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition {
@@ -4191,7 +3698,8 @@ impl App<AppId> for ReaderApp {
                 // re-typesetting is always slow enough to show, and
                 // the menu is closing in the same refresh anyway
                 self.begin_loading(LoadingReason::Font);
-                self.paint_loading(ctx);
+                self.paint_loading();
+                self.refresh_sheet(ctx, true);
             }
             self.rebuild_quick_actions();
         }
@@ -4217,14 +3725,9 @@ impl App<AppId> for ReaderApp {
         }
         if self.is_epub && !self.epub.spine.is_empty() {
             let ch = self.epub.chapter;
-            let named = self.epub.toc.as_ref().and_then(|t| {
-                (0..t.len())
-                    .map(|i| &t.entries[i])
-                    .find(|e| e.spine_idx == ch && !e.title_str().is_empty())
-            });
-            match named {
-                Some(e) => {
-                    let _ = write!(out, "{}", e.title_str());
+            match self.chapter_title(ch) {
+                Some(t) => {
+                    let _ = write!(out, "{}", t);
                 }
                 None => {
                     let _ = write!(out, "Chapter {} of {}", ch + 1, self.epub.spine.len());

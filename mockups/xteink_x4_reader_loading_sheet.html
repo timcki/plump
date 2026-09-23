@@ -1,0 +1,347 @@
+<title>Pulp Loading Sheet</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Lora:ital,wght@0,400;0,500;0,600;1,400&display=swap');
+
+:root {
+  --ground: #141414;
+  --frame: #1c1c1c;
+  --paper: #f6f4ee;
+  --ink: #181818;
+  --ink-25: rgba(24,24,24,0.25);
+  --ink-12: rgba(24,24,24,0.12);
+  --label: #d9d6cc;
+}
+body { background: var(--ground); color: var(--label); margin: 0; font-family: 'Atkinson Hyperlegible', system-ui, sans-serif; }
+h1.pg-t { font-size: 18px; font-weight: 700; text-align: center; margin: 2rem 1rem 0.3rem; }
+p.pg-s { text-align: center; font-size: 12.5px; opacity: 0.65; margin: 0 1rem 0.5rem; }
+h2.sec { font-size: 13px; letter-spacing: 0.18em; text-transform: uppercase; text-align: center; margin: 2.2rem 1rem 0; opacity: 0.8; }
+
+.fr { padding: 1.2rem 1rem 1rem; display: flex; justify-content: center; gap: 22px; flex-wrap: wrap; }
+.un { display: flex; flex-direction: column; align-items: center; gap: 9px; max-width: 354px; }
+.lab { font-size: 13px; color: var(--label); font-weight: 500; margin: 0; text-align: center; }
+.lab small { display: block; font-weight: 400; opacity: 0.6; font-size: 11px; margin-top: 2px; }
+.dv { background: var(--frame); padding: 7px; border-radius: 22px; }
+.sc { background: var(--paper); color: var(--ink); width: 340px; height: 567px; border-radius: 14px; display: flex; flex-direction: column; padding: 12px 14px 9px; box-sizing: border-box; position: relative; overflow: hidden; }
+.note { max-width: 66ch; margin: 0 auto 1.5rem; padding: 0 1rem; font-size: 12.5px; line-height: 1.55; opacity: 0.78; }
+.note b { font-weight: 700; }
+.cap-note { font-size: 11px; line-height: 1.5; opacity: 0.7; margin: 0; }
+
+/* top bar: the navigation (home-centred) */
+.tb { display: flex; align-items: baseline; gap: 10px; font-size: 10.5px; padding: 2px 2px 8px; border-bottom: 1px solid var(--ink); margin-bottom: 10px; }
+.tb .on { font-weight: 700; font-size: 12px; }
+.tb .bt { margin-left: auto; font-size: 10px; opacity: 0.8; }
+
+/* home under the sheet */
+.hm-cn { display: flex; gap: 11px; padding: 4px 2px 12px; border-bottom: 1px solid var(--ink-25); margin-bottom: 6px; }
+.cv { background: var(--ink); flex-shrink: 0; border-radius: 1px; position: relative; }
+.cv.lt { background: #d8d2bd; }
+.cv::after { content: ''; position: absolute; background: var(--paper); width: 30%; aspect-ratio: 1; border-radius: 50%; top: 28%; left: 35%; }
+.cv.lt::after { background: var(--ink); width: 14%; height: 60%; border-radius: 0; top: 20%; left: 43%; }
+.hm-cw { display: flex; flex-direction: column; flex: 1; min-width: 0; justify-content: center; }
+.hm-ct { font-family: 'Lora', Georgia, serif; font-size: 15px; font-weight: 500; margin: 0; line-height: 1.2; }
+.hm-ca { font-size: 11px; opacity: 0.65; margin: 2px 0 8px; }
+.tube { height: 4px; border: 1px solid var(--ink); border-radius: 3px; overflow: hidden; box-sizing: border-box; }
+.tube > b { display: block; height: 100%; background: var(--ink); }
+.hm-cm { display: flex; justify-content: space-between; margin-top: 5px; font-size: 10px; opacity: 0.65; }
+.hm-rr { padding: 7px 2px; border-bottom: 1px solid var(--ink-12); display: flex; gap: 10px; align-items: center; }
+.hm-rt { font-family: 'Lora', Georgia, serif; font-size: 12.5px; margin: 0; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+.hm-rp { font-size: 10px; opacity: 0.65; }
+
+/* library under the sheet */
+.lb-cap { font-size: 10px; opacity: 0.6; margin: 0 2px 6px; }
+
+/* reader page */
+.rd-bd { flex: 1; padding-top: 2px; font-family: 'Lora', Georgia, serif; font-size: 13px; line-height: 1.58; text-align: justify; hyphens: auto; overflow: hidden; }
+.rd-bd p { margin: 0 0 0.7em; }
+.rd-bd.blank { visibility: hidden; }
+.rd-ft { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding-top: 8px; font-size: 10px; }
+.rd-ft .ti { opacity: 0.8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rd-ft .tube { width: 64px; flex: none; }
+.rd-ft .fig { opacity: 0.7; font-variant-numeric: tabular-nums; flex: none; }
+
+/* the old top-line indicator, for the "today" frame */
+.old-ind { position: absolute; left: 14px; right: 24px; top: 14px; background: var(--paper); font-family: 'Courier New', monospace; font-size: 11px; padding: 3px 2px; }
+.old-foot { font-variant-numeric: tabular-nums; }
+
+/* the sheet: same component as the menu and contents (sheet.rs) */
+.sh { position: absolute; left: 14px; right: 14px; bottom: 14px; background: var(--paper); border: 1.5px solid var(--ink); border-radius: 10px; padding: 10px 11px 8px; display: flex; flex-direction: column; box-sizing: border-box; }
+.sh-hd { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 0 3px 3px; }
+.sh-hd h1 { font-family: 'Lora', Georgia, serif; font-weight: 500; font-size: 15px; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sh-hd h1.ui { font-family: 'Atkinson Hyperlegible', sans-serif; font-weight: 700; font-size: 14px; }
+.sh-hd .cap { font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; font-weight: 700; opacity: 0.55; flex: none; }
+.sh-meta { font-size: 10px; opacity: 0.6; padding: 0 3px 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gr { border: 1px solid var(--ink-25); border-radius: 7px; overflow: hidden; margin-bottom: 6px; }
+.rw { display: grid; grid-template-columns: auto 1fr auto; align-items: center; column-gap: 10px; padding: 7px 10px; font-size: 11.5px; border-bottom: 1px solid var(--ink-12); min-height: 19px; }
+.rw:last-child { border-bottom: none; }
+.rw .t { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.rw .t > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rw .t .sub { font-size: 10px; opacity: 0.6; }
+.rw .v { font-size: 10px; opacity: 0.6; font-variant-numeric: tabular-nums; }
+.rw .ic { width: 20px; display: inline-flex; justify-content: flex-end; }
+.rw .ic svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; opacity: 0.75; }
+.rw.on { background: var(--ink); color: var(--paper); }
+.rw.on .v { opacity: 0.85; }
+.sh-ft { display: flex; justify-content: flex-end; align-items: center; padding-top: 3px; }
+.hn { display: flex; gap: 14px; font-size: 9px; letter-spacing: 0.16em; opacity: 0.55; text-transform: uppercase; font-weight: 700; }
+
+/* centred card: the alternative placement */
+.card { position: absolute; left: 34px; right: 34px; top: 50%; transform: translateY(-50%); background: var(--paper); border: 1.5px solid var(--ink); border-radius: 10px; padding: 14px 14px 10px; display: flex; flex-direction: column; align-items: center; gap: 6px; text-align: center; }
+.card h1 { font-family: 'Lora', Georgia, serif; font-weight: 500; font-size: 15px; margin: 6px 0 0; }
+.card .au { font-size: 10.5px; opacity: 0.65; margin: 0; }
+.card .st { font-size: 11px; margin: 8px 0 0; }
+.card .tube { width: 100%; margin-top: 4px; }
+.card .hn { margin-top: 8px; }
+</style>
+
+<h2 style="position:absolute;left:-9999px">Xteink X4 mockups of the reader's loading sheet: the book opening over the screen it was opened from, a chapter change, a font change and a wake over paper, an error, and where background caching reports once the page is up.</h2>
+
+<h1 class="pg-t">Loading sheet</h1>
+<p class="pg-s">the reader loads under a bottom sheet over whatever you were looking at, not a screen of its own</p>
+
+<div class="note">
+<b>What changes.</b> Today a slow open replaces the whole screen with a plate (cover, title, author, rule, resume line, stage row); a slow chapter change or font change blanks the text area and puts the stage row above the footer. Afterwards, background caching paints <code>Caching 3/15...20%</code> in the kernel's mono font over the page's first line, and <code>[3/15]</code> in the footer. <br><br>
+In the new design every slow load is the <b>sheet</b> (the same component as the menu and contents) with one row: the stage, a real progress bar, a percent. The screen under it is the one you pressed Select on. Loads that finish inside the 400 ms hold still paint nothing but the page. Background caching after the page is up is not drawn on the page at all.
+</div>
+
+<h2 class="sec">Today</h2>
+<div class="fr">
+  <div class="un">
+    <p class="lab">After the first page<small>kernel LoadingIndicator over line one, footer figure</small></p>
+    <div class="dv"><div class="sc">
+      <div class="rd-bd">
+        <p style="opacity:.25">Ana had been working at Blue Gamma for a year when the first digients were released to the public. The launch party was held on a rooftop in the Mission, and she remembered the way the evening light had caught the towers downtown.</p>
+        <p>Jax was the first one she had trained herself. He had started as a generic mascot, one of a thousand identical instances, and in the months since he had become something she could not quite name: not a pet, not a child, not a program.</p>
+        <p>The forum threads that night were full of screenshots. Owners compared the words their digients had learned, the games they had invented, the small refusals that felt, to everyone posting, like the beginnings of a will.</p>
+      </div>
+      <div class="old-ind">Caching 3/15...20%</div>
+      <div class="rd-ft"><span class="ti">Exhalation</span><span class="fig old-foot">[3/15]</span><span class="tube"><b style="width:4%"></b></span></div>
+    </div></div>
+    <p class="cap-note">The indicator clears a 24 px band across the first text line, so the line under it is erased until caching ends. Every 10% step is its own full-screen DU.</p>
+  </div>
+</div>
+
+<h2 class="sec">Opening a book</h2>
+<div class="fr">
+
+  <div class="un">
+    <p class="lab">Cold open from Home<small>held 400 ms, then the sheet over Home (DU)</small></p>
+    <div class="dv"><div class="sc">
+      <div class="tb"><span>← settings</span><span class="on">home</span><span>library →</span><span class="bt">87%</span></div>
+      <div class="hm-cn">
+        <div class="cv" style="width:62px;height:92px"></div>
+        <div class="hm-cw">
+          <p class="hm-ct">Pachinko</p>
+          <p class="hm-ca">Min Jin Lee</p>
+          <div class="tube"><b style="width:62%"></b></div>
+          <div class="hm-cm"><span>chapter 14 of 22</span><span>4h 10m</span></div>
+        </div>
+      </div>
+      <div class="hm-rr"><div class="cv lt" style="width:34px;height:50px"></div><p class="hm-rt">Exhalation</p><span class="hm-rp">new</span></div>
+      <div class="hm-rr"><div class="cv" style="width:34px;height:50px"></div><p class="hm-rt">The MANIAC</p><span class="hm-rp">100%</span></div>
+      <div class="hm-rr"><div class="cv lt" style="width:34px;height:50px"></div><p class="hm-rt">Foundation</p><span class="hm-rp">100%</span></div>
+
+      <div class="sh">
+        <div class="sh-hd"><h1>Exhalation</h1><span class="cap">Opening</span></div>
+        <div class="sh-meta">Ted Chiang · 9 stories · from the start</div>
+        <div class="gr">
+          <div class="rw"><div class="cv lt" style="width:34px;height:50px"></div>
+            <div class="t"><span>Preparing chapter 1 of 9</span><div class="tube"><b style="width:25%"></b></div></div>
+            <span class="v">25%</span></div>
+        </div>
+        <div class="sh-ft"><div class="hn"><span>Back cancel</span></div></div>
+      </div>
+    </div></div>
+    <p class="cap-note">Stages collapse to three captions: <i>Opening</i> (zip, OPF, TOC), <i>Preparing chapter N of M</i> (the inflate + strip, with the bar from archive bytes read, in quarters so each step is one refresh), <i>Laying out pages</i> (typeset). Then the page lands as the usual fast GC.</p>
+  </div>
+
+  <div class="un">
+    <p class="lab">Same, from the Library<small>the backdrop is whichever screen pushed the reader</small></p>
+    <div class="dv"><div class="sc">
+      <div class="tb"><span>← home</span><span class="on">library</span><span>stats →</span><span class="bt">87%</span></div>
+      <p class="lb-cap">24 books</p>
+      <div class="hm-rr"><div class="cv" style="width:40px;height:60px"></div><p class="hm-rt">Blindsight</p><span class="hm-rp">12%</span></div>
+      <div class="hm-rr"><div class="cv lt" style="width:40px;height:60px"></div><p class="hm-rt">Exhalation</p><span class="hm-rp">new</span></div>
+      <div class="hm-rr"><div class="cv" style="width:40px;height:60px"></div><p class="hm-rt">Foundation</p><span class="hm-rp">100%</span></div>
+      <div class="hm-rr"><div class="cv lt" style="width:40px;height:60px"></div><p class="hm-rt">The MANIAC</p><span class="hm-rp">100%</span></div>
+
+      <div class="sh">
+        <div class="sh-hd"><h1>Exhalation</h1><span class="cap">Opening</span></div>
+        <div class="sh-meta">Ted Chiang · 9 stories · from the start</div>
+        <div class="gr">
+          <div class="rw"><div class="cv lt" style="width:34px;height:50px"></div>
+            <div class="t"><span>Laying out pages</span><span class="sub">Chapter 1 · Medium</span></div>
+            <span class="v"></span></div>
+        </div>
+        <div class="sh-ft"><div class="hn"><span>Back cancel</span></div></div>
+      </div>
+    </div></div>
+    <p class="cap-note">Typesetting is one blocking step with no fraction to report, so the row carries a sub line instead of a bar rather than a made-up percent.</p>
+  </div>
+
+  <div class="un">
+    <p class="lab">Alternative placement (not chosen)<small>centred card instead of the bottom sheet</small></p>
+    <div class="dv"><div class="sc">
+      <div class="tb"><span>← settings</span><span class="on">home</span><span>library →</span><span class="bt">87%</span></div>
+      <div class="hm-cn">
+        <div class="cv" style="width:62px;height:92px"></div>
+        <div class="hm-cw">
+          <p class="hm-ct">Pachinko</p>
+          <p class="hm-ca">Min Jin Lee</p>
+          <div class="tube"><b style="width:62%"></b></div>
+          <div class="hm-cm"><span>chapter 14 of 22</span><span>4h 10m</span></div>
+        </div>
+      </div>
+      <div class="hm-rr"><div class="cv lt" style="width:34px;height:50px"></div><p class="hm-rt">Exhalation</p><span class="hm-rp">new</span></div>
+      <div class="hm-rr"><div class="cv" style="width:34px;height:50px"></div><p class="hm-rt">The MANIAC</p><span class="hm-rp">100%</span></div>
+      <div class="hm-rr"><div class="cv lt" style="width:34px;height:50px"></div><p class="hm-rt">Foundation</p><span class="hm-rp">100%</span></div>
+
+      <div class="card">
+        <div class="cv lt" style="width:56px;height:84px"></div>
+        <h1>Exhalation</h1>
+        <p class="au">Ted Chiang</p>
+        <p class="st">Preparing chapter 1 of 9 · 40%</p>
+        <div class="tube"><b style="width:40%"></b></div>
+        <div class="hn"><span>Back cancel</span></div>
+      </div>
+    </div></div>
+    <p class="cap-note">Reads more like a classic dialog and keeps the cover larger, but it is a new component with its own geometry; the sheet reuses <code>sheet.rs</code> and <code>row.rs</code> as they are.</p>
+  </div>
+</div>
+
+<h2 class="sec">Inside the book</h2>
+<div class="fr">
+
+  <div class="un">
+    <p class="lab">Chapter change, not cached<small>paper under the sheet</small></p>
+    <div class="dv"><div class="sc">
+      <div class="rd-bd blank"><p>.</p></div>
+
+      <div class="sh">
+        <div class="sh-hd"><h1>Dacey’s Patent Automatic Nanny</h1><span class="cap">Chapter 6 of 9</span></div>
+        <div class="sh-meta">Exhalation</div>
+        <div class="gr">
+          <div class="rw"><span class="ic"><svg viewBox="0 0 12 12"><path d="M2 3h8M2 6h8M2 9h5"/></svg></span>
+            <div class="t"><span>Preparing chapter</span><div class="tube"><b style="width:50%"></b></div></div>
+            <span class="v">50%</span></div>
+        </div>
+        <div class="sh-ft"><div class="hn"><span>Back leave book</span></div></div>
+      </div>
+    </div></div>
+    <p class="cap-note">The header names where you are going (the TOC title, in the book face) and the meta line the book. A jump from Contents lands the same way. The page you turned from is not kept under the sheet: re-indexing overwrites it, and paper keeps the frame honest.</p>
+  </div>
+
+  <div class="un">
+    <p class="lab">Font change<small>paper under the sheet: the old layout is gone</small></p>
+    <div class="dv"><div class="sc">
+      <div class="rd-bd blank"><p>.</p></div>
+
+      <div class="sh">
+        <div class="sh-hd"><h1>Exhalation</h1><span class="cap">Bookerly · Large</span></div>
+        <div class="sh-meta">The Lifecycle of Software Objects</div>
+        <div class="gr">
+          <div class="rw"><span class="ic"><svg viewBox="0 0 12 12"><path d="M2 10L6 2l4 8M3.5 7h5"/></svg></span>
+            <div class="t"><span>Laying out pages</span></div>
+            <span class="v"></span></div>
+        </div>
+        <div class="sh-ft"><div class="hn"><span>Back leave book</span></div></div>
+      </div>
+    </div></div>
+    <p class="cap-note">The re-index starts before the first frame (from Settings, or from the menu's font row), so there is no page left to draw. The header is the book, the caption the new font and size, the meta line the chapter.</p>
+  </div>
+
+  <div class="un">
+    <p class="lab">Wake, slow bundle reopen<small>held 1.5 s, then the sheet on paper</small></p>
+    <div class="dv"><div class="sc">
+      <div class="rd-bd blank"><p>.</p></div>
+
+      <div class="sh">
+        <div class="sh-hd"><h1>Exhalation</h1><span class="cap">Resuming</span></div>
+        <div class="sh-meta">Ted Chiang · chapter 5 of 9 · 38% read</div>
+        <div class="gr">
+          <div class="rw"><div class="cv lt" style="width:34px;height:50px"></div>
+            <div class="t"><span>Opening</span><span class="sub">The Lifecycle of Software Objects</span></div>
+            <span class="v"></span></div>
+        </div>
+        <div class="sh-ft"><div class="hn"><span>Back leave book</span></div></div>
+      </div>
+    </div></div>
+    <p class="cap-note">The wallpaper cannot be redrawn under it (two gray passes and 96 KB of heap), and Home was never on the panel, so paper is the honest backdrop.</p>
+  </div>
+
+  <div class="un">
+    <p class="lab">Could not open<small>the same sheet, over the origin screen</small></p>
+    <div class="dv"><div class="sc">
+      <div class="tb"><span>← home</span><span class="on">library</span><span>stats →</span><span class="bt">87%</span></div>
+      <p class="lb-cap">24 books</p>
+      <div class="hm-rr"><div class="cv" style="width:40px;height:60px"></div><p class="hm-rt">Blindsight</p><span class="hm-rp">12%</span></div>
+      <div class="hm-rr"><div class="cv lt" style="width:40px;height:60px"></div><p class="hm-rt">broken-download.epub</p><span class="hm-rp">new</span></div>
+      <div class="hm-rr"><div class="cv" style="width:40px;height:60px"></div><p class="hm-rt">Foundation</p><span class="hm-rp">100%</span></div>
+
+      <div class="sh">
+        <div class="sh-hd"><h1>broken-download.epub</h1><span class="cap">Could not open</span></div>
+        <div class="gr">
+          <div class="rw"><span class="ic"><svg viewBox="0 0 12 12"><circle cx="6" cy="6" r="4.5"/><path d="M6 3.5v3M6 8.3v.2"/></svg></span>
+            <div class="t"><span>Not a valid EPUB</span><span class="sub">zip: end of central directory not found</span></div>
+            <span class="v"></span></div>
+        </div>
+        <div class="sh-ft"><div class="hn"><span>Back close</span></div></div>
+      </div>
+    </div></div>
+    <p class="cap-note">Back pops to the Library with one DU that only lifts the sheet.</p>
+  </div>
+</div>
+
+<h2 class="sec">Caching the rest of the book</h2>
+<div class="fr">
+
+  <div class="un">
+    <p class="lab">Reading while it caches<small>nothing on the page</small></p>
+    <div class="dv"><div class="sc">
+      <div class="rd-bd">
+        <p>Ana had been working at Blue Gamma for a year when the first digients were released to the public. The launch party was held on a rooftop in the Mission, and she remembered the way the evening light had caught the towers downtown, gilding them for a few minutes before the fog came in.</p>
+        <p>Jax was the first one she had trained herself. He had started as a generic mascot, one of a thousand identical instances, and in the months since he had become something she could not quite name: not a pet, not a child, not a program.</p>
+        <p>The forum threads that night were full of screenshots.</p>
+      </div>
+      <div class="rd-ft"><span class="ti">Exhalation</span><span class="tube"><b style="width:4%"></b></span></div>
+    </div></div>
+    <p class="cap-note">No indicator, no repaint of its own. The work was always invisible to reading; the only moment it matters is a turn into a chapter it has not reached, and that turn shows the chapter sheet above.</p>
+  </div>
+
+  <div class="un">
+    <p class="lab">…and in the menu<small>the meta line says how far along it is</small></p>
+    <div class="dv"><div class="sc">
+      <div class="rd-bd">
+        <p>Ana had been working at Blue Gamma for a year when the first digients were released to the public. The launch party was held on a rooftop in the Mission, and she remembered the way the evening light had caught the towers downtown, gilding them for a few minutes before the fog came in.</p>
+        <p>Jax was the first one she had trained herself.</p>
+      </div>
+      <div class="rd-ft"><span class="ti">Exhalation</span><span class="tube"><b style="width:4%"></b></span></div>
+
+      <div class="sh">
+        <div class="sh-hd"><h1>Exhalation</h1><span class="cap">Menu</span></div>
+        <div class="sh-meta">The Merchant and the Alchemist’s Gate · 4% read</div>
+        <div class="gr">
+          <div class="rw on"><span class="ic"><svg viewBox="0 0 12 12"><path d="M2 3h8M2 6h8M2 9h5"/></svg></span><div class="t"><span>Contents</span></div><span class="v">1 / 9 →</span></div>
+          <div class="rw"><span class="ic"><svg viewBox="0 0 12 12"><path d="M2 10L6 2l4 8M3.5 7h5"/></svg></span><div class="t"><span>Book font</span></div><span class="v">◀ Bookerly · M ▶</span></div>
+          <div class="rw"><span class="ic"><svg viewBox="0 0 12 12"><path d="M6 1.5v5M3.5 4.5L6 7l2.5-2.5M2 9.5h8"/></svg></span>
+            <div class="t"><span>Preparing book</span><div class="tube"><b style="width:33%"></b></div></div>
+            <span class="v">3 / 9</span></div>
+        </div>
+        <div class="sh-ft"><div class="hn"><span>↑↓ move</span><span>OK select</span><span>Menu close</span></div></div>
+      </div>
+    </div></div>
+    <p class="cap-note">An inert row while caching runs (chapters, then <i>images 2 / 8</i>), gone once it finishes. Where you look when you want to know, drawn only when the menu is.</p>
+  </div>
+
+  <div class="un">
+    <p class="lab">Alternative: in the footer (not chosen)<small>rides page turns, never its own refresh</small></p>
+    <div class="dv"><div class="sc">
+      <div class="rd-bd">
+        <p>Ana had been working at Blue Gamma for a year when the first digients were released to the public. The launch party was held on a rooftop in the Mission, and she remembered the way the evening light had caught the towers downtown, gilding them for a few minutes before the fog came in.</p>
+        <p>Jax was the first one she had trained herself. He had started as a generic mascot, one of a thousand identical instances, and in the months since he had become something she could not quite name.</p>
+        <p>The forum threads that night were full of screenshots.</p>
+      </div>
+      <div class="rd-ft"><span class="ti">Exhalation</span><span class="fig">preparing 3 / 9</span><span class="tube"><b style="width:4%"></b></span></div>
+    </div></div>
+    <p class="cap-note">Today's <code>[3/15]</code> in words, updated only when a page turn repaints the footer anyway. Cheap, but it is a second figure next to the one that answers "how much is left".</p>
+  </div>
+</div>

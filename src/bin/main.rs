@@ -189,7 +189,11 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     // decode JPEG/PNG without depending on smol-epub directly
     work_queue::register_image_decoder(|data, is_jpeg, max_w, max_h| {
         let raw = if is_jpeg {
-            smol_epub::jpeg::decode_jpeg(smol_epub::jpeg::SliceReader::new(data), max_w, max_h)
+            let reader = SampledReader {
+                inner: smol_epub::jpeg::SliceReader::new(data),
+                until_sample: SAMPLE_EVERY,
+            };
+            smol_epub::jpeg::decode_jpeg(reader, max_w, max_h)
         } else {
             smol_epub::png::decode_png_fit(data, max_w, max_h)
         };
@@ -201,8 +205,9 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         })
     });
 
+    tasks::install_input(input);
     spawner
-        .spawn(tasks::input_task(input))
+        .spawn(tasks::input_task())
         .expect("spawn input_task");
     // housekeeping and idle sleep run on Instant deadlines inside the
     // scheduler main loop; no dedicated tasks
@@ -212,4 +217,41 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     info!("kernel ready.");
 
     kernel.run(&mut app_mgr).await
+}
+
+// a JPEG decode runs for hundreds of milliseconds without yielding,
+// and the worker shares the one core with the input task: sample the
+// buttons every so many bytes read so a press made meanwhile is kept
+const SAMPLE_EVERY: u32 = 1024;
+
+struct SampledReader<R> {
+    inner: R,
+    until_sample: u32,
+}
+
+impl<R: smol_epub::jpeg::JpegRead> smol_epub::jpeg::JpegRead for SampledReader<R> {
+    #[inline]
+    fn read_byte(&mut self) -> Result<u8, &'static str> {
+        self.until_sample -= 1;
+        if self.until_sample == 0 {
+            self.until_sample = SAMPLE_EVERY;
+            tasks::sample_input();
+        }
+        self.inner.read_byte()
+    }
+
+    #[inline]
+    fn is_eof(&self) -> bool {
+        self.inner.is_eof()
+    }
+
+    #[inline]
+    fn position(&self) -> u32 {
+        self.inner.position()
+    }
+
+    #[inline]
+    fn seek(&mut self, pos: u32) -> Result<(), &'static str> {
+        self.inner.seek(pos)
+    }
 }

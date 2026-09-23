@@ -821,6 +821,7 @@ impl ReaderApp {
             is_jpeg,
             cover_cache::CARD_THUMB_W,
             cover_cache::CARD_THUMB_H,
+            false,
         ) {
             Ok(img) => img,
             Err(e) => {
@@ -842,6 +843,7 @@ impl ReaderApp {
             is_jpeg,
             cover_cache::MINI_THUMB_W,
             cover_cache::MINI_THUMB_H,
+            false,
         ) {
             Ok(img) => img,
             Err(e) => {

@@ -19,7 +19,7 @@ pub use stack_fmt::{StackFmt, stack_fmt};
 pub use statusbar::{StackHwmDetail, free_stack_bytes, paint_stack, stack_hwm_detail};
 pub use theme::Theme;
 pub use widget::{
-    AlignedRegion, Alignment, BatteryIcon, LoadingIndicator, ProgressBar, Region, wrap_next,
+    AlignedRegion, Alignment, BatteryIcon, ProgressBar, Region, wrap_next,
     wrap_prev,
 };
 

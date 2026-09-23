@@ -142,7 +142,7 @@ Then every 5 seconds: heap usage, stack watermark, battery percentage, uptime, S
 │       │   ├── layout.rs           shared layout constants (margins, content top, header width)
 │       │   ├── stack_fmt.rs        no-alloc fmt::Write buffers (StackFmt<N>, BorrowedFmt)
 │       │   ├── statusbar.rs        stack paint/measurement utilities for RISC-V
-│       │   └── widget.rs           Region, Alignment, progress bar, loading indicator
+│       │   └── widget.rs           Region, Alignment, progress bar, battery icon
 │       └── util/
 │           ├── mod.rs              utility re-exports
 │           └── utf8.rs             no_std UTF-8 decoder (single-char + iterator)
@@ -182,6 +182,8 @@ Then every 5 seconds: heap usage, stack watermark, battery percentage, uptime, S
 │       ├── reader/
 │       │   ├── mod.rs              reader state machine, draw, footer
 │       │   ├── paging.rs           text wrapping, page navigation
+│       │   ├── loading.rs          loading sheet: hold, stages, face
+│       │   │                       snapshot, over origin or paper
 │       │   ├── epubs.rs            EPUB ZIP/OPF pipeline, chapter cache
 │       │   ├── images.rs           inline image decode + dithering
 │       │   └── layout/             K-P typesetting: items, breaker,
@@ -195,6 +197,8 @@ Then every 5 seconds: heap usage, stack watermark, battery percentage, uptime, S
 │           ├── bitmap_label.rs     proportional text labels
 │           ├── sheet.rs            bottom sheet: frame, header, row
 │           │                       groups, hints (menu + contents)
+│           ├── loading_sheet.rs    the sheet a book loads under: header,
+│           │                       one stage row, Back hint
 │           ├── sleep_card.rs       continue-reading card painted over
 │           │                       the sleep wallpaper (time left,
 │           │                       battery)
@@ -312,6 +316,8 @@ The `Kernel` is split into a `Screen` half (EPD + strip + delay) and a `Services
 
 Two ADC resistance ladders at 100 Hz (adaptive: fast when active, 50 ms slow when idle). 4-sample oversampling per read. 15 ms debounce, 1 s long-press, 150 ms repeat. The `InputDriver` produces raw `Event`s (Press/Release/LongPress/Repeat of physical `Button`). The `ButtonMapper` translates these to semantic `ActionEvent`s (Next/Prev/Select/Back/Menu). Apps never see hardware buttons.
 
+**Sampling during long work.** The ladders have no interrupt, so a press is only seen when someone samples the ADC, and on this single-core executor `input_task` only runs between steps. A decode, scan or cache step that runs for a few hundred ms would let a whole press start and end between two samples. The driver therefore lives in `tasks::SAMPLER` (installed from `main` with `install_input`), and `tasks::sample_input()` takes a sample whenever a fast tick has passed since the last one: every `KernelHandle::sd()` call does it, which covers everything an app does chunk by chunk off the card, and the worker's JPEG decode does it every 1 KB read (`SampledReader` in `main.rs`). Events wait in `INPUT_EVENTS` until the scheduler gets the CPU back. Background work that can be picked up again checks `tasks::input_pending()` and stops early: the reader's inline image precache abandons its decode (and retries the same image later, with no failure marker), and the image scan stops between chapters.
+
 ### Navigation
 
 **Five tab screens on a line with Home in the middle**: `Upload · Settings · HOME · Library · Stats`. Right walks out through the books, Left out through the device, and nothing is more than two presses from Home. `Tab::left`/`right` return `Option` — the line does not wrap, and both ends are visible in the chrome because the missing arm is simply absent.
@@ -372,9 +378,9 @@ Progressive state machine: `NeedBookmark → NeedInit → NeedOpf → NeedToc �
 
 Background caching runs during the EPD waveform window and between user inputs. It's interruptible: if input arrives during `run_background`, the future is dropped. Partial chapter cache writes are safe because `ch_cached` stays false until the full write completes.
 
-**Loading screens hold.** A loading episode (`ReaderApp::begin_loading`: open, wake, chapter change, font change) paints nothing for its first 400 ms unless the next step is known to be slow (bundle miss, chapter not cached, no layout at this font). A fast open, wake or chapter crossing therefore costs one refresh, the page itself. When the screen does go up it is painted once (plate for entering a book, strip for moving inside it, footer already in its final place) and later stages mark only `STAGE_REGION`. The first frame after entering a book or waking is always a full clear (`first_paint_full`); the manager leaves that request to the reader. Design: mockups/xteink_x4_reader_loading.html.
+**Loading is a sheet.** A loading episode (`ReaderApp::begin_loading`: open, wake, chapter change, font change) paints nothing for its first 400 ms (1.5 s on wake) unless the next step is known to be slow (bundle miss, chapter not cached, no layout at this font). A fast open, wake or chapter crossing therefore costs one refresh, the page itself. A slower one puts up the loading sheet (`reader/loading.rs`, `widgets/loading_sheet.rs`): the bottom sheet with one row, whose text is the pipeline collapsed to *Opening*, *Preparing chapter* (a bar from `StreamStripStep::progress`, in quarters) and *Laying out pages*, plus a Back hint. Entering a book from a screen, the sheet goes up over that screen: `ReaderApp::loads_over_origin` makes the manager draw the app beneath the reader on the launcher stack (with its top bar) before the reader draws the sheet, so the sheet arrives as a partial that changes only its own pixels. A wake, a chapter change and a font change have no screen to show beneath (the wallpaper cannot be redrawn, the old page is gone once re-indexing starts), so the sheet sits on paper. An open error is the same sheet. The sheet draws from `SheetFace`, a boxed snapshot updated only on steps whose budget allows a repaint (`refresh_sheet` at the end of every `background_step`); a step inside a waveform window may move the pipeline on, and a sheet read live would then differ between phase 1 and phase 3. The first frame after entering a book or waking is a full clear (`first_paint_full`), except the sheet over the origin screen, which is a partial; the manager leaves that request to the reader. Design: mockups/xteink_x4_reader_loading_sheet.html.
 
-Rendering takes priority over the background chain: the scheduler's `'bg` loop breaks to render whenever a redraw is render-ready, so loading percentages paint as they change and the first page shows as soon as the reader hits `Ready` — remaining caching continues during the paint's waveform window. Once the page is visible the caching indicator repaints only on 10% progress steps (each repaint costs a DU refresh).
+Rendering takes priority over the background chain: the scheduler's `'bg` loop breaks to render whenever a redraw is render-ready, so the sheet repaints as its stage changes and the first page shows as soon as the reader hits `Ready`; remaining caching continues during the paint's waveform window. Background caching after the first page draws nothing on the page: it only updates the menu's *Preparing book* / *Preparing images* row (`QuickActionKind::Info`, skipped by the cursor), read when the menu opens.
 
 ### Text formatting
 
@@ -400,7 +406,7 @@ Inline images in EPUBs are detected by `IMG_REF` markers in the stripped text. I
 
 ### Deep sleep
 
-Idle timeout or power long-press triggers sleep:
+Idle timeout, power long-press or the menu's Sleep row triggers sleep. The two the user asked for first show the **sleep modal** (`widgets/sleep_modal.rs`, mockups/xteink_x4_sleep_modal.html): a centred card, moon and "Going to sleep", plus the book and "page N of M · place saved" when the reader has a page up. The deferred persistence flush (book record, RECENT, stats) runs before it is drawn so "place saved" is true; `AppLayer::show_sleep_ack` raises it, the kernel paints it as a partial (`sleep_prep_under_ack`) and runs steps 1, 2 and the wallpaper load (`Services::sleep_prep`) inside its waveform, then skips phase 3 because the sleep screen's full clear rewrites both planes. Idle timeout skips the modal.
 1. Save session to RTC FAST memory and to `_PULP/SESSION.BIN`, append a line to `_PULP/PWR.LOG`
 2. Flush bookmarks to SD
 3. Send CMD0 to SD card (reduces idle current from ~150 µA to ~10 µA)

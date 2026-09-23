@@ -1,5 +1,4 @@
-// app protocol: trait, context, transitions, redraw types, coalescing,
-// and loading indicator state
+// app protocol: trait, context, transitions, redraw types, coalescing
 //
 // these types define the contract between the kernel scheduler and
 // the app layer. concrete apps implement the App trait; the kernel
@@ -104,6 +103,8 @@ pub enum QuickActionKind {
     Trigger {
         display: &'static str,
     },
+    /// a row that reports instead of acting: the cursor skips it
+    Info,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,6 +116,8 @@ pub struct QuickAction {
     pub icon: Option<char>,
     /// short right-aligned text for trigger rows ("5 / 11", "62%")
     pub value: FixedStr<20>,
+    /// (done, total) drawn as a bar under the label
+    pub progress: Option<(u16, u16)>,
 }
 
 impl QuickAction {
@@ -130,6 +133,7 @@ impl QuickAction {
             kind: QuickActionKind::Cycle { value, options },
             icon: None,
             value: FixedStr::EMPTY,
+            progress: None,
         }
     }
 
@@ -140,6 +144,18 @@ impl QuickAction {
             kind: QuickActionKind::Trigger { display },
             icon: None,
             value: FixedStr::EMPTY,
+            progress: None,
+        }
+    }
+
+    pub const fn info(id: u8, label: &'static str) -> Self {
+        Self {
+            id,
+            label,
+            kind: QuickActionKind::Info,
+            icon: None,
+            value: FixedStr::EMPTY,
+            progress: None,
         }
     }
 
@@ -150,6 +166,11 @@ impl QuickAction {
 
     pub fn with_value(mut self, value: &str) -> Self {
         self.value.set(value.as_bytes());
+        self
+    }
+
+    pub const fn with_progress(mut self, done: u16, total: u16) -> Self {
+        self.progress = Some((done, total));
         self
     }
 }
@@ -268,7 +289,6 @@ pub enum Redraw {
 }
 
 const MSG_BUF_SIZE: usize = 64;
-const LOADING_BUF_SIZE: usize = 32;
 
 /// The pending redraw, if any.
 ///
@@ -288,14 +308,6 @@ enum PendingRedraw {
     Coalescing { region: Region, until: Instant },
 }
 
-/// Loading indicator state; present only while one is shown.
-struct Loading {
-    buf: [u8; LOADING_BUF_SIZE],
-    len: u8,
-    pct: u8,
-    region: Region,
-}
-
 pub struct AppContext {
     // the pending full redraw wants the real-temperature clear
     clean_refresh: bool,
@@ -307,12 +319,6 @@ pub struct AppContext {
     msg_len: usize,
     msg_tag: u8,
     redraw: PendingRedraw,
-
-    // loading indicator; kernel-level so any app can use it.
-    // drawn by the app manager after app content, before overlays.
-    // uses the built-in mono font so it works even with no bitmap
-    // fonts loaded.
-    loading: Option<Loading>,
 }
 
 impl Default for AppContext {
@@ -331,7 +337,6 @@ impl AppContext {
             clean_refresh: false,
             panel_lab: None,
             lab_hold: false,
-            loading: None,
         }
     }
 
@@ -490,71 +495,6 @@ impl AppContext {
             PendingRedraw::Now(r) => r,
             PendingRedraw::Coalescing { region, .. } => Redraw::Partial(region),
         }
-    }
-
-    // loading indicator: set text and percentage.
-    // draws "msg...pct%" using the built-in mono font.
-    // region defines where it renders; typically just below the
-    // app header in the content area.
-    // auto-marks the region dirty so the next render shows it.
-    pub fn set_loading(&mut self, region: Region, msg: &str, pct: u8) {
-        let pct = pct.min(100);
-        log::debug!(
-            "ui: set_loading msg='{}' pct={} region={:?} redraw_before={:?}",
-            msg,
-            pct,
-            region,
-            self.redraw
-        );
-
-        let n = msg.len().min(LOADING_BUF_SIZE);
-        let mut buf = [0u8; LOADING_BUF_SIZE];
-        buf[..n].copy_from_slice(&msg.as_bytes()[..n]);
-        self.loading = Some(Loading {
-            buf,
-            len: n as u8,
-            pct,
-            region,
-        });
-        self.mark_dirty(region);
-    }
-
-    // clear the loading indicator and mark its region dirty so
-    // the underlying content repaints
-    pub fn clear_loading(&mut self) {
-        if let Some(l) = self.loading.take() {
-            log::debug!(
-                "ui: clear_loading region={:?} redraw_before={:?}",
-                l.region,
-                self.redraw
-            );
-            self.mark_dirty(l.region);
-        }
-    }
-
-    #[inline]
-    pub fn loading_active(&self) -> bool {
-        self.loading.is_some()
-    }
-
-    #[inline]
-    pub fn loading_msg(&self) -> &str {
-        self.loading
-            .as_ref()
-            .and_then(|l| core::str::from_utf8(&l.buf[..l.len as usize]).ok())
-            .unwrap_or("")
-    }
-
-    #[inline]
-    pub fn loading_pct(&self) -> u8 {
-        self.loading.as_ref().map_or(0, |l| l.pct)
-    }
-
-    #[inline]
-    pub fn loading_region(&self) -> Region {
-        self.loading
-            .as_ref()
-            .map_or(Region::new(0, 0, 0, 0), |l| l.region)
     }
 }
 
@@ -901,6 +841,14 @@ pub trait AppLayer {
     /// scheduler right before `enter_sleep` so apps can drop transient
     /// heap to make room for the sleep wallpaper allocator.
     fn on_active_pre_sleep(&mut self, k: &mut KernelHandle<'_>);
+
+    /// A sleep the user asked for is about to start: put the sleep
+    /// modal into the next `draw`. true when there is one to show; the
+    /// kernel then paints it as a partial and runs the sleep prep
+    /// inside its waveform. never called for idle-timeout sleep.
+    fn show_sleep_ack(&mut self) -> bool {
+        false
+    }
 
     /// True when `draw_sleep_overlay` has something to paint. With no
     /// wallpaper and no overlay the kernel falls back to its mono

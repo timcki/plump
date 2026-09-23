@@ -573,8 +573,18 @@ impl ReaderApp {
                     let img_w = self.text_w as u16;
                     let img_h = self.text_area_h;
                     let result = self.epub.oom_retry("precache", img_w, img_h, |w, h| {
-                        decode_image_streaming(k, epub_name, &entry, is_jpeg, w, h)
+                        decode_image_streaming(k, epub_name, &entry, is_jpeg, w, h, true)
                     });
+
+                    // a press arrived mid-decode: hand the CPU back and
+                    // start this image over on a later step, without the
+                    // failure marker or the failure count
+                    if result.is_err() && crate::kernel::tasks::input_pending() {
+                        log::info!("precache: {} interrupted by input", full_path);
+                        return Ok(ScanResult::Dispatched {
+                            resume_offset: (offset + rec_start) as u32,
+                        });
+                    }
 
                     match result {
                         Ok(img) => {
@@ -708,6 +718,11 @@ impl ReaderApp {
                 ScanResult::NoneFound => {
                     self.epub.img_cache_ch += 1;
                     self.epub.img_cache_offset = 0;
+                    // the scan can cross the whole book in one call;
+                    // stop between chapters when input is waiting
+                    if crate::kernel::tasks::input_pending() {
+                        return Ok(true);
+                    }
                 }
             }
         }
@@ -877,6 +892,9 @@ pub(super) fn is_image_ext_png(path: &str) -> bool {
 
 // decode image directly from EPUB ZIP via streaming 4 KB SD reads;
 // large-image path -- worker can't stream from SD, so main loop does it
+/// Decode an image straight from the archive. `interruptible` stops
+/// the decode at its next read once input is waiting, for background
+/// work that can simply be picked up again after the input is handled
 pub(super) fn decode_image_streaming(
     k: &mut KernelHandle<'_>,
     epub_name: &str,
@@ -884,6 +902,7 @@ pub(super) fn decode_image_streaming(
     is_jpeg: bool,
     max_w: u16,
     max_h: u16,
+    interruptible: bool,
 ) -> crate::error::Result<DecodedImage> {
     let mut hdr = [0u8; 30];
     k.sd().read_file_chunk(epub_name, entry.local_offset, &mut hdr)?;
@@ -891,11 +910,17 @@ pub(super) fn decode_image_streaming(
         .map_err(|_| Error::new(ErrorKind::ParseFailed, "decode_image: local header"))?;
     let data_offset = entry.local_offset + skip;
 
-    let read_err = |_: Error| -> &'static str { "read failed" };
+    let k = &*k;
+    let read = |off: u32, buf: &mut [u8]| -> Result<usize, &'static str> {
+        if interruptible && crate::kernel::tasks::input_pending() {
+            return Err(DECODE_INTERRUPTED);
+        }
+        k.sd()
+            .read_file_chunk(epub_name, off, buf)
+            .map_err(|_| "read failed")
+    };
 
     let result = if is_jpeg && entry.method == zip::METHOD_STORED {
-        let read =
-            |off, buf: &mut [u8]| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err);
         let reader = smol_epub::jpeg::ChunkReader::new(
             read,
             data_offset,
@@ -903,28 +928,14 @@ pub(super) fn decode_image_streaming(
         );
         smol_epub::jpeg::decode_jpeg(reader, max_w, max_h)
     } else if is_jpeg {
-        let read =
-            |off, buf: &mut [u8]| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err);
         match smol_epub::jpeg::DeflateReader::new(read, data_offset, entry.comp_size) {
             Ok(reader) => smol_epub::jpeg::decode_jpeg(reader, max_w, max_h),
             Err(e) => Err(e),
         }
     } else if entry.method == zip::METHOD_STORED {
-        smol_epub::png::decode_png_sd(
-            |off, buf| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err),
-            data_offset,
-            entry.uncomp_size,
-            max_w,
-            max_h,
-        )
+        smol_epub::png::decode_png_sd(read, data_offset, entry.uncomp_size, max_w, max_h)
     } else {
-        smol_epub::png::decode_png_deflate_sd(
-            |off, buf| k.sd().read_file_chunk(epub_name, off, buf).map_err(read_err),
-            data_offset,
-            entry.comp_size,
-            max_w,
-            max_h,
-        )
+        smol_epub::png::decode_png_deflate_sd(read, data_offset, entry.comp_size, max_w, max_h)
     };
     result.map(from_smol_image).map_err(|msg| {
         log::warn!("decode_image_streaming: {}", msg);
@@ -1148,6 +1159,9 @@ pub(super) fn save_cached_image(
 // chapter has ≤20 unique images, so 24 slots is comfortable headroom.
 
 const PEEK_CACHE_CAP: usize = 24;
+
+// what an interruptible decode's read returns once input is waiting
+const DECODE_INTERRUPTED: &str = "decode interrupted by input";
 
 pub(super) struct ChapterImagePeek<'a> {
     /// Immutable SD reference. Sharing `&SdStorage` (rather than

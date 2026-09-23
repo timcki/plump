@@ -52,6 +52,7 @@ pub const ICON_TEXT_AA: char = '\u{E6EE}';
 pub const ICON_PLAY: char = '\u{E3D0}';
 pub const ICON_ARROWS_CLOCKWISE: char = '\u{E094}';
 pub const ICON_TRASH: char = '\u{E4A6}';
+pub const ICON_FILE: char = '\u{E230}';
 
 /// Fonts a sheet draws with: heading for the title, body for rows,
 /// the chrome font for the meta line, values and hints, and the

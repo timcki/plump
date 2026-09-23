@@ -50,6 +50,7 @@ enum MenuItemKind {
     AppTrigger {
         id: u8,
     },
+    AppInfo,
     CoreRefresh,
     CoreHome,
     CoreSleep,
@@ -60,6 +61,7 @@ struct MenuItem {
     label: &'static str,
     icon: Option<char>,
     value: FixedStr<20>,
+    progress: Option<(u16, u16)>,
     kind: MenuItemKind,
 }
 
@@ -68,8 +70,23 @@ impl MenuItem {
         label: "",
         icon: None,
         value: FixedStr::EMPTY,
+        progress: None,
         kind: MenuItemKind::CoreRefresh,
     };
+
+    const fn core(label: &'static str, icon: char, kind: MenuItemKind) -> Self {
+        Self {
+            label,
+            icon: Some(icon),
+            value: FixedStr::EMPTY,
+            progress: None,
+            kind,
+        }
+    }
+
+    fn selectable(&self) -> bool {
+        !matches!(self.kind, MenuItemKind::AppInfo)
+    }
 }
 
 pub struct QuickMenu {
@@ -122,6 +139,7 @@ impl QuickMenu {
                 label: a.label,
                 icon: a.icon,
                 value: a.value,
+                progress: a.progress,
                 kind: match a.kind {
                     QuickActionKind::Cycle { value, options } => MenuItemKind::AppCycle {
                         id: a.id,
@@ -129,38 +147,28 @@ impl QuickMenu {
                         options,
                     },
                     QuickActionKind::Trigger { .. } => MenuItemKind::AppTrigger { id: a.id },
+                    QuickActionKind::Info => MenuItemKind::AppInfo,
                 },
             };
             idx += 1;
         }
 
         // core rows form the second group
-        self.items[idx] = MenuItem {
-            label: "Clear ghosting",
-            icon: Some(sheet::ICON_ERASER),
-            value: FixedStr::EMPTY,
-            kind: MenuItemKind::CoreRefresh,
-        };
+        self.items[idx] = MenuItem::core(
+            "Clear ghosting",
+            sheet::ICON_ERASER,
+            MenuItemKind::CoreRefresh,
+        );
         idx += 1;
         self.items[idx] = if ctx.on_home {
-            MenuItem {
-                label: "Sleep",
-                icon: Some(sheet::ICON_MOON),
-                value: FixedStr::EMPTY,
-                kind: MenuItemKind::CoreSleep,
-            }
+            MenuItem::core("Sleep", sheet::ICON_MOON, MenuItemKind::CoreSleep)
         } else {
-            MenuItem {
-                label: "Go home",
-                icon: Some(sheet::ICON_HOUSE),
-                value: FixedStr::EMPTY,
-                kind: MenuItemKind::CoreHome,
-            }
+            MenuItem::core("Go home", sheet::ICON_HOUSE, MenuItemKind::CoreHome)
         };
         idx += 1;
 
         self.count = idx;
-        self.selected = 0;
+        self.selected = (0..idx).find(|&i| self.items[i].selectable()).unwrap_or(0);
         self.open = true;
         self.dirty = true;
         self.title.set(ctx.title.as_bytes());
@@ -168,7 +176,17 @@ impl QuickMenu {
 
         let group_break = if n_app > 0 { Some(n_app - 1) } else { None };
         let fonts = SheetFonts::for_ui(self.ui_font_idx);
-        self.geom = SheetGeom::anchored(self.count, group_break, fonts.row_h(fonts.body, false, false));
+        // a report row stacks its bar under the label; the group it
+        // sits in takes that height so its rows stay equal
+        let bar = self.items[..n_app].iter().any(|it| it.progress.is_some());
+        self.geom = SheetGeom::anchored_groups(
+            self.count,
+            group_break,
+            [
+                fonts.row_h(fonts.body, false, bar),
+                fonts.row_h(fonts.body, false, false),
+            ],
+        );
     }
 
     pub fn hide(&mut self) {
@@ -201,20 +219,12 @@ impl QuickMenu {
             }
 
             Action::Next => {
-                let new = wrap_next(self.selected, self.count);
-                if new != self.selected {
-                    self.selected = new;
-                    self.dirty = true;
-                }
+                self.step_selection(wrap_next);
                 QuickMenuResult::Consumed
             }
 
             Action::Prev => {
-                let new = wrap_prev(self.selected, self.count);
-                if new != self.selected {
-                    self.selected = new;
-                    self.dirty = true;
-                }
+                self.step_selection(wrap_prev);
                 QuickMenuResult::Consumed
             }
 
@@ -229,6 +239,21 @@ impl QuickMenu {
             }
 
             Action::Select => self.activate_selected(),
+        }
+    }
+
+    // move the cursor, stepping over report rows
+    fn step_selection(&mut self, step: fn(usize, usize) -> usize) {
+        let mut new = self.selected;
+        for _ in 0..self.count {
+            new = step(new, self.count);
+            if self.items[new].selectable() {
+                break;
+            }
+        }
+        if new != self.selected && self.items[new].selectable() {
+            self.selected = new;
+            self.dirty = true;
         }
     }
 
@@ -266,6 +291,7 @@ impl QuickMenu {
                 self.hide();
                 QuickMenuResult::AppTrigger(id)
             }
+            MenuItemKind::AppInfo => QuickMenuResult::Consumed,
             MenuItemKind::CoreRefresh => {
                 self.hide();
                 QuickMenuResult::RefreshScreen
@@ -318,6 +344,9 @@ impl QuickMenu {
                         let _ = write!(val, "{} \u{2192}", item.value.as_str());
                     }
                 }
+                MenuItemKind::AppInfo => {
+                    let _ = write!(val, "{}", item.value.as_str());
+                }
                 MenuItemKind::CoreRefresh | MenuItemKind::CoreSleep => {}
             }
             sheet::draw_row(
@@ -332,7 +361,7 @@ impl QuickMenu {
                     value: val.as_str(),
                     selected,
                     sub: "",
-                    progress: None,
+                    progress: item.progress.map(|(d, t)| (d as u32, t as u32)),
                     chip: ValueChip::None,
                 },
             );

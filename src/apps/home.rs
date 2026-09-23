@@ -82,9 +82,8 @@ pub(crate) const fn is_resume_action(id: u8) -> bool {
 const CARD_Y: u16 = CONTENT_TOP;
 const CARD_REGION: Region = Region::new(CARD_X, CARD_Y, CARD_W, CARD_H);
 
-// between the card and the list: a 24 px hairline, centred. the same
-// rule the reader's loading plate sets between an author and a resume
-// line, and 10 px cheaper than the caption it replaces -- which was
+// between the card and the list: a 24 px hairline, centred, and 10 px
+// cheaper than the caption it replaces -- which was
 // carrying one word plus a count of rows you can see and count.
 const RULE_W: u16 = 24;
 const RULE_LEAD: u16 = 13;

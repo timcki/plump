@@ -1,0 +1,252 @@
+<title>Pulp Sleep Modal</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Lora:ital,wght@0,400;0,500;0,600;1,400&display=swap');
+
+:root {
+  --ground: #141414;
+  --frame: #1c1c1c;
+  --paper: #f6f4ee;
+  --ink: #181818;
+  --ink-25: rgba(24,24,24,0.25);
+  --ink-12: rgba(24,24,24,0.12);
+  --label: #d9d6cc;
+}
+body { background: var(--ground); color: var(--label); margin: 0; font-family: 'Atkinson Hyperlegible', system-ui, sans-serif; }
+h1.pg-t { font-size: 18px; font-weight: 700; text-align: center; margin: 2rem 1rem 0.3rem; }
+p.pg-s { text-align: center; font-size: 12.5px; opacity: 0.65; margin: 0 1rem 0.5rem; }
+h2.sec { font-size: 13px; letter-spacing: 0.18em; text-transform: uppercase; text-align: center; margin: 2.2rem 1rem 0; opacity: 0.8; }
+.note { max-width: 70ch; margin: 0.8rem auto 1.2rem; padding: 0 1rem; font-size: 12.5px; line-height: 1.6; opacity: 0.8; }
+.note b { font-weight: 700; }
+.note code, .cap-note code { font-family: ui-monospace, Menlo, monospace; font-size: 0.92em; background: rgba(255,255,255,0.07); padding: 1px 4px; border-radius: 3px; }
+
+.fr { padding: 1.2rem 1rem 1rem; display: flex; justify-content: center; gap: 22px; flex-wrap: wrap; }
+.un { display: flex; flex-direction: column; align-items: center; gap: 9px; max-width: 354px; }
+.lab { font-size: 13px; font-weight: 500; margin: 0; text-align: center; }
+.lab small { display: block; font-weight: 400; opacity: 0.6; font-size: 11px; margin-top: 2px; }
+.cap-note { font-size: 11px; line-height: 1.5; opacity: 0.7; margin: 0; }
+.dv { background: var(--frame); padding: 7px; border-radius: 22px; }
+/* 480 x 800 panel at 340 x 567: 0.708 css px per panel px */
+.sc { background: var(--paper); color: var(--ink); width: 340px; height: 567px; border-radius: 14px; display: flex; flex-direction: column; padding: 12px 14px 9px; box-sizing: border-box; position: relative; overflow: hidden; }
+
+/* top bar */
+.tb { display: flex; align-items: baseline; gap: 10px; font-size: 10.5px; padding: 2px 2px 8px; border-bottom: 1px solid var(--ink); margin-bottom: 10px; }
+.tb .on { font-weight: 700; font-size: 12px; }
+.tb .bt { margin-left: auto; font-size: 10px; opacity: 0.8; }
+
+/* home */
+.hm-cn { display: flex; gap: 11px; padding: 4px 2px 12px; border-bottom: 1px solid var(--ink-25); margin-bottom: 6px; }
+.cv { background: var(--ink); flex-shrink: 0; border-radius: 1px; position: relative; }
+.cv.lt { background: #d8d2bd; }
+.cv::after { content: ''; position: absolute; background: var(--paper); width: 30%; aspect-ratio: 1; border-radius: 50%; top: 28%; left: 35%; }
+.cv.lt::after { background: var(--ink); width: 14%; height: 60%; border-radius: 0; top: 20%; left: 43%; }
+.hm-cw { display: flex; flex-direction: column; flex: 1; min-width: 0; justify-content: center; }
+.hm-ct { font-family: 'Lora', Georgia, serif; font-size: 15px; font-weight: 500; margin: 0; }
+.hm-ca { font-size: 11px; opacity: 0.65; margin: 2px 0 8px; }
+.tube { height: 4px; border: 1px solid var(--ink); border-radius: 3px; overflow: hidden; box-sizing: border-box; }
+.tube > b { display: block; height: 100%; background: var(--ink); }
+.hm-cm { display: flex; justify-content: space-between; margin-top: 5px; font-size: 10px; opacity: 0.65; }
+.hm-rr { padding: 7px 2px; border-bottom: 1px solid var(--ink-12); display: flex; gap: 10px; align-items: center; }
+.hm-rt { font-family: 'Lora', Georgia, serif; font-size: 12.5px; margin: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hm-rp { font-size: 10px; opacity: 0.65; }
+
+/* reader */
+.rd-bd { flex: 1; font-family: 'Lora', Georgia, serif; font-size: 13px; line-height: 1.58; text-align: justify; hyphens: auto; overflow: hidden; }
+.rd-bd p { margin: 0 0 0.7em; }
+.rd-ft { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding-top: 8px; font-size: 10px; }
+.rd-ft .ti { opacity: 0.8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rd-ft .tube { width: 64px; flex: none; }
+
+/* bottom sheet (only to show the modal over it) */
+.sh { position: absolute; left: 14px; right: 14px; bottom: 14px; background: var(--paper); border: 1.5px solid var(--ink); border-radius: 10px; padding: 10px 11px 8px; box-sizing: border-box; }
+.sh-hd { display: flex; align-items: baseline; justify-content: space-between; padding: 0 3px 3px; }
+.sh-hd h1 { font-family: 'Lora', Georgia, serif; font-weight: 500; font-size: 15px; margin: 0; }
+.sh-hd .cap { font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; font-weight: 700; opacity: 0.55; }
+.sh-meta { font-size: 10px; opacity: 0.6; padding: 0 3px 9px; }
+.gr { border: 1px solid var(--ink-25); border-radius: 7px; overflow: hidden; margin-bottom: 6px; }
+.rw { display: flex; justify-content: space-between; padding: 8px 10px; font-size: 11.5px; border-bottom: 1px solid var(--ink-12); }
+.rw:last-child { border-bottom: none; }
+.rw.on { background: var(--ink); color: var(--paper); }
+.hn { display: flex; justify-content: flex-end; gap: 14px; font-size: 9px; letter-spacing: 0.16em; opacity: 0.55; text-transform: uppercase; font-weight: 700; padding-top: 3px; }
+
+/* THE MODAL: centred on the panel, 336 panel px wide (238 css) */
+.md { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 238px; box-sizing: border-box; background: var(--paper); border: 1.5px solid var(--ink); border-radius: 8.5px; box-shadow: 3px 3px 0 var(--ink); padding: 14px 14px 13px; display: flex; flex-direction: column; align-items: center; text-align: center; }
+.md svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+.md .t { font-size: 14px; font-weight: 700; margin: 7px 0 0; }
+.md .rule { width: 17px; height: 1px; background: var(--ink); margin: 10px 0 9px; }
+.md .bk { font-family: 'Lora', Georgia, serif; font-size: 12.5px; margin: 0; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.md .pl { font-size: 10px; opacity: 0.62; margin: 3px 0 0; font-variant-numeric: tabular-nums; }
+.md.solo { padding-bottom: 15px; }
+
+/* alternative: the compact chip */
+.chip { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 198px; height: 28px; background: var(--ink); color: var(--paper); border-radius: 4px; display: flex; align-items: center; justify-content: center; gap: 7px; font-size: 12px; }
+.chip svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+
+/* timeline */
+.tl { max-width: 900px; margin: 0.6rem auto 1rem; padding: 0 1rem; }
+.tl .row { display: flex; align-items: stretch; height: 30px; font-size: 10.5px; border-radius: 4px; overflow: hidden; }
+.tl .row > div { display: flex; align-items: center; justify-content: center; padding: 0 6px; box-sizing: border-box; white-space: nowrap; overflow: hidden; }
+.tl .hold { background: #2c2c2a; }
+.tl .wr { background: #6d6a60; color: #111; }
+.tl .du { background: #d9d6cc; color: #111; }
+.tl .gc { background: #8a877c; color: #111; }
+.tl .gy { background: #a9a597; color: #111; }
+.tl .row2 { display: flex; height: 22px; font-size: 10px; margin-top: 4px; }
+.tl .row2 > div { display: flex; align-items: center; justify-content: center; box-sizing: border-box; }
+.tl .prep { background: repeating-linear-gradient(45deg, #3c3b37, #3c3b37 5px, #2e2d2a 5px, #2e2d2a 10px); color: var(--label); border-radius: 4px; }
+.tl .ax { display: flex; justify-content: space-between; font-size: 10px; opacity: 0.55; margin-top: 4px; }
+
+/* 1:1 anatomy */
+.one { display: flex; justify-content: center; padding: 1rem; }
+.p1 { background: var(--paper); color: var(--ink); border-radius: 8px; padding: 28px 40px; position: relative; }
+.m1 { width: 336px; box-sizing: border-box; background: var(--paper); border: 2px solid var(--ink); border-radius: 12px; box-shadow: 4px 4px 0 var(--ink); padding: 20px 20px 18px; display: flex; flex-direction: column; align-items: center; text-align: center; position: relative; }
+.m1 svg { width: 28px; height: 28px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.m1 .t { font-size: 20px; font-weight: 700; margin: 10px 0 0; }
+.m1 .rule { width: 24px; height: 1px; background: var(--ink); margin: 14px 0 12px; }
+.m1 .bk { font-family: 'Lora', Georgia, serif; font-size: 18px; margin: 0; }
+.m1 .pl { font-size: 15px; opacity: 0.62; margin: 4px 0 0; }
+.dim { position: absolute; font-size: 11px; color: #9a3b2e; font-family: ui-monospace, Menlo, monospace; }
+</style>
+
+<h2 style="position:absolute;left:-9999px">Xteink X4 mockups of a centred sleep modal shown when the power button is held: over the reader page, over Home, over an open menu, a compact chip alternative, the timing of the frame against the sleep sequence, and the modal's geometry at panel scale.</h2>
+
+<h1 class="pg-t">Sleep modal</h1>
+<p class="pg-s">power held past 1 s: the device says so at once, in the middle of whatever is on screen, while it saves your place</p>
+
+<div class="note">
+<b>What it answers.</b> Today a hold goes quiet for about two seconds: the session save, the persistence flush and the wallpaper load all run before the sleep screen's first waveform, so nothing on the panel says the hold registered. The modal is painted the moment the threshold fires and stays until the sleep screen takes the panel. It is a <b>centred card</b>, a different object from the bottom sheet on purpose: the sheet is something you act in, this is something the device tells you and needs no answer, so it has no rows and no hints.
+</div>
+
+<h2 class="sec">The modal</h2>
+<div class="fr">
+
+  <div class="un">
+    <p class="lab">Holding power while reading<small>recommended: the card names what it kept</small></p>
+    <div class="dv"><div class="sc">
+      <div class="rd-bd">
+        <p>Ana had been working at Blue Gamma for a year when the first digients were released to the public. The launch party was held on a rooftop in the Mission, and she remembered the way the evening light had caught the towers downtown, gilding them for a few minutes before the fog came in.</p>
+        <p>Jax was the first one she had trained herself. He had started as a generic mascot, one of a thousand identical instances, and in the months since he had become something she could not quite name: not a pet, not a child, not a program.</p>
+        <p>The forum threads that night were full of screenshots. Owners compared the words their digients had learned, the games they had invented, the small refusals that felt, to everyone posting, like the beginnings of a will.</p>
+        <p>Derek stopped by her desk on the way out.</p>
+      </div>
+      <div class="rd-ft"><span class="ti">Exhalation</span><span class="tube"><b style="width:38%"></b></span></div>
+
+      <div class="md">
+        <svg viewBox="0 0 16 16"><path d="M12.6 9.6A5.6 5.6 0 0 1 6.4 3.4a5.6 5.6 0 1 0 6.2 6.2z"/></svg>
+        <p class="t">Going to sleep</p>
+        <div class="rule"></div>
+        <p class="bk">Exhalation</p>
+        <p class="pl">page 124 of 322 · place saved</p>
+      </div>
+    </div></div>
+    <p class="cap-note">Moon (the menu's own Sleep glyph), the title in the UI face, the hairline Home uses between card and list, then the book in its own face and where you stopped, from the same fields the sleep card is filled from. "Place saved" is true when it is drawn: the record flush runs inside this frame's waveform, before the panel shows it.</p>
+  </div>
+
+  <div class="un">
+    <p class="lab">From any other screen<small>no book in front of you: the title alone</small></p>
+    <div class="dv"><div class="sc">
+      <div class="tb"><span>← settings</span><span class="on">home</span><span>library →</span><span class="bt">87%</span></div>
+      <div class="hm-cn">
+        <div class="cv" style="width:62px;height:92px"></div>
+        <div class="hm-cw">
+          <p class="hm-ct">Exhalation</p>
+          <p class="hm-ca">Ted Chiang</p>
+          <div class="tube"><b style="width:38%"></b></div>
+          <div class="hm-cm"><span>chapter 5 of 11</span><span>9h 32m</span></div>
+        </div>
+      </div>
+      <div class="hm-rr"><div class="cv lt" style="width:34px;height:50px"></div><p class="hm-rt">Pachinko</p><span class="hm-rp">62%</span></div>
+      <div class="hm-rr"><div class="cv" style="width:34px;height:50px"></div><p class="hm-rt">The MANIAC</p><span class="hm-rp">100%</span></div>
+      <div class="hm-rr"><div class="cv lt" style="width:34px;height:50px"></div><p class="hm-rt">Foundation</p><span class="hm-rp">100%</span></div>
+
+      <div class="md solo">
+        <svg viewBox="0 0 16 16"><path d="M12.6 9.6A5.6 5.6 0 0 1 6.4 3.4a5.6 5.6 0 1 0 6.2 6.2z"/></svg>
+        <p class="t">Going to sleep</p>
+      </div>
+    </div></div>
+    <p class="cap-note">Home, Library, Stats, Settings. Home already shows the book, and the sleep card names it a second later; a book line here would repeat the screen behind it.</p>
+  </div>
+
+  <div class="un">
+    <p class="lab">Sleep from the menu<small>the same modal over the sheet</small></p>
+    <div class="dv"><div class="sc">
+      <div class="tb"><span>← settings</span><span class="on">home</span><span>library →</span><span class="bt">87%</span></div>
+      <div class="hm-cn">
+        <div class="cv" style="width:62px;height:92px"></div>
+        <div class="hm-cw">
+          <p class="hm-ct">Exhalation</p>
+          <p class="hm-ca">Ted Chiang</p>
+          <div class="tube"><b style="width:38%"></b></div>
+          <div class="hm-cm"><span>chapter 5 of 11</span><span>9h 32m</span></div>
+        </div>
+      </div>
+      <div class="hm-rr"><div class="cv lt" style="width:34px;height:50px"></div><p class="hm-rt">Pachinko</p><span class="hm-rp">62%</span></div>
+
+      <div class="sh">
+        <div class="sh-hd"><h1>Exhalation</h1><span class="cap">Menu</span></div>
+        <div class="sh-meta">The Lifecycle of Software Objects · 61 / 143</div>
+        <div class="gr"><div class="rw"><span>Continue reading</span><span>124 / 322 →</span></div><div class="rw"><span>Contents</span><span>5 / 11 →</span></div></div>
+        <div class="gr"><div class="rw"><span>Clear ghosting</span><span></span></div><div class="rw on"><span>Sleep</span><span></span></div></div>
+        <div class="hn"><span>Back close</span><span>OK select</span></div>
+      </div>
+
+      <div class="md solo" style="top:38%">
+        <svg viewBox="0 0 16 16"><path d="M12.6 9.6A5.6 5.6 0 0 1 6.4 3.4a5.6 5.6 0 1 0 6.2 6.2z"/></svg>
+        <p class="t">Going to sleep</p>
+      </div>
+    </div></div>
+    <p class="cap-note">Choosing Sleep in the menu is the same deliberate act as the hold, so it gets the same frame. The modal is drawn after every overlay, so it wins over the sheet; the sheet is not closed first (that would cost a frame of its own). Idle-timeout sleep draws nothing: nobody is watching.</p>
+  </div>
+
+  <div class="un">
+    <p class="lab">Alternative (compact chip)<small>the page-position overlay's shape, 280 × 40</small></p>
+    <div class="dv"><div class="sc">
+      <div class="rd-bd">
+        <p>Ana had been working at Blue Gamma for a year when the first digients were released to the public. The launch party was held on a rooftop in the Mission, and she remembered the way the evening light had caught the towers downtown, gilding them for a few minutes before the fog came in.</p>
+        <p>Jax was the first one she had trained herself. He had started as a generic mascot, one of a thousand identical instances, and in the months since he had become something she could not quite name: not a pet, not a child, not a program.</p>
+        <p>The forum threads that night were full of screenshots. Owners compared the words their digients had learned, the games they had invented, the small refusals that felt, to everyone posting, like the beginnings of a will.</p>
+        <p>Derek stopped by her desk on the way out.</p>
+      </div>
+      <div class="rd-ft"><span class="ti">Exhalation</span><span class="tube"><b style="width:38%"></b></span></div>
+      <div class="chip">
+        <svg viewBox="0 0 16 16"><path d="M12.6 9.6A5.6 5.6 0 0 1 6.4 3.4a5.6 5.6 0 1 0 6.2 6.2z"/></svg>
+        <span>Going to sleep</span>
+      </div>
+    </div></div>
+    <p class="cap-note">An ink slab, paper text. Louder and smaller, and the geometry already exists (<code>POSITION_OVERLAY</code>), but it reads as a toast, not a modal, and cannot say what was saved.</p>
+  </div>
+</div>
+
+<h2 class="sec">When it lands</h2>
+<div class="tl">
+  <div class="row">
+    <div class="hold" style="width:30%">hold 1 s</div>
+    <div class="wr" style="width:4%">write</div>
+    <div class="du" style="width:19%">modal DU ~650 ms</div>
+    <div class="gc" style="width:36%">sleep screen base GC ~1.86 s</div>
+    <div class="gy" style="width:11%">gray ~0.39 s</div>
+  </div>
+  <div class="row2">
+    <div style="width:34%"></div>
+    <div class="prep" style="width:22%">save, flush, free heap, load wallpaper ~750 ms</div>
+  </div>
+  <div class="ax"><span>press</span><span>modal on the panel ~1.2 s after the press</span><span>asleep ~4.2 s (today ~4.0 s, with nothing shown until ~1.8 s)</span></div>
+</div>
+<div class="note">
+The sleep prep moves <b>inside</b> the modal's waveform: while the charge pump drives the panel there is no SPI traffic, and the prep is almost all SD reads and writes, which is what the waveform window already hosts for caching. So the modal costs its own RAM write (~120 ms) and the few tens of ms the prep overruns the waveform, not a second refresh stacked in front of the sleep screen. Phase 3 is skipped (<code>abandon</code>): the sleep screen's full clear rewrites both planes anyway, and after the heap drop the app could no longer draw the frame again. If the reader page is gray-coded (AA on), the partial pays the revert first, the same as any other partial today.
+</div>
+
+<h2 class="sec">At panel scale</h2>
+<div class="one"><div class="p1">
+  <div class="m1">
+    <svg viewBox="0 0 16 16"><path d="M12.6 9.6A5.6 5.6 0 0 1 6.4 3.4a5.6 5.6 0 1 0 6.2 6.2z"/></svg>
+    <p class="t">Going to sleep</p>
+    <div class="rule"></div>
+    <p class="bk">Exhalation</p>
+    <p class="pl">page 124 of 322 · place saved</p>
+  </div>
+  <span class="dim" style="top:8px;left:40px">336 px, centred on 480</span>
+  <span class="dim" style="bottom:6px;left:40px">radius 12 · border 2 · offset shadow 4 · pad 20</span>
+</div></div>
+<div class="note">
+Moon in the Phosphor face one tier above the UI tier; title in <code>ui_heading_font</code>; the 24 px hairline; the book in <code>heading_font(reader family)</code>, ellipsized; the place line in the chrome font. Height follows content (≈ 190 px with a book, ≈ 120 px without), centred on the panel's middle. The <b>offset shadow</b> (a 4 px ink slab behind the bottom-right edge) is what separates it from the bottom sheet at a glance: the sheet is flush with the page, the modal sits above it. No hints: the hold cannot be taken back once it fires.
+</div>
