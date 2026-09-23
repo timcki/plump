@@ -1035,16 +1035,40 @@ where
             )?;
             data.open_files[file_idx].current_cluster = current_cluster;
             trace!("Reading file ID {:?}", file);
-            let block = data
-                .block_cache
-                .read(block_idx)
-                .map_err(Error::DeviceError)?;
-            let to_copy = block_avail
-                .min(space)
-                .min(data.open_files[file_idx].left() as usize);
-            assert!(to_copy != 0);
-            buffer[read..read + to_copy]
-                .copy_from_slice(&block[block_offset..block_offset + to_copy]);
+            let want = space.min(data.open_files[file_idx].left() as usize);
+            // plump patch: whole blocks up to the end of the cluster go
+            // straight into the caller's buffer in one multi-block read
+            let direct = if block_offset == 0 {
+                let in_cluster = cluster_blocks_left(
+                    data,
+                    volume_idx,
+                    current_cluster.0,
+                    data.open_files[file_idx].current_offset,
+                );
+                (want / Block::LEN).min(in_cluster)
+            } else {
+                0
+            };
+            let to_copy = if direct >= 2 {
+                let bytes = direct * Block::LEN;
+                data.block_cache
+                    .read_direct(
+                        crate::blockdevice::as_blocks_mut(&mut buffer[read..read + bytes]),
+                        block_idx,
+                    )
+                    .map_err(Error::DeviceError)?;
+                bytes
+            } else {
+                let block = data
+                    .block_cache
+                    .read(block_idx)
+                    .map_err(Error::DeviceError)?;
+                let to_copy = block_avail.min(want);
+                assert!(to_copy != 0);
+                buffer[read..read + to_copy]
+                    .copy_from_slice(&block[block_offset..block_offset + to_copy]);
+                to_copy
+            };
             read += to_copy;
             space -= to_copy;
             data.open_files[file_idx]
@@ -1164,21 +1188,46 @@ where
                 }
                 Err(e) => return Err(e),
             };
-            let to_copy = core::cmp::min(block_avail, bytes_to_write - written);
-            let block = if (block_offset == 0) && (to_copy == block_avail) {
-                // we're replacing the whole Block, so the previous contents
-                // are irrelevant
-                data.block_cache.blank_mut(block_idx)
+            // plump patch: whole blocks up to the end of the cluster go
+            // out of the caller's buffer in one multi-block write
+            let direct = if block_offset == 0 {
+                let in_cluster = cluster_blocks_left(
+                    data,
+                    volume_idx,
+                    current_cluster.0,
+                    data.open_files[file_idx].current_offset,
+                );
+                ((bytes_to_write - written) / Block::LEN).min(in_cluster)
             } else {
-                debug!("Reading for partial block write");
-                data.block_cache
-                    .read_mut(block_idx)
-                    .map_err(Error::DeviceError)?
+                0
             };
-            block[block_offset..block_offset + to_copy]
-                .copy_from_slice(&buffer[written..written + to_copy]);
-            debug!("Writing block {:?}", block_idx);
-            data.block_cache.write_back()?;
+            let to_copy = if direct >= 2 {
+                let bytes = direct * Block::LEN;
+                data.block_cache
+                    .write_direct(
+                        crate::blockdevice::as_blocks(&buffer[written..written + bytes]),
+                        block_idx,
+                    )
+                    .map_err(Error::DeviceError)?;
+                bytes
+            } else {
+                let to_copy = core::cmp::min(block_avail, bytes_to_write - written);
+                let block = if (block_offset == 0) && (to_copy == block_avail) {
+                    // we're replacing the whole Block, so the previous contents
+                    // are irrelevant
+                    data.block_cache.blank_mut(block_idx)
+                } else {
+                    debug!("Reading for partial block write");
+                    data.block_cache
+                        .read_mut(block_idx)
+                        .map_err(Error::DeviceError)?
+                };
+                block[block_offset..block_offset + to_copy]
+                    .copy_from_slice(&buffer[written..written + to_copy]);
+                debug!("Writing block {:?}", block_idx);
+                data.block_cache.write_back()?;
+                to_copy
+            };
             written += to_copy;
             data.open_files[file_idx].current_cluster = current_cluster;
 
@@ -1543,6 +1592,23 @@ where
         let available = Block::LEN - block_offset;
         Ok((block_idx, block_offset, available))
     }
+}
+
+/// Blocks from the one holding `offset` to the end of its cluster, the
+/// cluster starting at file offset `cluster_start`. plump patch.
+fn cluster_blocks_left<D, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    data: &VolumeManagerData<D, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    volume_idx: usize,
+    cluster_start: u32,
+    offset: u32,
+) -> usize
+where
+    D: BlockDevice,
+{
+    let bytes_per_cluster = match &data.open_volumes[volume_idx].volume_type {
+        VolumeType::Fat(fat) => fat.bytes_per_cluster(),
+    };
+    ((bytes_per_cluster - (offset - cluster_start)) / Block::LEN_U32) as usize
 }
 
 /// Transform mode variants (ReadWriteCreate_Or_Append) to simple modes ReadWriteAppend or

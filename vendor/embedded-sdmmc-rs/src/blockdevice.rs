@@ -14,7 +14,10 @@
 ///
 /// This library does not support devices with a block size other than 512
 /// bytes.
+// plump patch: transparent so a byte buffer of whole blocks can be
+// viewed as `[Block]` for a direct multi-block transfer
 #[derive(Clone)]
+#[repr(transparent)]
 pub struct Block {
     /// The 512 bytes in this block (or sector).
     pub contents: [u8; Block::LEN],
@@ -151,6 +154,26 @@ where
         )?;
         self.block_device.write(&self.block, duplicate)?;
         Ok(())
+    }
+
+    /// Read whole blocks straight into `blocks`, bypassing the cache
+    /// slot (one multi-block command). The cache is write-through, so
+    /// the device already holds anything it has seen. plump patch.
+    pub fn read_direct(&mut self, blocks: &mut [Block], start: BlockIdx) -> Result<(), D::Error> {
+        self.block_device.read(blocks, start)
+    }
+
+    /// Write whole blocks straight from `blocks` (one multi-block
+    /// command), dropping the cached block when it falls in the range.
+    /// plump patch.
+    pub fn write_direct(&mut self, blocks: &[Block], start: BlockIdx) -> Result<(), D::Error> {
+        if let Some(cached) = self.block_idx
+            && cached.0 >= start.0
+            && cached.0 < start.0 + blocks.len() as u32
+        {
+            self.block_idx = None;
+        }
+        self.block_device.write(blocks, start)
     }
 
     /// Access a blank sector
@@ -446,3 +469,22 @@ where
 // End Of File
 //
 // ****************************************************************************
+
+/// View a byte buffer whose length is a multiple of [`Block::LEN`] as
+/// blocks. plump patch.
+pub(crate) fn as_blocks_mut(bytes: &mut [u8]) -> &mut [Block] {
+    assert!(bytes.len().is_multiple_of(Block::LEN));
+    // Safety: `Block` is a transparent wrapper over `[u8; 512]`, so it
+    // has size 512 and align 1 like the bytes it covers
+    unsafe {
+        core::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<Block>(), bytes.len() / Block::LEN)
+    }
+}
+
+/// View a byte buffer whose length is a multiple of [`Block::LEN`] as
+/// blocks. plump patch.
+pub(crate) fn as_blocks(bytes: &[u8]) -> &[Block] {
+    assert!(bytes.len().is_multiple_of(Block::LEN));
+    // Safety: as in `as_blocks_mut`
+    unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast::<Block>(), bytes.len() / Block::LEN) }
+}
