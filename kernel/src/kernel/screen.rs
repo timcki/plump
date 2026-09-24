@@ -8,6 +8,15 @@
 //   begin_full   -> Wave<'_, M>   (waveform running)
 //   wave.settle() / wave.wait() ->  Settled<'_, M>
 //   settled.sync_red / .abandon / .grayscale / .finish
+//   grayscale -> GrayDone: .rebase_red, or drop to keep the codes
+//
+// AA page turns (crosspoint's scheme): after the gray pass RED is
+// rewritten with the plain page, so the planes are tracked as AA
+// residue rather than gray codes. the next frame that grays again
+// (another AA reader page) runs a plain delta DU against RED: no
+// revert, no inv_red. any other frame re-drives via inv_red, which
+// puts every lifted edge back on its rail. if the rebase never runs
+// the codes stay tracked and the old revert path applies
 //
 // Wave borrows the Screen mutably, so no other panel access can
 // compile while a waveform is in flight; the scheduler exploits that
@@ -116,6 +125,7 @@ pub enum PartialPlan<'s> {
 pub struct PendingRevert<'s> {
     screen: &'s mut Screen,
     region: AlignedRegion,
+    close: FrameClose,
 }
 
 impl<'s> PendingRevert<'s> {
@@ -134,7 +144,11 @@ impl<'s> PendingRevert<'s> {
     where
         F: Fn(&mut StripBuffer),
     {
-        let PendingRevert { screen, region } = self;
+        let PendingRevert {
+            screen,
+            region,
+            close,
+        } = self;
         let t0 = Instant::now();
         let res = if region == FULL_REGION {
             screen.revert_windows(region).await
@@ -150,7 +164,53 @@ impl<'s> PendingRevert<'s> {
                 log::warn!("partial: revert pass timed out, forcing full GC next frame");
             }
         }
-        screen.start_partial_wave(region, draw)
+        screen.start_partial_wave(region, close, draw)
+    }
+}
+
+/// How the frame about to be written will close. Decides whether AA
+/// residue left by the previous gray pass is a delta baseline (the
+/// frame grays again, i.e. another AA reader page) or must be
+/// re-driven to the rails first (anything else: menus, other screens,
+/// the sleep modal).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FrameClose {
+    /// Phase 3 or nothing: the frame stays plain BW.
+    Plain,
+    /// A gray pass is expected to replace phase 3.
+    Gray,
+}
+
+/// A gray pass that completed: both planes hold its codes.
+///
+/// [`GrayDone::rebase_red`] rewrites RED with the plain page so the
+/// next AA frame is a delta; dropping it instead keeps the codes
+/// tracked, and the next partial reverts first (the path the sleep
+/// wallpaper takes, and the fallback if a caller never rebases).
+pub struct GrayDone<'s> {
+    screen: &'s mut Screen,
+    region: AlignedRegion,
+}
+
+impl GrayDone<'_> {
+    /// RED <- plain content over the grayed region. The draw must be
+    /// the frame the gray pass just drew (the strip is back in BW
+    /// mode), exactly as for phase 3.
+    pub fn rebase_red<F>(self, draw: &F)
+    where
+        F: Fn(&mut StripBuffer),
+    {
+        let s = self.screen;
+        let r = self.region.get();
+        let Some(win) = s.epd.region_state(r.x, r.y, r.w, r.h) else {
+            return;
+        };
+        let t0 = Instant::now();
+        s.epd.rebase_red_after_gray(s.strip, &win, draw);
+        if s.planes.apply(self.region, SessionOutcome::Rebased) {
+            s.force_ghost_clear();
+        }
+        log::info!("screen: red rebase ms={}", t0.elapsed().as_millis());
     }
 }
 
@@ -362,7 +422,7 @@ impl Screen {
     where
         F: Fn(&mut StripBuffer),
     {
-        match self.plan_partial(region, draw) {
+        match self.plan_partial(region, FrameClose::Plain, draw) {
             Ok(PartialPlan::Ready(wave)) => {
                 wave.wait().await?.sync_red(draw);
                 Ok(())
@@ -390,9 +450,15 @@ impl Screen {
     /// runs the revert pass (or, for a windowed region, the full
     /// neutralize). Callers cannot skip the revert or start phase 1
     /// over codes, and never track plane state themselves.
+    ///
+    /// `close` is how the caller expects this frame to close. With
+    /// [`FrameClose::Gray`], AA residue from a rebased gray pass is
+    /// taken as a delta baseline (the AA page turn); with
+    /// [`FrameClose::Plain`] it is re-driven like a stale area.
     pub fn plan_partial<F>(
         &mut self,
         region: Region,
+        close: FrameClose,
         draw: &F,
     ) -> Result<PartialPlan<'_>, PartialRejected>
     where
@@ -418,6 +484,11 @@ impl Screen {
         // the revert pass were full-screen already; this makes the
         // remaining path agree with them and with the whole-panel rule
         // this file's header describes.
+        //
+        // AA residue relies on it too: its BW plane still holds LSB
+        // codes, and only a full-screen phase 1 overwrites all of them
+        // before the DU reads the planes. narrowing this window again
+        // would need the residue neutralized first, like gray codes
         let _ = region;
         let r = FULL_REGION;
 
@@ -430,22 +501,27 @@ impl Screen {
             return Ok(PartialPlan::RevertFirst(PendingRevert {
                 screen: self,
                 region: r,
+                close,
             }));
         }
 
-        self.start_partial_wave(r, draw).map(PartialPlan::Ready)
+        self.start_partial_wave(r, close, draw)
+            .map(PartialPlan::Ready)
     }
 
     // phase 1 + DU kick, shared by the two plan arms
     fn start_partial_wave<F>(
         &mut self,
         r: AlignedRegion,
+        close: FrameClose,
         draw: &F,
     ) -> Result<Wave<'_, Du>, PartialRejected>
     where
         F: Fn(&mut StripBuffer),
     {
-        let hard_redrive = self.planes.needs_redrive(r);
+        let hard_redrive = self.planes.needs_redrive(r, close == FrameClose::Gray);
+        let over_aa = self.planes.has_residue(r);
+        let t_write = Instant::now();
 
         let (x, y, w, h) = {
             let r = r.get();
@@ -468,6 +544,7 @@ impl Screen {
             Phase1::NeedsFullFirst => return Err(PartialRejected::NeedsFull),
         };
 
+        let write_ms = t_write.elapsed().as_millis();
         let driven = self.epd.partial_start_du(written);
         self.partials = self.partials.saturating_add(1);
 
@@ -478,15 +555,19 @@ impl Screen {
         // waveform re-drives them from whatever BW happens to hold.
         // a non-empty `outside` on a frame that looks wrong is the
         // whole-panel rule biting the stale map the way it used to
-        // bite the gray one
+        // bite the gray one. `over_aa` says the panel held AA residue:
+        // with redrive=false that is the delta AA turn, with
+        // redrive=true a plain frame resetting the lifts
         let rg = r.get();
         log::info!(
-            "screen: du {},{} {}x{} redrive={} partials={} outside={:?}",
+            "screen: du {},{} {}x{} redrive={} over_aa={} write_ms={} partials={} outside={:?}",
             rg.x,
             rg.y,
             rg.w,
             rg.h,
             hard_redrive,
+            over_aa,
+            write_ms,
             self.partials,
             self.planes.stale_outside(r).map(|o| o.get()),
         );
@@ -547,9 +628,10 @@ impl Screen {
 
     /// Full-screen grayscale AA pass. Leaves the panel holding gray
     /// levels only the codes now in RAM describe, so the whole screen
-    /// is tracked as gray-coded; on timeout the next partial request
-    /// additionally promotes to a full GC.
-    pub async fn grayscale_full<F>(&mut self, draw: &F) -> Result<(), TimeoutError>
+    /// is tracked as gray-coded until the returned [`GrayDone`] is
+    /// rebased; on timeout the next partial request additionally
+    /// promotes to a full GC.
+    pub async fn grayscale_full<F>(&mut self, draw: &F) -> Result<GrayDone<'_>, TimeoutError>
     where
         F: Fn(&mut StripBuffer),
     {
@@ -562,10 +644,14 @@ impl Screen {
         if self.planes.apply(FULL_REGION, SessionOutcome::Grayed) {
             self.force_ghost_clear();
         }
-        if res.is_err() {
+        if let Err(e) = res {
             self.force_ghost_clear();
+            return Err(e);
         }
-        res
+        Ok(GrayDone {
+            screen: self,
+            region: FULL_REGION,
+        })
     }
 }
 
@@ -609,7 +695,7 @@ impl<'s, M> Wave<'s, M> {
     }
 }
 
-impl Settled<'_, Du> {
+impl<'s> Settled<'s, Du> {
     /// Phase 3: rewrite RED RAM with current content (BW already holds
     /// it from phase 1) so the next DU computes a minimal delta. Panel
     /// power stays latched for the next refresh.
@@ -650,14 +736,16 @@ impl Settled<'_, Du> {
     /// pixels the BW frame just drove black, and `{0,0}` is literally
     /// "no change", so the pass leaves the panel holding intermediate
     /// levels only the codes now in RAM describe. The screen is
-    /// tracked as gray-coded: the next partial reverts the grays to
-    /// their rails and re-drives via inv_red, the starting state the
-    /// DU transitions assume. On timeout the pass is additionally
-    /// promoted to a full GC.
+    /// tracked as gray-coded until the returned [`GrayDone`] rebases
+    /// RED (then AA residue: the next AA page is a delta, anything
+    /// else re-drives via inv_red); left un-rebased, the next partial
+    /// reverts the grays to their rails first. On timeout the pass is
+    /// additionally promoted to a full GC.
     ///
     /// Only a full-screen session takes the pass (whole-panel rule);
-    /// a windowed one closes with a plain phase 3 and stays BW.
-    pub async fn grayscale<F>(self, draw: &F) -> Result<(), TimeoutError>
+    /// a windowed one closes with a plain phase 3, stays BW, and
+    /// yields no [`GrayDone`].
+    pub async fn grayscale<F>(self, draw: &F) -> Result<Option<GrayDone<'s>>, TimeoutError>
     where
         F: Fn(&mut StripBuffer),
     {
@@ -667,7 +755,7 @@ impl Settled<'_, Du> {
                 self.region.get()
             );
             self.sync_red(draw);
-            return Ok(());
+            return Ok(None);
         }
         let s = self.screen;
         let t0 = Instant::now();
@@ -679,10 +767,14 @@ impl Settled<'_, Du> {
         if s.planes.apply(self.region, SessionOutcome::Grayed) {
             s.force_ghost_clear();
         }
-        if res.is_err() {
+        if let Err(e) = res {
             s.force_ghost_clear();
+            return Err(e);
         }
-        res
+        Ok(Some(GrayDone {
+            screen: s,
+            region: self.region,
+        }))
     }
 }
 

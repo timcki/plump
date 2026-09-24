@@ -79,6 +79,18 @@ enum ClosePlan {
 }
 
 impl ClosePlan {
+    /// How a frame is expected to close before its waveform runs, for
+    /// `plan_partial`: the same inputs as [`Self::decide`] minus the
+    /// interruption nobody can know yet. A frame predicted Gray that
+    /// ends up abandoned or synced is still sound: the delta it ran
+    /// against RED's plain page was a valid DU either way.
+    fn expected(aa_enabled: bool, mode: GrayscaleMode) -> super::screen::FrameClose {
+        match Self::decide(false, aa_enabled, mode) {
+            Self::GrayNow => super::screen::FrameClose::Gray,
+            Self::Abandon | Self::SyncRed => super::screen::FrameClose::Plain,
+        }
+    }
+
     fn decide(interrupted: bool, aa_enabled: bool, mode: GrayscaleMode) -> Self {
         if interrupted {
             Self::Abandon
@@ -808,16 +820,22 @@ impl super::Kernel {
             if let Redraw::Partial(r) = redraw {
                 if !screen.ghost_clear_due(app_mgr.ghost_clear_every()) {
                     // the plan picks bw vs inv_red from its own plane
-                    // state: a region overlapping gray left by an AA
-                    // pass comes back RevertFirst, whose only path to
-                    // a wave snaps the grays to their rails before the
-                    // re-drive; everything else is Ready with the DU
-                    // already running
+                    // state: gray codes left by an un-rebased AA pass
+                    // come back RevertFirst, whose only path to a wave
+                    // snaps the grays to their rails before the
+                    // re-drive; AA residue (rebased RED) is a delta
+                    // when this frame grays again and an inv_red
+                    // re-drive otherwise; everything else is Ready
+                    // with the DU already running
                     let stale = screen.stale_region();
+                    let close = ClosePlan::expected(
+                        app_mgr.system_settings().text_aa,
+                        app_mgr.grayscale_mode(),
+                    );
                     let t_write = Instant::now();
                     let wave = {
                         let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                        match screen.plan_partial(r, &draw) {
+                        match screen.plan_partial(r, close, &draw) {
                             Ok(super::screen::PartialPlan::Ready(wave)) => Ok(wave),
                             Ok(super::screen::PartialPlan::RevertFirst(pending)) => {
                                 pending.proceed(&draw).await
@@ -903,16 +921,29 @@ impl super::Kernel {
                                     settled.abandon();
                                 }
                                 ClosePlan::GrayNow => {
-                                    // grayscale AA replaces phase 3; the
-                                    // region stays marked stale so the next
-                                    // partial touching it re-drives via
-                                    // inv_red, which is the black starting
-                                    // state the gray pulses assume
+                                    // grayscale AA replaces phase 3, then
+                                    // RED is rebased to the plain page
+                                    // (crosspoint's scheme) so the next
+                                    // AA turn is a delta with no revert.
+                                    // the rebase follows the gray wave
+                                    // with no await between, so nothing
+                                    // can change the frame in between; if
+                                    // it is skipped (timeout) the codes
+                                    // stay tracked and the revert path
+                                    // or a forced GC takes over
+                                    log::info!(
+                                        "render: gray close write_ms={} wave_ms={} redrive={}",
+                                        write_ms,
+                                        wave_ms,
+                                        redrive
+                                    );
                                     let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                                    if settled.grayscale(&draw).await.is_err() {
-                                        log::warn!(
+                                    match settled.grayscale(&draw).await {
+                                        Ok(Some(done)) => done.rebase_red(&draw),
+                                        Ok(None) => {}
+                                        Err(_) => log::warn!(
                                             "render: grayscale_pass timed out, forcing full GC next frame"
-                                        );
+                                        ),
                                     }
                                 }
                                 ClosePlan::SyncRed => {
@@ -978,9 +1009,9 @@ impl super::Kernel {
                 crate::perf_event!("render", "full write_ms={} wave_ms={}", write_ms, wave_ms);
 
                 // after a full GC refresh the panel is left in plain BW.
-                // re-apply grayscale AA per the current `GrayscaleMode`.
-                // the pass marks the screen
-                // gray-coded; the next partial reverts and runs a delta.
+                // re-apply grayscale AA per the current `GrayscaleMode`,
+                // then rebase RED to the plain page so the first turn
+                // after entering a book or waking is already a delta.
                 //
                 // finish() already closed the session, so the plan's
                 // sync arms carry no work here: only GrayNow has a
@@ -993,10 +1024,11 @@ impl super::Kernel {
 
                 if matches!(plan, ClosePlan::GrayNow) {
                     let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                    if screen.grayscale_full(&draw).await.is_err() {
-                        log::warn!(
+                    match screen.grayscale_full(&draw).await {
+                        Ok(done) => done.rebase_red(&draw),
+                        Err(_) => log::warn!(
                             "render: post-GC grayscale_pass timed out, forcing full GC next frame"
-                        );
+                        ),
                     }
                 }
             }
@@ -1161,7 +1193,8 @@ impl super::Kernel {
         let wave = {
             let draw = |s: &mut StripBuffer| app_mgr.draw(s);
             let full = crate::ui::Region::new(0, 0, crate::board::SCREEN_W, crate::board::SCREEN_H);
-            match screen.plan_partial(full, &draw) {
+            // the modal is plain BW: AA residue under it is re-driven
+            match screen.plan_partial(full, super::screen::FrameClose::Plain, &draw) {
                 Ok(super::screen::PartialPlan::Ready(wave)) => Ok(wave),
                 Ok(super::screen::PartialPlan::RevertFirst(pending)) => pending.proceed(&draw).await,
                 Err(e) => Err(e),

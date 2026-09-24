@@ -715,6 +715,26 @@ where
         );
     }
 
+    /// Rewrite RED over `win` with the plain content after a gray pass
+    /// (crosspoint's `cleanupGrayscaleBuffers`). RED becomes the delta
+    /// baseline for the next DU; BW keeps the LSB codes, which the next
+    /// phase 1 overwrites. No waveform, so no token is taken or minted.
+    pub(crate) fn rebase_red_after_gray<F>(
+        &mut self,
+        strip: &mut StripBuffer,
+        win: &Window,
+        draw: &F,
+    ) where
+        F: Fn(&mut StripBuffer),
+    {
+        self.write_region_strips(
+            strip,
+            win,
+            PlaneWrite::Single(cmd::WRITE_RAM_RED),
+            draw,
+        );
+    }
+
     pub(crate) fn needs_initial_refresh(&self) -> bool {
         !self.life.ever_gc()
     }
@@ -972,7 +992,9 @@ where
     /// to BW RAM and MSB plane to RED RAM, then triggers a grayscale LUT
     /// refresh. Both RAMs keep the gray plane data afterwards: it is the
     /// index for a later [`Self::grayscale_revert_pass`], so the caller
-    /// must track the region as gray-coded and stale.
+    /// must track the region as gray-coded, or rewrite RED with the
+    /// plain content ([`Self::rebase_red_after_gray`]) and track it as
+    /// AA residue.
     ///
     /// On timeout the caller must force a full GC on the next refresh
     /// to bring panel and planes back in sync.
@@ -1007,11 +1029,10 @@ where
         self.wait_busy_async("grayscale_refresh").await?;
         crate::perf_event!("render", "gray wave_ms={}", _t1.elapsed().as_millis());
 
-        // both RAMs deliberately keep the gray plane data: the revert
-        // pass reads them as its waveform index, so restoring BW here
-        // would break it. the caller marks the region gray-coded and
-        // stale; the next partial over it reverts, then rewrites both
-        // planes via inv_red
+        // both RAMs keep the gray plane data: the revert pass reads
+        // them as its waveform index. the caller either leaves them
+        // (gray-coded, the next partial reverts first) or rebases RED
+        // to the plain page so the next AA turn is a delta
         Ok(())
     }
 

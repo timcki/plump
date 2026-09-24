@@ -29,6 +29,16 @@ pub enum PlaneState {
     /// Planes hold the codes an AA pass wrote and the panel holds the
     /// matching grays: revert to the rails before any re-drive.
     GrayCodes,
+    /// An AA pass ran and RED was then rewritten with the plain page
+    /// (crosspoint's scheme): RED is a valid delta baseline, BW holds
+    /// leftover LSB codes the next phase 1 overwrites, and the panel
+    /// shows the page with its AA edges lifted off black. Every lifted
+    /// pixel is black in RED, so a delta DU drives it whenever it
+    /// turns white. A frame that grays again takes the delta; any
+    /// other frame re-drives via inv_red, which resets the lifts to
+    /// the rails. No revert is possible (RED no longer holds codes)
+    /// and none is needed.
+    AaResidue,
 }
 
 /// How a refresh session left the planes across its region.
@@ -40,6 +50,8 @@ pub enum SessionOutcome {
     Abandoned,
     /// A gray pass replaced phase 3: planes hold AA codes.
     Grayed,
+    /// RED was rewritten with plain content after a gray pass.
+    Rebased,
 }
 
 #[derive(Default)]
@@ -59,9 +71,23 @@ impl PlaneMap {
     }
 
     /// Any entry under `r` means a delta DU there would compute from
-    /// planes the panel does not show.
-    pub fn needs_redrive(&self, r: AlignedRegion) -> bool {
-        self.entries.iter().flatten().any(|(e, _)| e.intersects(r))
+    /// planes the panel does not show. AA residue is the exception
+    /// when `regray` is set: the frame about to be written closes with
+    /// its own gray pass, so a delta against RED's plain page is the
+    /// intended turn and the lifts it leaves are what that pass needs.
+    pub fn needs_redrive(&self, r: AlignedRegion, regray: bool) -> bool {
+        self.entries
+            .iter()
+            .flatten()
+            .any(|(e, s)| e.intersects(r) && !(regray && *s == PlaneState::AaResidue))
+    }
+
+    /// Any AA residue under `r`; for the partial log line.
+    pub fn has_residue(&self, r: AlignedRegion) -> bool {
+        self.entries
+            .iter()
+            .flatten()
+            .any(|(e, s)| *s == PlaneState::AaResidue && e.intersects(r))
     }
 
     /// Any gray codes anywhere. A windowed waveform scans the whole
@@ -128,6 +154,7 @@ impl PlaneMap {
             SessionOutcome::Synced => false,
             SessionOutcome::Abandoned => self.insert(r, PlaneState::Stale),
             SessionOutcome::Grayed => self.insert(r, PlaneState::GrayCodes),
+            SessionOutcome::Rebased => self.insert(r, PlaneState::AaResidue),
         };
         gray_lost
     }
