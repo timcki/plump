@@ -35,6 +35,7 @@ use crate::error::{Error, ErrorKind};
 use crate::fonts;
 use crate::fonts::ReaderFont;
 use crate::kernel::KernelHandle;
+use plump_kernel::drivers::storage::OpenMode;
 use crate::kernel::QuickAction;
 use crate::kernel::bookmarks;
 use crate::kernel::work_queue;
@@ -2029,9 +2030,10 @@ pub(super) fn read_full(
     offset: u32,
     buf: &mut [u8],
 ) -> crate::error::Result<()> {
+    let mut file = k.sd().open_in_root(name, OpenMode::Read)?;
     let mut total = 0usize;
     while total < buf.len() {
-        let n = k.sd().read_file_chunk(name, offset + total as u32, &mut buf[total..])?;
+        let n = file.read_at(offset + total as u32, &mut buf[total..])?;
         if n == 0 {
             return Err(Error::new(
                 ErrorKind::ReadFailed,
@@ -2052,10 +2054,15 @@ pub(super) fn extract_zip_entry(
 ) -> Result<alloc::vec::Vec<u8>, &'static str> {
     use core::cell::RefCell;
     let entry = zip_index.entry(entry_idx);
-    let k = RefCell::new(k);
+    // one open for the whole entry instead of one per chunk
+    let file = RefCell::new(
+        k.sd()
+            .open_in_root(name, OpenMode::Read)
+            .map_err(|e: Error| -> &'static str { e.into() })?,
+    );
     zip::extract_entry(entry, entry.local_offset, |offset, buf| {
-        k.borrow_mut()
-            .sd().read_file_chunk(name, offset, buf)
+        file.borrow_mut()
+            .read_at(offset, buf)
             .map_err(|e: Error| -> &'static str { e.into() })
     })
 }

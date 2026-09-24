@@ -19,7 +19,7 @@ use plump_kernel::kernel::bundle::{BundleFile, SectionId, SectionRange};
 use plump_kernel::util::hash;
 
 use crate::apps::BgOutcome;
-use super::{BgCacheState, CHAPTER_CACHE_MAX, EOCD_TAIL, EpubState, PAGE_BUF, ReaderApp, ZipIndex};
+use super::{BgCacheState, CHAPTER_CACHE_MAX, EOCD_TAIL, EpubState, ReaderApp, ZipIndex};
 
 // ── bundle layout helpers ──────────────────────────────────────────
 //
@@ -459,22 +459,26 @@ impl EpubState {
             .as_mut()
             .expect("cache_chapter_step called without active cache_step");
 
-        let name_hash = self.name_hash;
+        // the EPUB and the bundle stay open for the whole step: one
+        // directory lookup each instead of one per 4 KB read and append
+        let mut epub = k.sd().open_in_root(epub_name, OpenMode::Read)?;
+        let mut out = bundle::open(k.sd(), self.name_hash, OpenMode::Write)?;
         let mut read_fn = |offset: u32, buf: &mut [u8]| -> Result<usize, &'static str> {
-            k.sd()
-                .read_file_chunk(epub_name, offset, buf)
+            epub.read_at(offset, buf)
                 .map_err(|e: Error| -> &'static str { e.into() })
         };
         let mut write_fn = |data: &[u8]| -> Result<(), &'static str> {
-            bundle::append(k.sd(), name_hash, data)
+            out.append(data)
                 .map_err(|e: Error| -> &'static str { e.into() })
         };
 
         let css = self.css.first().unwrap_or(&EMPTY_CSS);
-        match step
-            .step(&mut read_fn, &mut write_fn, css)
-            .map_err(|msg| Error::from(msg).with_source("cache_chapter_step: step"))?
-        {
+        let result = step.step(&mut read_fn, &mut write_fn, css);
+        // both close here: the volume manager will not open a file that
+        // is already open, and the spine write below reopens the bundle
+        drop(epub);
+        out.close()?;
+        match result.map_err(|msg| Error::from(msg).with_source("cache_chapter_step: step"))? {
             cache::StripStepResult::Continue => Ok(false),
             cache::StripStepResult::Done(text_size) => {
                 let ch_offset = self.chapter_table[ch].0;
@@ -559,15 +563,19 @@ impl EpubState {
         }
         self.ch_cache.resize(ch_size, 0);
 
+        // one open, and reads as large as the chapter: the volume
+        // manager moves whole blocks in multi-block commands
+        let mut file = match bundle::open(k.sd(), self.name_hash, OpenMode::Read) {
+            Ok(f) => f,
+            Err(e) => {
+                log::info!("chapter cache: bundle open failed: {}", e);
+                self.ch_cache = Vec::new();
+                return false;
+            }
+        };
         let mut pos = 0usize;
         while pos < ch_size {
-            let chunk = (ch_size - pos).min(PAGE_BUF);
-            match bundle::read_at(
-                k.sd(),
-                self.name_hash,
-                ch_off + pos as u32,
-                &mut self.ch_cache[pos..pos + chunk],
-            ) {
+            match file.read_at(ch_off + pos as u32, &mut self.ch_cache[pos..ch_size]) {
                 Ok(n) if n > 0 => pos += n,
                 Ok(_) => break,
                 Err(e) => {

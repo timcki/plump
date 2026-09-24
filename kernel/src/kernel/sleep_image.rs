@@ -14,6 +14,7 @@ use log::{debug, info, warn};
 
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::sdcard::SdStorage;
+use crate::drivers::storage::OpenMode;
 
 const IMG_W: usize = SCREEN_W as usize; // 480
 const IMG_H: usize = SCREEN_H as usize; // 800
@@ -290,6 +291,8 @@ pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
     // permanent image storage gets first pick of the heap; if this extra
     // batch buffer cannot fit we back off to smaller batches instead of OOMing.
     let mut read_batch = alloc_read_batch(row_stride)?;
+    // one open for every batch
+    let mut file = sd.open_in_root(FILENAME, OpenMode::Read).ok()?;
     let batch_rows = read_batch.len() / row_stride;
     info!(
         "sleep_image: row_stride={} batch_rows={} batch_bytes={}",
@@ -318,7 +321,7 @@ pub fn load_sleep_image(sd: &SdStorage) -> Option<SleepImage> {
             first_bmp_row, rows, offset
         );
 
-        match sd.read_file_chunk(FILENAME, offset, &mut read_batch[..batch_len]) {
+        match file.read_at(offset, &mut read_batch[..batch_len]) {
             Ok(n) if n == batch_len => {}
             Ok(n) => {
                 info!(

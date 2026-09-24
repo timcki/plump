@@ -18,6 +18,7 @@ use smol_epub::zip::{self, ZipIndex};
 
 use crate::error::{Error, ErrorKind};
 use crate::kernel::KernelHandle;
+use plump_kernel::drivers::storage::OpenMode;
 use crate::kernel::work_queue;
 
 use super::{
@@ -230,14 +231,17 @@ impl ReaderApp {
                          img_max_w: u16,
                          img_max_h: u16|
          -> Result<DecodedImage, &'static str> {
-            let k_cell = RefCell::new(k_ref);
+            // one open for the whole decode instead of one per chunk
+            let file = RefCell::new(
+                k_ref
+                    .sd()
+                    .open_in_root(epub_name, OpenMode::Read)
+                    .map_err(|e| -> &'static str { e.into() })?,
+            );
             let read_err = |e: Error| -> &'static str { e.into() };
             let raw = if is_jpeg && entry.method == zip::METHOD_STORED {
                 let read = |off, buf: &mut [u8]| {
-                    k_cell
-                        .borrow_mut()
-                        .sd().read_file_chunk(epub_name, off, buf)
-                        .map_err(read_err)
+                    file.borrow_mut().read_at(off, buf).map_err(read_err)
                 };
                 let reader = smol_epub::jpeg::ChunkReader::new(
                     read,
@@ -247,10 +251,7 @@ impl ReaderApp {
                 smol_epub::jpeg::decode_jpeg(reader, img_max_w, img_max_h)
             } else if is_jpeg {
                 let read = |off, buf: &mut [u8]| {
-                    k_cell
-                        .borrow_mut()
-                        .sd().read_file_chunk(epub_name, off, buf)
-                        .map_err(read_err)
+                    file.borrow_mut().read_at(off, buf).map_err(read_err)
                 };
                 match smol_epub::jpeg::DeflateReader::new(read, data_offset, entry.comp_size) {
                     Ok(reader) => smol_epub::jpeg::decode_jpeg(reader, img_max_w, img_max_h),
@@ -259,10 +260,7 @@ impl ReaderApp {
             } else if entry.method == zip::METHOD_STORED {
                 smol_epub::png::decode_png_sd(
                     |off, buf| {
-                        k_cell
-                            .borrow_mut()
-                            .sd().read_file_chunk(epub_name, off, buf)
-                            .map_err(read_err)
+                        file.borrow_mut().read_at(off, buf).map_err(read_err)
                     },
                     data_offset,
                     entry.uncomp_size,
@@ -272,10 +270,7 @@ impl ReaderApp {
             } else {
                 smol_epub::png::decode_png_deflate_sd(
                     |off, buf| {
-                        k_cell
-                            .borrow_mut()
-                            .sd().read_file_chunk(epub_name, off, buf)
-                            .map_err(read_err)
+                        file.borrow_mut().read_at(off, buf).map_err(read_err)
                     },
                     data_offset,
                     entry.comp_size,
@@ -909,19 +904,20 @@ pub(super) fn decode_image_streaming(
     max_h: u16,
     interruptible: bool,
 ) -> crate::error::Result<DecodedImage> {
+    // one open for the local header and every chunk of the decode
+    let file = RefCell::new(k.sd().open_in_root(epub_name, OpenMode::Read)?);
     let mut hdr = [0u8; 30];
-    k.sd().read_file_chunk(epub_name, entry.local_offset, &mut hdr)?;
+    file.borrow_mut().read_at(entry.local_offset, &mut hdr)?;
     let skip = ZipIndex::local_header_data_skip(&hdr)
         .map_err(|_| Error::new(ErrorKind::ParseFailed, "decode_image: local header"))?;
     let data_offset = entry.local_offset + skip;
 
-    let k = &*k;
     let read = |off: u32, buf: &mut [u8]| -> Result<usize, &'static str> {
         if interruptible && crate::kernel::tasks::input_pending() {
             return Err(DECODE_INTERRUPTED);
         }
-        k.sd()
-            .read_file_chunk(epub_name, off, buf)
+        file.borrow_mut()
+            .read_at(off, buf)
             .map_err(|_| "read failed")
     };
 
@@ -953,7 +949,9 @@ pub(super) fn load_cached_image(
     dir: &str,
     name: &str,
 ) -> crate::error::Result<DecodedImage> {
-    let size = k.sd().file_size_in_plump_subdir(dir, name)?;
+    // one open for the size, the header and the pixels
+    let mut file = k.sd().open_in_plump_subdir(dir, name, OpenMode::Read)?;
+    let size = file.len();
     if size < 5 {
         return Err(Error::new(
             ErrorKind::InvalidData,
@@ -961,7 +959,7 @@ pub(super) fn load_cached_image(
         ));
     }
     let mut header = [0u8; 4];
-    k.sd().read_chunk_in_plump_subdir(dir, name, 0, &mut header)?;
+    file.read_at(0, &mut header)?;
     let width = u16::from_le_bytes([header[0], header[1]]);
     let height = u16::from_le_bytes([header[2], header[3]]);
     if width == 0 || height == 0 {
@@ -982,7 +980,7 @@ pub(super) fn load_cached_image(
     data.try_reserve_exact(data_len)
         .map_err(|_| Error::new(ErrorKind::OutOfMemory, "load_cached_image"))?;
     data.resize(data_len, 0);
-    k.sd().read_chunk_in_plump_subdir(dir, name, 4, &mut data)?;
+    file.read_at(4, &mut data)?;
     Ok(DecodedImage {
         width,
         height,
@@ -1000,12 +998,12 @@ fn peek_cached_image_size(
     dir: &str,
     name: &str,
 ) -> Option<(u16, u16)> {
-    let size = sd.file_size_in_plump_subdir(dir, name).ok()?;
-    if size < 5 {
+    let mut file = sd.open_in_plump_subdir(dir, name, OpenMode::Read).ok()?;
+    if file.len() < 5 {
         return None;
     }
     let mut hdr = [0u8; 4];
-    sd.read_chunk_in_plump_subdir(dir, name, 0, &mut hdr).ok()?;
+    file.read_at(0, &mut hdr).ok()?;
     let w = u16::from_le_bytes([hdr[0], hdr[1]]);
     let h = u16::from_le_bytes([hdr[2], hdr[3]]);
     if w == 0 || h == 0 {
@@ -1045,11 +1043,13 @@ pub(super) fn peek_source_dimensions(
     let zip_idx = zip.find(full_path).or_else(|| zip.find_icase(full_path))?;
     let entry = *zip.entry(zip_idx);
 
+    // one open for the header, the magic and the dimension peek
+    let file = RefCell::new(sd.open_in_root(epub_name, OpenMode::Read).ok()?);
+
     // read local header to find data offset
     let data_offset = {
         let mut hdr = [0u8; 30];
-        sd.read_file_chunk(epub_name, entry.local_offset, &mut hdr)
-            .ok()?;
+        file.borrow_mut().read_at(entry.local_offset, &mut hdr).ok()?;
         let skip = ZipIndex::local_header_data_skip(&hdr).ok()?;
         entry.local_offset + skip
     };
@@ -1063,8 +1063,9 @@ pub(super) fn peek_source_dimensions(
         (is_jpeg_ext, is_png_ext)
     } else if entry.method == zip::METHOD_STORED {
         let mut magic = [0u8; 8];
-        let n = sd
-            .read_file_chunk(epub_name, data_offset, &mut magic)
+        let n = file
+            .borrow_mut()
+            .read_at(data_offset, &mut magic)
             .unwrap_or(0);
         (
             n >= 2 && magic[0] == 0xFF && magic[1] == 0xD8,
@@ -1079,8 +1080,7 @@ pub(super) fn peek_source_dimensions(
     }
 
     let read_err = |_: crate::error::Error| -> &'static str { "read failed" };
-    let read =
-        |off, buf: &mut [u8]| sd.read_file_chunk(epub_name, off, buf).map_err(read_err);
+    let read = |off, buf: &mut [u8]| file.borrow_mut().read_at(off, buf).map_err(read_err);
 
     let dims = match (is_jpeg, entry.method) {
         (true, zip::METHOD_STORED) => {

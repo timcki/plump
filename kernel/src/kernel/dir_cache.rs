@@ -2,7 +2,7 @@
 // loaded lazily from SD, held in RAM, invalidated on demand
 
 use crate::drivers::sdcard::SdStorage;
-use crate::drivers::storage::{DirEntry, DirPage, MAX_TITLE_LINE, TITLES_FILE};
+use crate::drivers::storage::{DirEntry, DirPage, MAX_TITLE_LINE, OpenMode, TITLES_FILE};
 use crate::error::Result;
 
 const MAX_DIR_ENTRIES: usize = 128;
@@ -78,9 +78,12 @@ impl DirCache {
         let mut carry = [0u8; CARRY_CAP];
         let mut state = LineState::Fresh;
         let mut offset = 0u32;
+        let Ok(mut file) = sd.open_in_plump(TITLES_FILE, OpenMode::Read) else {
+            return;
+        };
 
         while offset < READ_CAP {
-            let n = match sd.read_chunk_in_plump(TITLES_FILE, offset, &mut buf) {
+            let n = match file.read_at(offset, &mut buf) {
                 Ok(n) => n,
                 Err(_) => return,
             };
