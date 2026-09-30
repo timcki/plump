@@ -1,0 +1,14 @@
+[package]
+name = "plump-font-compare"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# host-only experiment, deliberately outside the firmware workspace
+[workspace]
+
+[dependencies]
+fontdue = "=0.9.3"
+ttf-parser = "=0.21.1"
+freetype-rs = { version = "=0.38.0", features = ["bundled"] }
+image = { version = "=0.25.9", default-features = false, features = ["png", "bmp"] }

@@ -27,6 +27,22 @@ Needs stable Rust ≥ 1.88 (`rust-toolchain.toml` pulls in `riscv32imc-unknown-n
 cargo run --release   # build, flash over USB, open the serial monitor
 ```
 
+### Font rendering comparison (host only)
+
+The isolated `tools/font-compare` crate compares the current fontdue pipeline with bundled FreeType. It does not change firmware fonts or dependencies. Run from the repository root with a C compiler available:
+
+```sh
+cargo run --manifest-path tools/font-compare/Cargo.toml --locked \
+  --target "$(rustc -vV | sed -n 's/^host: //p')" \
+  --config 'unstable.build-std=[]' -- target/font-compare
+```
+
+It renders Bookerly and Atkinson at the production Small and Medium sizes, in regular, bold and italic, with Polish accents and kerning probes. Four columns compare current BW, current AA, FreeType hinted mono (`TARGET_MONO | FORCE_AUTOHINT`) and FreeType light-hinted gray (`TARGET_LIGHT`). Both FreeType modes disable embedded bitmaps. The baseline rasterizer, size ladders and GPOS kerning extraction come directly from `build.rs`; grayscale uses the same four-level thresholds. Wrapping is a simple greedy fixture, not the reader's Knuth-Plass layout. Each backend supplies its own glyph advances.
+
+Outputs include native 480×800 PNGs, side-by-side sheets, enlarged stroke crops, per-glyph `metrics.csv`, and uncompressed 24-bit BMPs. Gray levels are ideal preview tones, not measured panel luminance. For a static panel comparison, back up the existing SD-root `SLEEP.BMP`, copy one generated BMP there as `SLEEP.BMP`, and enter sleep. The sleep-card overlay may cover part of the fixture. Restore the original wallpaper afterwards. This uses the sleep-image waveform, so it cannot verify reader AA residue, page-turn timing or ghosting across turns.
+
+Use the same Cargo options with `test` instead of `run` (omit the output argument) for the focused bitmap/metrics tests. Keep the firmware rasterizer unchanged until the physical-panel comparison identifies a preferred mode; integration must account for changed advances and invalidate pagination caches.
+
 ## Controls
 
 | | |
