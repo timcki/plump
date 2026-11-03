@@ -6,15 +6,24 @@
 //
 //   phase1_bw / phase1_bw_inv_red / write_full_frame -> FrameWritten
 //   partial_start_du / start_full_update(FrameWritten) -> Driven
-//   partial_phase3_sync(&Driven) / finish_full_update(Driven)
-//   grayscale_pass(&Window)  -- Window from region_state or Driven
+//   finish_full_update(Driven) / grayscale_pass(&Window)
+//     -- Window from region_state or Driven
 //
 // no caller can kick a waveform over a window it never wrote, or run
 // a closing phase for a waveform that never started. which closer a
-// given session is allowed (phase 3 vs finish vs a gray pass) is the
-// session layer's business, see kernel/screen.rs
+// given session is allowed (plain close vs finish vs a gray pass) is
+// the session layer's business, see kernel/screen.rs
 //
-// when phase3 is skipped, phase1_bw_inv_red writes RED=!BW so DU
+// RAM ping-pong (enabled in this panel's OTP, measured): every 0x22
+// activation with bit 3 set (mode 2, the DU) swaps which physical RAM
+// 0x24 (BW) and 0x26 (RED) address. the DU reads BW as the new frame
+// and RED as the old one, then swaps, so afterwards RED holds the
+// page just shown and BW the one before it. a DU therefore needs no
+// phase 3: the next phase 1 writes BW and RED is already its delta
+// baseline. bit 3 clear (the full clears, custom-LUT passes) never
+// swaps
+//
+// when RED cannot be trusted, phase1_bw_inv_red writes RED=!BW so DU
 // drives every pixel to the correct BW target without a full GC
 //
 // panel power is latched on across refreshes (crosspoint-style):
@@ -104,7 +113,13 @@ pub(crate) mod ctrl2 {
     /// remove.
     pub const FULL_CLEAN: u8 = 0x34;
     /// DISPLAY_START only: run the custom LUT already loaded.
-    pub const CUSTOM_LUT: u8 = 0x0C;
+    ///
+    /// Bit 3 (mode 2) clear on purpose: on this panel it is what
+    /// triggers the RAM ping-pong swap, and 0x04 runs the loaded LUT
+    /// exactly like 0x0C (same timing) without swapping. The revert
+    /// pass reads the gray codes still in RAM; after a swapping gray
+    /// pass it would index {LSB, MSB} instead of {MSB, LSB}.
+    pub const CUSTOM_LUT: u8 = 0x04;
 }
 
 /// Custom waveform LUT for 4-level grayscale rendering.
@@ -219,8 +234,8 @@ pub(crate) struct FrameWritten(Window);
 /// Proof that a waveform was activated over this window.
 ///
 /// Minted only by the starters, and required by every closing phase,
-/// so phase 3 (or a gray pass standing in for it) cannot run before
-/// phase 1 and its kick.
+/// so a closer (a GC finish, or a gray pass over a DU) cannot run
+/// before phase 1 and its kick.
 pub(crate) struct Driven(Window);
 
 impl Driven {
@@ -554,7 +569,8 @@ where
     // the controller takes a moment to assert busy after
     // MASTER_ACTIVATION; every completion path (is_busy poll,
     // wait_for_low) reads not-yet-started as finished, which let
-    // phase 3 rewrite RAM mid-waveform and leave half-driven ghosts.
+    // the closing phase rewrite RAM mid-waveform and leave half-driven
+    // ghosts.
     // block the few microseconds until the pin rises; a spin is
     // cheaper than any wakeup at this scale, and the timeout covers
     // a dead panel
@@ -684,7 +700,7 @@ where
         self.set_partial_ram_area(win.px, win.py, win.pw, win.ph);
 
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
-        self.send_data(&[0x00, 0x00]);
+        self.send_data(&[0x00]);
 
         self.kick(ctrl2::DU);
         Driven(win)
@@ -695,30 +711,12 @@ where
         self.busy.is_high().unwrap_or(false)
     }
 
-    // RED only: phase 3 always follows a phase 1 that wrote the
-    // current content into BW RAM (a gray pass replaces phase 3
-    // entirely, never precedes it), so rewriting BW here would halve
-    // throughput for nothing
-    pub(crate) fn partial_phase3_sync<F>(
-        &mut self,
-        strip: &mut StripBuffer,
-        driven: &Driven,
-        draw: &F,
-    ) where
-        F: Fn(&mut StripBuffer),
-    {
-        self.write_region_strips(
-            strip,
-            &driven.0,
-            PlaneWrite::Single(cmd::WRITE_RAM_RED),
-            draw,
-        );
-    }
-
     /// Rewrite RED over `win` with the plain content after a gray pass
-    /// (crosspoint's `cleanupGrayscaleBuffers`). RED becomes the delta
-    /// baseline for the next DU; BW keeps the LSB codes, which the next
-    /// phase 1 overwrites. No waveform, so no token is taken or minted.
+    /// (crosspoint's `cleanupGrayscaleBuffers`). The gray pass does not
+    /// swap (see [`ctrl2::CUSTOM_LUT`]), so RED held the MSB codes and
+    /// BW the LSB codes; RED becomes the delta baseline for the next
+    /// DU, BW keeps the LSB codes, which the next phase 1 overwrites.
+    /// No waveform, so no token is taken or minted.
     pub(crate) fn rebase_red_after_gray<F>(
         &mut self,
         strip: &mut StripBuffer,
@@ -780,7 +778,7 @@ where
         let FrameWritten(win) = written;
 
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
-        self.send_data(&[0x40, 0x00]);
+        self.send_data(&[0x40]);
 
         match kind {
             FullKind::Fast => {
@@ -834,7 +832,7 @@ where
         self.set_partial_ram_area(win.px, win.py, win.pw, win.ph);
 
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
-        self.send_data(&[0x00, 0x00]);
+        self.send_data(&[0x00]);
 
         self.kick(ctrl2::CUSTOM_LUT);
     }
@@ -942,9 +940,8 @@ where
 
     /// Panel-lab custom-LUT pass: load `lut` (a full 112-byte blob),
     /// set the whole-panel window, activate with `ctrl2` and wait.
-    /// `0x21` is written as the single parameter byte the datasheet
-    /// defines; which activation actually consumes the loaded LUT is
-    /// one of the things the lab measures.
+    /// Which activation actually consumes the loaded LUT is one of the
+    /// things the lab measures.
     pub(crate) async fn lab_lut_pass(
         &mut self,
         lut: &[u8; 112],
@@ -970,18 +967,16 @@ where
     }
 
     /// Panel-lab OTP pass: activate the factory waveform over the whole
-    /// panel with the given `0x21` parameter bytes. `ctrl1` is a slice
-    /// so the lab can compare the datasheet's one byte against the two
-    /// the production paths send.
+    /// panel with the given `0x21` parameter byte.
     pub(crate) async fn lab_otp_pass(
         &mut self,
-        ctrl1: &[u8],
+        ctrl1: u8,
         ctrl2: u8,
     ) -> Result<(), embassy_time::TimeoutError> {
         let Window { px, py, pw, ph } = Window::FULL;
         self.set_partial_ram_area(px, py, pw, ph);
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
-        self.send_data(ctrl1);
+        self.send_data(&[ctrl1]);
         self.kick(ctrl2);
         self.wait_busy_async("panel otp").await
     }
@@ -1039,7 +1034,8 @@ where
     /// Revert pass over `win`: drives every AA gray pixel back to its
     /// nearest rail using [`LUT_GRAYSCALE_REVERT`], indexed by the
     /// gray planes still resident in RAM from the preceding
-    /// [`Self::grayscale_pass`]. No RAM writes.
+    /// [`Self::grayscale_pass`] (MSB in RED, LSB in BW: neither pass
+    /// swaps). No RAM writes.
     pub(crate) async fn grayscale_revert_pass(
         &mut self,
         win: &Window,
@@ -1048,9 +1044,10 @@ where
         self.set_partial_ram_area(win.px, win.py, win.pw, win.ph);
 
         self.send_command(cmd::DISPLAY_UPDATE_CONTROL_1);
-        self.send_data(&[0x00, 0x00]);
+        self.send_data(&[0x00]);
 
-        // display with the custom LUT (no LUT_LOAD); the following DU
+        // display with the custom LUT (no LUT_LOAD, no swap, so the
+        // codes stay where the gray pass read them); the following DU
         // sets LUT_LOAD and restores the OTP waveform
         self.kick(ctrl2::CUSTOM_LUT);
 

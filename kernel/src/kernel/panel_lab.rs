@@ -55,9 +55,9 @@ pub enum LabOp {
     /// custom LUT with rows 1 and 2 live (opposite drives when
     /// `drive`), activated with `ctrl2`
     LutActivate { ctrl2: u8, drive: bool },
-    /// factory waveform over the whole panel with these 0x21 bytes,
+    /// factory waveform over the whole panel with this 0x21 byte,
     /// activated with `ctrl2`
-    Otp { ctrl1: &'static [u8], ctrl2: u8 },
+    Otp { ctrl1: u8, ctrl2: u8 },
     /// reprogram the controller registers (SW_RESET + init), the only
     /// way to put back what a custom LUT pass overwrote
     Reinit,
@@ -95,7 +95,7 @@ impl core::fmt::Display for OpDetail<'_> {
                 write!(f, "ctrl2=0x{:02X} drive={}", ctrl2, drive)
             }
             LabOp::Otp { ctrl1, ctrl2 } => {
-                write!(f, "ctrl1={:02X?} ctrl2=0x{:02X}", ctrl1, ctrl2)
+                write!(f, "ctrl1=0x{:02X} ctrl2=0x{:02X}", ctrl1, ctrl2)
             }
         }
     }
@@ -196,12 +196,11 @@ static MIST_ASKS: &[Ask] = &[Ask {
     answers: &["clean white", "light grey mist", "heavy grey mist"],
 }];
 
-// ── the 0x21 parameter bytes ────────────────────────────────────────
+// ── the 0x21 parameter byte (one byte: measured, a second is ignored)
 
-const CTRL1_NORMAL: &[u8] = &[0x00];
-const CTRL1_BYPASS: &[u8] = &[0x40];
-const CTRL1_INVERT: &[u8] = &[0x80];
-const CTRL1_BYPASS_TWO_BYTE: &[u8] = &[0x40, 0x00];
+const CTRL1_NORMAL: u8 = 0x00;
+const CTRL1_BYPASS: u8 = 0x40;
+const CTRL1_INVERT: u8 = 0x80;
 
 // ── 0x22 bases the mode experiment compares ─────────────────────────
 //
@@ -356,42 +355,6 @@ pub static EXPERIMENTS: &[Experiment] = &[
             LabStep {
                 op: LabOp::Otp {
                     ctrl1: CTRL1_INVERT,
-                    ctrl2: ctrl2::DU,
-                },
-                asks: MOVE_ASKS,
-            },
-        ],
-    },
-    Experiment {
-        name: "Ctrl1 width",
-        sub: "one 0x21 byte against the two the production paths send",
-        steps: &[
-            LabStep {
-                op: LabOp::Clear,
-                asks: NO_ASKS,
-            },
-            LabStep {
-                op: LabOp::WriteColumns,
-                asks: NO_ASKS,
-            },
-            LabStep {
-                op: LabOp::Otp {
-                    ctrl1: CTRL1_BYPASS,
-                    ctrl2: ctrl2::DU,
-                },
-                asks: MOVE_ASKS,
-            },
-            LabStep {
-                op: LabOp::Clear,
-                asks: NO_ASKS,
-            },
-            LabStep {
-                op: LabOp::WriteColumns,
-                asks: NO_ASKS,
-            },
-            LabStep {
-                op: LabOp::Otp {
-                    ctrl1: CTRL1_BYPASS_TWO_BYTE,
                     ctrl2: ctrl2::DU,
                 },
                 asks: MOVE_ASKS,

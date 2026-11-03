@@ -23,8 +23,9 @@ const CAP: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlaneState {
-    /// Planes hold content the panel does not show (skipped phase 3,
-    /// or a full refresh in flight): re-drive via inv_red, no delta.
+    /// Planes are not a trusted delta baseline (an abandoned or
+    /// unsettled DU, or a full refresh in flight): re-drive via
+    /// inv_red, no delta.
     Stale,
     /// Planes hold the codes an AA pass wrote and the panel holds the
     /// matching grays: revert to the rails before any re-drive.
@@ -44,11 +45,13 @@ pub enum PlaneState {
 /// How a refresh session left the planes across its region.
 #[derive(Clone, Copy)]
 pub enum SessionOutcome {
-    /// Phase 3 ran: planes match the panel again.
+    /// The DU completed: its ping-pong swap left the page shown in
+    /// RED, the delta baseline for the next one.
     Synced,
-    /// Phase 3 skipped: planes hold content the panel does not show.
+    /// The frame was overtaken, or the wave never settled: RED is not
+    /// trusted as a baseline.
     Abandoned,
-    /// A gray pass replaced phase 3: planes hold AA codes.
+    /// A gray pass closed the frame: planes hold AA codes.
     Grayed,
     /// RED was rewritten with plain content after a gray pass.
     Rebased,

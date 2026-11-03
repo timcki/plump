@@ -1,0 +1,9 @@
+# production init_display(), verbatim
+rst
+c 12
+ms 10
+c 18 80
+c 0C AE C7 C3 C0 40
+c 01 DF 01 02
+c 3C 01
+c 11 01

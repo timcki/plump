@@ -69,12 +69,13 @@ impl AfterInput {
 /// the app's `GrayscaleMode`) and then interpret it with their own
 /// closers, so the partial and full paths cannot drift apart.
 enum ClosePlan {
-    /// The frame was overtaken: skip phase 3 (partial) or the AA pass
-    /// (full).
+    /// The frame was overtaken: mark the DU stale (partial) or skip
+    /// the AA pass (full).
     Abandon,
-    /// Plain phase 3, nothing more.
+    /// Plain close: bookkeeping only (ping-pong already left the page
+    /// in RED).
     SyncRed,
-    /// Grayscale AA pass in place of phase 3.
+    /// Grayscale AA pass to close the frame.
     GrayNow,
 }
 
@@ -886,11 +887,13 @@ impl super::Kernel {
 
                             match plan {
                                 ClosePlan::Abandon => {
-                                    // skip phase 3 when content changed
-                                    // mid-DU (the screen will be redrawn
-                                    // right after); the next partial
-                                    // recovers the desynchronised RED RAM
-                                    // via inv_red.
+                                    // content changed mid-DU (the screen
+                                    // will be redrawn right after): no
+                                    // AA pass over a stale frame, and
+                                    // the region is marked stale so the
+                                    // next partial re-drives via inv_red
+                                    // (conservative: ping-pong already
+                                    // left the shown page in RED).
                                     //
                                     // discriminator for the page-turn AA
                                     // hunt: any turn logging this line
@@ -921,7 +924,7 @@ impl super::Kernel {
                                     settled.abandon();
                                 }
                                 ClosePlan::GrayNow => {
-                                    // grayscale AA replaces phase 3, then
+                                    // grayscale AA closes the frame, then
                                     // RED is rebased to the plain page
                                     // (crosspoint's scheme) so the next
                                     // AA turn is a delta with no revert.
@@ -952,8 +955,7 @@ impl super::Kernel {
                                         write_ms,
                                         wave_ms
                                     );
-                                    let draw = |s: &mut StripBuffer| app_mgr.draw(s);
-                                    settled.sync_red(&draw);
+                                    settled.sync_red();
                                 }
                             }
 
@@ -1097,12 +1099,10 @@ impl super::Services {
             };
 
             // input is deliberately left in the channel. dispatching
-            // it here mutates drawable state between phase 1 and
-            // phase 3, and that divergence is the only reason phase 3
-            // ever has to be skipped -- a skipped phase 3 leaves RED
-            // != BW, which the OTP DU reads as a drive state rather
-            // than as no-change, so the band gets re-pulsed by every
-            // later windowed refresh anywhere on the panel.
+            // it here mutates drawable state between phase 1 and the
+            // closing phase: the AA pass would draw a different frame
+            // than the DU showed, so the session has to abandon, and
+            // an abandoned DU costs the next turn an inv_red re-drive.
             //
             // nothing is slower for it: the main loop takes the
             // events the moment this session closes, which is the
@@ -1217,8 +1217,9 @@ impl super::Kernel {
             "sleep: modal waveform outlasted the prep by {}ms",
             t1.elapsed().as_millis()
         );
-        // no phase 3: the sleep screen's full clear rewrites both
-        // planes, and the app has dropped the heap its frame drew from
+        // abandon, not sync: the sleep screen's full clear rewrites
+        // both planes, and the app has dropped the heap its frame drew
+        // from, so nothing may draw again
         wave.settle().abandon();
         sleep_img
     }

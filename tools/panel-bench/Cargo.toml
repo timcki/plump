@@ -1,0 +1,21 @@
+[package]
+name = "plump-panel-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# bench firmware for the SSD1677, deliberately outside the firmware
+# workspace: no radio, no kernel, its own linker script
+[workspace]
+
+[dependencies]
+esp-hal = { version = "=1.0.0", features = ["esp32c3", "unstable"] }
+esp-backtrace = { version = "=0.18.1", features = ["esp32c3", "panic-handler", "println"] }
+esp-println = { version = "=0.16.1", features = ["esp32c3"] }
+esp-bootloader-esp-idf = { version = "=0.4.0", features = ["esp32c3"] }
+
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = "fat"
+opt-level = 3

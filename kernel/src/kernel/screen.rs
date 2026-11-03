@@ -10,19 +10,28 @@
 //   settled.sync_red / .abandon / .grayscale / .finish
 //   grayscale -> GrayDone: .rebase_red, or drop to keep the codes
 //
+// a DU has no phase 3: the panel's RAM ping-pong (see
+// drivers/ssd1677.rs) swaps the planes at the end of every mode 2
+// activation, so RED already holds the page the DU just showed and
+// sync_red is plane-map bookkeeping only. that only holds for a wave
+// that ran to completion: a session settled with the busy pin still
+// high leaves the swap unknown, so it is marked stale and forces a GC
+//
 // AA page turns (crosspoint's scheme): after the gray pass RED is
 // rewritten with the plain page, so the planes are tracked as AA
 // residue rather than gray codes. the next frame that grays again
 // (another AA reader page) runs a plain delta DU against RED: no
 // revert, no inv_red. any other frame re-drives via inv_red, which
 // puts every lifted edge back on its rail. if the rebase never runs
-// the codes stay tracked and the old revert path applies
+// the codes stay tracked and the old revert path applies. the gray
+// and revert passes run with 0x22 bit 3 clear, so neither swaps: the
+// codes stay MSB in RED, LSB in BW for as long as they are tracked
 //
 // Wave borrows the Screen mutably, so no other panel access can
 // compile while a waveform is in flight; the scheduler exploits that
 // window for SD I/O (the charge pump drives pixels with no SPI
-// traffic). misordered phases are unrepresentable: phase 3 methods
-// only exist on Settled, which only exists after the wave is consumed,
+// traffic). misordered phases are unrepresentable: the closers only
+// exist on Settled, which only exists after the wave is consumed,
 // and the driver tokens the session carries (see drivers/ssd1677.rs)
 // make the same order unrepresentable one layer down
 //
@@ -100,6 +109,9 @@ pub struct Settled<'s, M> {
     screen: &'s mut Screen,
     driven: Driven,
     region: AlignedRegion,
+    // busy was low at settle; false when the caller gave up on a
+    // stuck pin, so whether the DU swapped the planes is unknown
+    completed: bool,
     _mode: PhantomData<M>,
 }
 
@@ -175,13 +187,14 @@ impl<'s> PendingRevert<'s> {
 /// the sleep modal).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FrameClose {
-    /// Phase 3 or nothing: the frame stays plain BW.
+    /// No gray pass: the frame stays plain BW.
     Plain,
-    /// A gray pass is expected to replace phase 3.
+    /// A gray pass is expected to close the frame.
     Gray,
 }
 
-/// A gray pass that completed: both planes hold its codes.
+/// A gray pass that completed: both planes hold its codes (LSB in
+/// BW, MSB in RED; the pass does not swap).
 ///
 /// [`GrayDone::rebase_red`] rewrites RED with the plain page so the
 /// next AA frame is a delta; dropping it instead keeps the codes
@@ -195,7 +208,7 @@ pub struct GrayDone<'s> {
 impl GrayDone<'_> {
     /// RED <- plain content over the grayed region. The draw must be
     /// the frame the gray pass just drew (the strip is back in BW
-    /// mode), exactly as for phase 3.
+    /// mode).
     pub fn rebase_red<F>(self, draw: &F)
     where
         F: Fn(&mut StripBuffer),
@@ -424,12 +437,12 @@ impl Screen {
     {
         match self.plan_partial(region, FrameClose::Plain, draw) {
             Ok(PartialPlan::Ready(wave)) => {
-                wave.wait().await?.sync_red(draw);
+                wave.wait().await?.sync_red();
                 Ok(())
             }
             Ok(PartialPlan::RevertFirst(pending)) => match pending.proceed(draw).await {
                 Ok(wave) => {
-                    wave.wait().await?.sync_red(draw);
+                    wave.wait().await?.sync_red();
                     Ok(())
                 }
                 Err(_) => Ok(()),
@@ -488,7 +501,10 @@ impl Screen {
         // AA residue relies on it too: its BW plane still holds LSB
         // codes, and only a full-screen phase 1 overwrites all of them
         // before the DU reads the planes. narrowing this window again
-        // would need the residue neutralized first, like gray codes
+        // would need the residue neutralized first, like gray codes.
+        // so does dropping phase 3: after a DU's ping-pong swap BW
+        // holds the previous frame (or !page after inv_red), which a
+        // narrower phase 1 would leave outside its window
         let _ = region;
         let r = FULL_REGION;
 
@@ -677,50 +693,78 @@ impl<'s, M> Wave<'s, M> {
     }
 
     /// Consume the wave after the caller has observed busy-low (or
-    /// given up via its own guard timeout).
-    pub fn settle(self) -> Settled<'s, M> {
+    /// given up via its own guard timeout). A pin still high here is
+    /// remembered: the DU closers then treat the planes as unknown.
+    pub fn settle(mut self) -> Settled<'s, M> {
+        let completed = !self.is_busy();
         Settled {
             screen: self.screen,
             driven: self.driven,
             region: self.region,
+            completed,
             _mode: PhantomData,
         }
     }
 
     /// Wait inline for the waveform with the driver timeout, then
-    /// settle. For paths with nothing to overlap.
+    /// settle. For paths with nothing to overlap. On timeout the
+    /// planes are unknown (a DU may or may not have swapped them), so
+    /// the region is marked stale and the next refresh is a full GC.
     pub async fn wait(self) -> Result<Settled<'s, M>, TimeoutError> {
-        self.screen.epd.wait_busy_async("wave").await?;
+        if let Err(e) = self.screen.epd.wait_busy_async("wave").await {
+            let _ = self
+                .screen
+                .planes
+                .apply(self.region, SessionOutcome::Abandoned);
+            self.screen.force_ghost_clear();
+            return Err(e);
+        }
         Ok(self.settle())
     }
 }
 
 impl<'s> Settled<'s, Du> {
-    /// Phase 3: rewrite RED RAM with current content (BW already holds
-    /// it from phase 1) so the next DU computes a minimal delta. Panel
-    /// power stays latched for the next refresh.
-    pub fn sync_red<F>(self, draw: &F)
-    where
-        F: Fn(&mut StripBuffer),
-    {
+    /// Close a DU with no RAM traffic: the ping-pong swap at the end
+    /// of the mode 2 activation already put the page just shown in
+    /// RED (BW now holds the previous frame, or !page after an inv_red
+    /// re-drive, which the next full-screen phase 1 overwrites), so
+    /// the next DU computes a minimal delta. Bookkeeping only. A wave
+    /// that never completed is marked stale and forces a GC instead.
+    pub fn sync_red(self) {
         let s = self.screen;
-        s.epd.partial_phase3_sync(s.strip, &self.driven, draw);
-        // the panel matches both planes across this region again; the
-        // carve is exact, so claims outside it (gray codes elsewhere,
-        // an old skipped phase 3) survive as fragments instead of the
-        // old whole-box invalidation that kept dropping revert
-        // coverage after every sync
-        if s.planes.apply(self.region, SessionOutcome::Synced) {
+        let outcome = if self.completed {
+            // the carve is exact, so claims outside this region
+            // survive as fragments
+            SessionOutcome::Synced
+        } else {
+            log::warn!("screen: DU never settled, planes unknown, forcing full GC");
+            s.force_ghost_clear();
+            SessionOutcome::Abandoned
+        };
+        if s.planes.apply(self.region, outcome) {
             s.force_ghost_clear();
         }
     }
 
-    /// Skip phase 3 (content changed mid-waveform); RED RAM keeps the
-    /// pre-waveform image while the panel shows the new one, so the
-    /// region needs an inv_red re-drive before any delta DU.
+    /// Close a DU whose frame was overtaken mid-waveform. A completed
+    /// DU has already left the page it showed in RED (ping-pong), so
+    /// this is conservative: the region is still marked stale and the
+    /// next partial re-drives it via inv_red, which also resets any AA
+    /// lifts the overtaken frame left behind. A wave that never
+    /// completed additionally forces a GC.
     pub fn abandon(self) {
         let r = self.region.get();
-        log::info!("screen: abandon {},{} {}x{}", r.x, r.y, r.w, r.h);
+        log::info!(
+            "screen: abandon {},{} {}x{} completed={}",
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            self.completed
+        );
+        if !self.completed {
+            self.screen.force_ghost_clear();
+        }
         if self
             .screen
             .planes
@@ -730,7 +774,7 @@ impl<'s> Settled<'s, Du> {
         }
     }
 
-    /// Grayscale AA pass over this refresh instead of phase 3.
+    /// Grayscale AA pass to close this refresh.
     ///
     /// The gray LUT states are short relative pulses that lighten
     /// pixels the BW frame just drove black, and `{0,0}` is literally
@@ -742,19 +786,25 @@ impl<'s> Settled<'s, Du> {
     /// reverts the grays to their rails first. On timeout the pass is
     /// additionally promoted to a full GC.
     ///
-    /// Only a full-screen session takes the pass (whole-panel rule);
-    /// a windowed one closes with a plain phase 3, stays BW, and
-    /// yields no [`GrayDone`].
+    /// Only a full-screen session over a completed DU takes the pass
+    /// (whole-panel rule; gray codes written over a running wave would
+    /// be read mid-waveform); otherwise it closes like
+    /// [`Settled::sync_red`], stays BW, and yields no [`GrayDone`].
+    ///
+    /// The DU before the pass swapped the planes; the pass writes
+    /// both, so that does not matter, and the pass itself does not
+    /// swap: afterwards BW holds the LSB codes, RED the MSB codes.
     pub async fn grayscale<F>(self, draw: &F) -> Result<Option<GrayDone<'s>>, TimeoutError>
     where
         F: Fn(&mut StripBuffer),
     {
-        if self.region != FULL_REGION {
+        if self.region != FULL_REGION || !self.completed {
             log::debug!(
-                "screen: AA skipped for windowed session {:?}",
-                self.region.get()
+                "screen: AA skipped for session {:?} completed={}",
+                self.region.get(),
+                self.completed
             );
-            self.sync_red(draw);
+            self.sync_red();
             return Ok(None);
         }
         let s = self.screen;
