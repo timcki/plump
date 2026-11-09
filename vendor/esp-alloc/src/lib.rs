@@ -321,7 +321,7 @@ impl HeapRegion {
 #[derive(Debug)]
 pub struct HeapStats {
     /// Granular stats for all the configured memory regions.
-    pub region_stats: [Option<RegionStats>; 3],
+    pub region_stats: [Option<RegionStats>; MAX_REGIONS],
 
     /// Total size of all combined heap regions in bytes.
     pub size: usize,
@@ -385,6 +385,11 @@ impl defmt::Format for HeapStats {
     }
 }
 
+/// Maximum number of heap regions. plump patch: upstream reserves three,
+/// but plump registers one contiguous region and every slot embeds a
+/// full TLSF control block (~2 KB) in `.bss`.
+pub const MAX_REGIONS: usize = 1;
+
 /// Internal stats to keep track across multiple regions.
 #[cfg(feature = "internal-heap-stats")]
 struct InternalHeapStats {
@@ -397,7 +402,7 @@ struct InternalHeapStats {
 }
 
 struct EspHeapInner {
-    heap: [Option<HeapRegion>; 3],
+    heap: [Option<HeapRegion>; MAX_REGIONS],
     #[cfg(feature = "internal-heap-stats")]
     internal_heap_stats: InternalHeapStats,
 }
@@ -406,7 +411,7 @@ impl EspHeapInner {
     /// Crate a new UNINITIALIZED heap allocator
     pub const fn empty() -> Self {
         EspHeapInner {
-            heap: [const { None }; 3],
+            heap: [const { None }; MAX_REGIONS],
             #[cfg(feature = "internal-heap-stats")]
             internal_heap_stats: InternalHeapStats {
                 current_usage: 0,
@@ -453,7 +458,7 @@ impl EspHeapInner {
     /// called from within `println!()` to pretty-print the usage of the
     /// heap.
     pub fn stats(&self) -> HeapStats {
-        let mut region_stats: [Option<RegionStats>; 3] = [const { None }; 3];
+        let mut region_stats: [Option<RegionStats>; MAX_REGIONS] = [const { None }; MAX_REGIONS];
 
         let mut used = 0;
         let mut free = 0;

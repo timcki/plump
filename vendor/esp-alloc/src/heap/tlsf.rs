@@ -2,8 +2,12 @@ use core::{alloc::Layout, ptr::NonNull};
 
 use rlsf::Tlsf;
 
-// TODO: make this configurable
-type Heap = Tlsf<'static, usize, usize, { usize::BITS as usize }, { usize::BITS as usize }>;
+// plump patch: FLLEN 16 instead of usize::BITS. the largest block is
+// GRANULARITY (8) << FLLEN = 512 KB, more than all of the C3's DRAM, and
+// binning below that is unchanged; FLLEN 32 spent 2 KB of free-list
+// heads on sizes up to 32 GB
+const FLLEN: usize = 16;
+type Heap = Tlsf<'static, usize, usize, FLLEN, { usize::BITS as usize }>;
 
 pub(crate) struct TlsfHeap {
     heap: Heap,
