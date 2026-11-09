@@ -1,5 +1,6 @@
-/* vendored from esp-hal 1.0.0 generated esp32c3.x; only change:
-   includes stack-plump.x instead of stack.x. re-diff on esp-hal bumps */
+/* vendored from esp-hal 1.0.0 generated esp32c3.x; only changes:
+   includes stack-plump.x, rwtext-plump.x and text-plump.x instead of
+   stack.x, rwtext.x and text.x. re-diff on esp-hal bumps */
 
 /* esp32c3 fixups */
 
@@ -46,11 +47,11 @@ INSERT BEFORE .data;
 
 /* Shared sections - ordering matters */
 SECTIONS {
-  INCLUDE "rwtext.x"
+  INCLUDE "rwtext-plump.x"
   INCLUDE "rwdata.x"
 }
 INCLUDE "rodata.x"
-INCLUDE "text.x"
+INCLUDE "text-plump.x"
 INCLUDE "rtc_fast.x"
 INCLUDE "stack-plump.x"
 INCLUDE "dram2.x"
