@@ -810,11 +810,22 @@ pub struct StreamStripStep {
 
     // HTML stripper
     stripper: HtmlStripStream,
-    strip_buf: [u8; STRIP_BUF_SIZE],
+    // on the heap with the other buffers: inline it would make the
+    // step 4 KB bigger for every caller that keeps one between steps
+    strip_buf: Box<[u8; STRIP_BUF_SIZE]>,
     strip_pos: usize,
     total_written: u32,
 
     done: bool,
+}
+
+fn alloc_strip_buf() -> Result<Box<[u8; STRIP_BUF_SIZE]>, &'static str> {
+    let layout = core::alloc::Layout::new::<[u8; STRIP_BUF_SIZE]>();
+    let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return Err("cache: OOM for strip buffer");
+    }
+    Ok(unsafe { Box::from_raw(ptr.cast::<[u8; STRIP_BUF_SIZE]>()) })
 }
 
 impl StreamStripStep {
@@ -852,7 +863,7 @@ impl StreamStripStep {
                     remaining: entry.uncomp_size,
                     input_size: entry.uncomp_size,
                     stripper: HtmlStripStream::new(),
-                    strip_buf: [0u8; STRIP_BUF_SIZE],
+                    strip_buf: alloc_strip_buf()?,
                     strip_pos: 0,
                     total_written: 0,
                     done: false,
@@ -897,7 +908,7 @@ impl StreamStripStep {
                     remaining: 0,
                     input_size: entry.comp_size,
                     stripper: HtmlStripStream::new(),
-                    strip_buf: [0u8; STRIP_BUF_SIZE],
+                    strip_buf: alloc_strip_buf()?,
                     strip_pos: 0,
                     total_written: 0,
                     done: false,
