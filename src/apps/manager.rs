@@ -1112,7 +1112,9 @@ impl AppLayer for AppManager {
         // peripheral is not accessed again until the next upload session.
         let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
 
-        let exit = crate::apps::upload::run_upload_mode(
+        // boxed: the radio and network futures are ~26 KB, and inline
+        // they would sit in the main task's static pool for good
+        let exit = alloc::boxed::Box::pin(crate::apps::upload::run_upload_mode(
             wifi,
             screen,
             sd,
@@ -1120,7 +1122,7 @@ impl AppLayer for AppManager {
             &self.chrome,
             &self.mapper,
             self.settings.wifi_config(),
-        )
+        ))
         .await;
 
         let tab = match exit {
