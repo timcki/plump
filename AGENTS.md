@@ -13,7 +13,7 @@ The codebase splits into a **kernel** (hardware drivers, scheduling, storage) an
 | Resource | Detail |
 |----------|--------|
 | MCU | ESP32-C3, single-core RISC-V RV32IMC, 160 MHz |
-| RAM | 400 KB DRAM; ~160 KB heap in a single contiguous region (pinned stack top → end of bootloader-reclaimed RAM), TLSF allocator |
+| RAM | 400 KB DRAM; ~210 KB heap in a single contiguous region (pinned stack top → end of bootloader-reclaimed RAM), TLSF allocator |
 | Stack | 58 KB pinned right after .bss (see `ld/stack-plump.x`), painted with `0xDEAD_BEEF` canary at boot, high-water-mark logged every 5s |
 | Display | SSD1677 mono e-paper (GDEQ0426T82, 4.26"), 800×480 physical = **219 PPI**, displayed in portrait (480×800) via 270° rotation. 1 pt = 3.04 px; the portrait page is 55.6 × 92.7 mm |
 | Storage | microSD over shared SPI bus (400 kHz probe → 20 MHz run), FAT32 |
@@ -248,7 +248,7 @@ The distro implements `AppLayer` via `AppManager` in `src/apps/manager.rs`, whic
 
 ### `no_std` patterns and constraints
 
-**No standard library.** `#![no_std]` with `extern crate alloc`. The heap is a single contiguous ~160 KB region spanning from the pinned stack top to the end of the RAM reclaimed from the 2nd-stage bootloader, managed by `esp_alloc` with the TLSF backend (`ESP_ALLOC_CONFIG_HEAP_ALGORITHM` in `.cargo/config.toml`). The layout comes from the vendored linker chain in `ld/` (`linkall.x` → `esp32c3-plump.x` → `stack-plump.x`), which pins the stack after `.bss` instead of letting it split free DRAM in two; link-time ASSERTs trip if an esp-hal upgrade regresses the layout. Everything else is static or stack.
+**No standard library.** `#![no_std]` with `extern crate alloc`. The heap is a single contiguous ~210 KB region spanning from the pinned stack top to the end of the RAM reclaimed from the 2nd-stage bootloader, managed by `esp_alloc` with the TLSF backend (`ESP_ALLOC_CONFIG_HEAP_ALGORITHM` in `.cargo/config.toml`). The layout comes from the vendored linker chain in `ld/` (`linkall.x` → `esp32c3-plump.x` → `stack-plump.x`), which pins the stack after `.bss` instead of letting it split free DRAM in two; link-time ASSERTs trip if an esp-hal upgrade regresses the layout. `rwtext-plump.x` / `text-plump.x` run the WiFi blobs' sleep and extra-IRAM sections from flash (IDF's defaults), since IRAM is the same SRAM as the heap and nothing here disables the flash cache; `vendor/esp-alloc` keeps one 16-level TLSF region. Upload mode's ~26 KB of radio futures are boxed in `AppManager::run_special_mode` so they live on the heap only while it runs. Everything else is static or stack.
 
 **Heavy statics.** Large structs live in `ConstStaticCell` / `StaticCell` so the async future stays ~200 bytes:
 - `ReaderApp` — ~28 KB (page buffers, chapter state, image cache)

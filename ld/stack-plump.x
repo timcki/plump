@@ -41,6 +41,10 @@ ASSERT(_stack_start <= ORIGIN(dram2_seg), "pinned stack overlaps dram2_seg")
    text buffers (2026-09) took ~1 KB of .bss from the original 160K,
    the sleep card's strings and mini cover (2026-09) another ~1.1 KB,
    and the book cache sheet's 20-entry size table (2026-09) ~1.4 KB;
-   152K: the reader's per-page style-run table (2026-09) ~2 KB */
-ASSERT(_heap_end - _heap_start >= 152K, "merged heap smaller than expected; check .bss growth")
+   152K: the reader's per-page style-run table (2026-09) ~2 KB;
+   208K: upload futures boxed (26 KB), one 16-level TLSF region instead
+   of three 32-level ones (10.6 KB), WiFi sleep / extra IRAM code moved
+   to flash (17 KB, rwtext-plump.x), cache step strip buffer on the
+   heap (4 KB) (2026-11) */
+ASSERT(_heap_end - _heap_start >= 208K, "merged heap smaller than expected; check .bss growth")
 ASSERT(SIZEOF(.dram2_uninit) == 0, "dram2 statics exist; they would sit inside the merged heap")

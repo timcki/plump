@@ -65,7 +65,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
     paint_stack();
-    // single contiguous heap (~173 KB): pinned stack top .. end of the
+    // single contiguous heap (~210 KB): pinned stack top .. end of the
     // RAM reclaimed from the 2nd-stage bootloader. symbols come from
     // ld/stack-plump.x; the linker asserts the layout at build time
     unsafe extern "C" {
