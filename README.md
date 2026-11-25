@@ -2,7 +2,7 @@
 
 Bare-metal e-reader firmware for the [XTEink X4](https://github.com/xteink), built in Rust; `#![no_std]`, no framebuffer, no `dyn` dispatch, async via Embassy on esp-rtos. Based on [hansmrtn/pulp-os](https://github.com/hansmrtn/pulp-os).
 
-It's roughly split into a kernel (`kernel/`: drivers, scheduler, storage, EPD rendering) and a distro (`src/`: apps, fonts, UI). The kernel has zero imports from the app layer, so it could be forked for another device.
+It's roughly split into a kernel (`kernel/`: drivers, scheduler, storage, EPD rendering) and a distro (`src/`: apps, fonts, UI). The kernel has zero imports from the app layer, and a port to the Eegoread A4 is planned.
 
 ## Screens
 
