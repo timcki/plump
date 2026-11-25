@@ -6,9 +6,9 @@ It's roughly split into a kernel (`kernel/`: drivers, scheduler, storage, EPD re
 
 ## Screens
 
-| Home | Reader | Sleep |
-|---|---|---|
-| ![home screen with continue-reading card and recent books](docs/media/home.jpg) | ![reader showing a chapter opening with a dithered image](docs/media/reader.jpg) | ![deep-sleep wallpaper in 4-level grayscale](docs/media/sleep.jpg) |
+| Home | Reader | Reader menu | Settings | Sleep |
+|---|---|---|---|---|
+| ![home screen with a continue-reading card and recent books](docs/media/home.jpg) | ![reader showing a justified page of text](docs/media/reader.jpg) | ![quick-action menu over the reader with contents, font size, clear ghosting and go home](docs/media/menu.jpg) | ![settings screen with reading and display options](docs/media/settings.jpg) | ![deep-sleep wallpaper in 4-level grayscale with the current book card](docs/media/sleep.jpg) |
 
 ## Features
 
