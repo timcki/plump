@@ -1,57 +1,39 @@
 # plump
 
-Bare-metal e-reader firmware for the [XTEink X4](https://github.com/xteink), built in Rust; `#![no_std]`, no framebuffer, no `dyn` dispatch, async via Embassy on esp-rtos. Based on [hansmrtn/pulp-os](https://github.com/hansmrtn/pulp-os).
+Custom firmware for the [XTEink X4](https://github.com/xteink) e-reader, written in Rust. Bare metal, `#![no_std]`, no framebuffer, async via Embassy on esp-rtos.
+It reads EPUB and plain `.txt`, justifies text with a Knuth-Plass line breaker, dithers inline images to 1-bit and turns a page in about 400 ms. Books go on over WiFi from a browser at `http://plump.local/`.
 
-It's roughly split into a kernel (`kernel/`: drivers, scheduler, storage, EPD rendering) and a distro (`src/`: apps, fonts, UI). The kernel has zero imports from the app layer, and a port to the Eegoread A4 is planned.
+<p align="center">
+  <img src="docs/media/home.jpg" alt="Home screen with a continue-reading card and recent books" width="19%">
+  <img src="docs/media/reader.jpg" alt="A justified page in the reader" width="19%">
+  <img src="docs/media/menu.jpg" alt="The quick-action menu over the reader" width="19%">
+  <img src="docs/media/settings.jpg" alt="The settings screen" width="19%">
+  <img src="docs/media/sleep.jpg" alt="The sleep wallpaper with the current book card" width="19%">
+</p>
 
-## Screens
+## How it's put together
 
-| Home | Reader | Reader menu | Settings | Sleep |
-|---|---|---|---|---|
-| ![home screen with a continue-reading card and recent books](docs/media/home.jpg) | ![reader showing a justified page of text](docs/media/reader.jpg) | ![quick-action menu over the reader with contents, font size, clear ghosting and go home](docs/media/menu.jpg) | ![settings screen with reading and display options](docs/media/settings.jpg) | ![deep-sleep wallpaper in 4-level grayscale with the current book card](docs/media/sleep.jpg) |
+It's split into a kernel (`kernel/`: drivers, scheduler, storage, EPD rendering) and a distro (`src/`: apps, fonts, UI). The kernel has zero imports from the app layer, and a port to the Eegoread A4 is planned.
 
-## Features
-
-- **Reader**: EPUB (ZIP/OPF/HTML pipeline, chapter cache on SD, TOC, inline PNG/JPEG dithered to 1-bit) and plain `.txt`, with bold/italic/heading styles and configurable margins, line spacing and alignment. Justification runs a real Knuth-Plass breaker: whole-paragraph dynamic programming over legal breakpoints with badness, fitness classes and soft-hyphen breaks, in i32 fixed point with no allocator beyond the output vec. Progressive JPEGs decode too, band by band, so covers written that way aren't just a grey box
-- **Home**: continue-reading card plus recent books
-- **Stats**: WIP
-- **WiFi upload**: HTTP server + mDNS at `http://plump.local/`, drag-and-drop web UI, QR code on device. Falls back to bringing up its own hotspot (`PLUMP-X4`) when no configured network is in range
-- **Bookmarks**: 16-slot LRU in RAM, flushed to SD every 30 s and on sleep
-- **Display**: ~400 ms partial page turns, periodic full clear to kill ghosting, sunlight mode
+The X4 is an ESP32-C3 with 400 KB of RAM, and about 210 KB of that is heap. A framebuffer for the 800×480 panel would take 48 KB, so the screen is drawn in 12 strips through one 4 KB buffer instead. Only the EPUB reader and the image decoder allocate; everything else lives in statics or on a 58 KB stack.
 
 ## Build
 
-Needs stable Rust ≥ 1.88 (`rust-toolchain.toml` pulls in `riscv32imc-unknown-none-elf`) and [`espflash`](https://github.com/esp-rs/espflash). The [`timcki/smol-epub`](https://github.com/timcki/smol-epub) fork is vendored under `vendor/smol-epub`.
+Needs stable Rust ≥ 1.88 and [`espflash`](https://github.com/esp-rs/espflash). With the device plugged in over USB:
 
 ```sh
-cargo run --release   # build, flash over USB, open the serial monitor
+cargo run --release   # build, flash, open the serial monitor
 ```
 
-`tools/font-compare` is a host-only crate that compares the current fontdue rasteriser with FreeType; see [docs/font-compare.md](docs/font-compare.md).
+All the info about the architecture and the dev loop is in `AGENTS.md`. Point your agents to it and they should figure things out (:
 
-## Controls
+## Fun trivia from development
 
-| | |
-|---|---|
-| Prev / Next | scroll or turn page |
-| Prev / Next jump | page skip; chapter skip in the reader |
-| Select | open |
-| Back | go back; long-press for home |
-| Power short | quick-action menu |
-| Power long | deep sleep |
+Here's the setup I used to let Claude debug the display drivers in a loop.
 
-## Layout
-
-```
-kernel/src/  kernel, board support, drivers, no-alloc UI primitives
-src/         apps (home, library, reader, stats, settings, upload), fonts, chrome
-ld/          vendored linker chain: pinned stack + one contiguous heap
-assets/      TTF fonts, upload web UI
-build.rs     fontdue TTF rasterisation at compile time
-```
-
-Architecture notes on strip rendering, the 3-phase refresh, SPI arbitration and the app trait live in [AGENTS.md](AGENTS.md).
-
-## License
+<p align="center">
+  <img src="docs/media/setup.jpg" alt="A desk with a laptop, an external monitor and a phone on a stand pointed at the e-reader" width="70%">
+</p>
 
 MIT, see [LICENSE](LICENSE).
+Thanks to @hansmrtn for his work on [hansmrtn/pulp-os](https://github.com/hansmrtn/pulp-os). This OS is based on his initial work.
